@@ -18,14 +18,20 @@ from flaggems_vllm.runtime.backend._thead.ops.flash_attention import (
 
 
 def long_prefill_prepare_flags(
-    q, k, cuq, table, used, maxq, scale, qm, prefill_only=False
+    q, k, cuq, table, used, maxq, scale, qm, prefill_only=False, ordered=False
 ):
     batch, hk = (used.numel(), k.shape[-2])
     kw = max(1, table.shape[1])
     qw = max(1, triton.cdiv(maxq * (q.shape[1] // hk), 32))
-    kp = torch.empty((batch, hk, kw), device=k.device, dtype=torch.float32)
-    qp = torch.empty((batch, hk, qw), device=q.device, dtype=torch.float32)
-    flags = torch.empty((batch, hk), device=q.device, dtype=torch.int8)
+    kp = qp = None
+    if q.dtype != torch.float16:
+        kp = torch.empty((batch, hk, kw), device=k.device, dtype=torch.float32)
+        qp = torch.empty((batch, hk, qw), device=q.device, dtype=torch.float32)
+    flags = torch.empty(
+        (batch, hk),
+        device=q.device,
+        dtype=torch.int32 if q.dtype == torch.float16 else torch.int8,
+    )
     cap = triton.cdiv(q.shape[0], qm) + batch - 1
     meta = torch.empty((5 * cap + 1,), device=q.device, dtype=torch.int32)
     norm_kernel = (
@@ -36,26 +42,31 @@ def long_prefill_prepare_flags(
         if prefill_only
         else prefill.linear_metadata_combine_norms
     )
-    norm_kernel[max(qw, kw), batch, hk](
-        q,
-        k,
-        cuq,
-        table,
-        used,
-        qp,
-        kp,
-        q.shape[1],
-        hk,
-        qw,
-        kw,
-        *q.stride()[:2],
-        *k.stride()[:3],
-        table.stride(0),
-        k.shape[1],
-        32,
-        num_warps=4,
-        num_stages=1,
-    )
+    combine_options = {}
+    if ordered:
+        combine_kernel = prefill.ordered_worklist_combine_prefill
+        combine_options["INCLUDE_Q1"] = not prefill_only
+    if q.dtype != torch.float16:
+        norm_kernel[max(qw, kw), batch, hk](
+            q,
+            k,
+            cuq,
+            table,
+            used,
+            qp,
+            kp,
+            q.shape[1],
+            hk,
+            qw,
+            kw,
+            *q.stride()[:2],
+            *k.stride()[:3],
+            table.stride(0),
+            k.shape[1],
+            32,
+            num_warps=4,
+            num_stages=1,
+        )
     combine_kernel[batch * hk,](
         qp,
         kp,
@@ -74,8 +85,10 @@ def long_prefill_prepare_flags(
         qm,
         triton.next_power_of_2(max(1, triton.cdiv(maxq, qm))),
         cap,
+        CHECK_NORMS=q.dtype != torch.float16,
         num_warps=4,
         num_stages=1,
+        **combine_options,
     )
     return (flags, meta)
 
@@ -353,7 +366,20 @@ def async_long_launch_linear(
         q, norm_k, cuq, norm_table, usedk, maxq, scale, qm, prefill_only
     )
     grid = (triton.cdiv(q.shape[0], qm) + batches - 1, 1, q.shape[1] // 4)
-    prefill_tle.async_prefill_attention_kernel[grid](
+    fp16_aiu_q = (
+        q.dtype == torch.float16
+        and q.stride(1) >= q.shape[-1]
+        and q.stride(0) >= (q.shape[1] - 1) * q.stride(1) + q.shape[-1]
+        and q.data_ptr() % 16 == 0
+        and q.stride(0) % 8 == q.stride(1) % 8 == 0
+    )
+    attention_kernel = (
+        prefill_tle.async_small_prefill_attention_kernel
+        if fp16_aiu_q
+        else prefill_tle.async_prefill_attention_kernel
+    )
+    kernel_options = {"SCORE_PEAK": True} if fp16_aiu_q else {}
+    attention_kernel[grid](
         q,
         k,
         v,
@@ -400,6 +426,7 @@ def async_long_launch_linear(
         REVERSE=True,
         num_warps=plan.num_warps,
         num_stages=plan.num_stages,
+        **kernel_options,
     )
     mixed.attention_kernel[grid](
         q,
@@ -449,6 +476,7 @@ def async_long_launch_linear(
         num_warps=plan.num_warps,
         num_stages=plan.num_stages,
         FIXED_MODE=0,
+        TLE_FALLBACK=True,
         VORDER=0,
     )
     return flags
@@ -860,9 +888,27 @@ def async_small_launch_linear(
     hkv = k.shape[-2]
     batches = cuq.numel() - 1
     qm = plan.block_m // 4
+    fp16_short_mixed = (
+        q.dtype == torch.float16
+        and q.shape[1] == 4
+        and norm_k.shape[-2] == 1
+        and norm_k.shape[1] == 16
+        and 32 < batches <= 64
+        and 512 <= maxq <= 2048
+        and norm_table.shape[1] * norm_k.shape[1] <= 2048
+    )
     if norm_block == 32:
         flags, meta = long_prefill_prepare_flags(
-            q, norm_k, cuq, norm_table, usedk, maxq, scale, qm, prefill_only
+            q,
+            norm_k,
+            cuq,
+            norm_table,
+            usedk,
+            maxq,
+            scale,
+            qm,
+            prefill_only,
+            ordered=fp16_short_mixed,
         )
     else:
         flags, meta = prefill.short_metadata_prepare(
@@ -925,6 +971,8 @@ def async_small_launch_linear(
         WRITE_LSE=write_lse,
         SHORT_LIMIT=64,
         REVERSE=True,
+        SCORE_PEAK=q.dtype == torch.float16,
+        ROW_SUM_GUARD=fp16_short_mixed,
         num_warps=plan.num_warps,
         num_stages=plan.num_stages,
     )
@@ -976,6 +1024,7 @@ def async_small_launch_linear(
         num_warps=plan.num_warps,
         num_stages=plan.num_stages,
         FIXED_MODE=0,
+        TLE_FALLBACK=True,
         VORDER=0,
     )
     return flags
@@ -1404,7 +1453,13 @@ def launch_attention(
     if not math.isfinite(scale) or not math.isfinite(softcap) or softcap < 0:
         raise ValueError("Scale must be finite and softcap finite/nonnegative")
     fast_paged = (
-        q.dtype == torch.bfloat16
+        (
+            q.dtype == torch.bfloat16
+            or (
+                q.dtype == torch.float16
+                and (q.shape[1], k.shape[-2], k.shape[1]) in ((16, 2, 32), (4, 1, 16))
+            )
+        )
         and q.shape[-1] == 256
         and (block_table is not None)
         and (k.shape[1] in (16, 32, 64))
@@ -1433,7 +1488,21 @@ def launch_attention(
         )
     async_route = None
     batches = cu_seqlens_q.numel() - 1
-    if fast_paged and 512 <= max_seqlen_q <= 16384 and (1 <= batches <= 128):
+    small_fp16 = (
+        fast_paged
+        and q.dtype == torch.float16
+        and batches == 1
+        and 512 <= max_seqlen_q <= 2048
+        and max_seqlen_k <= 2048
+    )
+    if small_fp16:
+        plan = scheduling.AttentionPlan("single_prefill", 64, 64)
+    if (
+        fast_paged
+        and not small_fp16
+        and 512 <= max_seqlen_q <= 16384
+        and (1 <= batches <= 128)
+    ):
         if (
             q.shape[1] == 8
             and k.shape[-2] == 1
@@ -1453,7 +1522,10 @@ def launch_attention(
             if block_table.shape[1] * k.shape[1] >= 8192:
                 async_route = async_long_launch_long_prefill
             elif (
-                not (max_seqlen_k <= 2048 and (batches == 1 or q.shape[1] == 4))
+                (
+                    q.dtype == torch.float16
+                    or not (max_seqlen_k <= 2048 and (batches == 1 or q.shape[1] == 4))
+                )
                 and q.stride(1) >= q.shape[-1]
                 and (q.stride(0) >= (q.shape[1] - 1) * q.stride(1) + q.shape[-1])
                 and (q.data_ptr() % 16 == 0)
@@ -1464,6 +1536,7 @@ def launch_attention(
                 plan = scheduling.AttentionPlan("linear_prefill", 64, 32)
     if (
         fast_paged
+        and q.dtype == torch.bfloat16
         and 512 <= max_seqlen_q <= 2048
         and (max_seqlen_k <= 2048)
         and (2 <= batches <= 128)
@@ -1520,7 +1593,18 @@ def launch_attention(
                 launch = direct.launch_equal_length
             elif plan.family in ("paged", "hybrid"):
                 launch = direct.paged_launch_paged
-            extra = {"splits": 32, "packed": True} if plan.family == "split" else {}
+            extra = (
+                {
+                    "splits": (
+                        64 if q.dtype == torch.float16 and q.shape[1] == 4 else 32
+                    ),
+                    "packed": True,
+                }
+                if plan.family == "split"
+                else {}
+            )
+            if plan.family == "single_prefill" and q.dtype == torch.float16:
+                extra["fold"] = 4
             if plan.family in (
                 "tp2_decode",
                 "tp2_mixed",

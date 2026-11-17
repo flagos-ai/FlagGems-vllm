@@ -139,9 +139,18 @@ def splitkv_split_attention_kernel(
         high = tl.minimum(high, row_end + klen - qlen)
     if WR >= 0:
         high = tl.minimum(high, row_end + klen - qlen + WR)
-    chunk = tl.cdiv(tl.cdiv(klen, BN), SPLITS) * BN
-    low = tl.maximum(low, split * chunk)
-    high = tl.minimum(high, (split + 1) * chunk)
+    if Q.dtype.element_ty == tl.float16:
+        tiles = tl.cdiv(klen, BN)
+        base_tiles = tiles // SPLITS
+        extra_tiles = tiles % SPLITS
+        split_low = (split * base_tiles + tl.minimum(split, extra_tiles)) * BN
+        split_high = split_low + (base_tiles + (split < extra_tiles)) * BN
+    else:
+        chunk = tl.cdiv(tl.cdiv(klen, BN), SPLITS) * BN
+        split_low = split * chunk
+        split_high = (split + 1) * chunk
+    low = tl.maximum(low, split_low)
+    high = tl.minimum(high, split_high)
     m = tl.full((BM,), -float("inf"), tl.float32)
     row_sum = tl.zeros((BM,), tl.float32)
     acc = tl.zeros((BM, BD), tl.float32)

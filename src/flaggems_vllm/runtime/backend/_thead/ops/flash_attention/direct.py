@@ -3,6 +3,7 @@
 
 from functools import partial
 
+import torch
 import triton
 import triton.language as tl
 
@@ -306,6 +307,7 @@ def step(
     BD: tl.constexpr,
     CAUSAL: tl.constexpr,
     FULL: tl.constexpr,
+    FIRST_SHIFT: tl.constexpr = False,
 ):
     ns = tl.arange(0, BN)
     ds = tl.arange(0, BD)
@@ -341,12 +343,21 @@ def step(
         if CAUSAL:
             mask = mask & (cols[None, :] <= qi[:, None] + delta)
         scores = tl.where(mask, scores, -float("inf"))
-    new_m = tl.maximum(m, tl.max(scores, 1))
-    safe_m = tl.where(new_m == -float("inf"), 0.0, new_m)
-    alpha = tl.exp2(m - safe_m)
-    p = tl.exp2(scores - safe_m[:, None])
-    row_sum = row_sum * alpha + tl.sum(p, 1)
-    acc *= alpha[:, None]
+    if FIRST_SHIFT:
+        new_m = m
+        if start == 0:
+            new_m = tl.max(scores, 1)
+            new_m = tl.where(new_m == -float("inf"), 0.0, new_m)
+        p = tl.exp2(scores - new_m[:, None])
+        part = tl.sum(p, 1)
+        row_sum += part
+    else:
+        new_m = tl.maximum(m, tl.max(scores, 1))
+        safe_m = tl.where(new_m == -float("inf"), 0.0, new_m)
+        alpha = tl.exp2(m - safe_m)
+        p = tl.exp2(scores - safe_m[:, None])
+        row_sum = row_sum * alpha + tl.sum(p, 1)
+        acc *= alpha[:, None]
     if FULL:
         v = tl.load(V + vo[:, None] + kh * VH + ds[None, :])
     else:
@@ -1571,6 +1582,7 @@ def launch_single_key(
         "WRITE_LSE",
         "SINGLE",
         "FOLD",
+        "FIRST_SHIFT",
     ],
     strategy="default",
     use_cuda_graph=True,
@@ -1623,6 +1635,7 @@ def single_prefill_attention_kernel(
     WRITE_LSE: tl.constexpr = True,
     SINGLE: tl.constexpr = False,
     FOLD: tl.constexpr = 8,
+    FIRST_SHIFT: tl.constexpr = False,
 ):
     tl.static_assert(PAGED and (PAGE == 16 or PAGE == 32 or PAGE == 64) and (D == BD))
     tl.static_assert(
@@ -1676,69 +1689,8 @@ def single_prefill_attention_kernel(
     m = tl.full((BM,), -float("inf"), tl.float32)
     row_sum = tl.zeros((BM,), tl.float32)
     acc = tl.zeros((BM, BD), tl.float32)
-    for start in range(0, full_hi, BN):
-        acc, m, row_sum = step(
-            q,
-            K,
-            V,
-            TABLE,
-            acc,
-            m,
-            row_sum,
-            start,
-            batch,
-            kh,
-            qi,
-            klen,
-            delta,
-            KP,
-            KS,
-            KH,
-            VP,
-            VS,
-            VH,
-            TS,
-            PAGE,
-            SCALE,
-            BM,
-            BN,
-            BD,
-            CAUSAL,
-            True,
-        )
-    if hi - full_hi <= 32:
-        for start in range(full_hi, hi, 32):
-            acc, m, row_sum = step(
-                q,
-                K,
-                V,
-                TABLE,
-                acc,
-                m,
-                row_sum,
-                start,
-                batch,
-                kh,
-                qi,
-                klen,
-                delta,
-                KP,
-                KS,
-                KH,
-                VP,
-                VS,
-                VH,
-                TS,
-                PAGE,
-                SCALE,
-                BM,
-                32,
-                BD,
-                CAUSAL,
-                False,
-            )
-    else:
-        for start in range(full_hi, hi, BN):
+    if FIRST_SHIFT:
+        for start in range(0, full_hi, BN):
             acc, m, row_sum = step(
                 q,
                 K,
@@ -1766,8 +1718,262 @@ def single_prefill_attention_kernel(
                 BN,
                 BD,
                 CAUSAL,
-                False,
+                True,
+                FIRST_SHIFT=True,
             )
+        if hi - full_hi <= 32:
+            for start in range(full_hi, hi, 32):
+                acc, m, row_sum = step(
+                    q,
+                    K,
+                    V,
+                    TABLE,
+                    acc,
+                    m,
+                    row_sum,
+                    start,
+                    batch,
+                    kh,
+                    qi,
+                    klen,
+                    delta,
+                    KP,
+                    KS,
+                    KH,
+                    VP,
+                    VS,
+                    VH,
+                    TS,
+                    PAGE,
+                    SCALE,
+                    BM,
+                    32,
+                    BD,
+                    CAUSAL,
+                    False,
+                    FIRST_SHIFT=True,
+                )
+        else:
+            for start in range(full_hi, hi, BN):
+                acc, m, row_sum = step(
+                    q,
+                    K,
+                    V,
+                    TABLE,
+                    acc,
+                    m,
+                    row_sum,
+                    start,
+                    batch,
+                    kh,
+                    qi,
+                    klen,
+                    delta,
+                    KP,
+                    KS,
+                    KH,
+                    VP,
+                    VS,
+                    VH,
+                    TS,
+                    PAGE,
+                    SCALE,
+                    BM,
+                    BN,
+                    BD,
+                    CAUSAL,
+                    False,
+                    FIRST_SHIFT=True,
+                )
+        if not (tl.max(row_sum, 0) <= 32768.0):
+            m = tl.full((BM,), -float("inf"), tl.float32)
+            row_sum = tl.zeros((BM,), tl.float32)
+            acc = tl.zeros((BM, BD), tl.float32)
+            for start in range(0, full_hi, BN):
+                acc, m, row_sum = step(
+                    q,
+                    K,
+                    V,
+                    TABLE,
+                    acc,
+                    m,
+                    row_sum,
+                    start,
+                    batch,
+                    kh,
+                    qi,
+                    klen,
+                    delta,
+                    KP,
+                    KS,
+                    KH,
+                    VP,
+                    VS,
+                    VH,
+                    TS,
+                    PAGE,
+                    SCALE,
+                    BM,
+                    BN,
+                    BD,
+                    CAUSAL,
+                    True,
+                )
+            if hi - full_hi <= 32:
+                for start in range(full_hi, hi, 32):
+                    acc, m, row_sum = step(
+                        q,
+                        K,
+                        V,
+                        TABLE,
+                        acc,
+                        m,
+                        row_sum,
+                        start,
+                        batch,
+                        kh,
+                        qi,
+                        klen,
+                        delta,
+                        KP,
+                        KS,
+                        KH,
+                        VP,
+                        VS,
+                        VH,
+                        TS,
+                        PAGE,
+                        SCALE,
+                        BM,
+                        32,
+                        BD,
+                        CAUSAL,
+                        False,
+                    )
+            else:
+                for start in range(full_hi, hi, BN):
+                    acc, m, row_sum = step(
+                        q,
+                        K,
+                        V,
+                        TABLE,
+                        acc,
+                        m,
+                        row_sum,
+                        start,
+                        batch,
+                        kh,
+                        qi,
+                        klen,
+                        delta,
+                        KP,
+                        KS,
+                        KH,
+                        VP,
+                        VS,
+                        VH,
+                        TS,
+                        PAGE,
+                        SCALE,
+                        BM,
+                        BN,
+                        BD,
+                        CAUSAL,
+                        False,
+                    )
+    else:
+        for start in range(0, full_hi, BN):
+            acc, m, row_sum = step(
+                q,
+                K,
+                V,
+                TABLE,
+                acc,
+                m,
+                row_sum,
+                start,
+                batch,
+                kh,
+                qi,
+                klen,
+                delta,
+                KP,
+                KS,
+                KH,
+                VP,
+                VS,
+                VH,
+                TS,
+                PAGE,
+                SCALE,
+                BM,
+                BN,
+                BD,
+                CAUSAL,
+                True,
+            )
+        if hi - full_hi <= 32:
+            for start in range(full_hi, hi, 32):
+                acc, m, row_sum = step(
+                    q,
+                    K,
+                    V,
+                    TABLE,
+                    acc,
+                    m,
+                    row_sum,
+                    start,
+                    batch,
+                    kh,
+                    qi,
+                    klen,
+                    delta,
+                    KP,
+                    KS,
+                    KH,
+                    VP,
+                    VS,
+                    VH,
+                    TS,
+                    PAGE,
+                    SCALE,
+                    BM,
+                    32,
+                    BD,
+                    CAUSAL,
+                    False,
+                )
+        else:
+            for start in range(full_hi, hi, BN):
+                acc, m, row_sum = step(
+                    q,
+                    K,
+                    V,
+                    TABLE,
+                    acc,
+                    m,
+                    row_sum,
+                    start,
+                    batch,
+                    kh,
+                    qi,
+                    klen,
+                    delta,
+                    KP,
+                    KS,
+                    KH,
+                    VP,
+                    VS,
+                    VH,
+                    TS,
+                    PAGE,
+                    SCALE,
+                    BM,
+                    BN,
+                    BD,
+                    CAUSAL,
+                    False,
+                )
     inv = 1.0 / tl.where(row_sum > 0, row_sum, 1.0)
     result = acc * inv[:, None]
     orow = qstart + qi[:, None]
@@ -1801,6 +2007,8 @@ def launch_single_prefill(
     softcap,
     plan,
     write_lse=True,
+    short_limit=0,
+    fold=2,
 ):
     paged = table is not None
     packed = False
@@ -1808,7 +2016,7 @@ def launch_single_prefill(
     if single:
         maxq = q.shape[0]
     hkv = k.shape[-2]
-    grid = (triton.cdiv(maxq, plan.block_m) * 2, cuq.numel() - 1, q.shape[1] // 2)
+    grid = (triton.cdiv(maxq, plan.block_m) * fold, cuq.numel() - 1, q.shape[1] // fold)
     return single_prefill_attention_kernel[grid](
         q,
         k,
@@ -1848,9 +2056,10 @@ def launch_single_prefill(
         SINGLE=single,
         REVERSE=True,
         ORDER=1,
-        FOLD=2,
+        FOLD=fold,
+        FIRST_SHIFT=q.dtype == torch.float16 and q.shape[-1] == 256,
         WRITE_LSE=write_lse,
-        SHORT_LIMIT=0,
+        SHORT_LIMIT=short_limit,
     )
 
 

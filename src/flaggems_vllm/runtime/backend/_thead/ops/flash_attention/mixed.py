@@ -317,6 +317,7 @@ def tp2_mixed_prefill_step(
     return (acc, new_m, row_sum)
 
 
+@libentry()
 @triton.jit
 def attention_kernel(
     Q,
@@ -368,6 +369,7 @@ def attention_kernel(
     CAPACITY: tl.constexpr = 0,
     FIXED_MODE: tl.constexpr = -1,
     VORDER: tl.constexpr = 0,
+    TLE_FALLBACK: tl.constexpr = False,
 ):
     tl.static_assert(PAGED and (PAGE == 16 or PAGE == 32 or PAGE == 64) and (D == BD))
     tl.static_assert(
@@ -394,6 +396,9 @@ def attention_kernel(
     if REVERSE:
         tile = tl.cdiv(qlen, QM) - 1 - tile
     kh = head // (HQ // HK // FOLD)
+    if TLE_FALLBACK and Q.dtype.element_ty == tl.float16:
+        if tl.load(KNORM + batch * HK + kh) != 0:
+            return
     fixed_ok = (tl.load(KNORM + batch * HK + kh) != 0) & (
         Q.dtype.element_ty == tl.bfloat16
     )

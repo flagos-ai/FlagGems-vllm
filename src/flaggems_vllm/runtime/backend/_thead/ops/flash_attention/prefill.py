@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils import libentry
+
 
 @triton.jit
 def linear_metadata_page_norm(
@@ -86,6 +88,7 @@ def linear_metadata_combine_norms(
     QM: tl.constexpr,
     QT: tl.constexpr,
     CAP: tl.constexpr,
+    CHECK_NORMS: tl.constexpr = True,
 ):
     group = tl.program_id(0)
     batch = group // HK
@@ -94,12 +97,15 @@ def linear_metadata_combine_norms(
     if qlen <= 64 and klen >= 8192:
         tl.store(FLAG + group, 0)
     else:
-        qcols = tl.arange(0, QB)
-        kcols = tl.arange(0, KB)
-        qn = tl.max(tl.load(QPART + group * QW + qcols, qcols < QW, 0), 0)
-        kn = tl.max(tl.load(KPART + group * KW + kcols, kcols < KW, 0), 0)
-        ok = qn * kn * (SCALE * SCALE) <= 1008.0625
-        tl.store(FLAG + group, ok.to(tl.int8))
+        if CHECK_NORMS:
+            qcols = tl.arange(0, QB)
+            kcols = tl.arange(0, KB)
+            qn = tl.max(tl.load(QPART + group * QW + qcols, qcols < QW, 0), 0)
+            kn = tl.max(tl.load(KPART + group * KW + kcols, kcols < KW, 0), 0)
+            ok = qn * kn * (SCALE * SCALE) <= 1008.0625
+            tl.store(FLAG + group, ok.to(tl.int8))
+        else:
+            tl.store(FLAG + group, 1)
     batch = group // HK
     if group % HK == 0:
         bs = tl.arange(0, BB)
@@ -123,6 +129,7 @@ def linear_metadata_combine_norms(
             tl.store(META + 5 * CAP, total)
 
 
+@libentry()
 @triton.jit
 def linear_stage_copy_pages(
     K,
@@ -289,6 +296,7 @@ def linear_prefill_step(
     return (acc, new_m, row_sum)
 
 
+@libentry()
 @triton.jit
 def linear_prefill_attention_kernel(
     Q,
@@ -527,6 +535,7 @@ def linear_prefill_attention_kernel(
         tl.store(LSE + qh * TQ + qstart + qi, lse, qi < qlen)
 
 
+@libentry()
 @triton.jit
 def bounded_prefill_page_norm(
     Q,
@@ -639,6 +648,7 @@ def prepare_flags(q, k, cuq, table, used, maxq, scale, qm):
     return (flags, meta)
 
 
+@libentry()
 @triton.jit
 def bounded_prefill_combine_norms(
     QPART,
@@ -773,6 +783,7 @@ def bounded_prefill_step(
     return (acc, new_m, row_sum)
 
 
+@libentry()
 @triton.jit
 def bounded_prefill_attention_kernel(
     Q,
@@ -1343,17 +1354,21 @@ def ordered_worklist_combine_prefill(
     QT: tl.constexpr,
     CAP: tl.constexpr,
     INCLUDE_Q1: tl.constexpr = False,
+    CHECK_NORMS: tl.constexpr = True,
 ):
     MIN_Q: tl.constexpr = 0 if INCLUDE_Q1 else 1
     group = tl.program_id(0)
     batch = group // HK
     qlen = tl.load(CUQ + batch + 1) - tl.load(CUQ + batch)
     if qlen > MIN_Q:
-        qcols = tl.arange(0, QB)
-        kcols = tl.arange(0, KB)
-        qn = tl.max(tl.load(QPART + group * QW + qcols, qcols < QW, 0), 0)
-        kn = tl.max(tl.load(KPART + group * KW + kcols, kcols < KW, 0), 0)
-        ok = qn * kn * (SCALE * SCALE) <= 1008.0625
+        if CHECK_NORMS:
+            qcols = tl.arange(0, QB)
+            kcols = tl.arange(0, KB)
+            qn = tl.max(tl.load(QPART + group * QW + qcols, qcols < QW, 0), 0)
+            kn = tl.max(tl.load(KPART + group * KW + kcols, kcols < KW, 0), 0)
+            ok = qn * kn * (SCALE * SCALE) <= 1008.0625
+        else:
+            ok = True
         tl.store(FLAG + group, ok.to(tl.int8))
     else:
         tl.store(FLAG + group, 0)
@@ -1407,6 +1422,7 @@ def ordered_worklist_combine_prefill(
             tl.store(META + 5 * CAP, total)
 
 
+@libentry()
 @triton.jit
 def page_norm_prefill(
     Q,
@@ -1487,17 +1503,21 @@ def prefill_worklist_combine_prefill(
     QM: tl.constexpr,
     QT: tl.constexpr,
     CAP: tl.constexpr,
+    CHECK_NORMS: tl.constexpr = True,
 ):
     group = tl.program_id(0)
     batch = group // HK
     qlen = tl.load(CUQ + batch + 1) - tl.load(CUQ + batch)
     if qlen > 1:
-        qcols = tl.arange(0, QB)
-        kcols = tl.arange(0, KB)
-        qn = tl.max(tl.load(QPART + group * QW + qcols, qcols < QW, 0), 0)
-        kn = tl.max(tl.load(KPART + group * KW + kcols, kcols < KW, 0), 0)
-        ok = qn * kn * (SCALE * SCALE) <= 1008.0625
-        tl.store(FLAG + group, ok.to(tl.int8))
+        if CHECK_NORMS:
+            qcols = tl.arange(0, QB)
+            kcols = tl.arange(0, KB)
+            qn = tl.max(tl.load(QPART + group * QW + qcols, qcols < QW, 0), 0)
+            kn = tl.max(tl.load(KPART + group * KW + kcols, kcols < KW, 0), 0)
+            ok = qn * kn * (SCALE * SCALE) <= 1008.0625
+            tl.store(FLAG + group, ok.to(tl.int8))
+        else:
+            tl.store(FLAG + group, 1)
     else:
         tl.store(FLAG + group, 0)
     batch = group // HK
@@ -1600,6 +1620,7 @@ def short_metadata_prepare(
     return (flags, meta)
 
 
+@libentry()
 @triton.jit
 def async_stage_copy_pages(
     K,

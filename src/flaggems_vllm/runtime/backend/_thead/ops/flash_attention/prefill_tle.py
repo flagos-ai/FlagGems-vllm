@@ -6,8 +6,10 @@ import triton.language as tl
 from triton.experimental.tle.language import gpu
 
 from flaggems_vllm.runtime.backend._thead.ops.flash_attention import common
+from flaggems_vllm.utils import libentry
 
 
+@libentry()
 @triton.jit
 def async_prefill_attention_kernel(
     Q,
@@ -58,9 +60,12 @@ def async_prefill_attention_kernel(
     WORKLIST=None,
     CAPACITY: tl.constexpr = 0,
     FIXED_MODE: tl.constexpr = False,
+    UNROLL: tl.constexpr = 1,
 ):
     tl.static_assert(D == 256 and BM == 64 and (FOLD == 4) and PAGED)
-    tl.static_assert(Q.dtype.element_ty == tl.bfloat16)
+    tl.static_assert(
+        Q.dtype.element_ty == tl.bfloat16 or Q.dtype.element_ty == tl.float16
+    )
     tl.static_assert(KP == PAGE * KS and VP == PAGE * VS)
     index = tl.program_id(0)
     group = tl.program_id(2)
@@ -84,9 +89,15 @@ def async_prefill_attention_kernel(
     p = lane // 4
     q = lane % 4
     qhead = group * 4 + warp
-    word = tl.where(p % 4 == q, tl.where(lane >= 16, 1065353216, 16256), 0).to(
-        tl.uint32
-    )
+    word = tl.where(
+        p % 4 == q,
+        tl.where(
+            lane >= 16,
+            1006632960 if Q.dtype.element_ty == tl.float16 else 1065353216,
+            15360 if Q.dtype.element_ty == tl.float16 else 16256,
+        ),
+        0,
+    ).to(tl.uint32)
     cm0 = tile * 16 + p + 0
     cn0 = q + 0
     bk0 = 2 * q + 0
@@ -945,6 +956,8 @@ def async_prefill_attention_kernel(
     o15_7 = tl.full((128,), 0.0, tl.float32)
     sum0 = tl.full((128,), 0.0, tl.float32)
     sum1 = tl.full((128,), 0.0, tl.float32)
+    if Q.dtype.element_ty == tl.float16:
+        range_ok = tl.full((128,), True, tl.int1)
     hi = klen
     delta = klen - qlen
     if CAUSAL:
@@ -967,7 +980,7 @@ def async_prefill_attention_kernel(
         common.issue_copy(V + base * VS, vbuf, 0, klen, VS, 0, kh * VH)
         common.commit_copies()
     token = common.wait_copies() + tl.zeros((128,), tl.int32)
-    for start in range(0, hi, 32):
+    for start in tl.range(0, hi, 32, loop_unroll_factor=UNROLL):
         slot = start // 32 % 2
         if start + 32 < hi:
             common.issue_copy(
@@ -1011,6 +1024,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 0, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1030,6 +1044,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 16, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1049,6 +1064,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 16, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1068,6 +1084,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 32, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1087,6 +1104,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 32, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1106,6 +1124,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 48, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1125,6 +1144,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 48, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1144,6 +1164,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 64, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1163,6 +1184,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 64, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1182,6 +1204,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 80, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1201,6 +1224,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 80, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1220,6 +1244,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 96, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1239,6 +1264,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 96, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1258,6 +1284,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 112, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1277,6 +1304,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 112, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1296,6 +1324,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 128, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1315,6 +1344,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 128, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1334,6 +1364,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 144, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1353,6 +1384,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 144, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1372,6 +1404,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 160, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1391,6 +1424,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 160, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1410,6 +1444,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 176, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1429,6 +1464,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 176, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1448,6 +1484,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 192, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1467,6 +1504,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 192, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1486,6 +1524,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 208, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1505,6 +1544,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 208, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1524,6 +1564,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 224, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1543,6 +1584,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 224, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1562,6 +1604,7 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 240, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -1581,6 +1624,7 @@ def async_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 240, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -1600,98 +1644,131 @@ def async_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         valid0 = (cm0 < qlen) & (start + 0 + cn0 < klen)
         if CAUSAL:
             valid0 = valid0 & (start + 0 + cn0 <= cm0 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid0) | (tl.abs(s0_0 * SCALE) <= 8.0))
         p0 = tl.exp2(
             tl.where(
                 valid0,
-                s0_0 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_0 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid1 = (cm1 < qlen) & (start + 0 + cn1 < klen)
         if CAUSAL:
             valid1 = valid1 & (start + 0 + cn1 <= cm1 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid1) | (tl.abs(s0_1 * SCALE) <= 8.0))
         p1 = tl.exp2(
             tl.where(
                 valid1,
-                s0_1 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_1 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid2 = (cm2 < qlen) & (start + 0 + cn2 < klen)
         if CAUSAL:
             valid2 = valid2 & (start + 0 + cn2 <= cm2 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid2) | (tl.abs(s0_2 * SCALE) <= 8.0))
         p2 = tl.exp2(
             tl.where(
                 valid2,
-                s0_2 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_2 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid3 = (cm3 < qlen) & (start + 0 + cn3 < klen)
         if CAUSAL:
             valid3 = valid3 & (start + 0 + cn3 <= cm3 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid3) | (tl.abs(s0_3 * SCALE) <= 8.0))
         p3 = tl.exp2(
             tl.where(
                 valid3,
-                s0_3 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_3 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid4 = (cm4 < qlen) & (start + 0 + cn4 < klen)
         if CAUSAL:
             valid4 = valid4 & (start + 0 + cn4 <= cm4 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid4) | (tl.abs(s0_4 * SCALE) <= 8.0))
         p4 = tl.exp2(
             tl.where(
                 valid4,
-                s0_4 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_4 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid5 = (cm5 < qlen) & (start + 0 + cn5 < klen)
         if CAUSAL:
             valid5 = valid5 & (start + 0 + cn5 <= cm5 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid5) | (tl.abs(s0_5 * SCALE) <= 8.0))
         p5 = tl.exp2(
             tl.where(
                 valid5,
-                s0_5 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_5 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid6 = (cm6 < qlen) & (start + 0 + cn6 < klen)
         if CAUSAL:
             valid6 = valid6 & (start + 0 + cn6 <= cm6 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid6) | (tl.abs(s0_6 * SCALE) <= 8.0))
         p6 = tl.exp2(
             tl.where(
                 valid6,
-                s0_6 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_6 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid7 = (cm7 < qlen) & (start + 0 + cn7 < klen)
         if CAUSAL:
             valid7 = valid7 & (start + 0 + cn7 <= cm7 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid7) | (tl.abs(s0_7 * SCALE) <= 8.0))
         p7 = tl.exp2(
             tl.where(
                 valid7,
-                s0_7 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_7 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         sum0 += p0 + p1 + p2 + p3
         sum1 += p4 + p5 + p6 + p7
         pa0, pa1, pa2, pa3, pa4, pa5, pa6, pa7 = common.mma_reorder(
-            p0.to(tl.bfloat16),
-            p1.to(tl.bfloat16),
-            p2.to(tl.bfloat16),
-            p3.to(tl.bfloat16),
-            p4.to(tl.bfloat16),
-            p5.to(tl.bfloat16),
-            p6.to(tl.bfloat16),
-            p7.to(tl.bfloat16),
+            p0.to(Q.dtype.element_ty),
+            p1.to(Q.dtype.element_ty),
+            p2.to(Q.dtype.element_ty),
+            p3.to(Q.dtype.element_ty),
+            p4.to(Q.dtype.element_ty),
+            p5.to(Q.dtype.element_ty),
+            p6.to(Q.dtype.element_ty),
+            p7.to(Q.dtype.element_ty),
             word,
         )
         pp0_0 = common.pack_bf(pa0, pa1)
@@ -1701,94 +1778,126 @@ def async_prefill_attention_kernel(
         valid0 = (cm0 < qlen) & (start + 16 + cn0 < klen)
         if CAUSAL:
             valid0 = valid0 & (start + 16 + cn0 <= cm0 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid0) | (tl.abs(s1_0 * SCALE) <= 8.0))
         p0 = tl.exp2(
             tl.where(
                 valid0,
-                s1_0 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_0 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid1 = (cm1 < qlen) & (start + 16 + cn1 < klen)
         if CAUSAL:
             valid1 = valid1 & (start + 16 + cn1 <= cm1 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid1) | (tl.abs(s1_1 * SCALE) <= 8.0))
         p1 = tl.exp2(
             tl.where(
                 valid1,
-                s1_1 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_1 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid2 = (cm2 < qlen) & (start + 16 + cn2 < klen)
         if CAUSAL:
             valid2 = valid2 & (start + 16 + cn2 <= cm2 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid2) | (tl.abs(s1_2 * SCALE) <= 8.0))
         p2 = tl.exp2(
             tl.where(
                 valid2,
-                s1_2 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_2 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid3 = (cm3 < qlen) & (start + 16 + cn3 < klen)
         if CAUSAL:
             valid3 = valid3 & (start + 16 + cn3 <= cm3 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid3) | (tl.abs(s1_3 * SCALE) <= 8.0))
         p3 = tl.exp2(
             tl.where(
                 valid3,
-                s1_3 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_3 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid4 = (cm4 < qlen) & (start + 16 + cn4 < klen)
         if CAUSAL:
             valid4 = valid4 & (start + 16 + cn4 <= cm4 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid4) | (tl.abs(s1_4 * SCALE) <= 8.0))
         p4 = tl.exp2(
             tl.where(
                 valid4,
-                s1_4 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_4 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid5 = (cm5 < qlen) & (start + 16 + cn5 < klen)
         if CAUSAL:
             valid5 = valid5 & (start + 16 + cn5 <= cm5 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid5) | (tl.abs(s1_5 * SCALE) <= 8.0))
         p5 = tl.exp2(
             tl.where(
                 valid5,
-                s1_5 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_5 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid6 = (cm6 < qlen) & (start + 16 + cn6 < klen)
         if CAUSAL:
             valid6 = valid6 & (start + 16 + cn6 <= cm6 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid6) | (tl.abs(s1_6 * SCALE) <= 8.0))
         p6 = tl.exp2(
             tl.where(
                 valid6,
-                s1_6 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_6 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid7 = (cm7 < qlen) & (start + 16 + cn7 < klen)
         if CAUSAL:
             valid7 = valid7 & (start + 16 + cn7 <= cm7 + delta)
+        if Q.dtype.element_ty == tl.float16:
+            range_ok = range_ok & ((~valid7) | (tl.abs(s1_7 * SCALE) <= 8.0))
         p7 = tl.exp2(
             tl.where(
                 valid7,
-                s1_7 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_7 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         sum0 += p0 + p1 + p2 + p3
         sum1 += p4 + p5 + p6 + p7
         pa0, pa1, pa2, pa3, pa4, pa5, pa6, pa7 = common.mma_reorder(
-            p0.to(tl.bfloat16),
-            p1.to(tl.bfloat16),
-            p2.to(tl.bfloat16),
-            p3.to(tl.bfloat16),
-            p4.to(tl.bfloat16),
-            p5.to(tl.bfloat16),
-            p6.to(tl.bfloat16),
-            p7.to(tl.bfloat16),
+            p0.to(Q.dtype.element_ty),
+            p1.to(Q.dtype.element_ty),
+            p2.to(Q.dtype.element_ty),
+            p3.to(Q.dtype.element_ty),
+            p4.to(Q.dtype.element_ty),
+            p5.to(Q.dtype.element_ty),
+            p6.to(Q.dtype.element_ty),
+            p7.to(Q.dtype.element_ty),
             word,
         )
         pp1_0 = common.pack_bf(pa0, pa1)
@@ -1813,6 +1922,7 @@ def async_prefill_attention_kernel(
             o0_5,
             o0_6,
             o0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 0, token, True, ROW=slot * 32 + 16)
         o0_0, o0_1, o0_2, o0_3, o0_4, o0_5, o0_6, o0_7 = common.mma_packed(
@@ -1832,6 +1942,7 @@ def async_prefill_attention_kernel(
             o0_5,
             o0_6,
             o0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 16, token, True, ROW=slot * 32)
         o1_0, o1_1, o1_2, o1_3, o1_4, o1_5, o1_6, o1_7 = common.mma_packed(
@@ -1851,6 +1962,7 @@ def async_prefill_attention_kernel(
             o1_5,
             o1_6,
             o1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 16, token, True, ROW=slot * 32 + 16)
         o1_0, o1_1, o1_2, o1_3, o1_4, o1_5, o1_6, o1_7 = common.mma_packed(
@@ -1870,6 +1982,7 @@ def async_prefill_attention_kernel(
             o1_5,
             o1_6,
             o1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 32, token, True, ROW=slot * 32)
         o2_0, o2_1, o2_2, o2_3, o2_4, o2_5, o2_6, o2_7 = common.mma_packed(
@@ -1889,6 +2002,7 @@ def async_prefill_attention_kernel(
             o2_5,
             o2_6,
             o2_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 32, token, True, ROW=slot * 32 + 16)
         o2_0, o2_1, o2_2, o2_3, o2_4, o2_5, o2_6, o2_7 = common.mma_packed(
@@ -1908,6 +2022,7 @@ def async_prefill_attention_kernel(
             o2_5,
             o2_6,
             o2_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 48, token, True, ROW=slot * 32)
         o3_0, o3_1, o3_2, o3_3, o3_4, o3_5, o3_6, o3_7 = common.mma_packed(
@@ -1927,6 +2042,7 @@ def async_prefill_attention_kernel(
             o3_5,
             o3_6,
             o3_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 48, token, True, ROW=slot * 32 + 16)
         o3_0, o3_1, o3_2, o3_3, o3_4, o3_5, o3_6, o3_7 = common.mma_packed(
@@ -1946,6 +2062,7 @@ def async_prefill_attention_kernel(
             o3_5,
             o3_6,
             o3_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 64, token, True, ROW=slot * 32)
         o4_0, o4_1, o4_2, o4_3, o4_4, o4_5, o4_6, o4_7 = common.mma_packed(
@@ -1965,6 +2082,7 @@ def async_prefill_attention_kernel(
             o4_5,
             o4_6,
             o4_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 64, token, True, ROW=slot * 32 + 16)
         o4_0, o4_1, o4_2, o4_3, o4_4, o4_5, o4_6, o4_7 = common.mma_packed(
@@ -1984,6 +2102,7 @@ def async_prefill_attention_kernel(
             o4_5,
             o4_6,
             o4_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 80, token, True, ROW=slot * 32)
         o5_0, o5_1, o5_2, o5_3, o5_4, o5_5, o5_6, o5_7 = common.mma_packed(
@@ -2003,6 +2122,7 @@ def async_prefill_attention_kernel(
             o5_5,
             o5_6,
             o5_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 80, token, True, ROW=slot * 32 + 16)
         o5_0, o5_1, o5_2, o5_3, o5_4, o5_5, o5_6, o5_7 = common.mma_packed(
@@ -2022,6 +2142,7 @@ def async_prefill_attention_kernel(
             o5_5,
             o5_6,
             o5_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 96, token, True, ROW=slot * 32)
         o6_0, o6_1, o6_2, o6_3, o6_4, o6_5, o6_6, o6_7 = common.mma_packed(
@@ -2041,6 +2162,7 @@ def async_prefill_attention_kernel(
             o6_5,
             o6_6,
             o6_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 96, token, True, ROW=slot * 32 + 16)
         o6_0, o6_1, o6_2, o6_3, o6_4, o6_5, o6_6, o6_7 = common.mma_packed(
@@ -2060,6 +2182,7 @@ def async_prefill_attention_kernel(
             o6_5,
             o6_6,
             o6_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 112, token, True, ROW=slot * 32)
         o7_0, o7_1, o7_2, o7_3, o7_4, o7_5, o7_6, o7_7 = common.mma_packed(
@@ -2079,6 +2202,7 @@ def async_prefill_attention_kernel(
             o7_5,
             o7_6,
             o7_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 112, token, True, ROW=slot * 32 + 16)
         o7_0, o7_1, o7_2, o7_3, o7_4, o7_5, o7_6, o7_7 = common.mma_packed(
@@ -2098,6 +2222,7 @@ def async_prefill_attention_kernel(
             o7_5,
             o7_6,
             o7_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 128, token, True, ROW=slot * 32)
         o8_0, o8_1, o8_2, o8_3, o8_4, o8_5, o8_6, o8_7 = common.mma_packed(
@@ -2117,6 +2242,7 @@ def async_prefill_attention_kernel(
             o8_5,
             o8_6,
             o8_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 128, token, True, ROW=slot * 32 + 16)
         o8_0, o8_1, o8_2, o8_3, o8_4, o8_5, o8_6, o8_7 = common.mma_packed(
@@ -2136,6 +2262,7 @@ def async_prefill_attention_kernel(
             o8_5,
             o8_6,
             o8_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 144, token, True, ROW=slot * 32)
         o9_0, o9_1, o9_2, o9_3, o9_4, o9_5, o9_6, o9_7 = common.mma_packed(
@@ -2155,6 +2282,7 @@ def async_prefill_attention_kernel(
             o9_5,
             o9_6,
             o9_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 144, token, True, ROW=slot * 32 + 16)
         o9_0, o9_1, o9_2, o9_3, o9_4, o9_5, o9_6, o9_7 = common.mma_packed(
@@ -2174,6 +2302,7 @@ def async_prefill_attention_kernel(
             o9_5,
             o9_6,
             o9_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 160, token, True, ROW=slot * 32)
         o10_0, o10_1, o10_2, o10_3, o10_4, o10_5, o10_6, o10_7 = common.mma_packed(
@@ -2193,6 +2322,7 @@ def async_prefill_attention_kernel(
             o10_5,
             o10_6,
             o10_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 160, token, True, ROW=slot * 32 + 16)
         o10_0, o10_1, o10_2, o10_3, o10_4, o10_5, o10_6, o10_7 = common.mma_packed(
@@ -2212,6 +2342,7 @@ def async_prefill_attention_kernel(
             o10_5,
             o10_6,
             o10_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 176, token, True, ROW=slot * 32)
         o11_0, o11_1, o11_2, o11_3, o11_4, o11_5, o11_6, o11_7 = common.mma_packed(
@@ -2231,6 +2362,7 @@ def async_prefill_attention_kernel(
             o11_5,
             o11_6,
             o11_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 176, token, True, ROW=slot * 32 + 16)
         o11_0, o11_1, o11_2, o11_3, o11_4, o11_5, o11_6, o11_7 = common.mma_packed(
@@ -2250,6 +2382,7 @@ def async_prefill_attention_kernel(
             o11_5,
             o11_6,
             o11_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 192, token, True, ROW=slot * 32)
         o12_0, o12_1, o12_2, o12_3, o12_4, o12_5, o12_6, o12_7 = common.mma_packed(
@@ -2269,6 +2402,7 @@ def async_prefill_attention_kernel(
             o12_5,
             o12_6,
             o12_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 192, token, True, ROW=slot * 32 + 16)
         o12_0, o12_1, o12_2, o12_3, o12_4, o12_5, o12_6, o12_7 = common.mma_packed(
@@ -2288,6 +2422,7 @@ def async_prefill_attention_kernel(
             o12_5,
             o12_6,
             o12_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 208, token, True, ROW=slot * 32)
         o13_0, o13_1, o13_2, o13_3, o13_4, o13_5, o13_6, o13_7 = common.mma_packed(
@@ -2307,6 +2442,7 @@ def async_prefill_attention_kernel(
             o13_5,
             o13_6,
             o13_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 208, token, True, ROW=slot * 32 + 16)
         o13_0, o13_1, o13_2, o13_3, o13_4, o13_5, o13_6, o13_7 = common.mma_packed(
@@ -2326,6 +2462,7 @@ def async_prefill_attention_kernel(
             o13_5,
             o13_6,
             o13_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 224, token, True, ROW=slot * 32)
         o14_0, o14_1, o14_2, o14_3, o14_4, o14_5, o14_6, o14_7 = common.mma_packed(
@@ -2345,6 +2482,7 @@ def async_prefill_attention_kernel(
             o14_5,
             o14_6,
             o14_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 224, token, True, ROW=slot * 32 + 16)
         o14_0, o14_1, o14_2, o14_3, o14_4, o14_5, o14_6, o14_7 = common.mma_packed(
@@ -2364,6 +2502,7 @@ def async_prefill_attention_kernel(
             o14_5,
             o14_6,
             o14_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 240, token, True, ROW=slot * 32)
         o15_0, o15_1, o15_2, o15_3, o15_4, o15_5, o15_6, o15_7 = common.mma_packed(
@@ -2383,6 +2522,7 @@ def async_prefill_attention_kernel(
             o15_5,
             o15_6,
             o15_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 240, token, True, ROW=slot * 32 + 16)
         o15_0, o15_1, o15_2, o15_3, o15_4, o15_5, o15_6, o15_7 = common.mma_packed(
@@ -2402,8 +2542,12 @@ def async_prefill_attention_kernel(
             o15_5,
             o15_6,
             o15_7,
+            DTYPE=Q.dtype.element_ty,
         )
         token = common.wait_copies() + tl.zeros((128,), tl.int32)
+    if Q.dtype.element_ty == tl.float16:
+        if tl.sum(range_ok.to(tl.int32), 0) != 128:
+            tl.atomic_and(KNORM + batch * HK + kh, 0, sem="relaxed")
     den0 = tl.sum(sum0.reshape((4, 8, 4)), 2)
     den0 = tl.broadcast_to(den0[:, :, None], (4, 8, 4)).reshape((128,))
     inv0 = tl.div_rn(1.0, tl.where(den0 > 0.0, den0, 1.0))
@@ -3052,7 +3196,10 @@ def async_prefill_attention_kernel(
     )
     if WRITE_LSE:
         lse0 = tl.where(
-            den0 > 0.0, 32.0 + tl.log2(den0) * 0.6931471805599453, float("inf")
+            den0 > 0.0,
+            (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+            + tl.log2(den0) * 0.6931471805599453,
+            float("inf"),
         )
         tl.store(
             LSE + qhead.to(tl.int64) * TQ + (qstart + cm0).to(tl.int64),
@@ -3060,7 +3207,10 @@ def async_prefill_attention_kernel(
             (cm0 < qlen) & (thread % 4 == 0),
         )
         lse1 = tl.where(
-            den1 > 0.0, 32.0 + tl.log2(den1) * 0.6931471805599453, float("inf")
+            den1 > 0.0,
+            (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+            + tl.log2(den1) * 0.6931471805599453,
+            float("inf"),
         )
         tl.store(
             LSE + qhead.to(tl.int64) * TQ + (qstart + cm4).to(tl.int64),
@@ -3069,6 +3219,7 @@ def async_prefill_attention_kernel(
         )
 
 
+@libentry()
 @triton.jit
 def async_small_prefill_attention_kernel(
     Q,
@@ -3119,9 +3270,14 @@ def async_small_prefill_attention_kernel(
     WORKLIST=None,
     CAPACITY: tl.constexpr = 0,
     FIXED_MODE: tl.constexpr = False,
+    UNROLL: tl.constexpr = 1,
+    SCORE_PEAK: tl.constexpr = False,
+    ROW_SUM_GUARD: tl.constexpr = False,
 ):
     tl.static_assert(D == 256 and BM == 64 and (FOLD == 4) and PAGED)
-    tl.static_assert(Q.dtype.element_ty == tl.bfloat16)
+    tl.static_assert(
+        Q.dtype.element_ty == tl.bfloat16 or Q.dtype.element_ty == tl.float16
+    )
     tl.static_assert(QH >= D and QS >= (HQ - 1) * QH + D)
     tl.static_assert(KP == PAGE * KS and VP == PAGE * VS)
     index = tl.program_id(0)
@@ -3146,9 +3302,15 @@ def async_small_prefill_attention_kernel(
     p = lane // 4
     q = lane % 4
     qhead = group * 4 + warp
-    word = tl.where(p % 4 == q, tl.where(lane >= 16, 1065353216, 16256), 0).to(
-        tl.uint32
-    )
+    word = tl.where(
+        p % 4 == q,
+        tl.where(
+            lane >= 16,
+            1006632960 if Q.dtype.element_ty == tl.float16 else 1065353216,
+            15360 if Q.dtype.element_ty == tl.float16 else 16256,
+        ),
+        0,
+    ).to(tl.uint32)
     cm0 = tile * 16 + p + 0
     cn0 = q + 0
     cm1 = tile * 16 + p + 0
@@ -3373,6 +3535,11 @@ def async_small_prefill_attention_kernel(
     o15_7 = tl.full((128,), 0.0, tl.float32)
     sum0 = tl.full((128,), 0.0, tl.float32)
     sum1 = tl.full((128,), 0.0, tl.float32)
+    if Q.dtype.element_ty == tl.float16 and not ROW_SUM_GUARD:
+        if SCORE_PEAK:
+            range_peak = tl.full((128,), 0.0, tl.float32)
+        else:
+            range_ok = tl.full((128,), True, tl.int1)
     hi = klen
     delta = klen - qlen
     if CAUSAL:
@@ -3383,7 +3550,7 @@ def async_small_prefill_attention_kernel(
         common.issue_copy(V + base * VS, vbuf, 0, klen, VS, 0, kh * VH)
         common.commit_copies()
     token = common.wait_copies() + tl.zeros((128,), tl.int32)
-    for start in range(0, hi, 32):
+    for start in tl.range(0, hi, 32, loop_unroll_factor=UNROLL):
         slot = start // 32 % 2
         if start + 32 < hi:
             common.issue_copy(
@@ -3427,6 +3594,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 0, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3446,6 +3614,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 16, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3465,6 +3634,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 16, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3484,6 +3654,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 32, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3503,6 +3674,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 32, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3522,6 +3694,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 48, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3541,6 +3714,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 48, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3560,6 +3734,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 64, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3579,6 +3754,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 64, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3598,6 +3774,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 80, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3617,6 +3794,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 80, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3636,6 +3814,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 96, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3655,6 +3834,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 96, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3674,6 +3854,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 112, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3693,6 +3874,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 112, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3712,6 +3894,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 128, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3731,6 +3914,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 128, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3750,6 +3934,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 144, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3769,6 +3954,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 144, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3788,6 +3974,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 160, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3807,6 +3994,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 160, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3826,6 +4014,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 176, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3845,6 +4034,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 176, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3864,6 +4054,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 192, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3883,6 +4074,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 192, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3902,6 +4094,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 208, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3921,6 +4114,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 208, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3940,6 +4134,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 224, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3959,6 +4154,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 224, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -3978,6 +4174,7 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 240, token, False, ROW=slot * 32)
         s0_0, s0_1, s0_2, s0_3, s0_4, s0_5, s0_6, s0_7 = common.mma_packed(
@@ -3997,6 +4194,7 @@ def async_small_prefill_attention_kernel(
             s0_5,
             s0_6,
             s0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(kbuf, 240, token, False, ROW=slot * 32 + 16)
         s1_0, s1_1, s1_2, s1_3, s1_4, s1_5, s1_6, s1_7 = common.mma_packed(
@@ -4016,98 +4214,152 @@ def async_small_prefill_attention_kernel(
             s1_5,
             s1_6,
             s1_7,
+            DTYPE=Q.dtype.element_ty,
         )
+        if Q.dtype.element_ty == tl.float16 and SCORE_PEAK and not ROW_SUM_GUARD:
+            bound0 = tl.maximum(
+                tl.maximum(tl.abs(s0_0), tl.abs(s0_1)),
+                tl.maximum(tl.abs(s0_2), tl.abs(s0_3)),
+            )
+            bound1 = tl.maximum(
+                tl.maximum(tl.abs(s0_4), tl.abs(s0_5)),
+                tl.maximum(tl.abs(s0_6), tl.abs(s0_7)),
+            )
+            bound2 = tl.maximum(
+                tl.maximum(tl.abs(s1_0), tl.abs(s1_1)),
+                tl.maximum(tl.abs(s1_2), tl.abs(s1_3)),
+            )
+            bound3 = tl.maximum(
+                tl.maximum(tl.abs(s1_4), tl.abs(s1_5)),
+                tl.maximum(tl.abs(s1_6), tl.abs(s1_7)),
+            )
+            range_peak = tl.maximum(
+                range_peak,
+                tl.maximum(tl.maximum(bound0, bound1), tl.maximum(bound2, bound3)),
+            )
         valid0 = (cm0 < qlen) & (start + 0 + cn0 < klen)
         if CAUSAL:
             valid0 = valid0 & (start + 0 + cn0 <= cm0 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid0) | (tl.abs(s0_0 * SCALE) <= 8.0))
         p0 = tl.exp2(
             tl.where(
                 valid0,
-                s0_0 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_0 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid1 = (cm1 < qlen) & (start + 0 + cn1 < klen)
         if CAUSAL:
             valid1 = valid1 & (start + 0 + cn1 <= cm1 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid1) | (tl.abs(s0_1 * SCALE) <= 8.0))
         p1 = tl.exp2(
             tl.where(
                 valid1,
-                s0_1 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_1 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid2 = (cm2 < qlen) & (start + 0 + cn2 < klen)
         if CAUSAL:
             valid2 = valid2 & (start + 0 + cn2 <= cm2 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid2) | (tl.abs(s0_2 * SCALE) <= 8.0))
         p2 = tl.exp2(
             tl.where(
                 valid2,
-                s0_2 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_2 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid3 = (cm3 < qlen) & (start + 0 + cn3 < klen)
         if CAUSAL:
             valid3 = valid3 & (start + 0 + cn3 <= cm3 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid3) | (tl.abs(s0_3 * SCALE) <= 8.0))
         p3 = tl.exp2(
             tl.where(
                 valid3,
-                s0_3 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_3 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid4 = (cm4 < qlen) & (start + 0 + cn4 < klen)
         if CAUSAL:
             valid4 = valid4 & (start + 0 + cn4 <= cm4 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid4) | (tl.abs(s0_4 * SCALE) <= 8.0))
         p4 = tl.exp2(
             tl.where(
                 valid4,
-                s0_4 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_4 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid5 = (cm5 < qlen) & (start + 0 + cn5 < klen)
         if CAUSAL:
             valid5 = valid5 & (start + 0 + cn5 <= cm5 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid5) | (tl.abs(s0_5 * SCALE) <= 8.0))
         p5 = tl.exp2(
             tl.where(
                 valid5,
-                s0_5 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_5 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid6 = (cm6 < qlen) & (start + 0 + cn6 < klen)
         if CAUSAL:
             valid6 = valid6 & (start + 0 + cn6 <= cm6 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid6) | (tl.abs(s0_6 * SCALE) <= 8.0))
         p6 = tl.exp2(
             tl.where(
                 valid6,
-                s0_6 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_6 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid7 = (cm7 < qlen) & (start + 0 + cn7 < klen)
         if CAUSAL:
             valid7 = valid7 & (start + 0 + cn7 <= cm7 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid7) | (tl.abs(s0_7 * SCALE) <= 8.0))
         p7 = tl.exp2(
             tl.where(
                 valid7,
-                s0_7 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s0_7 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         sum0 += p0 + p1 + p2 + p3
         sum1 += p4 + p5 + p6 + p7
         pa0, pa1, pa2, pa3, pa4, pa5, pa6, pa7 = common.mma_reorder(
-            p0.to(tl.bfloat16),
-            p1.to(tl.bfloat16),
-            p2.to(tl.bfloat16),
-            p3.to(tl.bfloat16),
-            p4.to(tl.bfloat16),
-            p5.to(tl.bfloat16),
-            p6.to(tl.bfloat16),
-            p7.to(tl.bfloat16),
+            p0.to(Q.dtype.element_ty),
+            p1.to(Q.dtype.element_ty),
+            p2.to(Q.dtype.element_ty),
+            p3.to(Q.dtype.element_ty),
+            p4.to(Q.dtype.element_ty),
+            p5.to(Q.dtype.element_ty),
+            p6.to(Q.dtype.element_ty),
+            p7.to(Q.dtype.element_ty),
             word,
         )
         pp0_0 = common.pack_bf(pa0, pa1)
@@ -4117,94 +4369,126 @@ def async_small_prefill_attention_kernel(
         valid0 = (cm0 < qlen) & (start + 16 + cn0 < klen)
         if CAUSAL:
             valid0 = valid0 & (start + 16 + cn0 <= cm0 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid0) | (tl.abs(s1_0 * SCALE) <= 8.0))
         p0 = tl.exp2(
             tl.where(
                 valid0,
-                s1_0 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_0 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid1 = (cm1 < qlen) & (start + 16 + cn1 < klen)
         if CAUSAL:
             valid1 = valid1 & (start + 16 + cn1 <= cm1 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid1) | (tl.abs(s1_1 * SCALE) <= 8.0))
         p1 = tl.exp2(
             tl.where(
                 valid1,
-                s1_1 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_1 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid2 = (cm2 < qlen) & (start + 16 + cn2 < klen)
         if CAUSAL:
             valid2 = valid2 & (start + 16 + cn2 <= cm2 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid2) | (tl.abs(s1_2 * SCALE) <= 8.0))
         p2 = tl.exp2(
             tl.where(
                 valid2,
-                s1_2 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_2 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid3 = (cm3 < qlen) & (start + 16 + cn3 < klen)
         if CAUSAL:
             valid3 = valid3 & (start + 16 + cn3 <= cm3 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid3) | (tl.abs(s1_3 * SCALE) <= 8.0))
         p3 = tl.exp2(
             tl.where(
                 valid3,
-                s1_3 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_3 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid4 = (cm4 < qlen) & (start + 16 + cn4 < klen)
         if CAUSAL:
             valid4 = valid4 & (start + 16 + cn4 <= cm4 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid4) | (tl.abs(s1_4 * SCALE) <= 8.0))
         p4 = tl.exp2(
             tl.where(
                 valid4,
-                s1_4 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_4 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid5 = (cm5 < qlen) & (start + 16 + cn5 < klen)
         if CAUSAL:
             valid5 = valid5 & (start + 16 + cn5 <= cm5 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid5) | (tl.abs(s1_5 * SCALE) <= 8.0))
         p5 = tl.exp2(
             tl.where(
                 valid5,
-                s1_5 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_5 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid6 = (cm6 < qlen) & (start + 16 + cn6 < klen)
         if CAUSAL:
             valid6 = valid6 & (start + 16 + cn6 <= cm6 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid6) | (tl.abs(s1_6 * SCALE) <= 8.0))
         p6 = tl.exp2(
             tl.where(
                 valid6,
-                s1_6 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_6 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         valid7 = (cm7 < qlen) & (start + 16 + cn7 < klen)
         if CAUSAL:
             valid7 = valid7 & (start + 16 + cn7 <= cm7 + delta)
+        if Q.dtype.element_ty == tl.float16 and not SCORE_PEAK and not ROW_SUM_GUARD:
+            range_ok = range_ok & ((~valid7) | (tl.abs(s1_7 * SCALE) <= 8.0))
         p7 = tl.exp2(
             tl.where(
                 valid7,
-                s1_7 * (SCALE * 1.4426950408889634) - 32.0 * 1.4426950408889634,
+                s1_7 * (SCALE * 1.4426950408889634)
+                - (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+                * 1.4426950408889634,
                 -float("inf"),
             )
         )
         sum0 += p0 + p1 + p2 + p3
         sum1 += p4 + p5 + p6 + p7
         pa0, pa1, pa2, pa3, pa4, pa5, pa6, pa7 = common.mma_reorder(
-            p0.to(tl.bfloat16),
-            p1.to(tl.bfloat16),
-            p2.to(tl.bfloat16),
-            p3.to(tl.bfloat16),
-            p4.to(tl.bfloat16),
-            p5.to(tl.bfloat16),
-            p6.to(tl.bfloat16),
-            p7.to(tl.bfloat16),
+            p0.to(Q.dtype.element_ty),
+            p1.to(Q.dtype.element_ty),
+            p2.to(Q.dtype.element_ty),
+            p3.to(Q.dtype.element_ty),
+            p4.to(Q.dtype.element_ty),
+            p5.to(Q.dtype.element_ty),
+            p6.to(Q.dtype.element_ty),
+            p7.to(Q.dtype.element_ty),
             word,
         )
         pp1_0 = common.pack_bf(pa0, pa1)
@@ -4229,6 +4513,7 @@ def async_small_prefill_attention_kernel(
             o0_5,
             o0_6,
             o0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 0, token, True, ROW=slot * 32 + 16)
         o0_0, o0_1, o0_2, o0_3, o0_4, o0_5, o0_6, o0_7 = common.mma_packed(
@@ -4248,6 +4533,7 @@ def async_small_prefill_attention_kernel(
             o0_5,
             o0_6,
             o0_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 16, token, True, ROW=slot * 32)
         o1_0, o1_1, o1_2, o1_3, o1_4, o1_5, o1_6, o1_7 = common.mma_packed(
@@ -4267,6 +4553,7 @@ def async_small_prefill_attention_kernel(
             o1_5,
             o1_6,
             o1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 16, token, True, ROW=slot * 32 + 16)
         o1_0, o1_1, o1_2, o1_3, o1_4, o1_5, o1_6, o1_7 = common.mma_packed(
@@ -4286,6 +4573,7 @@ def async_small_prefill_attention_kernel(
             o1_5,
             o1_6,
             o1_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 32, token, True, ROW=slot * 32)
         o2_0, o2_1, o2_2, o2_3, o2_4, o2_5, o2_6, o2_7 = common.mma_packed(
@@ -4305,6 +4593,7 @@ def async_small_prefill_attention_kernel(
             o2_5,
             o2_6,
             o2_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 32, token, True, ROW=slot * 32 + 16)
         o2_0, o2_1, o2_2, o2_3, o2_4, o2_5, o2_6, o2_7 = common.mma_packed(
@@ -4324,6 +4613,7 @@ def async_small_prefill_attention_kernel(
             o2_5,
             o2_6,
             o2_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 48, token, True, ROW=slot * 32)
         o3_0, o3_1, o3_2, o3_3, o3_4, o3_5, o3_6, o3_7 = common.mma_packed(
@@ -4343,6 +4633,7 @@ def async_small_prefill_attention_kernel(
             o3_5,
             o3_6,
             o3_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 48, token, True, ROW=slot * 32 + 16)
         o3_0, o3_1, o3_2, o3_3, o3_4, o3_5, o3_6, o3_7 = common.mma_packed(
@@ -4362,6 +4653,7 @@ def async_small_prefill_attention_kernel(
             o3_5,
             o3_6,
             o3_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 64, token, True, ROW=slot * 32)
         o4_0, o4_1, o4_2, o4_3, o4_4, o4_5, o4_6, o4_7 = common.mma_packed(
@@ -4381,6 +4673,7 @@ def async_small_prefill_attention_kernel(
             o4_5,
             o4_6,
             o4_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 64, token, True, ROW=slot * 32 + 16)
         o4_0, o4_1, o4_2, o4_3, o4_4, o4_5, o4_6, o4_7 = common.mma_packed(
@@ -4400,6 +4693,7 @@ def async_small_prefill_attention_kernel(
             o4_5,
             o4_6,
             o4_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 80, token, True, ROW=slot * 32)
         o5_0, o5_1, o5_2, o5_3, o5_4, o5_5, o5_6, o5_7 = common.mma_packed(
@@ -4419,6 +4713,7 @@ def async_small_prefill_attention_kernel(
             o5_5,
             o5_6,
             o5_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 80, token, True, ROW=slot * 32 + 16)
         o5_0, o5_1, o5_2, o5_3, o5_4, o5_5, o5_6, o5_7 = common.mma_packed(
@@ -4438,6 +4733,7 @@ def async_small_prefill_attention_kernel(
             o5_5,
             o5_6,
             o5_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 96, token, True, ROW=slot * 32)
         o6_0, o6_1, o6_2, o6_3, o6_4, o6_5, o6_6, o6_7 = common.mma_packed(
@@ -4457,6 +4753,7 @@ def async_small_prefill_attention_kernel(
             o6_5,
             o6_6,
             o6_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 96, token, True, ROW=slot * 32 + 16)
         o6_0, o6_1, o6_2, o6_3, o6_4, o6_5, o6_6, o6_7 = common.mma_packed(
@@ -4476,6 +4773,7 @@ def async_small_prefill_attention_kernel(
             o6_5,
             o6_6,
             o6_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 112, token, True, ROW=slot * 32)
         o7_0, o7_1, o7_2, o7_3, o7_4, o7_5, o7_6, o7_7 = common.mma_packed(
@@ -4495,6 +4793,7 @@ def async_small_prefill_attention_kernel(
             o7_5,
             o7_6,
             o7_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 112, token, True, ROW=slot * 32 + 16)
         o7_0, o7_1, o7_2, o7_3, o7_4, o7_5, o7_6, o7_7 = common.mma_packed(
@@ -4514,6 +4813,7 @@ def async_small_prefill_attention_kernel(
             o7_5,
             o7_6,
             o7_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 128, token, True, ROW=slot * 32)
         o8_0, o8_1, o8_2, o8_3, o8_4, o8_5, o8_6, o8_7 = common.mma_packed(
@@ -4533,6 +4833,7 @@ def async_small_prefill_attention_kernel(
             o8_5,
             o8_6,
             o8_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 128, token, True, ROW=slot * 32 + 16)
         o8_0, o8_1, o8_2, o8_3, o8_4, o8_5, o8_6, o8_7 = common.mma_packed(
@@ -4552,6 +4853,7 @@ def async_small_prefill_attention_kernel(
             o8_5,
             o8_6,
             o8_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 144, token, True, ROW=slot * 32)
         o9_0, o9_1, o9_2, o9_3, o9_4, o9_5, o9_6, o9_7 = common.mma_packed(
@@ -4571,6 +4873,7 @@ def async_small_prefill_attention_kernel(
             o9_5,
             o9_6,
             o9_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 144, token, True, ROW=slot * 32 + 16)
         o9_0, o9_1, o9_2, o9_3, o9_4, o9_5, o9_6, o9_7 = common.mma_packed(
@@ -4590,6 +4893,7 @@ def async_small_prefill_attention_kernel(
             o9_5,
             o9_6,
             o9_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 160, token, True, ROW=slot * 32)
         o10_0, o10_1, o10_2, o10_3, o10_4, o10_5, o10_6, o10_7 = common.mma_packed(
@@ -4609,6 +4913,7 @@ def async_small_prefill_attention_kernel(
             o10_5,
             o10_6,
             o10_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 160, token, True, ROW=slot * 32 + 16)
         o10_0, o10_1, o10_2, o10_3, o10_4, o10_5, o10_6, o10_7 = common.mma_packed(
@@ -4628,6 +4933,7 @@ def async_small_prefill_attention_kernel(
             o10_5,
             o10_6,
             o10_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 176, token, True, ROW=slot * 32)
         o11_0, o11_1, o11_2, o11_3, o11_4, o11_5, o11_6, o11_7 = common.mma_packed(
@@ -4647,6 +4953,7 @@ def async_small_prefill_attention_kernel(
             o11_5,
             o11_6,
             o11_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 176, token, True, ROW=slot * 32 + 16)
         o11_0, o11_1, o11_2, o11_3, o11_4, o11_5, o11_6, o11_7 = common.mma_packed(
@@ -4666,6 +4973,7 @@ def async_small_prefill_attention_kernel(
             o11_5,
             o11_6,
             o11_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 192, token, True, ROW=slot * 32)
         o12_0, o12_1, o12_2, o12_3, o12_4, o12_5, o12_6, o12_7 = common.mma_packed(
@@ -4685,6 +4993,7 @@ def async_small_prefill_attention_kernel(
             o12_5,
             o12_6,
             o12_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 192, token, True, ROW=slot * 32 + 16)
         o12_0, o12_1, o12_2, o12_3, o12_4, o12_5, o12_6, o12_7 = common.mma_packed(
@@ -4704,6 +5013,7 @@ def async_small_prefill_attention_kernel(
             o12_5,
             o12_6,
             o12_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 208, token, True, ROW=slot * 32)
         o13_0, o13_1, o13_2, o13_3, o13_4, o13_5, o13_6, o13_7 = common.mma_packed(
@@ -4723,6 +5033,7 @@ def async_small_prefill_attention_kernel(
             o13_5,
             o13_6,
             o13_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 208, token, True, ROW=slot * 32 + 16)
         o13_0, o13_1, o13_2, o13_3, o13_4, o13_5, o13_6, o13_7 = common.mma_packed(
@@ -4742,6 +5053,7 @@ def async_small_prefill_attention_kernel(
             o13_5,
             o13_6,
             o13_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 224, token, True, ROW=slot * 32)
         o14_0, o14_1, o14_2, o14_3, o14_4, o14_5, o14_6, o14_7 = common.mma_packed(
@@ -4761,6 +5073,7 @@ def async_small_prefill_attention_kernel(
             o14_5,
             o14_6,
             o14_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 224, token, True, ROW=slot * 32 + 16)
         o14_0, o14_1, o14_2, o14_3, o14_4, o14_5, o14_6, o14_7 = common.mma_packed(
@@ -4780,6 +5093,7 @@ def async_small_prefill_attention_kernel(
             o14_5,
             o14_6,
             o14_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 240, token, True, ROW=slot * 32)
         o15_0, o15_1, o15_2, o15_3, o15_4, o15_5, o15_6, o15_7 = common.mma_packed(
@@ -4799,6 +5113,7 @@ def async_small_prefill_attention_kernel(
             o15_5,
             o15_6,
             o15_7,
+            DTYPE=Q.dtype.element_ty,
         )
         b0, b1, b2, b3 = common.ld_fragment(vbuf, 240, token, True, ROW=slot * 32 + 16)
         o15_0, o15_1, o15_2, o15_3, o15_4, o15_5, o15_6, o15_7 = common.mma_packed(
@@ -4818,14 +5133,42 @@ def async_small_prefill_attention_kernel(
             o15_5,
             o15_6,
             o15_7,
+            DTYPE=Q.dtype.element_ty,
         )
         token = common.wait_copies() + tl.zeros((128,), tl.int32)
+    if Q.dtype.element_ty == tl.float16 and not ROW_SUM_GUARD:
+        if SCORE_PEAK:
+            unsafe = not (tl.max(range_peak, 0) * tl.abs(SCALE) <= 8.0)
+        else:
+            unsafe = tl.sum(range_ok.to(tl.int32), 0) != 128
+        if unsafe:
+            tl.atomic_and(KNORM + batch * HK + kh, 0, sem="relaxed")
     den0 = tl.sum(sum0.reshape((4, 8, 4)), 2)
     den0 = tl.broadcast_to(den0[:, :, None], (4, 8, 4)).reshape((128,))
-    inv0 = tl.div_rn(1.0, tl.where(den0 > 0.0, den0, 1.0))
+    if ROW_SUM_GUARD:
+        inv0 = 1.0 / tl.where(den0 > 0.0, den0, 1.0)
+    else:
+        inv0 = tl.div_rn(1.0, tl.where(den0 > 0.0, den0, 1.0))
     den1 = tl.sum(sum1.reshape((4, 8, 4)), 2)
     den1 = tl.broadcast_to(den1[:, :, None], (4, 8, 4)).reshape((128,))
-    inv1 = tl.div_rn(1.0, tl.where(den1 > 0.0, den1, 1.0))
+    if ROW_SUM_GUARD:
+        inv1 = 1.0 / tl.where(den1 > 0.0, den1, 1.0)
+    else:
+        inv1 = tl.div_rn(1.0, tl.where(den1 > 0.0, den1, 1.0))
+    if Q.dtype.element_ty == tl.float16 and ROW_SUM_GUARD:
+        count0 = tl.full((128,), klen, tl.int32)
+        count1 = tl.full((128,), klen, tl.int32)
+        if CAUSAL:
+            count0 = tl.minimum(klen, tl.maximum(0, cm0 + delta + 1))
+            count1 = tl.minimum(klen, tl.maximum(0, cm4 + delta + 1))
+        safe0 = (cm0 >= qlen) | ((den0 <= 32768.0) & (den0 >= count0 * 0.0078125))
+        safe1 = (cm4 >= qlen) | ((den1 <= 32768.0) & (den1 >= count1 * 0.0078125))
+        tl.atomic_and(
+            KNORM + batch * HK + kh + tl.zeros((128,), tl.int32),
+            tl.zeros((128,), tl.int32),
+            mask=~(safe0 & safe1),
+            sem="relaxed",
+        )
     tl.store(
         Out + (qstart + cm0).to(tl.int64) * OS + qhead.to(tl.int64) * OH + 0 + cn0,
         o0_0 * inv0,
@@ -5468,7 +5811,10 @@ def async_small_prefill_attention_kernel(
     )
     if WRITE_LSE:
         lse0 = tl.where(
-            den0 > 0.0, 32.0 + tl.log2(den0) * 0.6931471805599453, float("inf")
+            den0 > 0.0,
+            (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+            + tl.log2(den0) * 0.6931471805599453,
+            float("inf"),
         )
         tl.store(
             LSE + qhead.to(tl.int64) * TQ + (qstart + cm0).to(tl.int64),
@@ -5476,7 +5822,10 @@ def async_small_prefill_attention_kernel(
             (cm0 < qlen) & (thread % 4 == 0),
         )
         lse1 = tl.where(
-            den1 > 0.0, 32.0 + tl.log2(den1) * 0.6931471805599453, float("inf")
+            den1 > 0.0,
+            (0.0 if Q.dtype.element_ty == tl.float16 else 32.0)
+            + tl.log2(den1) * 0.6931471805599453,
+            float("inf"),
         )
         tl.store(
             LSE + qhead.to(tl.int64) * TQ + (qstart + cm4).to(tl.int64),

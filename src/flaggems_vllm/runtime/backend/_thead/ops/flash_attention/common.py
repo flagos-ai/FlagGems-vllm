@@ -200,12 +200,18 @@ def mma_reorder(a0, a1, a2, a3, a4, a5, a6, a7, word):
     ap3 = pack_bf(a6, a7).to(tl.float32, bitcast=True)
     w = word.to(tl.float32, bitcast=True)
     z = tl.full((128,), 0.0, tl.float32)
-    d0, d1, d2, d3 = tl.inline_asm_elementwise(
-        (
+    if a0.dtype == tl.float16:
+        instruction: tl.constexpr = (
+            "ppu.tc01.mma.sync.aligned.m16n16k16.row.col.f16.f16.f16.f16 "
+            "{$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9,$10,$11}, {$12,$13,$14,$15};"
+        )
+    else:
+        instruction: tl.constexpr = (
             "ppu.tc01.mma.sync.aligned.m16n16k16.row.col.bf16.bf16.bf16.bf16 "
-            "{$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9,$10,$11}, {$12,$13,$14,$15}"
-            ";"
-        ),
+            "{$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9,$10,$11}, {$12,$13,$14,$15};"
+        )
+    d0, d1, d2, d3 = tl.inline_asm_elementwise(
+        instruction,
         constraints="=f,=f,=f,=f,f,f,f,f,f,f,f,f,f,f,f,f",
         args=(ap0, ap1, ap2, ap3, w, z, z, w, z, z, z, z),
         dtype=(tl.float32, tl.float32, tl.float32, tl.float32),
@@ -213,28 +219,54 @@ def mma_reorder(a0, a1, a2, a3, a4, a5, a6, a7, word):
         pack=1,
     )
     bits0 = d0.to(tl.uint32, bitcast=True)
-    v0 = (bits0 & 65535).to(tl.uint16).to(tl.bfloat16, bitcast=True)
-    v1 = (bits0 >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    v0 = (bits0 & 65535).to(tl.uint16).to(a0.dtype, bitcast=True)
+    v1 = (bits0 >> 16).to(tl.uint16).to(a0.dtype, bitcast=True)
     bits1 = d1.to(tl.uint32, bitcast=True)
-    v2 = (bits1 & 65535).to(tl.uint16).to(tl.bfloat16, bitcast=True)
-    v3 = (bits1 >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    v2 = (bits1 & 65535).to(tl.uint16).to(a0.dtype, bitcast=True)
+    v3 = (bits1 >> 16).to(tl.uint16).to(a0.dtype, bitcast=True)
     bits2 = d2.to(tl.uint32, bitcast=True)
-    v4 = (bits2 & 65535).to(tl.uint16).to(tl.bfloat16, bitcast=True)
-    v5 = (bits2 >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    v4 = (bits2 & 65535).to(tl.uint16).to(a0.dtype, bitcast=True)
+    v5 = (bits2 >> 16).to(tl.uint16).to(a0.dtype, bitcast=True)
     bits3 = d3.to(tl.uint32, bitcast=True)
-    v6 = (bits3 & 65535).to(tl.uint16).to(tl.bfloat16, bitcast=True)
-    v7 = (bits3 >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    v6 = (bits3 & 65535).to(tl.uint16).to(a0.dtype, bitcast=True)
+    v7 = (bits3 >> 16).to(tl.uint16).to(a0.dtype, bitcast=True)
     return (v0, v1, v2, v3, v4, v5, v6, v7)
 
 
 @triton.jit
-def mma_packed(a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7):
+def mma_packed(
+    a0,
+    a1,
+    a2,
+    a3,
+    b0,
+    b1,
+    b2,
+    b3,
+    c0,
+    c1,
+    c2,
+    c3,
+    c4,
+    c5,
+    c6,
+    c7,
+    DTYPE: tl.constexpr = tl.bfloat16,
+):
+    if DTYPE == tl.float16:
+        instruction: tl.constexpr = (
+            "ppu.tc01.mma.sync.aligned.m16n16k16.row.col.f32.f16.f16.f32 "
+            "{$0,$1,$2,$3,$4,$5,$6,$7}, {$8,$9,$10,$11}, {$12,$13,$14,$15}, "
+            "{$16,$17,$18,$19,$20,$21,$22,$23};"
+        )
+    else:
+        instruction: tl.constexpr = (
+            "ppu.tc01.mma.sync.aligned.m16n16k16.row.col.f32.bf16.bf16.f32 "
+            "{$0,$1,$2,$3,$4,$5,$6,$7}, {$8,$9,$10,$11}, {$12,$13,$14,$15}, "
+            "{$16,$17,$18,$19,$20,$21,$22,$23};"
+        )
     return tl.inline_asm_elementwise(
-        (
-            "ppu.tc01.mma.sync.aligned.m16n16k16.row.col.f32.bf16.bf16.f32 {$"
-            "0,$1,$2,$3,$4,$5,$6,$7}, {$8,$9,$10,$11}, {$12,$13,$14,$15}, {$1"
-            "6,$17,$18,$19,$20,$21,$22,$23};"
-        ),
+        instruction,
         constraints="=f,=f,=f,=f,=f,=f,=f,=f,r,r,r,r,r,r,r,r,f,f,f,f,f,f,f,f",
         args=(a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7),
         dtype=(
