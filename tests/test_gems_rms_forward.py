@@ -109,6 +109,30 @@ def test_gems_rms_forward_rejects_mismatched_residual_shape():
 
 
 @pytest.mark.gems_rms_forward
+@pytest.mark.parametrize("with_residual", [False, True], ids=["standalone", "residual"])
+@pytest.mark.parametrize(
+    "x_shape,weight_shape",
+    [((2, 128), (129,)), ((2, 3, 17), (51,)), ((2, 128), (1, 2, 128))],
+    ids=["wrong-width", "same-size-wrong-shape", "extra-axis"],
+)
+def test_gems_rms_forward_rejects_mismatched_weight_shape(
+    with_residual, x_shape, weight_shape
+):
+    # Invalid shapes are rejected before any accelerator dispatch.
+    x = torch.empty(x_shape)
+    residual = torch.empty_like(x) if with_residual else None
+    weight = torch.empty(weight_shape)
+
+    with pytest.raises(
+        ValueError, match=r"weight\.shape .* must match the trailing dimensions"
+    ) as exc:
+        flaggems_vllm.gems_rms_forward(x, residual, weight, 1e-5)
+
+    assert str(x_shape) in str(exc.value)
+    assert str(weight_shape) in str(exc.value)
+
+
+@pytest.mark.gems_rms_forward
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "ascend", reason="Checks Ascend reduction order"
 )

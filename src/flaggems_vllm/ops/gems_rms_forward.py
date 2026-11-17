@@ -328,7 +328,15 @@ def gems_rms_forward(
     Without a residual, return a new tensor. With a residual, contiguous input
     buffers are updated in place and the pair of updated buffers is returned.
     The fused path applies its existing layout rules to noncontiguous inputs.
+    The weight shape must match the trailing dimensions of the input.
     """
+    trailing_shape = x.shape[x.ndim - weight.ndim :]
+    if weight.shape != trailing_shape:
+        raise ValueError(
+            f"weight.shape {tuple(weight.shape)} must match the trailing dimensions "
+            f"of x.shape {tuple(x.shape)}"
+        )
+
     if residual is not None:
         return _gems_rms_forward_residual(x, residual, weight, eps)
 
