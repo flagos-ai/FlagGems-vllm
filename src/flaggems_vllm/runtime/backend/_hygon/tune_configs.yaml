@@ -441,3 +441,21 @@ cooperative_topk_hygon_suffix_finish:
   - META: {BLOCK: 1024, TILE: 4}
     num_warps: 1
     num_stages: 1
+# Qwen3.6-35B-A3B W16A16 prefill tiling measured on gfx936.
+hygon_fused_moe_qwen_small:
+  - META:
+      BLOCK_SIZE_M: 64
+      BLOCK_SIZE_N: 128
+      BLOCK_SIZE_K: 64
+      GROUP_SIZE_M: 1
+    num_warps: 8
+    num_stages: 2
+
+hygon_fused_moe_qwen_large:
+  - META:
+      BLOCK_SIZE_M: 128
+      BLOCK_SIZE_N: 128
+      BLOCK_SIZE_K: 64
+      GROUP_SIZE_M: 1
+    num_warps: 8
+    num_stages: 2

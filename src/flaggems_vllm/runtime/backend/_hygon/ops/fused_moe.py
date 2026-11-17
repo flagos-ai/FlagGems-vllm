@@ -156,6 +156,26 @@ def dequant_mxfp6(
 # Activation quantization helpers
 
 
+@functools.lru_cache(maxsize=2)
+def _qwen_w16a16_tuned_config(small_m: bool) -> dict[str, Any]:
+    """Load the measured Qwen W16A16 tiling from the Hygon tune config."""
+    from flaggems_vllm import runtime
+
+    name = (
+        "hygon_fused_moe_qwen_small"
+        if small_m
+        else "hygon_fused_moe_qwen_large"
+    )
+    configs = runtime.get_tuned_config(name)
+    if not configs:
+        raise RuntimeError(f"missing tuned config: {name}")
+    triton_config = configs[0]
+    tuned = dict(triton_config.kwargs)
+    tuned["num_warps"] = triton_config.num_warps
+    tuned["num_stages"] = triton_config.num_stages
+    return tuned
+
+
 def _apply_qwen_w16a16_tuning(
     config: dict[str, Any],
     w1_shape: tuple[int, ...],
@@ -189,13 +209,7 @@ def _apply_qwen_w16a16_tuning(
         return config
 
     tuned = dict(config)
-    tuned.update(
-        BLOCK_SIZE_N=128,
-        BLOCK_SIZE_K=64,
-        GROUP_SIZE_M=1,
-        num_warps=8,
-        num_stages=2,
-    )
+    tuned.update(_qwen_w16a16_tuned_config(M < 4096))
     tuned.pop("PAIR_GATE_UP_DOT", None)
     return tuned
 
