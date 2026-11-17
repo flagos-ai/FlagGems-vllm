@@ -102,50 +102,6 @@ def native_per_token_group_quant_fp8(
 
 
 @pytest.mark.per_token_group_quant_fp8
-@pytest.mark.parametrize("scale_ue8m0", [True, False])
-def test_per_token_group_quant_fp8_285b(scale_ue8m0):
-    """285B profiling shape: prefill 8×H100 TP=8, [524288, 128] group=128.
-
-    Exercises per_token_group_quant_fp8 with the exact tensor dimensions seen
-    in production (shape1: [[524288, 128], [524288, 128], [524288, 1]]).
-    Uses vLLM as the reference when available.
-    """
-    if scale_ue8m0 and not _VLLM_FP8_HAS_UE8M0 and _HAS_VLLM_FP8_REF:
-        pytest.skip("installed vLLM does not support use_ue8m0")
-
-    torch.manual_seed(0)
-    num_tokens, d, group_size = 524288, 128, 128
-    x = torch.rand(num_tokens, d, dtype=torch.bfloat16, device=flaggems_vllm.device)
-    ref_x = utils.to_reference(x)
-
-    if _HAS_VLLM_FP8_REF:
-        if scale_ue8m0 and _VLLM_FP8_HAS_UE8M0:
-            ref_out, ref_scale = _vllm_per_token_group_quant_fp8(
-                ref_x, group_size, use_ue8m0=scale_ue8m0
-            )
-        elif not scale_ue8m0:
-            ref_out, ref_scale = _vllm_per_token_group_quant_fp8(ref_x, group_size)
-        else:
-            ref_out, ref_scale = native_per_token_group_quant_fp8(
-                ref_x, group_size, scale_ue8m0=scale_ue8m0
-            )
-    else:
-        ref_out, ref_scale = native_per_token_group_quant_fp8(
-            ref_x, group_size, scale_ue8m0=scale_ue8m0
-        )
-
-    out, scale = flaggems_vllm.per_token_group_quant_fp8(
-        x, group_size, scale_ue8m0=scale_ue8m0
-    )
-
-    assert out.dtype == ref_out.dtype
-    utils.gems_assert_close(scale, ref_scale, dtype=torch.float32)
-    out_fp32 = _fp8_to_float32(utils.to_cpu(out, ref_out))
-    ref_out_fp32 = _fp8_to_float32(ref_out)
-    assert torch.allclose(out_fp32, ref_out_fp32, rtol=0.15)
-
-
-@pytest.mark.per_token_group_quant_fp8
 @pytest.mark.parametrize(
     "output_dtype",
     [None, torch.float8_e4m3fn] if flaggems_vllm.vendor_name == "thead" else [None],

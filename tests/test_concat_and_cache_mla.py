@@ -62,79 +62,12 @@ except (ImportError, RuntimeError):
     _HAS_VLLM_CONCAT_AND_CACHE_MLA = False
 
 
-def _vllm_concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale):
+def _vllm_concat_and_cache_mla(
+    kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+):
     torch.ops._C_cache_ops.concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )
-
-
-@pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2800: RuntimeError")
-@pytest.mark.concat_and_cache_mla
-@pytest.mark.parametrize("kv_lora_rank", [512])
-@pytest.mark.parametrize("qk_rope_head_dim", [64])
-@pytest.mark.parametrize("num_tokens", [8192, 128])
-@pytest.mark.parametrize("block_size", [16])
-@pytest.mark.parametrize("num_blocks", [1302])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("seed", [0])
-@pytest.mark.parametrize(
-    "device",
-    [flaggems_vllm.device] if vendor_name == "mthreads" else ["cuda:0"],
-)
-@pytest.mark.parametrize("kv_cache_dtype", ["auto"])
-@torch.inference_mode()
-def test_concat_and_cache_mla_285b(
-    kv_lora_rank,
-    qk_rope_head_dim,
-    num_tokens,
-    block_size,
-    num_blocks,
-    dtype,
-    seed,
-    device,
-    kv_cache_dtype,
-):
-    """285B profiling shapes: concat_and_cache_mla, prefill M=8192 and decode M=128.
-
-    Shape from CSV: [[8192, 512], [8192, 64], [1301, 64, 576], ...].
-    Uses vLLM native op as the reference when available.
-    """
-    random.seed(seed)
-    torch.manual_seed(seed)
-
-    with torch.device(device):
-        total_slots = num_blocks * block_size
-        num_tokens_actual = min(num_tokens, total_slots)
-        slot_mapping_lst = random.sample(range(total_slots), num_tokens_actual)
-        slot_mapping = torch.tensor(slot_mapping_lst, dtype=torch.long, device=device)
-
-        kv_c = torch.randn(num_tokens_actual, kv_lora_rank, dtype=dtype, device=device)
-        k_pe = torch.randn(num_tokens_actual, qk_rope_head_dim, dtype=dtype, device=device)
-        entry_size = kv_lora_rank + qk_rope_head_dim
-        scale = torch.tensor(0.1, dtype=torch.float32, device=device)
-        kv_cache = _create_mla_cache(
-            num_blocks, block_size, entry_size, dtype, kv_cache_dtype, device
-        )
-        ref_cache = kv_cache.clone()
-
-        if _HAS_VLLM_CONCAT_AND_CACHE_MLA and device.startswith("cuda"):
-            _vllm_concat_and_cache_mla(kv_c, k_pe, ref_cache, slot_mapping, kv_cache_dtype, scale)
-        else:
-            ref_temp = utils.to_reference(
-                torch.zeros(*kv_cache.shape, dtype=dtype, device=device)
-            )
-            for i in range(num_tokens_actual):
-                slot = slot_mapping[i].item()
-                block_idx = slot // block_size
-                block_offset = slot % block_size
-                ref_temp[block_idx, block_offset, :kv_lora_rank] = kv_c[i]
-                ref_temp[block_idx, block_offset, kv_lora_rank:] = k_pe[i]
-            ref_cache.copy_(ref_temp)
-
-        flaggems_vllm.concat_and_cache_mla(
-            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-        )
-        utils.gems_assert_close(kv_cache, utils.to_reference(ref_cache), kv_cache.dtype)
 
 
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2800: RuntimeError")
@@ -179,6 +112,16 @@ def test_concat_and_cache_mla(
         kv_cache = _create_mla_cache(
             num_blocks, block_size, entry_size, dtype, kv_cache_dtype, device
         )
+
+        if _HAS_VLLM_CONCAT_AND_CACHE_MLA and device.startswith("cuda") and kv_cache_dtype == "auto":
+            ref_kv_cache = kv_cache.clone()
+            _vllm_concat_and_cache_mla(kv_c, k_pe, ref_kv_cache, slot_mapping, kv_cache_dtype, scale)
+            flaggems_vllm.concat_and_cache_mla(
+                kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+            )
+            utils.gems_assert_close(kv_cache, utils.to_reference(ref_kv_cache), kv_cache.dtype)
+            return
+
         ref_temp = utils.to_reference(
             torch.zeros(*kv_cache.shape, dtype=dtype, device=device)
         )

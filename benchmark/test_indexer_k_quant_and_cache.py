@@ -246,6 +246,12 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
             )
             for num_tokens in (8192, 32768, 65536)
         ]
+        # 285B profiling shapes: head_dim=128 (K cache for MLA, block_size=16)
+        # Prefill M=8192 and decode M=128 from CSV [[8192, 128], [1301, 64, 132]]
+        self.shapes += [
+            (8192, 1302, 16, 128, 128),
+            (128, 20, 16, 128, 128),
+        ]
 
     def get_input_iter(self, dtype):
         for (
@@ -282,24 +288,3 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
 def test_indexer_k_quant_and_cache_benchmark():
     bench = IndexerKQuantAndCacheBenchmark(ref_indexer)
     bench.run()
-
-
-@pytest.mark.indexer_k_quant_and_cache
-def test_indexer_k_quant_and_cache_285b():
-    """285B profiling shapes for indexer_k_quant_and_cache.
-
-    Prefill: 8192 tokens, head_dim=128, block_size=16 (num_blocks covers KV cache).
-    Decode: 128 tokens (single decode step per TP shard).
-    Uses the vLLM baseline when available, torch composition otherwise.
-    """
-
-    class Bench285B(IndexerKQuantAndCacheBenchmark):
-        def set_shapes(self, shape_file_path=None):
-            # (num_tokens, num_blocks, block_size, head_dim, quant_block_size)
-            # Derived from 285B profile: prefill M=8192 and decode M=128, head_dim=128
-            self.shapes = [
-                (8192, 1302, 16, 128, 128),
-                (128, 20, 16, 128, 128),
-            ]
-
-    Bench285B(ref_indexer).run()

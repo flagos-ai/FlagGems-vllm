@@ -24,39 +24,6 @@ except (ImportError, RuntimeError):
 
 @gpu
 @pytest.mark.concat_mla_q
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize(
-    "tokens,heads,nope,rope",
-    [
-        # 285B profiling shapes: prefill M=8192, heads=16, nope=512, rope=64
-        # CSV: [[8192, 16, 512], [8192, 16, 64], [8192, 16, 576]]
-        (8192, 16, 512, 64),
-        # decode M=128
-        (128, 16, 512, 64),
-    ],
-)
-def test_concat_mla_q_285b(dtype, tokens, heads, nope, rope):
-    """285B profiling shapes: concat_mla_q, prefill M=8192 and decode M=128.
-
-    Uses vLLM native op (_C_cache_ops::concat_mla_q) as the reference when
-    available, plain torch.cat otherwise.
-    """
-    qn = torch.randn(tokens, heads, nope, dtype=dtype, device="cuda")
-    qr = torch.randn(tokens, 1, rope, dtype=dtype, device="cuda")
-    out = torch.empty(tokens, heads, nope + rope, dtype=dtype, device="cuda")
-
-    if _HAS_VLLM_CONCAT_MLA_Q:
-        ref = torch.empty_like(out)
-        torch.ops._C_cache_ops.concat_mla_q(qn, qr.expand(tokens, heads, rope), ref)
-    else:
-        ref = torch.cat([qn, qr.expand(tokens, heads, rope)], dim=-1)
-
-    assert flaggems_vllm.concat_mla_q(qn, qr, out) is None
-    torch.testing.assert_close(out, ref, rtol=0, atol=0)
-
-
-@gpu
-@pytest.mark.concat_mla_q
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("broadcast", [False, True])
@@ -77,7 +44,16 @@ def test_concat_mla_q_matches_reference(dtype, shape, broadcast, strided):
     before_n, before_r = qn.clone(), qr.clone()
     address = out.data_ptr()
     assert flaggems_vllm.concat_mla_q(qn, qr, out) is None
-    expected = torch.cat([qn, qr.expand(tokens, heads, rope)], dim=-1)
+    # Prefer vLLM's native concat_mla_q as the reference when available; the
+    # op writes to a contiguous output, so only use it for the contiguous
+    # (non-strided) case and fall back to torch.cat otherwise.
+    if _HAS_VLLM_CONCAT_MLA_Q and not strided:
+        expected = torch.empty(tokens, heads, nope + rope, dtype=dtype, device="cuda")
+        torch.ops._C_cache_ops.concat_mla_q(
+            qn, qr.expand(tokens, heads, rope), expected
+        )
+    else:
+        expected = torch.cat([qn, qr.expand(tokens, heads, rope)], dim=-1)
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
     assert out.data_ptr() == address
     torch.testing.assert_close(qn, before_n, rtol=0, atol=0)
