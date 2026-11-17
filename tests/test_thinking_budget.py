@@ -6,16 +6,14 @@
 import pytest
 import torch
 
-try:
-    from vllm.v1.worker.gpu.sample.thinking_budget import (
-        apply_thinking_budget as vllm_reference,
-    )
-except ImportError as exc:
-    raise ImportError(
-        "Failed to import apply_thinking_budget from vLLM. "
-        "Check that the installed vLLM version provides this API "
-        "and its dependencies are installed correctly."
-    ) from exc
+_thinking_budget_mod = pytest.importorskip(
+    "vllm.v1.worker.gpu.sample.thinking_budget",
+    reason=(
+        "vllm.v1.worker.gpu.sample.thinking_budget not available in the "
+        "installed vLLM version"
+    ),
+)
+vllm_reference = _thinking_budget_mod.apply_thinking_budget
 
 from flaggems_vllm import apply_thinking_budget
 from flaggems_vllm import device as DEVICE
