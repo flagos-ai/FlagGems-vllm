@@ -13,18 +13,21 @@ from baseline import fused_kimi_k3_mla_kv_concat as workload
 pytestmark = pytest.mark.fused_kimi_k3_mla_kv_concat
 
 
+@workload._cpu_single_thread()
 def reference_output(k_nope, k_pe, k_out):
     n = k_nope.cpu().view(torch.int16)
     p = k_pe.cpu().view(torch.int16)
     return torch.cat((n, p[:, None, :].expand(n.shape[0], n.shape[1], 64)), dim=-1)
 
 
+@workload._cpu_single_thread()
 def assert_output(result, out, expected):
     assert result is None
     assert out.is_contiguous()
     assert torch.equal(out.cpu().view(torch.int16), expected)
 
 
+@workload._cpu_single_thread()
 def snapshot_inputs(args):
     saved = []
     for source in args[:2]:
@@ -35,6 +38,7 @@ def snapshot_inputs(args):
     return saved
 
 
+@workload._cpu_single_thread()
 def assert_inputs_unchanged(saved):
     for base, before in saved:
         assert torch.equal(base.cpu().view(torch.int16), before)

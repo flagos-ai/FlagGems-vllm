@@ -3,6 +3,7 @@
 """Three-argument vLLM _C baseline and the single frozen workload matrix."""
 
 import importlib
+from contextlib import contextmanager
 
 import torch
 
@@ -21,6 +22,19 @@ NATIVE_SOURCE = (
 )
 NATIVE_UNAVAILABLE_REASON = None
 NATIVE_PROVENANCE = None
+
+
+@contextmanager
+def _cpu_single_thread():
+    previous = torch.get_num_threads()
+    if previous == 1:
+        yield
+        return
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def native():
@@ -111,6 +125,7 @@ def strides(binding):
     raise ValueError(f"unknown layout: {layout}")
 
 
+@_cpu_single_thread()
 def build_inputs(binding, dtype, device):
     """Copy CPU integer bit patterns, retaining full packed backing storage."""
     if dtype not in DTYPES:
