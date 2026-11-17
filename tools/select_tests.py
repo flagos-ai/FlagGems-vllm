@@ -89,6 +89,22 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "conftest.py": ["tests/test_fused_matmul_reduce_scatter.py"],
+    "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
+        "tests/test_fused_matmul_reduce_scatter.py"
+    ],
+    "src/flaggems_vllm/runtime/symm_mem.py": [
+        "tests/test_fused_matmul_reduce_scatter.py",
+    ],
+    **{
+        f"src/flaggems_vllm/ops/{name}.py": [
+            "tests/test_fused_matmul_reduce_scatter.py"
+        ]
+        for name in (
+            "_fused_matmul_reduce_scatter_tle",
+            "_fused_matmul_reduce_scatter_runtime",
+        )
+    },
     "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
         "tests/test_gdn_w8a16.py"
     ],
@@ -128,6 +144,11 @@ EXPLICIT_SOURCE_TO_TESTS = {
     },
     "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
         "tests/test_mhc_post.py",
+    ],
+    # The test does not follow the source-stem convention because the operator
+    # is named after what it does (it clamps before the Sinkhorn rounds).
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_pre.py": [
+        "tests/test_npu_mhc_pre_clamp_sinkhorn.py",
     ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
@@ -180,6 +201,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/mhc/mhc_pre.py": [
         "tests/test_mhc_ops.py",
         "tests/test_mhc_with_norm.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre_broadcast.py": [
+        "tests/test_mhc_pre_broadcast.py",
     ],
     "src/flaggems_vllm/ops/mhc_with_norm.py": [
         "tests/test_mhc_with_norm.py",
@@ -262,6 +286,22 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "conftest.py": ["benchmark/test_fused_matmul_reduce_scatter.py"],
+    "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
+        "benchmark/test_fused_matmul_reduce_scatter.py"
+    ],
+    "src/flaggems_vllm/runtime/symm_mem.py": [
+        "benchmark/test_fused_matmul_reduce_scatter.py"
+    ],
+    **{
+        f"src/flaggems_vllm/ops/{name}.py": [
+            "benchmark/test_fused_matmul_reduce_scatter.py"
+        ]
+        for name in (
+            "_fused_matmul_reduce_scatter_tle",
+            "_fused_matmul_reduce_scatter_runtime",
+        )
+    },
     "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
         "benchmark/test_gdn_w8a16.py"
     ],
