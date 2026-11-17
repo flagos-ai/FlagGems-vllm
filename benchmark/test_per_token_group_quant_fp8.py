@@ -185,6 +185,8 @@ CORE_SHAPES = [
     (83, 512, 64),
     (2048, 4096, 256),
     (2048, 13824, 512),
+    # 285B profiling shape: prefill 8×H100, 8×TP, per-token FP8 quant
+    (524288, 128, 128),
 ]
 
 
@@ -224,6 +226,37 @@ def _gems_per_token_group_quant_fp8_wrapper(x, group_size, scale_ue8m0):
     return flaggems_vllm.per_token_group_quant_fp8(
         x, group_size, scale_ue8m0=scale_ue8m0
     )
+
+
+@pytest.mark.per_token_group_quant_fp8
+@pytest.mark.skipif(
+    not (HAS_VLLM_PER_TOKEN_GROUP_QUANT_FP8),
+    reason="requires vLLM",
+)
+@pytest.mark.parametrize(
+    "scale_ue8m0", [False, True], ids=["standard_scale", "ue8m0_scale"]
+)
+def test_per_token_group_quant_fp8_285b(scale_ue8m0):
+    """285B profiling shape: prefill 8×H100 TP=8, shape [524288, 128] group=128."""
+    if scale_ue8m0 and not IS_ASCEND and not VLLM_SUPPORTS_UE8M0:
+        pytest.skip("installed vLLM does not support use_ue8m0")
+
+    torch_op = (
+        ascend_triton_per_token_group_quant_fp8
+        if IS_ASCEND
+        else _vllm_per_token_group_quant_fp8_wrapper
+    )
+
+    bench = PerTokenGroupQuantFp8Benchmark(
+        op_name="per_token_group_quant_fp8",
+        input_fn=partial(_input_fn, scale_ue8m0=scale_ue8m0),
+        torch_op=torch_op,
+        dtypes=[torch.bfloat16],
+    )
+    # Override shapes to the single 285B profiling shape only.
+    bench.shapes = [(524288, 128, 128)]
+    bench.set_gems(_gems_per_token_group_quant_fp8_wrapper)
+    bench.run()
 
 
 @pytest.mark.per_token_group_quant_fp8

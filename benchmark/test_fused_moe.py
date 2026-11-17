@@ -158,3 +158,34 @@ def test_fused_moe_impl_gems_vs_vllm():
     )
     bench.set_gems(_gems_fused_moe_wrapper)
     bench.run()
+
+
+@pytest.mark.fused_experts_impl
+@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
+def test_fused_moe_impl_285b():
+    """285B profiling shapes: MoE fused GEMM, prefill and decode.
+
+    Prefill (M=8192): DeepSeek-285B config, 256 experts, topk=8, hidden=4096,
+    intermediate=4096 (TP=8 shard: 7168//2 = 3584 routed, intermediate≈4096 per shard).
+    Decode  (M=1):   Single-token decode — the dominant latency case.
+
+    Both shapes appear in the CSV; the benchmark calls vLLM as the reference.
+    """
+
+    class FusedMoE285BBenchmark(FusedMoEBenchmark):
+        def set_shapes(self, shape_file_path=None):
+            # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
+            # 285B prefill: M=8192, 256 experts, TP=8 shard hidden=4096, inter=4096, topk=8
+            # 285B decode:  M=1,    same expert config
+            self.shapes = [
+                (8192, 256, 4096, 4096, 8),
+                (1, 256, 4096, 4096, 8),
+            ]
+
+    bench = FusedMoE285BBenchmark(
+        op_name="fused_experts_impl",
+        torch_op=_vllm_fused_moe_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_fused_moe_wrapper)
+    bench.run()

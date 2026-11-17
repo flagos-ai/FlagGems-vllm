@@ -14,6 +14,47 @@ if cfg.QUICK_MODE:
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+try:
+    import vllm._custom_ops  # noqa: F401
+
+    _HAS_VLLM_CONCAT_MLA_Q = hasattr(torch.ops._C_cache_ops, "concat_mla_q")
+except (ImportError, RuntimeError):
+    _HAS_VLLM_CONCAT_MLA_Q = False
+
+
+@gpu
+@pytest.mark.concat_mla_q
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "tokens,heads,nope,rope",
+    [
+        # 285B profiling shapes: prefill M=8192, heads=16, nope=512, rope=64
+        # CSV: [[8192, 16, 512], [8192, 16, 64], [8192, 16, 576]]
+        (8192, 16, 512, 64),
+        # decode M=128
+        (128, 16, 512, 64),
+    ],
+)
+def test_concat_mla_q_285b(dtype, tokens, heads, nope, rope):
+    """285B profiling shapes: concat_mla_q, prefill M=8192 and decode M=128.
+
+    Uses vLLM native op (_C_cache_ops::concat_mla_q) as the reference when
+    available, plain torch.cat otherwise.
+    """
+    qn = torch.randn(tokens, heads, nope, dtype=dtype, device="cuda")
+    qr = torch.randn(tokens, 1, rope, dtype=dtype, device="cuda")
+    out = torch.empty(tokens, heads, nope + rope, dtype=dtype, device="cuda")
+
+    if _HAS_VLLM_CONCAT_MLA_Q:
+        ref = torch.empty_like(out)
+        torch.ops._C_cache_ops.concat_mla_q(qn, qr.expand(tokens, heads, rope), ref)
+    else:
+        ref = torch.cat([qn, qr.expand(tokens, heads, rope)], dim=-1)
+
+    assert flaggems_vllm.concat_mla_q(qn, qr, out) is None
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
 @gpu
 @pytest.mark.concat_mla_q
 @pytest.mark.parametrize("dtype", DTYPES)

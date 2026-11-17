@@ -136,6 +136,52 @@ def test_top_k_per_row_prefill_radix_final_config_prefers_large_vocab():
 
 
 @pytest.mark.top_k_per_row_prefill
+@pytest.mark.parametrize(
+    "num_rows,vocab_size,top_k",
+    [
+        (8192, 8192, 2048),
+        (8192, 16384, 2048),
+    ],
+)
+def test_top_k_per_row_prefill_285b(num_rows, vocab_size, top_k):
+    """285B profiling shapes: TopK per row, prefill 8×H100 TP=8.
+
+    Corresponds to CSV rows with shapes [[8192, 8192], ...] and
+    [[8192, 16384], ...], topk=2048 (indices output [8192, 2048]).
+    Uses vLLM as the reference when available.
+    """
+    if top_k > vocab_size:
+        return
+
+    torch.manual_seed(42)
+    logits = torch.randn(num_rows, vocab_size, device=device, dtype=torch.float32)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    row_ends = torch.full((num_rows,), vocab_size, dtype=torch.int32, device=device)
+    stride0 = logits.stride(0)
+    stride1 = logits.stride(1)
+
+    indices_test = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, row_starts, row_ends, indices_test, num_rows, stride0, stride1, top_k
+    )
+
+    if HAS_VLLM:
+        # Compare against vLLM's native kernel when available.
+        indices_vllm = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+        _vllm_top_k_per_row_prefill(
+            logits, row_starts, row_ends, indices_vllm, num_rows, stride0, stride1, top_k
+        )
+        assert check_topk_values_match(
+            logits, indices_test, indices_vllm, row_starts, top_k
+        ), f"FAIL vs vLLM: num_rows={num_rows}, vocab_size={vocab_size}"
+    else:
+        indices_ref = reference_top_k_per_row(logits.clone(), row_starts, row_ends, top_k)
+        assert check_topk_values_match(
+            logits, indices_test, indices_ref, row_starts, top_k
+        ), f"FAIL: num_rows={num_rows}, vocab_size={vocab_size}"
+
+
+@pytest.mark.top_k_per_row_prefill
 @pytest.mark.parametrize("num_rows", NUM_ROWS_FULL_VOCAB)
 @pytest.mark.parametrize("vocab_size", [129280])  # DeepSeek V4 vocab size
 @pytest.mark.parametrize("top_k", [1024])  # DeepSeek V4 KV cache topk

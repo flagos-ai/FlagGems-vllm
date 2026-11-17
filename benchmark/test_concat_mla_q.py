@@ -40,3 +40,38 @@ def test_concat_mla_q():
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
+
+
+@pytest.mark.concat_mla_q
+def test_concat_mla_q_285b():
+    """285B profiling shapes: concat_mla_q, prefill M=8192 and decode M=128.
+
+    CSV shape: [[8192, 16, 512], [8192, 16, 64], [8192, 16, 576]].
+    """
+
+    def input_kwargs(shape, dtype, device):
+        tokens, heads, nope, rope = shape
+        yield (
+            torch.randn(tokens, heads, nope, dtype=dtype, device=device),
+            torch.randn(tokens, 1, rope, dtype=dtype, device=device),
+            torch.empty(tokens, heads, nope + rope, dtype=dtype, device=device),
+        )
+
+    class ConcatMLAQ285BBenchmark(ConcatMLAQBenchmark):
+        DEFAULT_SHAPES = [
+            (8192, 16, 512, 64),
+            (128, 16, 512, 64),
+        ]
+        DEFAULT_SHAPE_DESC = "tokens, heads, nope_width, rope_width"
+
+        def set_more_shapes(self):
+            return []
+
+    bench = ConcatMLAQ285BBenchmark(
+        op_name="concat_mla_q",
+        input_fn=input_kwargs,
+        torch_op=torch_concat_mla_q,
+        gems_op=flaggems_vllm.concat_mla_q,
+        dtypes=[torch.bfloat16],
+    )
+    bench.run()
