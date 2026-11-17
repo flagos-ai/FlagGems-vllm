@@ -8,6 +8,7 @@ import importlib
 import os
 import sys
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -107,14 +108,40 @@ def _gemm_rs_group():
             dist.destroy_process_group()
 
 
+@pytest.fixture(scope="session")
+def gemm_rs_api():
+    import torch
+
+    from flaggems_vllm.runtime.symm_mem import supports_symm_mem_override
+
+    api = "symm_mem" if supports_symm_mem_override() else "direct"
+    print(
+        f"[rank {os.getenv('RANK', '?')}] GEMM-RS API={api} "
+        f"(PyTorch {torch.__version__})",
+        flush=True,
+    )
+    return api
+
+
 @pytest.fixture
-def gemm_rs_context(_gemm_rs_group):
+def gemm_rs_context(_gemm_rs_group, gemm_rs_api):
     from flaggems_vllm import clear_fused_matmul_reduce_scatter_cache, use_symm_mem
 
-    # Function scope lets registration tests verify the original dispatcher
-    # between collective cases, even when both live in the same test module.
-    with use_symm_mem():
+    scope = use_symm_mem() if gemm_rs_api == "symm_mem" else nullcontext()
+    with scope:
         try:
             yield _gemm_rs_group
         finally:
             clear_fused_matmul_reduce_scatter_cache()
+
+
+@pytest.fixture
+def gemm_rs_op(gemm_rs_context, gemm_rs_api):
+    if gemm_rs_api == "symm_mem":
+        import torch
+
+        return torch.ops.symm_mem.fused_matmul_reduce_scatter
+
+    from flaggems_vllm import fused_matmul_reduce_scatter
+
+    return fused_matmul_reduce_scatter

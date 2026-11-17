@@ -6,6 +6,8 @@
 All ranks execute identical warmups/trials. Score = max(rank-local median ms).
 Packing/copying and result allocation are included; context creation and compile
 time are excluded. This reports composed Torch GEMM+RS as the baseline.
+The measured API is selected from the installed PyTorch override capability and
+reported with the results: symm_mem when supported, otherwise direct calls.
 """
 
 import json
@@ -85,7 +87,9 @@ def _candidates(group, device):
     "rows,n,k", [(256, 256, 256), (384, 512, 256), (256, 4096, 2048)]
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_matmul_reduce_scatter(gemm_rs_context, rows, n, k, dtype):
+def test_fused_matmul_reduce_scatter(
+    gemm_rs_context, gemm_rs_op, gemm_rs_api, rows, n, k, dtype
+):
     group, device = gemm_rs_context
     torch.manual_seed(8123 + group.rank())
     a = torch.randn((rows * group.size(), k), device=device, dtype=dtype) * 0.01
@@ -109,9 +113,7 @@ def test_fused_matmul_reduce_scatter(gemm_rs_context, rows, n, k, dtype):
             configure_fused_matmul_reduce_scatter(group.group_name, config)
 
             def implementation():
-                return torch.ops.symm_mem.fused_matmul_reduce_scatter(
-                    a, b, "sum", 0, group.group_name
-                )
+                return gemm_rs_op(a, b, "sum", 0, group.group_name)
 
             actual = implementation()
             try:
@@ -128,6 +130,7 @@ def test_fused_matmul_reduce_scatter(gemm_rs_context, rows, n, k, dtype):
                 json.dumps(
                     {
                         "op": "fused_matmul_reduce_scatter",
+                        "api": gemm_rs_api,
                         "shape": list(a.shape) + [n],
                         "dtype": str(dtype),
                         "world_size": group.size(),
@@ -140,7 +143,10 @@ def test_fused_matmul_reduce_scatter(gemm_rs_context, rows, n, k, dtype):
                 )
             )
             metric = consts.BenchmarkMetrics(
-                shape_detail=f"M={a.shape[0]}, N={n}, local_K={k}, TP={group.size()}, packing included",
+                shape_detail=(
+                    f"M={a.shape[0]}, N={n}, local_K={k}, TP={group.size()}, "
+                    f"api={gemm_rs_api}, packing included"
+                ),
                 latency_base=baseline_ms,
                 latency=best_ms,
                 speedup=baseline_ms / best_ms,

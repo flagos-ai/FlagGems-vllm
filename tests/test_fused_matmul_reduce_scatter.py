@@ -1,7 +1,11 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Correctness and dispatcher tests; launch collective cases with torchrun."""
+"""Adaptive API correctness and optional symm_mem dispatcher tests.
+
+Launch collective cases with torchrun. Use symm_mem when the installed PyTorch
+supports overriding kernels, or call FlagGems-vllm directly otherwise.
+"""
 
 import importlib
 import inspect
@@ -28,6 +32,7 @@ from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     configure_fused_matmul_reduce_scatter,
     fused_matmul_reduce_scatter,
 )
+from flaggems_vllm.runtime.symm_mem import supports_symm_mem_override
 from flaggems_vllm.testing.fused_matmul_reduce_scatter import (
     assert_close as assert_rs_close,
 )
@@ -314,14 +319,12 @@ def test_reduction_preserves_small_terms_during_cancellation(dtype, local_rank, 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("reduce_op", ["sum", "avg"])
-def test_exact_rank_and_shard_identity(gemm_rs_context, dtype, reduce_op):
+def test_exact_rank_and_shard_identity(gemm_rs_context, gemm_rs_op, dtype, reduce_op):
     group, device = gemm_rs_context
     if group.size() not in (2, 4, 8):
         pytest.skip("exact encoding covers 2, 4 or 8 ranks")
     a, b, expected = make_exact_case(group, device, dtype, reduce_op)
-    actual = torch.ops.symm_mem.fused_matmul_reduce_scatter(
-        a, b, reduce_op, 0, group.group_name
-    )
+    actual = gemm_rs_op(a, b, reduce_op, 0, group.group_name)
     assert_rs_close(actual, expected, torch.zeros_like(expected), group, dtype=dtype)
     clear_fused_matmul_reduce_scatter_cache(group.group_name)
 
@@ -332,7 +335,7 @@ def test_exact_rank_and_shard_identity(gemm_rs_context, dtype, reduce_op):
 @pytest.mark.parametrize("rows_per_rank", [256, 384])
 @pytest.mark.fused_matmul_reduce_scatter
 def test_fused_matmul_reduce_scatter(
-    gemm_rs_context, dtype, reduce_op, layout, rows_per_rank
+    gemm_rs_context, gemm_rs_op, dtype, reduce_op, layout, rows_per_rank
 ):
     group, device = gemm_rs_context
     m = rows_per_rank * group.size()
@@ -353,9 +356,7 @@ def test_fused_matmul_reduce_scatter(
         selected = stream if iteration % 2 else torch.cuda.current_stream(device)
         with torch.cuda.stream(selected):
             a.add_(0.001)
-            actual = torch.ops.symm_mem.fused_matmul_reduce_scatter(
-                a, b, reduce_op, 0, group.group_name
-            )
+            actual = gemm_rs_op(a, b, reduce_op, 0, group.group_name)
             reference, tolerance = make_reference(a, b, reduce_op, group)
         torch.cuda.current_stream(device).wait_stream(selected)
         stream.wait_stream(torch.cuda.current_stream(device))
@@ -367,7 +368,7 @@ def test_fused_matmul_reduce_scatter(
     assert dist.get_world_size(group) == group.size()
 
 
-def test_subgroup_and_configuration(gemm_rs_context):
+def test_subgroup_and_configuration(gemm_rs_context, gemm_rs_op):
     world, device = gemm_rs_context
     if world.size() < 4 or world.size() % 2:
         pytest.skip("subgroup isolation test requires an even world size >=4")
@@ -381,7 +382,7 @@ def test_subgroup_and_configuration(gemm_rs_context):
         (512, 64), 0.01 * (world.rank() + 1), device=device, dtype=torch.float16
     )
     b = torch.full((64, 256), 0.02, device=device, dtype=torch.float16)
-    actual = fused_matmul_reduce_scatter(a, b, "sum", 0, group.group_name)
+    actual = gemm_rs_op(a, b, "sum", 0, group.group_name)
     expected, tolerance = make_reference(a, b, "sum", group)
     assert_rs_close(actual, expected, tolerance, group, dtype=a.dtype)
     with pytest.raises(RuntimeError, match="clear"):
@@ -394,17 +395,47 @@ def test_subgroup_and_configuration(gemm_rs_context):
     dist.destroy_process_group(group)
 
 
-def test_rank_metadata_mismatch(gemm_rs_context):
+def test_rank_metadata_mismatch(gemm_rs_context, gemm_rs_op):
     group, device = gemm_rs_context
     m = (256 if group.rank() == 0 else 512) * group.size()
     a = torch.empty((m, 64), device=device, dtype=torch.float16)
     b = torch.empty((64, 256), device=device, dtype=torch.float16)
     with pytest.raises(ValueError, match="identical"):
-        fused_matmul_reduce_scatter(a, b, "sum", 0, group.group_name)
+        gemm_rs_op(a, b, "sum", 0, group.group_name)
+
+
+def _require_symm_mem_override():
+    if not supports_symm_mem_override():
+        pytest.skip("symm_mem override requires Library.impl(allow_override=True)")
+
+
+@pytest.mark.parametrize(
+    "version,has_override",
+    [
+        ("2.8.0a0+5228986c39.nv25.05", False),
+        ("2.8.0", True),
+        ("2.7.0+vendor_backport", True),
+    ],
+)
+def test_symm_mem_capability_uses_api_instead_of_version(
+    monkeypatch, version, has_override
+):
+    def old_impl(self, name, fn, dispatch_key=""):
+        pytest.fail("capability detection must not register a kernel")
+
+    def new_impl(self, name, fn, dispatch_key="", *, allow_override=False):
+        pytest.fail("capability detection must not register a kernel")
+
+    monkeypatch.setattr(torch, "__version__", version)
+    monkeypatch.setattr(
+        torch.library.Library, "impl", new_impl if has_override else old_impl
+    )
+    assert supports_symm_mem_override() is has_override
 
 
 @pytest.fixture
 def dispatch_probe(monkeypatch):
+    _require_symm_mem_override()
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA to exercise the CUDA dispatcher")
     implementation = importlib.import_module(
@@ -505,6 +536,7 @@ def test_persistent_activation_outlives_scope(dispatch_probe):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_actual_operator_reached_and_unsupported_inputs_raise():
+    _require_symm_mem_override()
     a = torch.empty((512, 64), device="cuda", dtype=torch.float32)
     b = torch.empty((64, 128), device="cuda", dtype=torch.float32)
     # The real implementation rejects the dtype before requiring a process group
