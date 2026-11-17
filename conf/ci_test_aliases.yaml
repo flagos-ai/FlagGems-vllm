@@ -18,6 +18,7 @@ fused_recurrent_gated_delta_rule_fwd: test_FLA/test_fused_recurrent_gated_delta_
 
 # --- MHC operators (tested in test_mhc_ops.py) ---
 hc_head_fused_kernel: test_mhc_ops
+hc_split_sinkhorn: test_mhc_ops
 hc_split_sinkhorn_forward: test_mhc_ops
 mhc_bwd: test_mhc_ops
 mhc_post: test_mhc_ops
@@ -34,6 +35,7 @@ silu_and_mul_with_clamp_out: test_silu_and_mul_with_clamp
 weight_norm_interface_backward: test_weight_norm_interface
 
 # --- Alternative naming ---
+gather_sampler_output: test_batch_shard
 draft_watermarking_mask: test_watermark
 act_quant_triton: test_quant
 apply_thinking_budget: test_thinking_budget
