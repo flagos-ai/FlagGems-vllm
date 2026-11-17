@@ -420,6 +420,8 @@ silu_and_mul_with_clamp_linear:
     num_warps: 4
     num_stages: 1
 
+# Ascend vector sort has a fixed UB/proposal geometry. In particular the final
+# stage modifies private proposal slots and must not be repeatedly autotuned.
 fused_kimi_k3_mla_kv_concat_ascend:
   - META: {HEADS_PER_PROGRAM: 1}
     num_warps: 4
@@ -428,5 +430,35 @@ fused_kimi_k3_mla_kv_concat_ascend:
     num_warps: 4
     num_stages: 1
   - META: {HEADS_PER_PROGRAM: 16}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_ascend_sort:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_ascend_finish:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_small:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_ascend_merge:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_ascend_prepare_sorted:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_ascend_finish_sorted:
+  - META: {}
     num_warps: 4
     num_stages: 1

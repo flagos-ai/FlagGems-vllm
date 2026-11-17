@@ -18,7 +18,6 @@ fwht128_quant_fp8
 gather_rows
 gather_state_rows
 hadamard128
-hc_head_fused_kernel_ref
 ihc_post
 ihc_post_ref
 ihc_pre
@@ -27,7 +26,6 @@ invoke_fused_moe_triton_kernel
 kpool_compress_and_write_cache
 kpool_decode_update_and_maybe_write_cache_batched
 kpool_seed_tail_cache
-mhc_bwd_ref
 mhc_fused_post_pre_with_norm
 mhc_pre_with_norm
 mhc_rms_norm
@@ -66,8 +64,6 @@ safe_kda_gate_chunk_cumsum
 scaled_int8_quant
 scatter_decode_tokens
 scatter_state_rows
-sinkhorn_forward
-topk_sigmoid
 triton_scaled_mm
 triton_unified_attention
 vision_flash_attn_varlen
