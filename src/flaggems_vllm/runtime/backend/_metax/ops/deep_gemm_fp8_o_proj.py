@@ -65,9 +65,9 @@ from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
 logger = logging.getLogger(__name__)
 
 _QUANT_BLOCK = 128
+_CAST_BLOCK = 1024
 _FP8_MAX = 448.0
 _INT8_MAX = 127.0
-_INT8_TO_FP8 = _INT8_MAX / _FP8_MAX
 _FP8_TO_INT8 = _FP8_MAX / _INT8_MAX
 _EPS = 1e-10
 
@@ -293,6 +293,22 @@ _TENSOR_CACHE_BYTES = 0
 _TENSOR_CACHE_LIMIT = 512 << 20
 
 
+@triton.jit
+def _fp8_to_int8_round_kernel(
+    x_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK: tl.constexpr,
+):
+    """``round(x * 127/448)`` over the raw E4M3 bytes of one FP8 tensor."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    values = _e4m3_bits_to_f32(tl.load(x_ptr + offs, mask=mask, other=0))
+    y = values * 0.28348214285714285  # 127/448: FP8 grid onto the INT8 grid
+    q = tl.where(y >= 0, y + 0.5, y - 0.5).to(tl.int32).to(tl.int8)
+    tl.store(out_ptr + offs, q, mask=mask)
+
+
 def _quantize_weight_int8(
     weight: torch.Tensor, scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -301,10 +317,14 @@ def _quantize_weight_int8(
     out = torch.empty(
         (groups, columns, reduction), dtype=torch.int8, device=weight.device
     )
-    for group in range(groups):
-        out[group].copy_(
-            torch.round(weight[group].float() * _INT8_TO_FP8).to(torch.int8)
-        )
+    n_elements = weight.numel()
+    _fp8_to_int8_round_kernel[(triton.cdiv(n_elements, _CAST_BLOCK),)](
+        weight.view(torch.int8),
+        out,
+        n_elements,
+        BLOCK=_CAST_BLOCK,
+        num_warps=4,
+    )
     return out, (scale * _FP8_TO_INT8).contiguous()
 
 
