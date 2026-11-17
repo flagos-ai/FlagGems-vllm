@@ -451,3 +451,15 @@ cooperative_topk_ascend_finish_sorted:
   - META: {}
     num_warps: 4
     num_stages: 1
+
+
+silu_mul_quant_fp8_ascend:
+  - META: {BR: 8, BG: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BR: 16, BG: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BR: 32, BG: 1}
+    num_warps: 4
+    num_stages: 1
