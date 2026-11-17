@@ -21,13 +21,19 @@ import flaggems_vllm
 
 from . import base, consts
 
+# Use the vLLM native C++ kernel as the performance baseline when available.
+# The pure-Python loop reference performs one .item() per token (triggering a
+# CPU-GPU sync each time), which makes it ~10,000x slower than a real GPU
+# kernel and produces misleading SpeedUp numbers.
+try:
+    import vllm._custom_ops  # noqa: F401
 
-class ConcatAndCacheMLABenchmark(base.GenericBenchmark):
-    def set_more_shapes(self):
-        return None
+    _HAS_VLLM_NATIVE = hasattr(torch.ops._C_cache_ops, "concat_and_cache_mla")
+except (ImportError, RuntimeError):
+    _HAS_VLLM_NATIVE = False
 
 
-def torch_concat_and_cache_mla_ref(
+def _vllm_concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -35,24 +41,14 @@ def torch_concat_and_cache_mla_ref(
     kv_cache_dtype: str = "auto",
     scale: torch.Tensor | None = None,
 ) -> None:
-    kv_lora_rank = kv_c.size(1)
-    block_size = kv_cache.size(1)
-    temp_cache = torch.zeros(kv_cache.shape, dtype=kv_c.dtype, device=kv_cache.device)
+    torch.ops._C_cache_ops.concat_and_cache_mla(
+        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+    )
 
-    for token_idx in range(slot_mapping.numel()):
-        slot = slot_mapping[token_idx].item()
-        block_id = slot // block_size
-        block_offset = slot % block_size
-        temp_cache[block_id, block_offset, :kv_lora_rank] = kv_c[token_idx]
-        temp_cache[block_id, block_offset, kv_lora_rank:] = k_pe[token_idx]
 
-    if kv_cache_dtype != "auto":
-        scale_val = scale.item() if scale is not None else 1.0
-        kv_cache.copy_(
-            (temp_cache / scale_val).to(torch.float8_e4m3fn).view(torch.uint8)
-        )
-    else:
-        kv_cache.copy_(temp_cache)
+class ConcatAndCacheMLABenchmark(base.GenericBenchmark):
+    def set_more_shapes(self):
+        return None
 
 
 @pytest.mark.skipif(flaggems_vllm.vendor_name == "hygon", reason="#2885: RuntimeError")
@@ -95,7 +91,7 @@ def test_concat_and_cache_mla():
     bench = ConcatAndCacheMLABenchmark(
         op_name="concat_and_cache_mla",
         input_fn=input_kwargs,
-        torch_op=torch_concat_and_cache_mla_ref,
+        torch_op=_vllm_concat_and_cache_mla if _HAS_VLLM_NATIVE else None,
         gems_op=flaggems_vllm.concat_and_cache_mla,
         dtypes=consts.FLOAT_DTYPES,
     )
