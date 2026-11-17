@@ -749,7 +749,80 @@ def _tiled_kernel(
         )
 
 
+# Align with the interface of vLLM 0.20.1
 def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    position_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    cache_block_size: int,
+):
+    """
+    Horizontally-fused DeepseekV4-MLA: per-head RMSNorm + GPT-J RoPE for Q, and
+    GPT-J RoPE + UE8M0 FP8 quant + paged cache insert for KV, all in one kernel
+    launch.
+    K Cache block layout (block_size=64 tokens):
+    - First 64 * 576 = 36864 bytes: Token data
+      - Each token: 448 bytes (fp8) + 128 bytes (bf16)
+    - Next 64 * 8 = 512 bytes: Scales
+      - Each token: 8 bytes (uint8 scales, 7 real + 1 padding)
+    - Padded to multiple of 576
+
+    Args:
+        q: [num_tokens, num_heads, 512], bfloat16, in place
+        kv: [num_tokens, 512], bfloat16, read-only
+        k_cache: [num_blocks, block_bytes], uint8
+        slot_mapping: [num_tokens_insert], i64
+        position_ids: [num_tokens], i64
+        cos_sin_cache: [max_pos, 64], fp32
+        eps: used in RMSNorm
+        cache_block_size: tokens per paged-cache block
+    """
+    assert q.is_contiguous() and kv.is_contiguous()
+    num_tokens, num_heads, head_dims = q.shape
+    assert head_dims == 512
+    assert kv.shape == (num_tokens, 512)
+    assert q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16
+    assert k_cache.dtype == torch.uint8
+    assert slot_mapping.dim() == 1
+    num_tokens_insert = slot_mapping.shape[0]
+    assert num_tokens_insert <= num_tokens
+    assert slot_mapping.dtype == torch.int64
+    assert position_ids.shape == (num_tokens,)
+    assert position_ids.dtype == torch.int64
+    assert cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64
+    assert cos_sin_cache.dtype == torch.float32
+
+    grid = num_tokens * (num_heads + 1)
+    fused_qnorm_rope_kv_insert_kernel[(grid,)](
+        q,
+        q,  # q_out
+        kv,
+        k_cache,
+        slot_mapping,
+        position_ids,
+        cos_sin_cache,
+        num_heads,  # q_head_padded
+        eps,
+        cache_block_size,
+        True,  # apply_q_norm
+        False,  # kv_mxfp8
+        True,  # apply_q_rope
+        False,  # is_q_interleaved
+        num_tokens,
+        num_heads,
+        k_cache.stride(0),
+        num_tokens_insert,
+        num_warps=1,
+        num_stages=2,
+    )
+
+
+# Align with the interface of vLLM 0.32.0
+def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2(
     q: torch.Tensor,
     kv: torch.Tensor,
     k_cache: torch.Tensor,
@@ -858,7 +931,61 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     return q_out
 
 
-def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_impl(
+def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_tiled(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    position_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    cache_block_size: int,
+    TPP: int = 8,
+    num_warps: int = 4,
+):
+    """Tiled version shared for hygon, metax, mthread"""
+    assert q.is_contiguous() and kv.is_contiguous()
+    num_tokens, num_heads, head_dims = q.shape
+    assert head_dims == 512
+    assert kv.shape == (num_tokens, 512)
+    assert q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16
+    assert k_cache.dtype == torch.uint8
+    assert slot_mapping.dim() == 1
+    num_tokens_insert = slot_mapping.shape[0]
+    assert num_tokens_insert <= num_tokens
+    assert slot_mapping.dtype == torch.int64
+    assert position_ids.shape == (num_tokens,)
+    assert position_ids.dtype == torch.int64
+    assert cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64
+    assert cos_sin_cache.dtype == torch.float32
+
+    grid = triton.cdiv(num_tokens, TPP) * (num_heads + 1)
+    _tiled_kernel[(grid,)](
+        q,
+        q,  # q_out
+        kv,
+        k_cache,
+        slot_mapping,
+        position_ids,
+        cos_sin_cache,
+        num_heads,  # q_head_padded,
+        eps,
+        cache_block_size,
+        True,  # apply_q_norm
+        False,  # kv_mxfp8
+        True,  # apply_q_rope
+        False,  # is_q_interleaved
+        num_tokens,
+        num_heads,
+        k_cache.stride(0),
+        num_tokens_insert,
+        TPP=TPP,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+
+def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_tiled_v2(
     q: torch.Tensor,
     kv: torch.Tensor,
     k_cache: torch.Tensor,

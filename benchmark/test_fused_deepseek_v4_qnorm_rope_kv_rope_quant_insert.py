@@ -177,6 +177,45 @@ def torch_ref_wrapper(
     )
 
 
+def gems_wrapper(
+    q,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    num_heads,
+    eps,
+    block_size,
+):
+    if (
+        VLLM_0_22_0_AVAILABLE
+        or (IS_MTHREADS and VLLM_MUSA_0_1_28_AVAILABLE)
+        or (not VLLM_REF_AVAILABLE)
+    ):
+        return flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            num_heads,
+            eps,
+            block_size,
+        )
+    else:
+        flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+        )
+        return q
+
+
 @dataclasses.dataclass
 class TestParam:
     # Instruct pytest to ignore this class
@@ -201,12 +240,12 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
             "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
             (
                 torch_ref_wrapper
-                if IS_ASCEND
+                if not VLLM_REF_AVAILABLE
                 else musa_ref_wrapper if IS_MTHREADS else cuda_ref_wrapper
             ),
             [torch.bfloat16],
         )
-        self.set_gems(flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert)
+        self.set_gems(gems_wrapper)
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = []
