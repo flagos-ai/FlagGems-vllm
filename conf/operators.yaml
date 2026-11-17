@@ -37,6 +37,17 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: apply_min_p
+  description: Filter logits in place using per-request minimum probability ratios.
+  for:
+  - apply_min_p
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: apply_repetition_penalties
   description: 'Modifies logit tensors in place to penalize tokens that have already
     appeared in the generated sequence.
@@ -69,6 +80,17 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
+- id: apply_thinking_budget
+  description: Update reasoning-marker caches and force the budgeted end token.
+  for:
+  - apply_thinking_budget
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: beam_search_score
   description: Computes beam search scores by adding cumulative log probabilities
     with new token scores.
@@ -145,6 +167,18 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: cast_sigmoid
+  description: 'Element-wise sigmoid with explicit output and compute dtype, used for
+    vLLM grouped-topk gating scores. Precisions: FP16, BF16 and FP32.'
+  for:
+  - None
+  labels:
+  - vLLM
+  - pointwise
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: causal_conv1d_fn
   description: 'Causal depthwise conv1d prefill for vLLM continuous batching with
 
@@ -403,11 +437,11 @@ ops:
   stages:
   - beta: '3.0'
 - id: cooperative_topk
-  description: 'Select exact top-k indices from FP32 CUDA logits through vLLM''s in-place
+  description: 'Select exact top-k indices from FP32 logits through vLLM''s in-place
 
-    interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
+    interface, with Ascend and Iluvatar fast paths. Supports up to 64 rows,
 
-    and -1 padding for short rows.
+    k in {512, 1024, 2048}, variable lengths, and -1 padding for short rows.
 
     '
   for:
@@ -549,6 +583,12 @@ ops:
     tuned TMA/WGMMA kernels; other NVIDIA GPUs (compute capability 8.9 for FP8,
 
     8.0 for BF16) use plain Triton kernels.
+
+    On Hygon BW1000, which has no FP8
+
+    compute, an FP8 wo_a runs in INT8 with the same per-128 activation scales,
+
+    and a BF16 wo_a is read in place without a full copy.
 
     '
   for:
@@ -922,6 +962,22 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: fused_matmul_reduce_scatter
+  description: |
+    Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
+    Matches the symm_mem argument signature; currently inference-only, NVIDIA SM90+
+    or an experimental HCU descriptor-lowering path (BF16 sum validated on two BW nodes),
+    FP16/BF16 2D inputs, sum/avg, scatter_dim=0, aligned shapes, eager execution.
+    Uses process-group-scoped communication resources and explicit configuration.
+  for:
+  - symm_mem.fused_matmul_reduce_scatter
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Distributed
+  stages:
+  - alpha: '5.4'
 - id: fused_moe
   description: The generic interface for fused MoE.
   for:
@@ -1013,6 +1069,29 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: gather_draft_sampled
+  description: Gather logits-aligned draft tokens and positions for speculative verification.
+  for:
+  - gather_draft_sampled
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: gather_sampler_output
+  description: Pack and restore batch-sharded tokens, counts, and logprobs around
+    vLLM all-gather.
+  for:
+  - gather_sampler_output
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: gdn_950dt_triton_ascend
   description: 'Gated delta rule for Ascend 950DT (A5 / arch35), triton-ascend only.
 
@@ -1124,6 +1203,16 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: get_num_sampled_and_rejected
+  description: Update sampled and rejected token counts per request.
+  for:
+    - get_num_sampled_and_rejected
+  labels:
+    - fused
+  kind:
+    - Sampling
+  stages:
+    - beta: '0.3'
 - id: group_list_cumsum
   description: 'Computes expert token-count offsets (cumsum) for expert-parallel MoE
 
@@ -1200,6 +1289,21 @@ ops:
   stages:
   - beta: '5.2'
   - stable: '5.3'
+- id: hc_split_sinkhorn
+  description: 'Splits the mHC mix coefficients into the pre/post gates and the comb
+    matrix, then runs the Sinkhorn normalisation on the comb matrix.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: hc_split_sinkhorn_forward
   description: 'Computes a differentiable approximation of the Wasserstein distance
     (Optimal Transport)
@@ -1505,6 +1609,17 @@ ops:
   - fused
   - vLLM
   - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
+- id: mhc_pre_broadcast
+  description: Triton implementation of mHC Pre Broadcast operator (hc_mult=4).
+  for:
+  - vllm.model_executor.kernels.mhc.tilelang.mhc_pre_broadcast_tilelang
+  labels:
+  - fused
+  - vLLM
   kind:
   - NeuralNetwork
   stages:
@@ -2111,13 +2226,21 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: topk_sigmoid
+  description: Selects MoE experts using sigmoid scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and scaling and marks padded experts.
+  for:
+  - _moe_C.topk_sigmoid
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.5'
 - id: topk_softmax
-  description: 'Selects the k most likely next-token candicates, sets all others to
-    zero,
-
-    and renormalize the prbabilities of these top candidates.
-
-    '
+  description: Selects MoE experts using softmax scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and marks padded experts.
   for:
   - _moe_C.topk_softmax
   labels:

@@ -26,7 +26,8 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post_ref as generic_mhc_post_ref
+
+from .test_mhc_ops import mhc_post_ref as generic_mhc_post_ref
 
 try:
     import torch_npu  # noqa: F401

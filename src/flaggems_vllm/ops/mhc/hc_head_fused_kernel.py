@@ -175,32 +175,6 @@ def _hc_head_fused_kernel(
         tl.store(out_ptr + out_base + h_off, acc.to(tl.bfloat16), mask=h_mask)
 
 
-def hc_head_fused_kernel_ref(
-    hs_flat: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    out: torch.Tensor,
-    hidden_size: int,
-    rms_eps: float,
-    hc_eps: float,
-    hc_mult: int,
-) -> torch.Tensor:
-    """Pure PyTorch reference implementation for correctness testing."""
-    if hs_flat.shape[0] == 0:
-        return out
-    x = hs_flat.reshape(hs_flat.shape[0], hc_mult * hidden_size).to(torch.float32)
-    mixes = torch.matmul(x, fn.t())
-    sqrsum = x.square().sum(dim=-1, keepdim=True)
-    rsqrt = torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
-    pre_mix = torch.sigmoid(mixes * rsqrt * hc_scale[0] + hc_base) + hc_eps
-    result = torch.sum(pre_mix.unsqueeze(-1) * hs_flat.to(torch.float32), dim=1).to(
-        out.dtype
-    )
-    out.copy_(result)
-    return out
-
-
 def hc_head_fused_kernel(
     hs_flat: torch.Tensor,
     fn: torch.Tensor,
@@ -229,11 +203,6 @@ def hc_head_fused_kernel(
     assert hc_base.shape == (hc_mult,)
     assert out.shape == (num_tokens, hidden_size)
     assert out.dtype == hs_flat.dtype
-
-    if hs_flat.device.type != "cuda":
-        return hc_head_fused_kernel_ref(
-            hs_flat, fn, hc_scale, hc_base, out, hidden_size, rms_eps, hc_eps, hc_mult
-        )
 
     H = hidden_size
 

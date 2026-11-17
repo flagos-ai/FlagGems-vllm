@@ -26,6 +26,20 @@ else:
     FLOAT_DTYPES = utils.FLOAT_DTYPES
 
 
+try:
+    from vllm import _custom_ops as _vllm_ops
+
+    _HAS_VLLM_FUSED_ADD_RMS_NORM = hasattr(_vllm_ops, "fused_add_rms_norm")
+except (ImportError, RuntimeError):
+    _HAS_VLLM_FUSED_ADD_RMS_NORM = False
+
+
+def _vllm_fused_add_rms_norm_ref(x, residual, weight, eps):
+    """In-place vLLM baseline; returns normalized output for comparison."""
+    _vllm_ops.fused_add_rms_norm(x, residual, weight, eps)
+    return x, residual
+
+
 @pytest.mark.fused_add_rms_norm
 @pytest.mark.parametrize("shape", utils.REDUCTION_SHAPES)
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
@@ -39,22 +53,31 @@ def test_fused_add_rms_norm(shape, dtype):
     weight = torch.randn(layer_shape, dtype=dtype, device=flaggems_vllm.device)
     eps = 1e-5
 
-    ref_inp = utils.to_reference(inp, True)
-    ref_residual = utils.to_reference(residual, True)
-    ref_weight = utils.to_reference(weight, True)
+    # Prefer vLLM's native fused_add_rms_norm as the reference when available;
+    # fall back to the torch composition otherwise.
+    if _HAS_VLLM_FUSED_ADD_RMS_NORM:
+        ref_inp = inp.clone()
+        ref_res = residual.clone()
+        ref_out, ref_new_residual = _vllm_fused_add_rms_norm_ref(
+            ref_inp, ref_res, weight, eps
+        )
+    else:
+        ref_inp = utils.to_reference(inp, True)
+        ref_residual = utils.to_reference(residual, True)
+        ref_weight = utils.to_reference(weight, True)
 
-    def _torch_fused_add_rms_norm(x, residual, weight, eps):
-        x = x + residual
-        variance = x.pow(2).mean(-1, keepdim=True)
-        hidden_states = x * torch.rsqrt(variance + eps)
-        return weight * hidden_states, x
+        def _torch_fused_add_rms_norm(x, residual, weight, eps):
+            x = x + residual
+            variance = x.pow(2).mean(-1, keepdim=True)
+            hidden_states = x * torch.rsqrt(variance + eps)
+            return weight * hidden_states, x
 
-    ref_out, ref_new_residual = _torch_fused_add_rms_norm(
-        ref_inp,
-        ref_residual,
-        weight=ref_weight,
-        eps=eps,
-    )
+        ref_out, ref_new_residual = _torch_fused_add_rms_norm(
+            ref_inp,
+            ref_residual,
+            weight=ref_weight,
+            eps=eps,
+        )
 
     res_out, res_new_residual = flaggems_vllm.ops.fused_add_rms_norm(
         inp, residual, list(layer_shape), weight=weight, eps=eps

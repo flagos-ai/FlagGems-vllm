@@ -25,6 +25,15 @@ import flaggems_vllm
 from benchmark import base, consts
 from benchmark.conftest import TEST_RESULTS, Config
 
+try:
+    from vllm.models.glm5next.common.attention import (
+        _fused_indexer_k_norm as _vllm_fused_indexer_k_norm,
+    )
+
+    _HAS_VLLM_INDEXER_K_NORM = True
+except ImportError:
+    _HAS_VLLM_INDEXER_K_NORM = False
+
 
 class FusedIndexerKNormBenchmark(base.Benchmark):
     DEFAULT_SHAPE_FILES = "core_shapes.yaml"
@@ -89,6 +98,8 @@ class FusedIndexerKNormBenchmark(base.Benchmark):
         records[:] = merged.values()
 
     def _torch_op(self, x, weight, bias, dim, eps):
+        if _HAS_VLLM_INDEXER_K_NORM:
+            return _vllm_fused_indexer_k_norm(x, weight, bias, dim, eps)
         return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
 
     def get_input_iter(self, dtype):
