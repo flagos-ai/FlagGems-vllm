@@ -17,6 +17,7 @@ from flaggems_vllm.runtime.backend._mthreads.fused.fused_add_rms_norm import (
 )
 from flaggems_vllm.runtime.backend._mthreads.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2,
 )
 from flaggems_vllm.runtime.backend._mthreads.fused.fused_marlin_moe import (
     fused_marlin_moe,
@@ -33,6 +34,7 @@ __all__ = [
     "fused_marlin_moe_w4a16_int4",
     "fused_marlin_moe_w8a16_fp8",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2",
     "moe_sum",
     "top_k_per_row_prefill",
     "fused_add_rms_norm",

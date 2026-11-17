@@ -33,7 +33,59 @@ _TPP = 4
 _NUM_WARPS = 4
 
 
+# Align with the interface of vLLM 0.20.1
 def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    position_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    cache_block_size: int,
+):
+    """See the generic implementation for the layout contract."""
+    assert q.is_contiguous() and kv.is_contiguous()
+    num_tokens, num_heads, head_dims = q.shape
+
+    if num_heads > _TILED_MAX_HEADS or num_tokens < _TILED_MIN_TOKENS:
+        # 128 heads: no tiling configuration beats the generic kernel. Small shapes:
+        # launch-bound, and too noisy to claim a win in.
+        from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
+            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert as _generic,
+        )
+
+        return _generic(
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            position_ids,
+            cos_sin_cache,
+            eps,
+            cache_block_size,
+        )
+
+    from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
+        _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_tiled as _tiled_impl,
+    )
+
+    return _tiled_impl(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        position_ids,
+        cos_sin_cache,
+        eps,
+        cache_block_size,
+        TPP=_TPP,
+        num_warps=_NUM_WARPS,
+    )
+
+
+# Align with the interface of vLLM 0.32.0
+def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2(
     q: torch.Tensor,
     kv: torch.Tensor,
     k_cache: torch.Tensor,
@@ -56,7 +108,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         # 128 heads: no tiling configuration beats the generic kernel. Small shapes:
         # launch-bound, and too noisy to claim a win in.
         from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
-            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert as _generic,
+            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2 as _generic,
         )
 
         return _generic(
@@ -76,7 +128,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         )
 
     from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
-        _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_impl as _tiled_impl,
+        _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_tiled_v2 as _tiled_impl,
     )
 
     return _tiled_impl(

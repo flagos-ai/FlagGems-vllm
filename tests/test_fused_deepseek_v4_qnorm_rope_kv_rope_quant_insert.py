@@ -520,7 +520,7 @@ def fused_impl(
     apply_q_rope: bool = True,
     is_q_interleaved: bool = False,
 ):
-    return flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    return flaggems_vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2(
         q,
         kv,
         k_cache,

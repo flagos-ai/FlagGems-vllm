@@ -526,7 +526,84 @@ def fused_qnorm_rope_kv_insert_kernel(
                 )
 
 
+# Align with the interface of vLLM 0.20.1
 def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    position_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    cache_block_size: int,
+):
+    """See the generic implementation for the layout contract."""
+    assert q.is_contiguous() and kv.is_contiguous()
+    num_tokens, num_heads, head_dims = q.shape
+    assert head_dims == 512
+    assert kv.shape == (num_tokens, 512)
+    assert q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16
+    assert k_cache.dtype == torch.uint8
+    assert slot_mapping.dim() == 1
+    num_tokens_insert = slot_mapping.shape[0]
+    assert num_tokens_insert <= num_tokens
+    assert slot_mapping.dtype == torch.int64
+    assert position_ids.shape == (num_tokens,)
+    assert position_ids.dtype == torch.int64
+    assert cos_sin_cache.dim() == 2 and cos_sin_cache.shape[1] == 64
+    assert cos_sin_cache.dtype == torch.float32
+
+    assert k_cache.is_contiguous()
+    k_cache_bf16 = k_cache.view(torch.bfloat16)
+
+    # One grid: Q tiles first, then one program per inserted token. It is issued in
+    # chunks within MAX_PROGRAMS_PER_LAUNCH, each program adding its chunk's offset,
+    # and every launch is a whole number of core groups.
+
+    heads_per_program = q_heads_per_program(num_heads, False)
+    tiles_per_token = num_heads // heads_per_program
+    q_programs = num_tokens * tiles_per_token
+    total_programs = q_programs + num_tokens_insert
+    device_index = q.device.index
+    if device_index is None:
+        device_index = torch.npu.current_device()
+    group, step = launch_geometry(device_index)
+    for pid_offset in range(0, total_programs, step):
+        grid = min(step, total_programs - pid_offset)
+        if grid > group:
+            # Integer arithmetic: triton.cdiv is slow on this host.
+            grid = -(-grid // group) * group
+        fused_qnorm_rope_kv_insert_kernel[(grid,)](
+            q,
+            q,  # q_out
+            kv,
+            k_cache,
+            k_cache_bf16,
+            slot_mapping,
+            position_ids,
+            cos_sin_cache,
+            num_heads,  # q_head_padded
+            eps,
+            cache_block_size,
+            True,  # apply_q_norm
+            False,  # kv_mxfp8
+            True,  # apply_q_rope
+            False,  # is_q_interleaved
+            num_heads,
+            k_cache.stride(0),
+            pid_offset,
+            q_programs,
+            total_programs,
+            tiles_per_token,
+            heads_per_program,
+            HAS_PADDING=False,
+            num_warps=1,
+            num_stages=1,
+        )
+
+
+# Align with the interface of vLLM 0.32.0
+def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2(
     q: torch.Tensor,
     kv: torch.Tensor,
     k_cache: torch.Tensor,

@@ -18,7 +18,8 @@ import torch
 
 OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
 DTYPES = [torch.bfloat16]
-IS_INPLACE = False
+IS_INPLACE = True
+MUTATED_INPUTS = (2,)
 HEAD_DIM = 512
 ROPE_DIM = 64
 HEAD_BYTES = 584
@@ -34,6 +35,17 @@ def native():
     except (ImportError, AttributeError):
         return None
     return op if callable(op) else None
+
+
+def _check_vllm_version():
+    try:
+        vllm_mod = importlib.import_module("vllm")
+        packaging_version_mod = importlib.import_module("packaging.version")
+        version = getattr(vllm_mod, "__version__", "0.0.0")
+        parsed = packaging_version_mod.Version(version.split("+", 1)[0])
+        return parsed >= packaging_version_mod.Version("0.22.0")
+    except Exception:
+        return False
 
 
 def grid():
@@ -100,17 +112,29 @@ def build_inputs(binding, dtype, device):
         dtype=torch.uint8,
         device=device,
     )
-    args = (
-        q,
-        kv,
-        k_cache,
-        slot_mapping,
-        positions,
-        cos_sin_cache,
-        q_head_padded,
-        eps,
-        block_size,
-    )
+    if _check_vllm_version():
+        args = (
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            q_head_padded,
+            eps,
+            block_size,
+        )
+    else:
+        args = (
+            q,
+            kv,
+            k_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+        )
     return args, {}
 
 
@@ -139,7 +163,11 @@ def config(binding, dtype):
             "slot_mapping": {"shape": [num_tokens_insert], "dtype": "torch.int64"},
             "position_ids": {"shape": [num_tokens], "dtype": "torch.int64"},
             "cos_sin_cache": {"shape": [max_pos, ROPE_DIM], "dtype": "torch.float32"},
-            "q_head_padded": {"scalar": q_head_padded},
+            **(
+                {"q_head_padded": {"scalar": q_head_padded}}
+                if _check_vllm_version()
+                else {}
+            ),
             "eps": {"scalar": eps},
             "cache_block_size": {"scalar": block_size},
         },
