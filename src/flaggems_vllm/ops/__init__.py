@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.batch_shard import gather_sampler_output
 from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
@@ -22,6 +23,7 @@ from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
 from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
+from flaggems_vllm.ops.cast_sigmoid import cast_sigmoid
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
@@ -106,6 +108,7 @@ from flaggems_vllm.ops.fused_moe import (
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
 from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
+from flaggems_vllm.ops.input_batch import get_num_sampled_and_rejected
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
@@ -119,13 +122,11 @@ from flaggems_vllm.ops.ihc import (
 from flaggems_vllm.ops.mhc import (
     MixLayout,
     hc_head_fused_kernel,
-    hc_head_fused_kernel_ref,
+    hc_split_sinkhorn,
     mhc_bwd,
-    mhc_bwd_ref,
     mhc_post,
     mhc_pre,
     mhc_shifted_post_pre,
-    sinkhorn_forward,
 )
 from flaggems_vllm.ops.min_p import apply_min_p
 from flaggems_vllm.ops.qwen4 import (
@@ -181,6 +182,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
+from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
 from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
@@ -272,6 +274,7 @@ __all__ = [
     "bf16_paged_mqa_logits",
     "bincount",
     "bucket_sort_topk",
+    "cast_sigmoid",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule",
@@ -330,18 +333,21 @@ __all__ = [
     "fused_recurrent_kda",
     "fwht128_quant_fp8",
     "gate_sigmoid_mul",
+    "gather_draft_sampled",
     "gather_rows",
+    "gather_sampler_output",
     "gather_state_rows",
     "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
+    "get_num_sampled_and_rejected",
     "grouped_gemma_rmsnorm",
     "grouped_topk",
     "hadamard128",
     "hc_combine",
     "hc_head_fused_kernel",
-    "hc_head_fused_kernel_ref",
+    "hc_split_sinkhorn",
     "ihc_post",
     "ihc_post_ref",
     "ihc_pre",
@@ -354,7 +360,6 @@ __all__ = [
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
     "mhc_bwd",
-    "mhc_bwd_ref",
     "mhc_fused_post_pre_with_norm",
     "mhc_post",
     "mhc_pre",
@@ -423,7 +428,6 @@ __all__ = [
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
-    "sinkhorn_forward",
     "skip_layer_norm",
     "sparse_attn_triton",
     "stage_deepseek_v4_mega_moe_inputs",
