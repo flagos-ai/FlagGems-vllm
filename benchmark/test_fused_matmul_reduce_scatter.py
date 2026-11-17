@@ -8,6 +8,9 @@ Packing/copying and result allocation are included; context creation and compile
 time are excluded. This reports composed Torch GEMM+RS as the baseline.
 The measured API is selected from the installed PyTorch override capability and
 reported with the results: symm_mem when supported, otherwise direct calls.
+Shapes are global (M, N, K), with 1K = 1024. Each rank holds A[M, K/TP]
+and B[K/TP, N], and receives an output shard [M/TP, N]. Unsupported shapes
+are reported as skips on every rank before allocating inputs or timing.
 """
 
 import json
@@ -19,6 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import triton
+import triton.language as tl
 
 from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     _default_config,
@@ -84,16 +88,48 @@ def _candidates(group, device):
 
 
 @pytest.mark.parametrize(
-    "rows,n,k", [(256, 256, 256), (384, 512, 256), (256, 4096, 2048)]
+    "m,n,k",
+    [
+        pytest.param(2048, 4096, 16384, id="M2K-N4K-K16K"),
+        pytest.param(4096, 4096, 16384, id="M4K-N4K-K16K"),
+        pytest.param(8192, 8192, 32768, id="M8K-N8K-K32K"),
+        pytest.param(16384, 12288, 49152, id="M16K-N12K-K48K"),
+        pytest.param(16384, 16384, 65536, id="M16K-N16K-K64K"),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_matmul_reduce_scatter(
-    gemm_rs_context, gemm_rs_op, gemm_rs_api, rows, n, k, dtype
+    gemm_rs_context, gemm_rs_op, gemm_rs_api, m, n, k, dtype
 ):
     group, device = gemm_rs_context
+    world_size = group.size()
+    if m % world_size or k % world_size:
+        pytest.skip(f"global M={m} and K={k} must be divisible by TP={world_size}")
+    rows, local_k = m // world_size, k // world_size
+    if rows < 256:
+        pytest.skip(
+            f"M/TP={m}/{world_size}={rows}; the TLE path requires at least 256 rows"
+        )
+
+    # Match the runtime's cross-node transfer limit. A collective decision keeps
+    # every rank in the same trial sequence even when compiler limits differ.
+    transfer_elements = triton.next_power_of_2(rows * n)
+    multi_node = world_size > int(os.environ["LOCAL_WORLD_SIZE"])
+    eligible = torch.tensor(
+        int(not multi_node or transfer_elements <= tl.TRITON_MAX_TENSOR_NUMEL),
+        device=device,
+    )
+    dist.all_reduce(eligible, op=dist.ReduceOp.MIN, group=group)
+    if not eligible.item():
+        pytest.skip(
+            f"cross-node transfer requires {transfer_elements} tensor elements; "
+            "at least one rank's Triton tensor limit is smaller "
+            f"(local limit: {tl.TRITON_MAX_TENSOR_NUMEL})"
+        )
+
     torch.manual_seed(8123 + group.rank())
-    a = torch.randn((rows * group.size(), k), device=device, dtype=dtype) * 0.01
-    b = torch.randn((k, n), device=device, dtype=dtype) * 0.01
+    a = torch.randn((m, local_k), device=device, dtype=dtype) * 0.01
+    b = torch.randn((local_k, n), device=device, dtype=dtype) * 0.01
 
     def baseline():
         partial = a @ b
@@ -131,7 +167,9 @@ def test_fused_matmul_reduce_scatter(
                     {
                         "op": "fused_matmul_reduce_scatter",
                         "api": gemm_rs_api,
-                        "shape": list(a.shape) + [n],
+                        "shape": [m, n, k],
+                        "local_k": local_k,
+                        "rows_per_rank": rows,
                         "dtype": str(dtype),
                         "world_size": group.size(),
                         "aggregation": "max_rank_median_ms",
@@ -144,7 +182,7 @@ def test_fused_matmul_reduce_scatter(
             )
             metric = consts.BenchmarkMetrics(
                 shape_detail=(
-                    f"M={a.shape[0]}, N={n}, local_K={k}, TP={group.size()}, "
+                    f"M={m}, N={n}, K={k}, local_K={local_k}, TP={world_size}, "
                     f"api={gemm_rs_api}, packing included"
                 ),
                 latency_base=baseline_ms,
