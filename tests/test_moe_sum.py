@@ -37,7 +37,6 @@ def test_moe_sum(shape, dtype):
     ref_inp1 = utils.to_reference(inp1)
     ref_out = torch.sum(ref_inp1, dim=1)
 
-    with flaggems_vllm.use_gems():
-        flaggems_vllm.moe_sum(inp1, res_out)
+    flaggems_vllm.moe_sum(inp1, res_out)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
