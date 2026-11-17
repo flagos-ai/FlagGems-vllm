@@ -10,7 +10,7 @@ import triton.language as tl
 
 from flaggems_vllm.ops.flash_mla import _get_num_sms
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
+from flaggems_vllm.runtime.backend._metax.ops._flash_mla_sparse_int8_kernels import (
     FlashMLAInt8PreparedHandle,
     NativeCachedHandle,
     NativeSmallHandle,
@@ -164,8 +164,6 @@ class SparseMLAInt8PreparedHandle:
                 self.native = NativeSmallHandle(
                     native_tensors,
                     scale,
-                    False,
-                    is_sparse=True,
                     uses_raw_indices=self.uses_raw_indices,
                 )
             elif rows <= 32 or (rows > LARGE_D512_ROWS and qr.shape[-1] == 0):
@@ -226,8 +224,6 @@ class SparseMLAInt8PreparedHandle:
                     native_tensors,
                     splits,
                     scale,
-                    False,
-                    is_sparse=True,
                     uses_raw_indices=self.uses_raw_indices,
                 )
                 self.native.head_tile = tile
@@ -253,8 +249,6 @@ class SparseMLAInt8PreparedHandle:
                 self.native = NativeCachedHandle(
                     native_tensors,
                     scale,
-                    False,
-                    is_sparse=True,
                     uses_raw_indices=self.uses_raw_indices,
                 )
             self.output = (
@@ -342,7 +336,7 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
 ) -> tuple[SparseMLAInt8PreparedHandle, tuple[torch.Tensor, torch.Tensor]]:
     """Sparse INT8 MLA over physical page64 cache indices.
 
-    RoPE is divided by the corresponding content scale, as in dense W8A8 MLA.
+    RoPE is divided by the corresponding content scale.
     Negative/out-of-range indices are ignored; duplicates remain independent.
     Scales must be finite and positive. LSE excludes the optional attention sink.
     """

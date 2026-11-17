@@ -1,7 +1,4 @@
-# FlashMLA scheduler metadata and prepared-handle factories, not tensor operators.
-FlashMLAFp8SplitKSchedMeta
-get_mla_fp8_metadata
-prepare_flash_mla_with_kvcache_fwd_w8a8_fp8
+# Sparse FlashMLA prepared-handle factory, not a tensor operator.
 prepare_flash_mla_with_kvcache_sparse_w8a8_int8
 
 # GEMM reduce-scatter configuration and cache lifecycle APIs, not tensor operators.

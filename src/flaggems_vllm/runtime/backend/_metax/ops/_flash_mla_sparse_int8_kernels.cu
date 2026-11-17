@@ -50,23 +50,15 @@ __device__ __forceinline__ float4_ rope_mma(uint2_ a, uint2_ b, float4_ c,
 // Sparse tables contain compact physical token IDs rather than page IDs.
 __device__ __forceinline__ long long cache_page(long long table, int batch,
                                                 long long stride, int page) {
-#if defined(FMLA_SPARSE)
   return page;
-#else
-  return uniform(input<int>(table)[batch * stride + page]);
-#endif
 }
 __device__ __forceinline__ long long cache_token(long long table, int batch,
                                                  long long page, int token) {
-#if defined(FMLA_SPARSE)
   const int index = input<int>(table)[(long long)batch * FMLA_CAP + page * 64 + token];
 #if defined(FMLA_SPARSE_RAW)
   return index >= 0 && index < FMLA_CACHE_TOKENS ? index : 0;
 #else
   return index;
-#endif
-#else
-  return page * 64 + token;
 #endif
 }
 __device__ __forceinline__ bool cache_valid(long long table, int batch,
@@ -92,12 +84,12 @@ reciprocal(float) __asm("llvm.mxc.rcp.f32");
 #ifndef HEADS
 #define HEADS 16
 #endif
-#if defined(FMLA_SPARSE) && HEADS == 16 && !FMLA_NO_ROPE
+#if HEADS == 16 && !FMLA_NO_ROPE
 #define FMLA_SEPARATE_ROPE_STATS 1
 #else
 #define FMLA_SEPARATE_ROPE_STATS 0
 #endif
-#if defined(FMLA_SPARSE) && !FMLA_NO_ROPE
+#if !FMLA_NO_ROPE
 #define FMLA_PIPELINE_ROPE 1
 #else
 #define FMLA_PIPELINE_ROPE 0
@@ -414,13 +406,9 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                     retained[HEADS == 16 ? chunk : 0][k]);
       }
       if (HEADS == 16) {
-#if defined(FMLA_SPARSE)
         // Plane 1 is not reused until the following stats/copy barrier.
         if (chunk < 3 || FMLA_NO_ROPE)
           sync();
-#else
-        sync();
-#endif
         if (chunk < 2)
           load_plane(page, chunk + 2, fixed_h16 ? page_offsets : nullptr);
         if (FMLA_PIPELINE_ROPE && chunk == 2)
@@ -899,14 +887,10 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
     float4_ scores[4], weighted[4], scales[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-#if defined(FMLA_SPARSE)
 #pragma unroll
       for (int n = 0; n < 4; ++n)
         scales[j][n] = input<float>(ksp)[
             cache_token(tp, batch, page, group * 16 + j * 4 + n)];
-#else
-      scales[j] = *input<float4_>(ksp + (page * 64 + group * 16 + j * 4) * 4);
-#endif
     }
 #pragma unroll
     for (int n = 0; n < 4; ++n) {

@@ -6,7 +6,6 @@ import torch
 
 import flaggems_vllm
 from tests.accuracy_utils import gems_assert_close, gems_assert_equal
-from tests.flash_mla_with_kvcache_w8a8_utils import get_backend_adapter
 from tests.test_flash_mla_sparse_fwd import (
     Flashmla_Sparse_Test_Param,
     FlashmlaSparseTestKit,
@@ -20,6 +19,15 @@ pytestmark = [
 ]
 
 
+def quantize_w8a8(x: torch.Tensor):
+    scale = x[..., :512].float().abs().amax(-1, keepdim=True) / 127.0
+    scale = torch.exp2(torch.ceil(torch.log2(scale)))
+    nope = (x[..., :512].float() / scale).round().to(torch.int8)
+    rope = (x[..., 512:].float() / scale).to(torch.bfloat16)
+    native = (torch.cat((nope.float(), rope.float()), -1) * scale).to(torch.bfloat16)
+    return nope, rope, scale, native
+
+
 def make_inputs(
     batch, queries, heads, topk, pages=32, dtype=torch.bfloat16, rope_dim=64
 ):
@@ -29,13 +37,8 @@ def make_inputs(
     query, cache, indices, _, _ = FlashmlaSparseTestKit.make_input_flashmla(
         param, seed=42
     )
-    adapter = get_backend_adapter()
-    q, qr, qs, native_q = adapter.quantize(
-        query.view(batch, queries, heads, 576), benchmark=False
-    )
-    kv, kr, ks, native_kv = adapter.quantize(
-        cache.view(pages, 64, 1, 576), benchmark=False
-    )
+    q, qr, qs, native_q = quantize_w8a8(query.view(batch, queries, heads, 576))
+    kv, kr, ks, native_kv = quantize_w8a8(cache.view(pages, 64, 1, 576))
     if rope_dim == 0:
         qr, kr = qr[..., :0].contiguous(), kr[..., :0].contiguous()
         native_q, native_kv = (

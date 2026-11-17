@@ -14,13 +14,11 @@
 
 import functools
 import hashlib
-import math
 import os
 import struct
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
 
 import torch
 import triton
@@ -30,198 +28,13 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import extern
 from triton.runtime.cache import get_cache_manager
 
-from flaggems_vllm.ops.flash_mla import _get_num_sms
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-from flaggems_vllm.utils.shape_utils import can_use_int32_index
-
-
-@triton.jit
-def accumulate_int8_pv(
-    KVBase, Valid, PHigh, PLow, Rescale, PScale, Accumulator, OFFSET: tl.constexpr
-):
-    # Reload V in small tiles to bound live registers and shared-memory usage.
-    dims = OFFSET + tl.arange(0, 128)
-    value = tl.load(KVBase + dims[None, :], Valid[:, None], 0)
-    high = tl.dot(tl.trans(value), tl.trans(PHigh), out_dtype=tl.int32).to(tl.float32)
-    low = tl.dot(tl.trans(value), tl.trans(PLow), out_dtype=tl.int32).to(tl.float32)
-    return (
-        Accumulator * Rescale[None, :] + (high + low * (1.0 / 127.0)) * PScale[None, :]
-    )
 
 
 @libentry()
 @triton.jit
-def dense_int8_mla_kernel(
-    Q,
-    QR,
-    KV,
-    KR,
-    QS,
-    KS,
-    Table,
-    Lengths,
-    Partial,
-    Stats,
-    Output,
-    LSE,
-    Q_STRIDES: tl.constexpr,
-    QR_STRIDES: tl.constexpr,
-    KV_STRIDES: tl.constexpr,
-    KR_STRIDES: tl.constexpr,
-    QS_STRIDES: tl.constexpr,
-    KS_STRIDES: tl.constexpr,
-    TABLE_STRIDE: tl.constexpr,
-    LENGTH_STRIDE: tl.constexpr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    SPLITS: tl.constexpr,
-    SCALE: tl.constexpr,
-    SQ: tl.constexpr,
-    CAUSAL: tl.constexpr,
-    BH: tl.constexpr,
-):
-    head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    heads = head_tile * BH + tl.arange(0, BH)
-    queries, qheads = heads // H, heads % H
-    merged_heads = SQ * H
-    content_dims = tl.arange(0, 64)
-    rope_dims = tl.arange(0, 64)
-    tokens = tl.arange(0, 64)
-    q_base = (
-        Q
-        + batch * Q_STRIDES[0]
-        + queries[:, None] * Q_STRIDES[1]
-        + qheads[:, None] * Q_STRIDES[2]
-    )
-    qr = tl.load(
-        QR
-        + batch * QR_STRIDES[0]
-        + queries[:, None] * QR_STRIDES[1]
-        + qheads[:, None] * QR_STRIDES[2]
-        + rope_dims[None, :],
-        heads[:, None] < merged_heads,
-        0,
-    )
-    qs = tl.load(
-        QS + batch * QS_STRIDES[0] + queries * QS_STRIDES[1] + qheads * QS_STRIDES[2],
-        heads < merged_heads,
-        0,
-    )
-    length = tl.load(Lengths + batch * LENGTH_STRIDE)
-    query_length = tl.full((BH,), length, tl.int32)
-    if CAUSAL:
-        query_length = tl.maximum(length - SQ + queries + 1, 0)
-    maximum = tl.full((BH,), -float("inf"), tl.float32)
-    denominator = tl.zeros((BH,), tl.float32)
-    acc0 = tl.zeros((128, BH), tl.float32)
-    acc1 = tl.zeros((128, BH), tl.float32)
-    acc2 = tl.zeros((128, BH), tl.float32)
-    acc3 = tl.zeros((128, BH), tl.float32)
-    valid_pages = tl.cdiv(length, 64)
-    first_page = valid_pages * split // SPLITS
-    end_page = valid_pages * (split + 1) // SPLITS
-    for page_idx in range(first_page, end_page):
-        page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)
-        valid = page_idx * 64 + tokens < length
-        kv_base = KV + page * KV_STRIDES[0] + tokens[:, None] * KV_STRIDES[1]
-        content_raw = tl.zeros((64, BH), tl.int32)
-        # A full query tile kept across PV spills on C550.
-        for chunk in tl.range(8, loop_unroll_factor=1, disable_licm=True):
-            dims = chunk * 64 + content_dims
-            q = tl.load(
-                q_base + dims[None, :], heads[:, None] < merged_heads, 0, volatile=True
-            )
-            key = tl.load(kv_base + dims[None, :], valid[:, None], 0)
-            content_raw = tl.dot(key, tl.trans(q), content_raw, out_dtype=tl.int32)
-        kr = tl.load(
-            KR
-            + page * KR_STRIDES[0]
-            + tokens[:, None] * KR_STRIDES[1]
-            + rope_dims[None, :],
-            valid[:, None],
-            0,
-        )
-        ks = tl.load(KS + page * KS_STRIDES[0] + tokens * KS_STRIDES[1], valid, 0)
-        content_scores = tl.trans(content_raw).to(tl.float32)
-        rope_scores = tl.trans(tl.dot(kr, tl.trans(qr), out_dtype=tl.float32))
-        scores = (
-            (content_scores + rope_scores)
-            * qs[:, None]
-            * ks[None, :]
-            * (SCALE * 1.4426950408889634)
-        )
-        scores = tl.where(
-            page_idx * 64 + tokens[None, :] < query_length[:, None],
-            scores,
-            -float("inf"),
-        )
-        next_maximum = tl.maximum(maximum, tl.max(scores, 1))
-        safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
-        probabilities = tl.exp2(scores - safe_maximum[:, None])
-        rescale = tl.exp2(maximum - safe_maximum)
-        denominator = denominator * rescale + tl.sum(probabilities, 1)
-        scaled = probabilities * ks[None, :]
-        probability_scale = tl.maximum(tl.max(scaled, 1) / 127.0, 1.0e-30)
-        scaled /= probability_scale[:, None]
-        high = tl.floor(scaled + 0.5).to(tl.int8)
-        low = tl.floor((scaled - high.to(tl.float32)) * 127.0 + 0.5).to(tl.int8)
-        acc0 = accumulate_int8_pv(
-            kv_base, valid, high, low, rescale, probability_scale, acc0, 0
-        )
-        acc1 = accumulate_int8_pv(
-            kv_base, valid, high, low, rescale, probability_scale, acc1, 128
-        )
-        acc2 = accumulate_int8_pv(
-            kv_base, valid, high, low, rescale, probability_scale, acc2, 256
-        )
-        acc3 = accumulate_int8_pv(
-            kv_base, valid, high, low, rescale, probability_scale, acc3, 384
-        )
-        maximum = next_maximum
-    out_dims = tl.arange(0, 128)
-    if SPLITS == 1:
-        inverse = 1.0 / tl.where(denominator > 0, denominator, 1.0)
-        base = (
-            Output + (batch * merged_heads + heads[None, :]) * 512 + out_dims[:, None]
-        )
-        tl.store(base, acc0 * inverse[None, :], heads[None, :] < merged_heads)
-        tl.store(base + 128, acc1 * inverse[None, :], heads[None, :] < merged_heads)
-        tl.store(base + 256, acc2 * inverse[None, :], heads[None, :] < merged_heads)
-        tl.store(base + 384, acc3 * inverse[None, :], heads[None, :] < merged_heads)
-        logsum = tl.where(
-            denominator > 0,
-            maximum * 0.6931471805599453 + tl.log(denominator),
-            float("inf"),
-        )
-        tl.store(
-            LSE + (batch * H + qheads) * SQ + queries, logsum, heads < merged_heads
-        )
-    else:
-        base = (
-            Partial
-            + ((split * B + batch) * merged_heads + heads[None, :]) * 512
-            + out_dims[:, None]
-        )
-        tl.store(base, acc0, heads[None, :] < merged_heads)
-        tl.store(base + 128, acc1, heads[None, :] < merged_heads)
-        tl.store(base + 256, acc2, heads[None, :] < merged_heads)
-        tl.store(base + 384, acc3, heads[None, :] < merged_heads)
-        tl.store(
-            Stats + (split * 2 * B + batch) * merged_heads + heads,
-            maximum,
-            heads < merged_heads,
-        )
-        tl.store(
-            Stats + ((split * 2 + 1) * B + batch) * merged_heads + heads,
-            denominator,
-            heads < merged_heads,
-        )
-
-
-@libentry()
-@triton.jit
-def dense_int8_mla_merge(
+def merge_int8_partials(
     Partial,
     Stats,
     Output,
@@ -279,22 +92,17 @@ class FlashMLAInt8PreparedHandle:
         tensors: tuple[torch.Tensor, ...],
         splits: int,
         scale: float,
-        causal: bool,
         *,
-        is_sparse: bool = False,
         uses_raw_indices: bool = False,
     ):
         self.tensors = tensors
-        self.is_sparse = is_sparse
         self.uses_raw_indices = uses_raw_indices
         query, rope, _, _, _, _, _, _ = tensors
         self.batch, self.queries, self.heads, _ = query.shape
-        self.causal = causal
         self.head_tile = 16
         self.splits = splits
         self.scale = scale
         self.num_warps = 4
-        self.kernel = dense_int8_mla_kernel
         self.kernel_arguments = {}
         self.batch_order = None
         self.batch_order_kernel = None
@@ -366,7 +174,7 @@ class FlashMLAInt8PreparedHandle:
                 self.splits,
                 self.scale,
                 self.queries,
-                self.causal,
+                False,
                 BH=self.head_tile,
                 num_warps=self.num_warps,
                 num_stages=2,
@@ -374,7 +182,7 @@ class FlashMLAInt8PreparedHandle:
                 **self.kernel_arguments,
             )
             if self.splits > 1:
-                dense_int8_mla_merge[(self.batch, self.queries * self.heads)](
+                merge_int8_partials[(self.batch, self.queries * self.heads)](
                     self.partial,
                     self.stats,
                     self.output,
@@ -391,7 +199,7 @@ class FlashMLAInt8PreparedHandle:
 
 @libentry()
 @triton.jit
-def dense_int8_probability_merge(
+def merge_int8_probabilities(
     Stats,
     Metadata,
     PS,
@@ -480,7 +288,7 @@ def dense_int8_probability_merge(
 
 @libentry()
 @gluon.jit
-def dense_int8_value_merge(
+def merge_int8_values(
     Partial,
     PartialD,
     Metadata,
@@ -559,7 +367,7 @@ def dense_int8_value_merge(
 
 @libentry()
 @triton.jit
-def dense_int8_batch_order(
+def sort_batches_by_length(
     Lengths, Order, LS: tl.constexpr, B: tl.constexpr, BLOCK: tl.constexpr
 ):
     batches = tl.arange(0, BLOCK)
@@ -622,15 +430,18 @@ def _library(stage, tile, spec):
 
 def _scale_spec(handle):
     value = struct.unpack("f", struct.pack("f", handle.scale * 1.4426950408889634))[0]
-    sparse = (("SPARSE", 1),) if handle.is_sparse else ()
+    index_spec = ()
     if handle.uses_raw_indices:
-        sparse += (("SPARSE_RAW", 1), ("CACHE_TOKENS", handle.tensors[2].shape[0] * 64))
-    return sparse + (
+        index_spec += (
+            ("SPARSE_RAW", 1),
+            ("CACHE_TOKENS", handle.tensors[2].shape[0] * 64),
+        )
+    return index_spec + (
         ("NO_ROPE", int(handle.tensors[1].shape[-1] == 0)),
         ("HQ", handle.heads),
         ("SQ", handle.queries),
         ("CAP", handle.tensors[6].shape[1] * 64),
-        ("CAUSAL", int(handle.causal)),
+        ("CAUSAL", 0),
         ("BF16", int(handle.tensors[1].dtype == torch.bfloat16)),
         ("SCALE", value.hex() + "f"),
     )
@@ -973,7 +784,6 @@ class SmallKernel:
         self.fn = (
             _bsm_offset_kernel()
             if heads == 32
-            and handle.is_sparse
             and handle.uses_raw_indices
             and handle.tensors[1].shape[-1] == 0
             and torch.cuda.get_device_properties(handle.tensors[0].device).name
@@ -1034,8 +844,6 @@ class ValuesKernel:
             ("UNIFORM", handle.uniform_value_splits),
             ("BF16", int(handle.output.dtype == torch.bfloat16)),
         )
-        if handle.is_sparse:
-            spec += (("SPARSE", 1),)
         if handle.uses_raw_indices:
             spec += (
                 ("SPARSE_RAW", 1),
@@ -1059,9 +867,7 @@ class ValuesKernel:
 
 
 class NativeSmallHandle(FlashMLAInt8PreparedHandle):
-    def __init__(
-        self, tensors, scale, causal, *, is_sparse=False, uses_raw_indices=False
-    ):
+    def __init__(self, tensors, scale, *, uses_raw_indices=False):
         capacity = tensors[6].shape[1] * 64
         splits = min(
             (
@@ -1075,8 +881,6 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
             tensors,
             splits,
             scale,
-            causal,
-            is_sparse=is_sparse,
             uses_raw_indices=uses_raw_indices,
         )
         self.head_tile = self.queries * self.heads
@@ -1085,22 +889,18 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
             self.batch_order = torch.empty(
                 (self.batch,), dtype=torch.int32, device=tensors[0].device
             )
-            self.batch_order_kernel = dense_int8_batch_order
+            self.batch_order_kernel = sort_batches_by_length
         self.kernel_arguments = {"BatchOrder": self.batch_order}
         self.grid = (1, self.batch, self.splits)
         self.kernel = SmallKernel(self.head_tile, self)
 
 
 class NativeCachedHandle(FlashMLAInt8PreparedHandle):
-    def __init__(
-        self, tensors, scale, causal, *, is_sparse=False, uses_raw_indices=False
-    ):
+    def __init__(self, tensors, scale, *, uses_raw_indices=False):
         super().__init__(
             tensors,
             1,
             scale,
-            causal,
-            is_sparse=is_sparse,
             uses_raw_indices=uses_raw_indices,
         )
         merged = self.queries * self.heads
@@ -1134,7 +934,7 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
             self.batch_order = torch.empty(
                 (self.batch,), dtype=torch.int32, device=device
             )
-            self.batch_order_kernel = dense_int8_batch_order
+            self.batch_order_kernel = sort_batches_by_length
         self.scores = torch.empty(
             (self.batch, self.capacity // 64, merged, 64),
             dtype=torch.uint16,
@@ -1194,14 +994,14 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 self.queries,
                 self.capacity,
                 self.scale,
-                self.causal,
+                False,
                 BH=64,
                 SPLITS=self.score_splits,
                 COL_STATS=True,
                 NATIVE_SYNC=True,
                 BatchOrder=self.batch_order,
             )
-            dense_int8_probability_merge[(triton.cdiv(rows, 32),)](
+            merge_int8_probabilities[(triton.cdiv(rows, 32),)](
                 self.stats,
                 self.probability_metadata,
                 self.probability_scale,
@@ -1252,7 +1052,7 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 STAGED=True,
             )
             if self.adaptive:
-                dense_int8_value_merge[(self.batch, triton.cdiv(merged, 4))](
+                merge_int8_values[(self.batch, triton.cdiv(merged, 4))](
                     self.partial,
                     self.partial_denominator,
                     self.probability_metadata,
@@ -1270,214 +1070,3 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                     num_stages=1,
                 )
         return self.output, self.lse
-
-
-def prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_lora: torch.Tensor,
-    k_rope: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    head_dim_v: int = 512,
-    *,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    num_splits: Optional[int] = None,
-) -> tuple[FlashMLAInt8PreparedHandle, tuple[torch.Tensor, torch.Tensor]]:
-    """Decode 64-token pages; RoPE is divided by the content scale as in PR851.
-
-    Active page IDs and lengths must be valid, scales finite and positive.
-    Causal queries attend the aligned suffix of the valid cache.
-    """
-    if q_nope.ndim != 4 or q_nope.shape[1] not in (1, 2) or q_nope.shape[-1] != 512:
-        raise NotImplementedError("requires Q [batch, 1 or 2, heads, 512]")
-    if q_nope.device.type != "cuda":
-        raise ValueError("requires MetaX device tensors")
-    batch, queries, heads, _ = q_nope.shape
-    if (
-        k_lora.ndim not in (3, 4)
-        or k_lora.shape[1] != 64
-        or k_lora.shape[-1] != 512
-        or (k_lora.ndim == 4 and k_lora.shape[2] != 1)
-        or head_dim_v != 512
-    ):
-        raise NotImplementedError("requires KV [pages, 64, 512] and head_dim_v=512")
-    expected_shapes = (
-        (batch, queries, heads, 64),
-        (*k_lora.shape[:-1], 64),
-        (batch, queries, heads, 1),
-        (*k_lora.shape[:-1], 1),
-        (batch,),
-    )
-    for tensor, shape in zip(
-        (q_rope, k_rope, q_scale, k_scale, cache_seqlens), expected_shapes
-    ):
-        if tensor.shape != shape:
-            raise ValueError(f"expected shape {shape}, got {tuple(tensor.shape)}")
-    if (
-        block_table.ndim != 2
-        or block_table.shape[0] != batch
-        or block_table.shape[1] == 0
-    ):
-        raise ValueError("block_table must have shape [batch, positive page capacity]")
-    if q_nope.dtype != torch.int8 or k_lora.dtype != torch.int8:
-        raise TypeError("Q and KV content must be INT8")
-    if (
-        q_rope.dtype not in (torch.float16, torch.bfloat16)
-        or k_rope.dtype != q_rope.dtype
-    ):
-        raise TypeError("RoPE tensors must have the same FP16 or BF16 dtype")
-    if q_scale.dtype != torch.float32 or k_scale.dtype != torch.float32:
-        raise TypeError("scales must be FP32")
-    if block_table.dtype != torch.int32 or cache_seqlens.dtype != torch.int32:
-        raise TypeError("block_table and cache_seqlens must be INT32")
-    tensors = (
-        q_nope,
-        q_rope,
-        k_lora,
-        k_rope,
-        q_scale,
-        k_scale,
-        block_table,
-        cache_seqlens,
-    )
-    for tensor in tensors:
-        if tensor.device != q_nope.device or (
-            tensor.numel() != 0 and tensor.stride(-1) != 1
-        ):
-            raise ValueError(
-                "all tensors must share a device and contiguous last dimension"
-            )
-    if not all(
-        can_use_int32_index(tensor)
-        for tensor in (q_nope, q_rope, q_scale, block_table, cache_seqlens)
-    ):
-        raise NotImplementedError("query and metadata offsets must fit signed INT32")
-    if not isinstance(causal, bool):
-        raise TypeError("causal must be a bool")
-    if softmax_scale is not None and not isinstance(softmax_scale, (int, float)):
-        raise TypeError("softmax_scale must be a Python number")
-    scale = 576**-0.5 if softmax_scale is None else float(softmax_scale)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("softmax_scale must be finite and positive")
-    if num_splits is None:
-        splits = min(
-            16,
-            triton.next_power_of_2(
-                max(
-                    1,
-                    triton.cdiv(
-                        4 * _get_num_sms(q_nope.device),
-                        max(1, batch * triton.cdiv(queries * heads, 16)),
-                    ),
-                )
-            ),
-        )
-        splits = min(splits, max(1, triton.next_power_of_2(block_table.shape[1])))
-    else:
-        splits = num_splits
-    if (
-        isinstance(splits, bool)
-        or not isinstance(splits, int)
-        or splits not in (1, 2, 4, 8, 16)
-    ):
-        raise ValueError("num_splits must be one of 1, 2, 4, 8, 16")
-    output_bytes = batch * queries * heads * 512 * q_rope.element_size()
-    partial_bytes = (splits if splits > 1 else 0) * batch * queries * heads * 512 * 4
-    if max(output_bytes, partial_bytes) > 2**31 - 1:
-        raise NotImplementedError(
-            "output and partial workspaces must fit signed INT32 indexing"
-        )
-    capacity = block_table.shape[1] * 64
-    merged_heads = queries * heads
-    rows = batch * merged_heads
-    # The native ABI uses contiguous rows, 64-token pages and aligned 128-bit copies.
-    fast_path = (
-        torch.cuda.get_device_capability(q_nope.device) == (8, 0)
-        and "C550" in torch.cuda.get_device_name(q_nope.device)
-        and num_splits is None
-        and 0 < batch < 2**14
-        and (
-            merged_heads in (16, 32) or (merged_heads >= 64 and merged_heads % 64 == 0)
-        )
-        and triton.cdiv(merged_heads, 64) < 2**16
-        and capacity <= 65536
-        and batch * capacity < 2**31
-        and all(tensor.is_contiguous() for tensor in tensors)
-        and all(tensor.data_ptr() % 16 == 0 for tensor in tensors[:6])
-        and not torch.cuda.is_current_stream_capturing()
-    )
-    if fast_path:
-        native_splits = min(
-            4 if merged_heads == 32 and capacity <= 8192 else 8,
-            triton.next_power_of_2(block_table.shape[1]),
-        )
-        if merged_heads <= 32:
-            workspace_bytes = (
-                output_bytes + rows * 4 + native_splits * rows * (512 + 2) * 4
-            )
-            if merged_heads == 32 and 1 < batch <= 256:
-                workspace_bytes += 4 * batch
-        else:
-            score_splits = (
-                8
-                if merged_heads == 64 or (merged_heads <= 128 and capacity >= 16384)
-                else 4
-            )
-            workspace_bytes = (
-                output_bytes
-                + rows * capacity * 2
-                + rows * (capacity // 64) * 8 * 4
-                + rows * score_splits * 12 * 4
-                + rows * 3 * 4
-                + 4 * (batch + 1)
-                + 4 * batch
-            )
-            if merged_heads <= 64:
-                workspace_bytes += rows * 4 * (512 + 1) * 4
-        free_bytes, _ = torch.cuda.mem_get_info(q_nope.device)
-        free_bytes += torch.cuda.memory_reserved(
-            q_nope.device
-        ) - torch.cuda.memory_allocated(q_nope.device)
-        fast_path = workspace_bytes <= min(8 * 1024**3, free_bytes // 2)
-    if fast_path:
-        handle_class = NativeSmallHandle if merged_heads <= 32 else NativeCachedHandle
-        handle = handle_class(tensors, scale, causal)
-    else:
-        handle = FlashMLAInt8PreparedHandle(tensors, splits, scale, causal)
-    return handle, handle()
-
-
-def flash_mla_with_kvcache_fwd_w8a8_int8(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_lora: torch.Tensor,
-    k_rope: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    head_dim_v: int = 512,
-    *,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    num_splits: Optional[int] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    _, outputs = prepare_flash_mla_with_kvcache_fwd_w8a8_int8(
-        q_nope,
-        q_rope,
-        k_lora,
-        k_rope,
-        q_scale,
-        k_scale,
-        block_table,
-        cache_seqlens,
-        head_dim_v,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        num_splits=num_splits,
-    )
-    return outputs
