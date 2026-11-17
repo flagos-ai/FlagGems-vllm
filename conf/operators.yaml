@@ -37,6 +37,17 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: apply_min_p
+  description: Filter logits in place using per-request minimum probability ratios.
+  for:
+  - apply_min_p
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: apply_repetition_penalties
   description: 'Modifies logit tensors in place to penalize tokens that have already
     appeared in the generated sequence.
@@ -69,6 +80,17 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
+- id: apply_thinking_budget
+  description: Update reasoning-marker caches and force the budgeted end token.
+  for:
+  - apply_thinking_budget
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: beam_search_score
   description: Computes beam search scores by adding cumulative log probabilities
     with new token scores.
@@ -1245,6 +1267,21 @@ ops:
   stages:
   - beta: '5.2'
   - stable: '5.3'
+- id: hc_split_sinkhorn
+  description: 'Splits the mHC mix coefficients into the pre/post gates and the comb
+    matrix, then runs the Sinkhorn normalisation on the comb matrix.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: hc_split_sinkhorn_forward
   description: 'Computes a differentiable approximation of the Wasserstein distance
     (Optimal Transport)

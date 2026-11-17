@@ -129,6 +129,11 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
         "tests/test_mhc_post.py",
     ],
+    # The test does not follow the source-stem convention because the operator
+    # is named after what it does (it clamps before the Sinkhorn rounds).
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_pre.py": [
+        "tests/test_npu_mhc_pre_clamp_sinkhorn.py",
+    ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "tests/test_bmm_w8a8.py",
