@@ -3056,9 +3056,9 @@ def _dense_get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens):
     if entry is not None:
         return entry
     if _DENSE_CACHE:
+        # Do not empty_cache() here: on MUSA it can invalidate buffers that
+        # are still referenced by an earlier launch while switching shapes.
         _DENSE_CACHE.clear()
-        if hasattr(torch, "musa"):
-            torch.musa.empty_cache()
     meta = torch.zeros(3 * E + 1, dtype=torch.int32, device=device)
     row_token = torch.empty(max_tokens, dtype=torch.int32, device=device)
     inv_perm = torch.empty(M * topk, dtype=torch.int32, device=device)
@@ -3164,10 +3164,13 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         num_warps=4,
     )
     g2 = (total // BM) * triton.cdiv(H, 128)
+    # GEMM2 must not write back into hidden_perm: that buffer is consumed by
+    # GEMM1, and reusing it here triggers an IMA on MUSA/Triton.
+    mm2 = torch.empty((max_tokens, H), dtype=dtype, device=device)
     _grouped_gemm_kernel[(g2,)](
         act,
         w2t,
-        hidden_perm,
+        mm2,
         m_indices,
         total,
         H,
@@ -3180,7 +3183,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
     )
     out = torch.empty((M, H), dtype=dtype, device=device)
     _unpermute_kernel[(M, triton.cdiv(H, 512))](
-        hidden_perm,
+        mm2,
         out,
         inv_perm,
         topk_weights,
