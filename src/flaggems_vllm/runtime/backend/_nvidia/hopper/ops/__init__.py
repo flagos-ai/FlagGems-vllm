@@ -29,3 +29,11 @@ if _triton_version_utils.has_triton_tle(3, 6, 0):
     )
 
     __all__.append("megamoe_fp8")
+
+if _triton_version_utils.has_triton_tle():
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.lightning_attention import (
+        lightning_attention,
+        lightning_attention_decode,
+    )
+
+    __all__ += ["lightning_attention", "lightning_attention_decode"]
