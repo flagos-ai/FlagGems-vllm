@@ -6,6 +6,10 @@
 import pytest
 import torch
 
+from flaggems_vllm import apply_thinking_budget
+from flaggems_vllm import device as DEVICE
+from flaggems_vllm import runtime
+
 _thinking_budget_mod = pytest.importorskip(
     "vllm.v1.worker.gpu.sample.thinking_budget",
     reason=(
@@ -14,10 +18,6 @@ _thinking_budget_mod = pytest.importorskip(
     ),
 )
 vllm_reference = _thinking_budget_mod.apply_thinking_budget
-
-from flaggems_vllm import apply_thinking_budget
-from flaggems_vllm import device as DEVICE
-from flaggems_vllm import runtime
 
 pytestmark = [
     pytest.mark.apply_thinking_budget,
