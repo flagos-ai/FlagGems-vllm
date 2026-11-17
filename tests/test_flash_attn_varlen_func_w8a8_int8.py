@@ -700,6 +700,31 @@ def test_paged_large_query_tile(causal, broadcast_scales, query_len):
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="Hygon head_dim=256")
+@pytest.mark.parametrize(
+    "paged,qlens,klens",
+    [
+        (False, [33, 70], [77, 167]),
+        (True, [1, 1], [65, 257]),
+        (True, [1, 257], [193, 529]),
+        (True, [1025], [1177]),
+        (True, [1, 2051, 1], [81, 2177, 63]),
+    ],
+)
+def test_hygon_head_dim_256(paged, qlens, klens):
+    _run_case(
+        qlens,
+        klens,
+        dim=256,
+        heads=16,
+        kvheads=2,
+        causal=True,
+        paged=paged,
+        page_size=64,
+    )
+
+
+@pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.parametrize("value", [-127, 127])
 @pytest.mark.parametrize("q_scale_factor", [0.03, 0.1])
 def test_paged_long_query_constant_v(value, q_scale_factor):

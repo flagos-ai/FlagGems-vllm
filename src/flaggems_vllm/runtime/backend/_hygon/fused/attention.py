@@ -106,6 +106,7 @@ def _flash_int8_fwd(
     GROUP: tl.constexpr,
     D: tl.constexpr,
     PAGE: tl.constexpr,
+    WIDE_PAGES: tl.constexpr,
     PAGED: tl.constexpr,
     CAUSAL: tl.constexpr,
     LEFT: tl.constexpr,
@@ -175,6 +176,8 @@ def _flash_int8_fwd(
             n = start * BN + tl.arange(0, BN)
             if PAGED:
                 page = tl.load(TABLE + batch * table_stride + n // PAGE, n < nk, 0)
+                if WIDE_PAGES:
+                    page = page.to(tl.int64)
                 k_row = page * pk + (n % PAGE) * sk
                 v_row = page * pv + (n % PAGE) * sv
             else:
@@ -295,7 +298,7 @@ def flash_attn_varlen_func_w8a8_int8(
     """Hygon DCU INT8 variable-length attention, inference forward only.
 
     Q is [total_q, heads, D]; K/V are [total_k, kv_heads, D] or paged
-    [pages, page_size, kv_heads, D]. D is 64 or 128, heads must be a multiple
+    [pages, page_size, kv_heads, D]. D is 64, 128, or 256, heads must be a multiple
     of kv_heads, and the last dimension must be contiguous. Q/K/V are INT8.
     Required FP32 descales have shape [batch, heads, ceil(max_length / 128)]
     (kv_heads for K/V), indexed by logical sequence position even for paged KV.
@@ -324,8 +327,8 @@ def flash_attn_varlen_func_w8a8_int8(
         raise NotImplementedError("Only FA2 is implemented")
     if q.dtype != torch.int8 or k.dtype != torch.int8 or v.dtype != torch.int8:
         raise NotImplementedError("Q/K/V must use INT8")
-    if q.shape[-1] not in (64, 128):
-        raise NotImplementedError("Only head dimensions 64 and 128 are supported")
+    if q.shape[-1] not in (64, 128, 256):
+        raise NotImplementedError("Only head dimensions 64, 128, and 256 are supported")
     if seqused_k is not None and block_table is None:
         raise NotImplementedError("seqused_k requires paged KV")
 
@@ -342,6 +345,11 @@ def flash_attn_varlen_func_w8a8_int8(
         return (out, lse) if return_softmax_lse else out
     left, right = (-1, -1) if window_size is None else window_size
     paged = block_table is not None
+    wide_pages = paged and any(
+        sum((size - 1) * stride for size, stride in zip(cache.shape, cache.stride()))
+        >= 1 << 31
+        for cache in (k, v)
+    )
     # Packed non-causal prefill benefits from more query rows per program.
     block_m = 64 if not paged and not causal and max_seqlen_q >= 512 else 16
     # Pack query heads sharing a KV head into MMA rows, reusing K/V loads.
@@ -354,6 +362,9 @@ def flash_attn_varlen_func_w8a8_int8(
             # Hygon DCU MFMA needs wide MMA rows for INT8 dot throughput;
             # compact grids already get parallelism from packed requests.
             block_m = 128 if compact else 256
+    if dim == 256:
+        # Limit the FP32 accumulator and Q/K/V tiles for the wider head.
+        block_m = min(block_m, 32)
     query_tile = block_m // group if fold else block_m
     grid_heads = k.shape[-2] if fold else heads
     num_warps = 8 if block_m >= 128 or (block_m == 64 and dim == 128) else 4
@@ -428,6 +439,7 @@ def flash_attn_varlen_func_w8a8_int8(
             heads // k.shape[-2],
             dim,
             k.shape[1] if paged else 0,
+            wide_pages,
             paged,
             causal,
             left,
