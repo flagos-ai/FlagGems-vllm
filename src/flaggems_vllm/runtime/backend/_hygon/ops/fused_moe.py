@@ -161,11 +161,7 @@ def _qwen_w16a16_tuned_config(small_m: bool) -> dict[str, Any]:
     """Load the measured Qwen W16A16 tiling from the Hygon tune config."""
     from flaggems_vllm import runtime
 
-    name = (
-        "hygon_fused_moe_qwen_small"
-        if small_m
-        else "hygon_fused_moe_qwen_large"
-    )
+    name = "hygon_fused_moe_qwen_small" if small_m else "hygon_fused_moe_qwen_large"
     configs = runtime.get_tuned_config(name)
     if not configs:
         raise RuntimeError(f"missing tuned config: {name}")
