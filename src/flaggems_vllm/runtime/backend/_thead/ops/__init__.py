@@ -32,6 +32,9 @@ from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_no
 from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
+from flaggems_vllm.runtime.backend._thead.ops.input_batch import (
+    get_num_sampled_and_rejected,
+)
 from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -53,6 +56,7 @@ __all__ = [
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
+    "get_num_sampled_and_rejected",
     "hc_combine",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
