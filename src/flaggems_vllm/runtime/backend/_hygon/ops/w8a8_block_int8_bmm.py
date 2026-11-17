@@ -283,8 +283,67 @@ EXACT_CONFIGS = {
 }
 
 
-def _get_int8_config(batch, m, n, k, scale_n=128):
+# Four-scale loads with 64x64 output tiles. These row group sizes were
+# measured with contiguous K groups, and both scale layouts for B=4100.
+_SINGLE_HEAD_PACK_SCALE_GROUPS = {
+    512: 8,
+    1028: 1,
+    3076: 1,
+    3805: 1,
+    4096: 1,
+    4100: 1,
+    13021: 1,
+}
+
+
+def _get_int8_config(batch, m, n, k, scale_n=128, scale_m=1, scale_k_contiguous=False):
     key = (batch, m, n, k)
+    if (batch, n, k, scale_m, scale_n) == (1, 1024, 4096, 1, 128):
+        pack_group = (
+            _SINGLE_HEAD_PACK_SCALE_GROUPS.get(m)
+            if scale_k_contiguous or m == 4100
+            else None
+        )
+        pack_scales = pack_group is not None
+        num_stages = 1
+        unroll = 4 if m <= 96 else (2 if m <= 512 else 1)
+        if pack_group is not None:
+            bm, bn, warps, group = 64, 64, 4, pack_group
+        elif m <= 96:
+            bm, bn, warps, group = 32, 16, 2, 1
+        elif m <= 128:
+            bm, bn, warps, group = 16, 32, 2, 1
+        elif m <= 224:
+            bm, bn, warps, group = 16, 64, 2, 1
+            num_stages, unroll = 2, 1
+        elif m <= 480 and scale_k_contiguous:
+            bm, bn, warps, group = 16, 64, 2, 1
+            pack_scales = True
+        elif m <= 256:
+            bm, bn, warps, group = 16, 64, 2, 1
+        elif m <= 384:
+            bm, bn, warps, group = 32, 64, 4, 4
+        elif m == 496 and scale_k_contiguous:
+            bm, bn, warps, group = 64, 32, 2, 1
+            pack_scales = True
+        elif m <= 512:
+            bm, bn, warps, group = 64, 32, 2, 1
+        elif m < 2048:
+            bm, bn, warps, group = 64, 128, 4, 4
+        else:
+            bm, bn, warps, group = 128, 128, 4, 4
+        return dict(
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            num_warps=warps,
+            num_stages=num_stages,
+            GROUP_M=group,
+            ACC_FP32=True,
+            TILE_K=128,
+            UNROLL=unroll,
+            PACK_SCALES=pack_scales,
+            kpack=2,
+        )
     acc_fp32, swap_ab, tile_k, unroll = False, False, None, 1
     if key in EXACT_CONFIGS:
         values = EXACT_CONFIGS[key]
@@ -363,7 +422,6 @@ def small_bmm_kernel(
     tl.store(O + batch * SO[0] + row * SO[1] + cols * SO[2], result, cols < N)
 
 
-@libentry()
 @triton.jit
 def _int8_block_bmm_kernel(
     A,
@@ -390,6 +448,7 @@ def _int8_block_bmm_kernel(
     UNROLL: tl.constexpr = 1,
     ACC_FP32: tl.constexpr = False,
     SWAP_AB: tl.constexpr = False,
+    PACK_SCALES: tl.constexpr = False,
 ):
     batch = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0)
@@ -416,61 +475,119 @@ def _int8_block_bmm_kernel(
         acc = tl.zeros((BLOCK_N, BLOCK_M), acc_dtype)
     else:
         acc = tl.zeros((BLOCK_M, BLOCK_N), acc_dtype)
-    for kb in tl.range(
-        tl.cdiv(K, TILE_K),
-        loop_unroll_factor=(
-            (K + TILE_K - 1) // TILE_K if K > 0 and K <= 256 else UNROLL
-        ),
-    ):
-        kk = kb * TILE_K + rk
-        scale_k = kb * TILE_K // SCALE_K
-        ap = A + batch * SA[0] + rm[:, None] * SA[1] + kk[None, :] * SA[2]
-        wp = W + batch * SW[0] + kk[:, None] * SW[1] + rn[None, :] * SW[2]
-        if K <= 256 and SCALE_M >= BLOCK_M and SCALE_M % BLOCK_M == 0:
-            asp = (
+    k_tiles: tl.constexpr = (K + TILE_K - 1) // TILE_K
+    if PACK_SCALES:
+        tl.static_assert(SCALE_M == 1 and TILE_K == SCALE_K and K % (4 * TILE_K) == 0)
+        large_scale_offsets: tl.constexpr = (
+            max(
+                M * SAS[1] + k_tiles * SAS[2],
+                k_tiles * SWS[1] + (N // SCALE_N) * SWS[2],
+            )
+            >= 2**31
+        )
+        scale_row = rm
+        scale_col = pn * BLOCK_N // SCALE_N
+        if large_scale_offsets:
+            scale_row = scale_row.to(tl.int64)
+            scale_col = scale_col.to(tl.int64)
+        for first_k in tl.range(0, k_tiles, 4):
+            # Fetch adjacent scales together while keeping all four dots independent.
+            groups = first_k + tl.arange(0, 4)
+            if large_scale_offsets:
+                groups = groups.to(tl.int64)
+            scale_rows = (
                 AS
                 + batch * SAS[0]
-                + (pm * BLOCK_M // SCALE_M) * SAS[1]
-                + scale_k * SAS[2]
+                + scale_row[:, None] * SAS[1]
+                + groups[None, :] * SAS[2]
             )
-        else:
-            asp = AS + batch * SAS[0] + (rm // SCALE_M) * SAS[1] + scale_k * SAS[2]
-        # BLOCK_N divides SCALE_N: all columns of the tile share one weight scale.
-        wsp = (
-            WS + batch * SWS[0] + scale_k * SWS[1] + (pn * BLOCK_N // SCALE_N) * SWS[2]
-        )
-        if ALIGNED:
-            a = tl.load(ap)
-            w = tl.load(wp)
-            a_scale = tl.load(asp)
-        else:
-            a = tl.load(ap, (rm[:, None] < M) & (kk[None, :] < K), other=0)
-            w = tl.load(wp, (kk[:, None] < K) & (rn[None, :] < N), other=0)
+            scale_cols = WS + batch * SWS[0] + scale_col * SWS[2] + groups * SWS[1]
+            scale_rows = tl.load(scale_rows, rm[:, None] < M, 0).to(tl.float32)
+            scale_cols = tl.load(scale_cols).to(tl.float32)
+            even, odd = tl.split(
+                tl.reshape(scale_rows * scale_cols[None, :], (BLOCK_M, 2, 2))
+            )
+            scale0, scale2 = tl.split(even)
+            scale1, scale3 = tl.split(odd)
+            for part in tl.static_range(4):
+                kb = first_k + part
+                if part == 0:
+                    row_scale = scale0
+                elif part == 1:
+                    row_scale = scale1
+                elif part == 2:
+                    row_scale = scale2
+                else:
+                    row_scale = scale3
+                kk = kb * TILE_K + rk
+                ap = A + batch * SA[0] + rm[:, None] * SA[1] + kk[None, :] * SA[2]
+                wp = W + batch * SW[0] + kk[:, None] * SW[1] + rn[None, :] * SW[2]
+                a = tl.load(ap, (rm[:, None] < M) & (kk[None, :] < K), other=0)
+                w = tl.load(wp, (kk[:, None] < K) & (rn[None, :] < N), other=0)
+                partial = tl.dot(a, w, out_dtype=tl.int32).to(tl.float32)
+                acc = tl.fma(partial, row_scale[:, None], acc)
+    else:
+        for kb in tl.range(
+            0,
+            k_tiles,
+            loop_unroll_factor=(
+                (K + TILE_K - 1) // TILE_K if K > 0 and K <= 256 else UNROLL
+            ),
+        ):
+            kk = kb * TILE_K + rk
+            scale_k = kb * TILE_K // SCALE_K
+            ap = A + batch * SA[0] + rm[:, None] * SA[1] + kk[None, :] * SA[2]
+            wp = W + batch * SW[0] + kk[:, None] * SW[1] + rn[None, :] * SW[2]
             if K <= 256 and SCALE_M >= BLOCK_M and SCALE_M % BLOCK_M == 0:
+                asp = (
+                    AS
+                    + batch * SAS[0]
+                    + (pm * BLOCK_M // SCALE_M) * SAS[1]
+                    + scale_k * SAS[2]
+                )
+            else:
+                asp = AS + batch * SAS[0] + (rm // SCALE_M) * SAS[1] + scale_k * SAS[2]
+            # BLOCK_N divides SCALE_N: all columns of the tile share one weight scale.
+            wsp = (
+                WS
+                + batch * SWS[0]
+                + scale_k * SWS[1]
+                + (pn * BLOCK_N // SCALE_N) * SWS[2]
+            )
+            if ALIGNED:
+                a = tl.load(ap)
+                w = tl.load(wp)
                 a_scale = tl.load(asp)
             else:
-                a_scale = tl.load(asp, rm < M, other=0)
-        w_scale = tl.load(wsp)
-        row_scale = (a_scale.to(tl.float32) * w_scale.to(tl.float32)).to(acc_dtype)
-        # Swap small-M contractions so M occupies the narrower dot dimension.
-        if SWAP_AB:
-            partial = tl.dot(tl.trans(w), tl.trans(a), out_dtype=tl.int32).to(acc_dtype)
-        else:
-            partial = tl.dot(a, w, out_dtype=tl.int32).to(acc_dtype)
-        if K <= 256 and SCALE_M >= BLOCK_M and SCALE_M % BLOCK_M == 0:
-            scale = row_scale
-        elif SWAP_AB:
-            scale = row_scale[None, :]
-        else:
-            scale = row_scale[:, None]
-        if ACC_FP32:
-            acc = tl.fma(partial, scale, acc)
-        else:
-            dequant = (partial * scale).to(tl.bfloat16)
-            if K <= TILE_K:
-                acc = dequant
+                a = tl.load(ap, (rm[:, None] < M) & (kk[None, :] < K), other=0)
+                w = tl.load(wp, (kk[:, None] < K) & (rn[None, :] < N), other=0)
+                if K <= 256 and SCALE_M >= BLOCK_M and SCALE_M % BLOCK_M == 0:
+                    a_scale = tl.load(asp)
+                else:
+                    a_scale = tl.load(asp, rm < M, other=0)
+            w_scale = tl.load(wsp)
+            row_scale = (a_scale.to(tl.float32) * w_scale.to(tl.float32)).to(acc_dtype)
+            # Swap small-M contractions so M occupies the narrower dot dimension.
+            if SWAP_AB:
+                partial = tl.dot(tl.trans(w), tl.trans(a), out_dtype=tl.int32).to(
+                    acc_dtype
+                )
             else:
-                acc = (acc + dequant).to(tl.bfloat16)
+                partial = tl.dot(a, w, out_dtype=tl.int32).to(acc_dtype)
+            if K <= 256 and SCALE_M >= BLOCK_M and SCALE_M % BLOCK_M == 0:
+                scale = row_scale
+            elif SWAP_AB:
+                scale = row_scale[None, :]
+            else:
+                scale = row_scale[:, None]
+            if ACC_FP32:
+                acc = tl.fma(partial, scale, acc)
+            else:
+                dequant = (partial * scale).to(tl.bfloat16)
+                if K <= TILE_K:
+                    acc = dequant
+                else:
+                    acc = (acc + dequant).to(tl.bfloat16)
     if SWAP_AB:
         acc = tl.trans(acc)
     op = O + batch * SO[0] + rm[:, None] * SO[1] + rn[None, :] * SO[2]
@@ -478,6 +595,130 @@ def _int8_block_bmm_kernel(
         tl.store(op, acc)
     else:
         tl.store(op, acc, (rm[:, None] < M) & (rn[None, :] < N))
+
+
+@triton.jit
+def int8_single_head_paired_k_kernel(
+    A,
+    W,
+    XS,
+    WS,
+    Out,
+    M: tl.constexpr,
+    XS_M: tl.constexpr,
+    XS_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    block_m: tl.constexpr = 16
+    n: tl.constexpr = 1024
+    k: tl.constexpr = 4096
+    scale_block: tl.constexpr = 128
+    k_groups: tl.constexpr = k // scale_block
+    pid = tl.program_id(0)
+    pm = pid // (n // BLOCK_N)
+    pn = pid % (n // BLOCK_N)
+    row = pm * block_m + tl.arange(0, block_m)
+    col = pn * BLOCK_N + tl.arange(0, BLOCK_N)
+    inner_k = tl.arange(0, scale_block)
+    valid = row < M
+    ap = A + row[:, None] * k + inner_k[None, :]
+    wp = W + col[None, :] * k + inner_k[:, None]
+    asp = XS + row * XS_M
+    wsp = WS + (pn * BLOCK_N // scale_block) * k_groups
+    even = tl.zeros((block_m, BLOCK_N), tl.float32)
+    odd = tl.zeros((block_m, BLOCK_N), tl.float32)
+    # Separate accumulators let the adjacent dot and scale operations overlap.
+    for pair in range(k_groups // 2):
+        group = pair * 2
+        offset = group * scale_block
+        a0 = tl.load(ap + offset, valid[:, None], 0)
+        w0 = tl.load(wp + offset)
+        a1 = tl.load(ap + offset + scale_block, valid[:, None], 0)
+        w1 = tl.load(wp + offset + scale_block)
+        s0 = tl.load(asp + group * XS_K, valid, 0).to(tl.float32) * tl.load(
+            wsp + group
+        ).to(tl.float32)
+        s1 = tl.load(asp + (group + 1) * XS_K, valid, 0).to(tl.float32) * tl.load(
+            wsp + group + 1
+        ).to(tl.float32)
+        d0 = tl.dot(a0, w0, out_dtype=tl.int32)
+        d1 = tl.dot(a1, w1, out_dtype=tl.int32)
+        even = tl.fma(d0.to(tl.float32), s0[:, None], even)
+        odd = tl.fma(d1.to(tl.float32), s1[:, None], odd)
+    tl.store(Out + row[:, None] * n + col[None, :], even + odd, valid[:, None])
+
+
+@triton.jit
+def int8_single_head_bmm_kernel(
+    A,
+    W,
+    AS,
+    WS,
+    Out,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    SA: tl.constexpr,
+    SW: tl.constexpr,
+    SAS: tl.constexpr,
+    SWS: tl.constexpr,
+    SO: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_start = tl.program_id(1) * BLOCK_N
+    col = col_start + tl.arange(0, BLOCK_N)
+    scale_block: tl.constexpr = 128
+    k_groups: tl.constexpr = K // scale_block
+    groups = tl.arange(0, BLOCK_GROUPS)
+    inner_k = tl.arange(0, scale_block)
+    use_int64: tl.constexpr = (
+        max(
+            M * SA[1] + K * SA[2],
+            K * SW[1] + N * SW[2],
+            M * SAS[1] + k_groups * SAS[2],
+            k_groups * SWS[1] + (N // scale_block) * SWS[2],
+            M * SO[1] + N * SO[2],
+        )
+        >= 2**31
+    )
+    if use_int64:
+        row = row.to(tl.int64)
+        col = col.to(tl.int64)
+        col_start = col_start.to(tl.int64)
+        groups = groups.to(tl.int64)
+        inner_k = inner_k.to(tl.int64)
+    k = groups[:, None] * scale_block + inner_k[None, :]
+    a_ptr = A + row[None, :, None] * SA[1] + k[:, None, :] * SA[2]
+    w_ptr = W + k[:, :, None] * SW[1] + col[None, None, :] * SW[2]
+    as_ptr = AS + groups[:, None] * SAS[2] + row[None, :] * SAS[1]
+    ws_ptr = WS + groups * SWS[1] + (col_start // scale_block) * SWS[2]
+    valid_row = row < M
+    acc = tl.zeros((BLOCK_GROUPS, BLOCK_M, BLOCK_N), tl.float32)
+    # Each dot has its own scale. Reduce the FP32 results inside the program
+    # to avoid a workspace and a second launch for small single-head batches.
+    for group in range(k_groups // BLOCK_GROUPS):
+        if use_int64:
+            group_offset = group.to(tl.int64) * BLOCK_GROUPS
+        else:
+            group_offset = group * BLOCK_GROUPS
+        k_offset = group_offset * scale_block
+        a = tl.load(a_ptr + k_offset * SA[2], valid_row[None, :, None], other=0)
+        w = tl.load(w_ptr + k_offset * SW[1])
+        a_scale = tl.load(
+            as_ptr + group_offset * SAS[2], valid_row[None, :], other=0
+        ).to(tl.float32)
+        w_scale = tl.load(ws_ptr + group_offset * SWS[1]).to(tl.float32)
+        dot = tl.dot(a, w, out_dtype=tl.int32).to(tl.float32)
+        acc = tl.fma(dot, a_scale[:, :, None] * w_scale[:, None, None], acc)
+    result = tl.sum(acc, axis=0)
+    tl.store(
+        Out + row[:, None] * SO[1] + col[None, :] * SO[2],
+        result,
+        valid_row[:, None],
+    )
 
 
 def _int8_block_bmm(
@@ -495,7 +736,8 @@ def _int8_block_bmm(
     [B,ceil(K/block_k),ceil(N/block_n)]. Set block_m=1 for per-row scales.
     Unlike the NVIDIA FP8 entry point, input tensors must be signed INT8.
     Arbitrary nonnegative input strides are supported; output columns must be contiguous.
-    Tuned shapes may accumulate in FP32; fallback shapes accumulate in BF16.
+    The single-group projection and other tuned shapes accumulate in FP32;
+    fallback shapes accumulate in BF16.
     The output dtype does not override this internal accumulation choice.
     """
     if A_scale is None or B_scale is None:
@@ -521,9 +763,10 @@ def _int8_block_bmm(
     if B.shape[:2] != (batch, k):
         raise ValueError("batch or K dimension mismatch")
     n = B.shape[2]
-    if A_scale.shape != (batch, triton.cdiv(m, sm), triton.cdiv(k, sk)):
+    k_scales = (k + sk - 1) // sk
+    if A_scale.shape != (batch, (m + sm - 1) // sm, k_scales):
         raise ValueError("incorrect A_scale shape")
-    if B_scale.shape != (batch, triton.cdiv(k, sk), triton.cdiv(n, sn)):
+    if B_scale.shape != (batch, k_scales, (n + sn - 1) // sn):
         raise ValueError("incorrect B_scale shape")
     if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError("unsupported output dtype")
@@ -566,14 +809,70 @@ def _int8_block_bmm(
                 num_stages=1,
             )
             return out
-        cfg = _get_int8_config(batch, m, n, k, sn)
+        if m <= 64 and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128):
+            if m <= 16:
+                bm, bn, groups = 16, 16, 8
+            elif m <= 32:
+                bm, bn, groups = 16, 32, 4
+            else:
+                bm, bn, groups = 32, 32, 4
+            int8_single_head_bmm_kernel[((m + bm - 1) // bm, n // bn)](
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out,
+                m,
+                n,
+                k,
+                A.stride(),
+                B.stride(),
+                A_scale.stride(),
+                B_scale.stride(),
+                out.stride(),
+                bm,
+                bn,
+                groups,
+                num_warps=4,
+                kpack=2,
+            )
+            return out
+        a_scale_stride = A_scale.stride()
+        if (
+            64 < m <= 176
+            and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
+            and A.stride()[1:] == (4096, 1)
+            and B.stride()[1:] == (1, 4096)
+            and B_scale.stride()[1:] == (1, 32)
+            and a_scale_stride[1:] in ((32, 1), (1, m))
+            and out.stride(1) == 1024
+        ):
+            bn = 32 if m <= 96 else 64
+            int8_single_head_paired_k_kernel[(triton.cdiv(m, 16) * (n // bn),)](
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out,
+                m,
+                a_scale_stride[1],
+                a_scale_stride[2],
+                bn,
+                num_warps=2,
+                num_stages=2,
+                kpack=2,
+            )
+            return out
+        cfg = _get_int8_config(batch, m, n, k, sn, sm, a_scale_stride[2] == 1)
         bm, bn = cfg["BLOCK_M"], cfg["BLOCK_N"]
-        tile_k = min(sk, max(32, triton.next_power_of_2(k)))
-        chosen_tile_k = cfg.pop("TILE_K")
-        if chosen_tile_k is not None:
-            tile_k = chosen_tile_k
+        tile_k = cfg.pop("TILE_K")
+        if tile_k is None:
+            tile_k = min(sk, max(32, triton.next_power_of_2(k)))
         aligned = m % bm == 0 and n % bn == 0 and k % tile_k == 0
-        _int8_block_bmm_kernel[(triton.cdiv(m, bm) * triton.cdiv(n, bn), batch)](
+        # These kernels have fixed launch configurations. Use the direct JIT
+        # launcher to avoid rebuilding libentry's specialization key on every call.
+        tiles = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
+        _int8_block_bmm_kernel[(tiles, batch, 1)](
             A,
             B,
             A_scale,
@@ -584,7 +883,7 @@ def _int8_block_bmm(
             k,
             A.stride(),
             B.stride(),
-            A_scale.stride(),
+            a_scale_stride,
             B_scale.stride(),
             out.stride(),
             sm,
@@ -647,10 +946,12 @@ def w8a8_block_int8_bmm(
     if x.dtype == torch.int8:
         if xs is None or ys is None:
             raise ValueError("INT8 W8A8 BMM requires both scale tensors")
-        if xs.shape != (batch, m, triton.cdiv(k, block_size[1])) or ys.shape != (
+        block_n, block_k = block_size
+        k_scales = (k + block_k - 1) // block_k
+        if xs.shape != (batch, m, k_scales) or ys.shape != (
             batch,
-            triton.cdiv(n, block_size[0]),
-            triton.cdiv(k, block_size[1]),
+            (n + block_n - 1) // block_n,
+            k_scales,
         ):
             raise ValueError("incorrect W8A8 BMM scale shape")
         return _int8_block_bmm(
@@ -658,7 +959,7 @@ def w8a8_block_int8_bmm(
             y.transpose(1, 2),
             xs,
             ys.transpose(1, 2),
-            block_size=(1, block_size[0], block_size[1]),
+            block_size=(1, block_n, block_k),
             out_dtype=output_dtype,
             out=z,
         )

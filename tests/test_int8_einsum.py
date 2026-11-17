@@ -23,6 +23,7 @@ from benchmark.test_int8_einsum import (
     _make_block_einsum_inputs,
 )
 
+from .accuracy_utils import gems_assert_close
 from .conftest import QUICK_MODE
 
 _EINSUM_BATCHES = (1, 4, 8, 16, 32, 64, 128)
@@ -73,6 +74,37 @@ def test_accuracy_int8_einsum(shape):
         .item()
     )
     assert floating_nrms < 0.01
+
+
+@pytest.mark.fp8_einsum
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "hygon", reason="requires Hygon single-group INT8"
+)
+@pytest.mark.parametrize(
+    "b, transposed_scales",
+    [(b, True) for b in (1, 4, 64, 72, 96, 160, 256, 272, 1028, 4100)]
+    + [(b, False) for b in (72, 160, 512, 1028, 3076, 4100)],
+)
+def test_int8_einsum_single_group(b, transposed_scales):
+    r, d = 4096, 1024
+    x, xs, y, ys, _, _ = _make_block_einsum_inputs(
+        b, 1, r, d, (128, 128), flaggems_vllm.device, EINSUM_LOW_PRECISION_DTYPE
+    )
+    # RoPE quantization can store activation scales with unit token stride.
+    if transposed_scales:
+        xs = xs.transpose(0, 2).contiguous().transpose(0, 2)
+    if b == 4:
+        y = y.transpose(1, 2).contiguous().transpose(1, 2)
+    out = flaggems_vllm.int8_einsum("bhr,hdr->bhd", x, xs, y, ys)
+    assert out.shape == (b, 1, d) and out.is_contiguous()
+    scale_k = torch.arange(r, device=x.device) // 128
+    scale_n = torch.arange(d, device=x.device) // 128
+    ref = torch.einsum(
+        "bhr,hdr->bhd",
+        x.float() * xs[:, :, scale_k],
+        y.float() * ys[:, scale_n, :][:, :, scale_k],
+    )
+    gems_assert_close(out, ref, torch.bfloat16, reduce_dim=r)
 
 
 @pytest.mark.einsum
