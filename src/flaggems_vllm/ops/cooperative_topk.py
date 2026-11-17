@@ -43,6 +43,19 @@ def _key_greater(left, right):
 
 
 @triton.jit
+def _masked_histogram(digits, active, BINS: tl.constexpr):
+    if _IS_ASCEND:
+        # Some Ascend compiler releases ignore the histogram mask argument.
+        # Count inactive lanes in a separate bin, then keep the original bins.
+        counted = tl.histogram(tl.where(active, digits, BINS), 2 * BINS)
+        # Ascend gather does not support int32; select the first half with
+        # shape operations so histogram counts never pass through FP32.
+        kept, _ = tl.split(tl.trans(tl.reshape(counted, (2, BINS))))
+        return kept
+    return tl.histogram(digits, BINS, mask=active)
+
+
+@triton.jit
 def _radix_digit(histogram, remaining, BINS: tl.constexpr = 256):
     bins = tl.arange(0, BINS)
     suffix = tl.cumsum(histogram, reverse=True)
@@ -86,7 +99,7 @@ def _cooperative_topk_small(
         candidates = valid
         for shift in tl.static_range(24, -1, -8):
             digits = ((keys >> shift) & 255).to(tl.int32)
-            histogram = tl.histogram(digits, 256, mask=candidates)
+            histogram = _masked_histogram(digits, candidates, 256)
             digit, remaining = _radix_digit(histogram, remaining)
             prefix = prefix | (digit << shift)
             candidates = candidates & (digits == digit)
@@ -163,7 +176,7 @@ def _cooperative_topk_histogram(
             if PASS > 0:
                 valid = valid & ((keys >> (SHIFT + BITS)) == (prefix >> (SHIFT + BITS)))
             digits = ((keys >> SHIFT) & (BINS - 1)).to(tl.int32)
-            histogram += tl.histogram(digits, BINS, mask=valid)
+            histogram += _masked_histogram(digits, valid, BINS)
     tl.store(scratch + part * BINS + tl.arange(0, BINS), histogram)
 
 

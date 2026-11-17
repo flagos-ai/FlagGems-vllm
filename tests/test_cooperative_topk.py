@@ -108,7 +108,7 @@ def test_cooperative_topk_random(shape, k):
 
 @gpu
 @pytest.mark.parametrize("k", KS)
-@pytest.mark.parametrize("width", [4097, 16384, 65539])
+@pytest.mark.parametrize("width", [4097, 16384, 65539, 262147])
 def test_mixed_lengths_rank_two_poison_padding_and_workspace_reuse(k, width):
     # Rank-two lengths are flattened, without persistent_topk's MTP adjustment.
     host_lengths = [-3, 0, 1, k - 1, k, k + 1, width - 1, width]
@@ -144,7 +144,7 @@ def test_mixed_lengths_rank_two_poison_padding_and_workspace_reuse(k, width):
 
 @gpu
 @pytest.mark.parametrize("k", [512] if cfg.QUICK_MODE else KS)
-@pytest.mark.parametrize("width", [4097, 16384, 65539])
+@pytest.mark.parametrize("width", [4097, 16384, 65539, 262147])
 @pytest.mark.parametrize(
     "distribution",
     [
@@ -198,7 +198,7 @@ def test_exact_selection_edge_values(width, distribution, k):
 
 @gpu
 @pytest.mark.parametrize("k", [512] if cfg.QUICK_MODE else [512, 2048])
-@pytest.mark.parametrize("width", [4097, 16385, 65539])
+@pytest.mark.parametrize("width", [4097, 16385, 65539, 262147])
 def test_arbitrary_fp32_bit_patterns(width, k):
     # Cover the whole exponent range and both NaN signs without device
     # arithmetic changing subnormal values before the selection is tested.
@@ -238,7 +238,17 @@ def test_arbitrary_fp32_bit_patterns(width, k):
 @gpu
 @pytest.mark.parametrize(
     "width,candidate_count",
-    [(4097, 63), (4097, 64), (4097, 65), (65539, 255), (65539, 256), (65539, 257)],
+    [
+        (4097, 63),
+        (4097, 64),
+        (4097, 65),
+        (65539, 255),
+        (65539, 256),
+        (65539, 257),
+        (262147, 255),
+        (262147, 256),
+        (262147, 257),
+    ],
 )
 def test_threshold_bucket_capacity_boundaries(width, candidate_count):
     # Distinct nearby FP32 values share a coarse bucket. The best candidates
@@ -257,6 +267,22 @@ def test_threshold_bucket_capacity_boundaries(width, candidate_count):
         )
     logits = storage.to(device)[:, :width]
     lengths, output, workspace = _buffers(logits, [width] * rows, k)
+    flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
+@pytest.mark.parametrize("width", [16385, 65539])
+@pytest.mark.parametrize("k", [1024, 2048])
+def test_top_values_concentrated_in_one_segment(width, k):
+    # Segmented selection must detect when a local candidate limit would
+    # discard globally selected values, even without exceptional FP32 inputs.
+    logits = torch.full((2, width), -1.0)
+    values = torch.arange(4096, dtype=torch.float32)
+    logits[0, :4096] = values
+    logits[1, width - 4096 :] = values.flip(0)
+    logits = logits.to(device)
+    lengths, output, workspace = _buffers(logits, [width, width], k)
     flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
     _check(logits, lengths, output, k, reference_on_cpu=True)
 
@@ -445,7 +471,18 @@ def test_cpu_is_unsupported():
 
 
 @gpu
-@pytest.mark.parametrize("width", [4097, 16384, 65539])
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="Ascend width limit")
+def test_ascend_unsupported_width_preserves_output():
+    width, k = 1048578, 512
+    logits = torch.empty((1, width), device=device)
+    lengths, output, workspace = _buffers(logits, [width], k)
+    with pytest.raises(NotImplementedError, match="1048577"):
+        flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    assert torch.all(output == -17)
+
+
+@gpu
+@pytest.mark.parametrize("width", [4097, 16384, 65539, 262147])
 @pytest.mark.parametrize("k", [512] if cfg.QUICK_MODE else [512, 2048])
 def test_device_graph_replay_with_changed_values_and_lengths(width, k):
     graph_type = getattr(
@@ -515,11 +552,23 @@ def test_vllm_cross_agreement_when_available(k, width):
     _check(logits, lengths, output, k)
 
 
-def test_export():
+def test_export_and_vendor_dispatch():
     assert "cooperative_topk" in flaggems_vllm.ops.__all__
     assert callable(flaggems_vllm.ops.cooperative_topk)
     assert callable(flaggems_vllm.cooperative_topk)
-    if flaggems_vllm.vendor_name == "mthreads":
+    if flaggems_vllm.vendor_name == "ascend":
+        from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import (
+            cooperative_topk as ascend_cooperative_topk,
+        )
+
+        assert flaggems_vllm.cooperative_topk is ascend_cooperative_topk
+    elif flaggems_vllm.vendor_name == "iluvatar":
+        from flaggems_vllm.runtime.backend._iluvatar.ops.cooperative_topk import (
+            cooperative_topk as iluvatar_cooperative_topk,
+        )
+
+        assert flaggems_vllm.cooperative_topk is iluvatar_cooperative_topk
+    elif flaggems_vllm.vendor_name == "mthreads":
         from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
             cooperative_topk as mthreads_cooperative_topk,
         )
