@@ -88,7 +88,6 @@ def _from_fp8(x):
 
 CUDA_AVAILABLE = is_supported_backend()
 pytestmark = [
-    pytest.mark.deep_gemm_fp8_o_proj,
     pytest.mark.skipif(
         not CUDA_AVAILABLE,
         reason=(
@@ -250,6 +249,7 @@ def _call_op(inp, recipe=(1, 128, 128), tma_aligned_scales=False):
     )
 
 
+@pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.parametrize("config", CONFIGS)
 @pytest.mark.parametrize("seed", SEEDS)
 def test_accuracy_deep_gemm_fp8_o_proj(config, seed):
@@ -313,6 +313,7 @@ def _reference_torch(inp):
     return _reference_torch_from_dequant(inp, dequant)
 
 
+@pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.parametrize("config", TORCH_COMPOSED_CONFIGS)
 def test_accuracy_deep_gemm_fp8_o_proj_torch_composed(config):
     """Match a torch-composed reference across decode, small batch and prefill."""
@@ -330,6 +331,7 @@ def test_accuracy_deep_gemm_fp8_o_proj_torch_composed(config):
     utils.gems_assert_close(out, ref, torch.bfloat16, atol=atol)
 
 
+@pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.parametrize("config", TORCH_COMPOSED_CONFIGS)
 def test_accuracy_deep_gemm_fp8_o_proj_prequantized(config):
     """A pre-quantized activation skips RoPE/quant and keeps the same math."""
@@ -369,6 +371,7 @@ def _vllm_native_op():
     return native_op, compute_fp8_einsum_recipe
 
 
+@pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.parametrize("config", CONFIGS)
 @pytest.mark.skipif(
     not is_hopper_available(), reason="vLLM's DeepGEMM path is NVIDIA Hopper only"
@@ -409,6 +412,7 @@ def test_deep_gemm_fp8_o_proj_matches_vllm_native(config):
     )
 
 
+@pytest.mark.deep_gemm_fp8_o_proj
 def test_deep_gemm_fp8_o_proj_invalid_recipe():
     """The generic path only implements the Hopper FP32 block-scale recipe."""
     device = flaggems_vllm.device
