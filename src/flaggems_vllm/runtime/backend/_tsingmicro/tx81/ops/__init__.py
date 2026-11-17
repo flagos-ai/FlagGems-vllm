@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.attention import (
+    flash_attention_forward,
+    flash_attn_varlen_func,
+)
+
 # tx81 specialized vLLM operators, migrated from FlagGems
 # runtime/backend/_tsingmicro/tx81/fused/. Functions re-exported here override
 # the generic implementations through SpecOpRegistrar (matched by function
 # name), so every public entry must keep the generic-op signature.
-from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.attention import (
-    flash_attention_forward,
-    flash_attn_varlen_func,
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.fla import (
+    chunk_gated_delta_rule,
+    chunk_gated_delta_rule_fwd,
 )
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.flash_mla import flash_mla
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.flashmla_sparse import (
@@ -54,6 +59,8 @@ from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.silu_and_mul_with_clamp 
 )
 
 __all__ = [
+    "chunk_gated_delta_rule",
+    "chunk_gated_delta_rule_fwd",
     "flash_attention_forward",
     "flash_attn_varlen_func",
     "flash_mla",
