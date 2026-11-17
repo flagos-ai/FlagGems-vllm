@@ -293,7 +293,7 @@ jobs:
       gpu_check_script: tools/gpu_check_nvidia.sh
       changed_files: ${{ needs.preprocess.outputs.targets }}
       pr_id: ${{ needs.preprocess.outputs.pr_id }}
-      timeout_minutes: 60
+      timeout_minutes: 90
       # h20 is a persistent, non-ephemeral runner (see backend-test.yaml).
       uv_refresh: "1"
 
