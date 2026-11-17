@@ -12,15 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Accuracy tests for the Ascend standalone ``npu_mhc_pre`` operator.
+"""Accuracy tests for the Ascend standalone ``npu_mhc_pre_clamp_sinkhorn`` operator.
 
 Style mirrors the other platform-operator tests (e.g.
 tests/test_scaled_int8_quant.py): call through the package-level name
-``flaggems_vllm.npu_mhc_pre`` so the vendor registry resolution is what is
+``flaggems_vllm.npu_mhc_pre_clamp_sinkhorn`` so the vendor registry resolution is what is
 actually exercised, guarded by ``flaggems_vllm.vendor_name``.
 
-``flaggems_vllm.mhc_pre`` stays the generic variant on Ascend (``npu_mhc_pre``
+``flaggems_vllm.mhc_pre`` stays the generic variant on Ascend (``npu_mhc_pre_clamp_sinkhorn``
 registers under its own name), so the existing generic tests are unaffected.
+
+The regular-shape test is parametrized over two reference sources:
+
+* ``cpu`` - the clamped PyTorch reference, always available;
+* ``vllm_ascend`` - ``torch.ops._C_ascend.npu_hc_pre_v2``, the AscendC kernel
+  the model actually runs on Ascend. That case skips itself when vllm-ascend's
+  private-use ops are not registered, and also when the vendor kernel returns
+  non-finite values for a shape (measured: ``hidden_size <= 2048``; our own
+  output is finite there, so it is a vendor limitation, not ours).
 
 """
 
@@ -43,7 +52,7 @@ from .test_mhc_ops import MHC_PRE_CONFIGS, generate_mhc_pre_data, mhc_pre_ref
 
 requires_ascend = pytest.mark.skipif(
     not HAS_NPU or flaggems_vllm.vendor_name != "ascend",
-    reason="npu_mhc_pre requires torch_npu on an Ascend platform",
+    reason="npu_mhc_pre_clamp_sinkhorn requires torch_npu on an Ascend platform",
 )
 
 NORMAL_SHAPES = [
@@ -141,33 +150,172 @@ def _assert_close(exp, ref, case, rtol=1e-2, atol=1e-2):
     )
 
 
-@requires_ascend
-@pytest.mark.parametrize(
-    "num_tokens, hc_mult, hidden_size",
-    NORMAL_SHAPES,
-    ids=["n{}_hc{}_h{}".format(n, hc, h) for n, hc, h in NORMAL_SHAPES],
-)
-def test_npu_mhc_pre_regular_shapes(num_tokens, hc_mult, hidden_size):
-    """Regular real shapes: must agree with the clamped reference (4/4)."""
-    case = "n{}_hc{}_h{}".format(num_tokens, hc_mult, hidden_size)
-    data = generate_mhc_pre_data(num_tokens, hc_mult, hidden_size)
-    ref_post, ref_comb, ref_hin = mhc_pre_ref_clamped(
+# ---------------------------------------------------------------------------
+# vllm-ascend reference (``torch.ops._C_ascend.npu_hc_pre_v2``)
+# ---------------------------------------------------------------------------
+# vllm-ascend ships the AscendC mHC kernel behind its private-use operator
+# namespace; that is what the model runs on Ascend, so it is the reference this
+# functional test compares against when it registers. The resolver stays in this
+# file on purpose: the tests own their references, and nothing here participates
+# in ``flaggems_vllm`` dispatch (which is why the operator under test is called
+# through ``flaggems_vllm.npu_mhc_pre_clamp_sinkhorn`` rather than by module path).
+#
+# Contract mapping (vllm-ascend -> FlagGems) for ``npu_hc_pre_v2``::
+#
+#     y, post, comb = npu_hc_pre_v2(x, hc_fn, hc_scale, hc_base,
+#                                   n, sinkhorn_iters, norm_eps, hc_eps)
+#
+# ``y`` is our ``hin``, and their ``post`` is ``2 * sigmoid(...)`` while ours is
+# ``hc_post_mult_value * sigmoid(...)``, hence the rescale. They take one shared
+# ``hc_eps`` (exact only when ``hc_pre_eps == hc_sinkhorn_eps``), do not clamp
+# the comb logits, and support ``n == 4`` only on Atlas A2/A3.
+_VLLM_ASCEND_PRE = None
+_VLLM_ASCEND_PRE_ERROR = None
+_VLLM_ASCEND_PRE_RESOLVED = False
+
+
+def _resolve_vllm_ascend_pre():
+    """Resolve once, lazily; never at collection time."""
+    global _VLLM_ASCEND_PRE, _VLLM_ASCEND_PRE_ERROR, _VLLM_ASCEND_PRE_RESOLVED
+    if _VLLM_ASCEND_PRE_RESOLVED:
+        return _VLLM_ASCEND_PRE
+    _VLLM_ASCEND_PRE_RESOLVED = True
+    try:
+        import torch_npu  # noqa: F401 - registers the PrivateUse1 backend
+
+        if not torch.npu.is_available():
+            raise RuntimeError("no NPU device available")
+        from vllm_ascend.utils import enable_custom_op
+
+        if not enable_custom_op():
+            raise RuntimeError("vllm_ascend.utils.enable_custom_op() failed")
+        ops = getattr(torch.ops, "_C_ascend", None)
+        if ops is None or not hasattr(ops, "npu_hc_pre_v2"):
+            raise ImportError("torch.ops._C_ascend.npu_hc_pre_v2 is not registered")
+        _VLLM_ASCEND_PRE = ops.npu_hc_pre_v2
+    except Exception as exc:  # noqa: BLE001 - availability is environment-specific
+        _VLLM_ASCEND_PRE_ERROR = exc
+    return _VLLM_ASCEND_PRE
+
+
+def _vllm_ascend_pre(residual, fn, hc_scale, hc_base, **kwargs):
+    """``npu_hc_pre_v2`` behind the FlagGems ``mhc_pre`` signature and shapes."""
+    op = _resolve_vllm_ascend_pre()
+    if op is None:
+        raise RuntimeError(
+            "vllm-ascend npu_hc_pre_v2 unavailable: {!r}".format(_VLLM_ASCEND_PRE_ERROR)
+        )
+    hc_mult = residual.shape[-2]
+    if hc_mult != 4:
+        raise NotImplementedError(
+            "npu_hc_pre_v2 supports hc_mult == 4, got {}".format(hc_mult)
+        )
+    if kwargs["hc_pre_eps"] != kwargs["hc_sinkhorn_eps"]:
+        raise NotImplementedError(
+            "npu_hc_pre_v2 takes one shared hc_eps; "
+            "hc_pre_eps={} != hc_sinkhorn_eps={}".format(
+                kwargs["hc_pre_eps"], kwargs["hc_sinkhorn_eps"]
+            )
+        )
+    out, post, comb = op(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        hc_mult,
+        kwargs["sinkhorn_repeat"],
+        kwargs["rms_eps"],
+        kwargs["hc_sinkhorn_eps"],
+    )
+    post = (post * (kwargs["hc_post_mult_value"] / 2.0)).unsqueeze(-1)
+    return post, comb, out
+
+
+def _reference_outputs(ref_source, data):
+    """Reference ``(post, comb, hin)`` from ``ref_source``, or ``None`` + reason.
+
+    ``vllm_ascend`` is resolved on first use (never at collection time); a
+    missing registration is a skip, not a failure. The vendor kernel is also
+    skipped when it returns non-finite values for the shape (``hidden_size <=
+    2048`` on 910B4, while ``npu_mhc_pre_clamp_sinkhorn`` stays finite), so a vendor
+    limitation never reds our suite.
+    """
+    if ref_source == "cpu":
+        return (
+            mhc_pre_ref_clamped(
+                data["residual"],
+                data["fn"],
+                data["hc_scale"],
+                data["hc_base"],
+                **MODEL_KWARGS,
+            ),
+            None,
+        )
+
+    if _resolve_vllm_ascend_pre() is None:
+        return None, "vllm-ascend npu_hc_pre_v2 unavailable: {!r}".format(
+            _VLLM_ASCEND_PRE_ERROR
+        )
+
+    ref_post, ref_comb, ref_hin = _vllm_ascend_pre(
         data["residual"],
         data["fn"],
         data["hc_scale"],
         data["hc_base"],
         **MODEL_KWARGS,
     )
-    out_post, out_comb, out_hin = flaggems_vllm.npu_mhc_pre(**{**data, **MODEL_KWARGS})
     torch.npu.synchronize()
+    if not all(torch.isfinite(t.float()).all() for t in (ref_post, ref_comb, ref_hin)):
+        return None, (
+            "vllm-ascend npu_hc_pre_v2 returned non-finite values for "
+            "hidden_size={} (vendor kernel limitation; npu_mhc_pre_clamp_sinkhorn is finite)".format(
+                data["residual"].shape[-1]
+            )
+        )
+    return (ref_post, ref_comb, ref_hin), None
 
-    _assert_close(out_post.squeeze(-1), ref_post, case + "/post")
-    _assert_close(out_comb, ref_comb, case + "/comb")
-    _assert_close(out_hin, ref_hin, case + "/hin")
+
+# ``vllm_ascend`` tolerances come from measuring our bf16 Sinkhorn against the
+# vendor HF32 kernel: post/comb agree within 1e-2, while ``hin`` carries a bf16
+# output-resolution floor (one ULP near |x| = 4 is 3.1e-2), so it needs
+# atol = 4e-2. All three pass at 100% of elements on 910B4.
+_REFERENCE_TOLERANCES = {
+    "cpu": dict(rtol=1e-2, atol=1e-2),
+    "vllm_ascend": dict(rtol=1e-2, atol=4e-2),
+}
 
 
 @requires_ascend
-def test_npu_mhc_pre_shape_validation():
+@pytest.mark.parametrize("ref_source", ["cpu", "vllm_ascend"])
+@pytest.mark.parametrize(
+    "num_tokens, hc_mult, hidden_size",
+    NORMAL_SHAPES,
+    ids=["n{}_hc{}_h{}".format(n, hc, h) for n, hc, h in NORMAL_SHAPES],
+)
+def test_npu_mhc_pre_clamp_sinkhorn_regular_shapes(
+    num_tokens, hc_mult, hidden_size, ref_source
+):
+    """Regular real shapes must agree with the CPU and vllm-ascend references."""
+    case = "n{}_hc{}_h{}".format(num_tokens, hc_mult, hidden_size)
+    data = generate_mhc_pre_data(num_tokens, hc_mult, hidden_size)
+    reference, skip_reason = _reference_outputs(ref_source, data)
+    if reference is None:
+        pytest.skip(skip_reason)
+    ref_post, ref_comb, ref_hin = reference
+
+    out_post, out_comb, out_hin = flaggems_vllm.npu_mhc_pre_clamp_sinkhorn(
+        **{**data, **MODEL_KWARGS}
+    )
+    torch.npu.synchronize()
+
+    tol = _REFERENCE_TOLERANCES[ref_source]
+    _assert_close(out_post.squeeze(-1), ref_post.squeeze(-1), case + "/post", **tol)
+    _assert_close(out_comb, ref_comb, case + "/comb", **tol)
+    _assert_close(out_hin, ref_hin, case + "/hin", **tol)
+
+
+@requires_ascend
+def test_npu_mhc_pre_clamp_sinkhorn_shape_validation():
     """Invalid shapes must raise ValueError; hc_mult=6 must be accepted
     (the mhc_post hc_mult==4 restriction does not apply here)."""
     data = generate_mhc_pre_data(8, 4, 1280)
@@ -178,7 +326,7 @@ def test_npu_mhc_pre_shape_validation():
         kwargs = dict(data)
         kwargs.update(overrides)
         try:
-            flaggems_vllm.npu_mhc_pre(**{**kwargs, **MODEL_KWARGS})
+            flaggems_vllm.npu_mhc_pre_clamp_sinkhorn(**{**kwargs, **MODEL_KWARGS})
         except ValueError:
             print("  [PASS] {}".format(case))
             passed += 1
@@ -226,7 +374,9 @@ def test_npu_mhc_pre_shape_validation():
     base6 = torch.randn((hc_mult3,), dtype=torch.float32, device=device) * 0.1
     try:
         ref6 = mhc_pre_ref_clamped(residual6, fn6, scale6, base6, **MODEL_KWARGS)
-        out6 = flaggems_vllm.npu_mhc_pre(residual6, fn6, scale6, base6, **MODEL_KWARGS)
+        out6 = flaggems_vllm.npu_mhc_pre_clamp_sinkhorn(
+            residual6, fn6, scale6, base6, **MODEL_KWARGS
+        )
         torch.npu.synchronize()
         _assert_close(out6[1], ref6[1], "hc_mult6/comb")
         print("  [PASS] hc_mult=6 accepted and matches reference")
@@ -245,7 +395,7 @@ def test_npu_mhc_pre_shape_validation():
     MHC_PRE_CONFIGS,
     ids=[f"n{n}_h{h}_hc_mult{hc}" for n, h, hc in MHC_PRE_CONFIGS],
 )
-def test_npu_mhc_pre_generic_parity(n, hidden_size, hc_mult):
+def test_npu_mhc_pre_clamp_sinkhorn_generic_parity(n, hidden_size, hc_mult):
     """Ordinary generic-suite cases replayed on the specialized op.
 
     Same inputs as tests/test_mhc_ops.py (seed 42, sinkhorn_repeat=10),
@@ -257,7 +407,7 @@ def test_npu_mhc_pre_generic_parity(n, hidden_size, hc_mult):
     data = generate_mhc_pre_data(n, hc_mult, hidden_size)
     data_cpu = {k: v.cpu() if torch.is_tensor(v) else v for k, v in data.items()}
     post_ref, comb_ref, li_ref = mhc_pre_ref(**data_cpu)
-    out_post, out_comb, out_li = flaggems_vllm.npu_mhc_pre(**data)
+    out_post, out_comb, out_li = flaggems_vllm.npu_mhc_pre_clamp_sinkhorn(**data)
     torch.npu.synchronize()
     _assert_close(out_post, post_ref, case + "/post")
     _assert_close(out_comb, comb_ref, case + "/comb")

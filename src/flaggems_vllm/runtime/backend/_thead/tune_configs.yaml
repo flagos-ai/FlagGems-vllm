@@ -1006,3 +1006,56 @@ hc_combine:
   - META: {BLOCK_D: 512, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+cast_sigmoid:
+  - META: {BLOCK_SIZE: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 4096}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE: 8192}
+    num_warps: 8
+    num_stages: 1
+
+# PPU-ZW810E measured configurations. Pipeline partition count is selected by
+# host dispatch because it defines the shared histogram/state geometry.
+cooperative_topk_thead_histogram:
+  - META:
+      BLOCK: 1024
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_thead_compact:
+  - META:
+      BLOCK: 1024
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_thead_finish:
+  - META:
+      BLOCK: 1024
+      TILE: 8
+    num_warps: 4
+    num_stages: 1
+
+
+# The coarse bucket is refined with exact FP32 integer keys.
+cooperative_topk_thead_small:
+  - META:
+      BINS: 32
+    num_warps: 32
+    num_stages: 1
+  - META:
+      BINS: 64
+    num_warps: 32
+    num_stages: 1
+
+# Register-resident coarse selection avoids a global histogram for medium rows.
+cooperative_topk_thead_medium:
+  - META: {}
+    num_warps: 32
+    num_stages: 1
