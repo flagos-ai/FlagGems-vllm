@@ -16,6 +16,14 @@
 # runtime/backend/_tsingmicro/tx81/fused/. Functions re-exported here override
 # the generic implementations through SpecOpRegistrar (matched by function
 # name), so every public entry must keep the generic-op signature.
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.attention import (
+    flash_attention_forward,
+    flash_attn_varlen_func,
+)
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.flash_mla import flash_mla
+from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.flashmla_sparse import (
+    flash_mla_sparse_fwd,
+)
 from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
@@ -33,6 +41,10 @@ from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.silu_and_mul_with_clamp 
 )
 
 __all__ = [
+    "flash_attention_forward",
+    "flash_attn_varlen_func",
+    "flash_mla",
+    "flash_mla_sparse_fwd",
     "fused_add_rms_norm",
     "grouped_topk",
     "reshape_and_cache_flash",
