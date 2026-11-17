@@ -95,6 +95,9 @@ from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     configure_fused_matmul_reduce_scatter,
     fused_matmul_reduce_scatter,
 )
+from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -333,6 +336,7 @@ __all__ = [
     "fp8_fp4_paged_mqa_logits_graph",
     "fused_add_rms_norm",
     "fused_allreduce_rms_norm",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_k_norm",
