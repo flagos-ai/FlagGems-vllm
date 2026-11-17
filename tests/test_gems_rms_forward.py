@@ -96,3 +96,28 @@ def test_gems_rms_forward_ascend_rounds_residual_output_before_weight(dtype, wid
     actual, residual_out = flaggems_vllm.gems_rms_forward(x, residual, weight, 8.0)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(residual_out, torch.ones_like(residual), rtol=0, atol=0)
+
+
+@pytest.mark.gems_rms_forward
+def test_gems_rms_forward_rejects_mismatched_residual_shape():
+    # Shape validation must run before device checks or kernel dispatch.
+    x = torch.empty((2, 128))
+    residual = torch.empty((1, 128))
+    weight = torch.empty((128,))
+    with pytest.raises(ValueError, match="x and residual must have the same shape"):
+        flaggems_vllm.gems_rms_forward(x, residual, weight, 1e-5)
+
+
+@pytest.mark.gems_rms_forward
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Checks Ascend reduction order"
+)
+@pytest.mark.parametrize("width", [128, 4097, 8193])
+def test_gems_rms_forward_ascend_scales_before_reduction(width):
+    x = torch.full(
+        (2, width), float(2**62), device=flaggems_vllm.device, dtype=torch.float32
+    )
+    weight = torch.ones_like(x[0])
+    # Squaring each value is finite, but the unscaled sum of squares overflows.
+    actual = flaggems_vllm.gems_rms_forward(x, None, weight, 1e-5)
+    torch.testing.assert_close(actual, torch.ones_like(x))

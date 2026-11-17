@@ -25,6 +25,8 @@ from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils import triton_lang_extension as ext
 
+_ASCEND_MAX_GRID_SIZE = 65535
+
 
 @triton.jit
 def prev_multiple_of(a, b):
@@ -144,6 +146,32 @@ def _rms_norm_loop_kernel(
         tl.store(out_ptr + pid * N + n_offsets, y)
 
 
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def _ascend_rms_norm_kernel(
+    out_ptr, x_ptr, w_ptr, N, eps, row_offset, BLOCK_SIZE: tl.constexpr
+):
+    row_start = (ext.program_id(0) + row_offset) * N
+    lanes = tl.arange(0, BLOCK_SIZE)
+    var = 0.0
+    for start in range(0, N, BLOCK_SIZE):
+        cols = start + lanes
+        mask = cols < N
+        x = tl.load(x_ptr + row_start + cols, mask, other=0.0).to(tl.float32)
+        # Scale before summing, as in FlagGems v5.4.0 on Ascend.
+        var += tl.sum(x * x / N)
+
+    rrms = 1 / tl.sqrt(var + eps)
+    for start in range(0, N, BLOCK_SIZE):
+        cols = start + lanes
+        mask = cols < N
+        offsets = row_start + cols
+        x = tl.load(x_ptr + offsets, mask, other=0.0).to(tl.float32)
+        weight = tl.load(w_ptr + cols, mask, other=0.0)
+        out = (x * rrms).to(out_ptr.dtype.element_ty) * weight
+        tl.store(out_ptr + offsets, out, mask)
+
+
 # FlagGems v5.4.0 uses different residual rounding on CUDA and Ascend.
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
@@ -242,6 +270,11 @@ def _ascend_residual_kernel(
 
 
 def _gems_rms_forward_residual(x, residual, weight, eps):
+    if x.shape != residual.shape:
+        raise ValueError(
+            f"x and residual must have the same shape, got {x.shape} and {residual.shape}"
+        )
+
     if runtime.device.vendor_name not in ("nvidia", "ascend"):
         from flaggems_vllm import fused_add_rms_norm
 
@@ -259,7 +292,7 @@ def _gems_rms_forward_residual(x, residual, weight, eps):
         if runtime.device.vendor_name == "ascend":
             block_size = min(triton.next_power_of_2(n), 8192)
             # Ascend limits the grid size. Launch each group of rows.
-            max_grid = 65535
+            max_grid = _ASCEND_MAX_GRID_SIZE
             for row_offset in range(0, m, max_grid):
                 grid = (min(m - row_offset, max_grid),)
                 # The 8192-element tile can exhaust unified buffer with multibuffering.
@@ -307,7 +340,22 @@ def gems_rms_forward(
     n = weight.numel()
     m = math.prod(x.shape[: x.ndim - weight.ndim])
     with torch_device_fn.device(x.device):
-        if n <= 4096:
+        if runtime.device.vendor_name == "ascend":
+            block_size = min(triton.next_power_of_2(n), 8192)
+            max_grid = _ASCEND_MAX_GRID_SIZE
+            for row_offset in range(0, m, max_grid):
+                grid = (min(m - row_offset, max_grid),)
+                _ascend_rms_norm_kernel[grid](
+                    out,
+                    x,
+                    weight,
+                    n,
+                    eps,
+                    row_offset,
+                    BLOCK_SIZE=block_size,
+                    multibuffer=False,
+                )
+        elif n <= 4096:
             _rms_norm_kernel[(m,)](
                 out, x, weight, n, 1, n, 1, n, eps, BLOCK_SIZE=triton.next_power_of_2(n)
             )
