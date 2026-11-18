@@ -371,45 +371,44 @@ def _vllm_native_op():
     return native_op, compute_fp8_einsum_recipe
 
 
-@pytest.mark.deep_gemm_fp8_o_proj
-@pytest.mark.parametrize("config", CONFIGS)
-@pytest.mark.skipif(
-    not is_hopper_available(), reason="vLLM's DeepGEMM path is NVIDIA Hopper only"
-)
-def test_deep_gemm_fp8_o_proj_matches_vllm_native(config):
-    """Cross-check against vLLM's DeepGEMM implementation when it is runnable."""
-    native_op, recipe_fn = _vllm_native_op()
-    if native_op is None:
-        pytest.skip("vLLM build has no deepseek_v4 deep_gemm_fp8_o_proj")
+if is_hopper_available():
 
-    device = flaggems_vllm.device
-    inp = _build_inputs(config, SEEDS[0], device)
-    recipe, tma_aligned = recipe_fn()
-    try:
-        ref = native_op(
-            inp["o"],
-            inp["positions"],
-            inp["cos_sin_cache"],
-            inp["wo_a"],
-            inp["wo_b"],
-            n_groups=inp["n_groups"],
-            heads_per_group=inp["heads_per_group"],
-            nope_dim=NOPE_DIM,
-            rope_dim=ROPE_DIM,
-            o_lora_rank=inp["o_lora_rank"],
-            einsum_recipe=recipe,
-            tma_aligned_scales=tma_aligned,
+    @pytest.mark.deep_gemm_fp8_o_proj
+    @pytest.mark.parametrize("config", CONFIGS)
+    def test_deep_gemm_fp8_o_proj_matches_vllm_native(config):
+        """Cross-check against vLLM's DeepGEMM implementation when it is runnable."""
+        native_op, recipe_fn = _vllm_native_op()
+        if native_op is None:
+            pytest.skip("vLLM build has no deepseek_v4 deep_gemm_fp8_o_proj")
+
+        device = flaggems_vllm.device
+        inp = _build_inputs(config, SEEDS[0], device)
+        recipe, tma_aligned = recipe_fn()
+        try:
+            ref = native_op(
+                inp["o"],
+                inp["positions"],
+                inp["cos_sin_cache"],
+                inp["wo_a"],
+                inp["wo_b"],
+                n_groups=inp["n_groups"],
+                heads_per_group=inp["heads_per_group"],
+                nope_dim=NOPE_DIM,
+                rope_dim=ROPE_DIM,
+                o_lora_rank=inp["o_lora_rank"],
+                einsum_recipe=recipe,
+                tma_aligned_scales=tma_aligned,
+            )
+        except (RuntimeError, NotImplementedError, TypeError) as exc:
+            pytest.skip(f"vLLM native path unavailable: {exc}")
+
+        out = _call_op(inp, recipe=recipe, tma_aligned_scales=tma_aligned)
+        _sync()
+
+        atol = max(5e-2, ref.abs().max().item() * 5e-2)
+        utils.gems_assert_close(
+            out, utils.to_reference(ref, upcast=True), torch.bfloat16, atol=atol
         )
-    except (RuntimeError, NotImplementedError, TypeError) as exc:
-        pytest.skip(f"vLLM native path unavailable: {exc}")
-
-    out = _call_op(inp, recipe=recipe, tma_aligned_scales=tma_aligned)
-    _sync()
-
-    atol = max(5e-2, ref.abs().max().item() * 5e-2)
-    utils.gems_assert_close(
-        out, utils.to_reference(ref, upcast=True), torch.bfloat16, atol=atol
-    )
 
 
 @pytest.mark.deep_gemm_fp8_o_proj
