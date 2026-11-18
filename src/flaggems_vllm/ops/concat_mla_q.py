@@ -66,8 +66,12 @@ def _validate_inputs(ql_nope, q_pe, q_out):
         raise ValueError("concat_mla_q requires positive head count and nope width")
     if q_pe.shape[:2] not in ((tokens, heads), (tokens, 1)):
         raise ValueError("concat_mla_q rope token/head dimensions do not match")
-    if q_out.shape != (tokens, heads, nope + rope):
-        raise ValueError("concat_mla_q output shape does not match")
+    if (
+        q_out.shape[0] != tokens
+        or q_out.shape[1] < heads
+        or q_out.shape[2] != nope + rope
+    ):
+        raise ValueError("concat_mla_q output must fit all input tokens and heads")
     if not (ql_nope.dtype == q_pe.dtype == q_out.dtype):
         raise ValueError("concat_mla_q tensors must have the same dtype")
     if not (ql_nope.device == q_pe.device == q_out.device):
@@ -98,21 +102,22 @@ def concat_mla_q(
 ) -> None:
     """Write ``[ql_nope, q_pe]`` into q_out, broadcasting one rope head.
 
-    Inputs and output may be strided; zero-width rope is supported. Output
-    aliasing is rejected before any launch. This is an inference-only data copy,
-    with no dtype conversion.
+    Inputs and output may be strided; zero-width rope is supported. A wider
+    output head dimension preserves the existing padding lanes. Output aliasing
+    is rejected before launch. This copy does not convert dtypes.
     """
     _validate_inputs(ql_nope, q_pe, q_out)
     if not q_out.numel():
         return
     tokens, heads, nope = ql_nope.shape
     width = q_out.shape[-1]
+    count = tokens * heads * width
     with torch.cuda.device(ql_nope.device):
-        _concat_mla_q_kernel[lambda meta: (triton.cdiv(q_out.numel(), meta["BLOCK"]),)](
+        _concat_mla_q_kernel[lambda meta: (triton.cdiv(count, meta["BLOCK"]),)](
             ql_nope,
             q_pe,
             q_out,
-            tokens * heads * width,
+            count,
             heads,
             nope,
             width,
