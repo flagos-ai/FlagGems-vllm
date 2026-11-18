@@ -28,6 +28,7 @@ from . import accuracy_utils as utils  # noqa: E402
 from . import conftest as cfg  # noqa: E402
 
 try:
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm as _VllmGemmaRMSNorm
 
     _HAS_VLLM_GEMMA = True
@@ -38,11 +39,12 @@ except ImportError:
 def _vllm_gemma_rms_norm(x, w, eps):
     """Reference using vllm.model_executor.layers.layernorm.GemmaRMSNorm."""
     N = x.shape[-1]
-    norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
-    norm.weight = torch.nn.Parameter(w.float())
-    norm = norm.to(x.device)
-    with torch.inference_mode():
-        return norm(x)
+    with set_current_vllm_config(VllmConfig()):
+        norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
+        norm.weight = torch.nn.Parameter(w.float())
+        norm = norm.to(x.device)
+        with torch.inference_mode():
+            return norm(x)
 
 
 def _torch_gemma_rms_norm(x, w, eps):

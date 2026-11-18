@@ -951,6 +951,23 @@ ops:
   - Quantization
   stages:
   - beta: '5.4'
+- id: fused_kimi_k3_mla_kv_concat
+  description: 'Copy Kimi-K3 NoPE keys and broadcast the shared PE component into a
+
+    caller-provided contiguous full-key output, preserving FP16/BF16 bits.
+
+    No cache, query, RoPE, or quantization work. Output/input overlap rejected.
+
+    '
+  for:
+  - _C.fused_kimi_k3_mla_kv_concat
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '5.4'
 - id: fused_marlin_moe_w4a16
   description: 'Fused mixture-of-experts computation with 4-bit weights and 16-bit
 
@@ -1911,6 +1928,27 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: ple_conv
+  description: 'Upstream-compatible Qwen4Exp PLE dilated short convolution. Writes
+
+    SiLU(conv) into residual (optionally fused with outer residual) and
+
+    updates the persistent conv cache for decode, prefill, and speculative
+
+    decode modes, matching vLLM ops.ple.ple_conv.
+
+    '
+  for:
+  - vllm.models.qwen4_exp.common.ops.ple.ple_conv
+  labels:
+  - fused
+  - vLLM
+  - Qwen4Exp
+  - NoCPU
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: qsa_prepare
   description: 'Horizontally-fused Qwen4Exp QSA prepare: Gemma RMSNorm and MRoPE for
     the
@@ -2313,6 +2351,17 @@ ops:
   description: iHC gated residual scatter with unfused FP32 multiply and addition.
   for:
   - triton_ihc_post
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.4'
+- id: triton_ihc_pre
+  description: iHC RMS-normalized FP32 gates and pre-gated channel reduction.
+  for:
+  - triton_ihc_pre
   labels:
   - fused
   - vLLM

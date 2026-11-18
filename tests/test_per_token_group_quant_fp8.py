@@ -135,7 +135,7 @@ def test_per_token_group_quant_fp8(
         # Use the vllm reference implementation when available
         # (vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8)
         # column_major_scales is FlagGems-only; fall through to the torch reference for that path.
-        if scale_ue8m0 and _VLLM_FP8_HAS_UE8M0:
+        if _VLLM_FP8_HAS_UE8M0:
             ref_out, ref_scale = _vllm_per_token_group_quant_fp8(
                 ref_x, group_size, use_ue8m0=scale_ue8m0
             )
@@ -166,4 +166,10 @@ def test_per_token_group_quant_fp8(
     out_fp32 = _fp8_to_float32(utils.to_cpu(out, ref_out))
     ref_out_fp32 = _fp8_to_float32(ref_out)
 
-    assert torch.allclose(out_fp32, ref_out_fp32, rtol=0.15)
+    matches = torch.isclose(out_fp32, ref_out_fp32, rtol=0.15)
+    if out.dtype == torch.float8_e4m3fn:
+        # A one-ULP scale difference can move a subnormal by one FP8 code.
+        min_normal = torch.finfo(out.dtype).tiny
+        subnormal = (out_fp32.abs() < min_normal) & (ref_out_fp32.abs() < min_normal)
+        matches |= subnormal & ((out_fp32 - ref_out_fp32).abs() <= min_normal / 8)
+    assert matches.all()
