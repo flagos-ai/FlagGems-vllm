@@ -8,27 +8,32 @@ bookCollapseSection: true
 
 Learn how to use FlagGems-vllm operators in your applications.
 
-## Basic Patterns
+> [!IMPORTANT]
+> **Dependency Note**: FlagGems-vllm depends on FlagGems. Several FlagGems-vllm operators invoke FlagGems operators internally during execution. Ensure `flag_gems` is installed, and call `flag_gems.enable()` before running workloads.
 
-FlagGems-vllm operators can be used in three ways:
+## Usage Patterns
 
-1. **Direct invocation**: Call operators directly from `flaggems_vllm`
-2. **With FlagGems enabled**: Use alongside `flag_gems.enable()` for general ops
-3. **Through vllm-plugin-fl**: Automatic integration in vLLM inference
+FlagGems-vllm **only supports direct invocation; it does not support PyTorch dispatch registration, nor does it support the `use_gems` context manager**:
+
+1. **Direct invocation (recommended with FlagGems enabled)**: Import `flag_gems`, call `flag_gems.enable()` to initialize the general operator foundation, and call fused operators directly via `flaggems_vllm.<op>()`;
+2. **Through vllm-plugin-fl**: Automatic end-to-end integration within vLLM inference by invoking `flaggems_vllm.<op>()`.
 
 ## Topics
 
-- [Basic Usage](basic/) - Direct operator calls and API patterns
-- [vLLM Plugin Integration](vllm-plugin/) - Using with vllm-plugin-fl
-- [Selective Enablement](selective/) - Fine-grained operator control
-- [Non-NVIDIA Backends](non-nvidia/) - Running on AMD, Ascend, and other hardware
-- [Debugging](debugging/) - Logging and troubleshooting
+- [Basic Usage](basic.md) - Direct operator calls and FlagGems cooperation patterns
+- [vLLM Plugin Integration](vllm-plugin.md) - Using with vllm-plugin-fl
+- [Non-NVIDIA Backends](non-nvidia.md) - Running on AMD, Ascend, and other hardware
+- [Debugging](debugging.md) - Logging and troubleshooting
 
 ## Quick Example
 
 ```python
 import torch
+import flag_gems
 import flaggems_vllm
+
+# Enable FlagGems general operators (required for underlying kernel dispatch)
+flag_gems.enable()
 
 # MoE grouped topk with bias and renormalization
 scores = torch.randn((8, 16), device="cuda", dtype=torch.float32)

@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.ops.qwen4.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
+from flaggems_vllm.ops.qwen4.hc_combine import hc_combine
+from flaggems_vllm.ops.qwen4.hc_down_silu import hc_down_silu
 from flaggems_vllm.ops.qwen4.hyperconnection import (
     can_use_hc_combine_norm_triton,
     can_use_hc_inject_triton,
@@ -21,7 +24,7 @@ from flaggems_vllm.ops.qwen4.hyperconnection import (
     qwen4_hc_gate_reduce,
     qwen4_hc_inject_combine,
 )
-from flaggems_vllm.ops.qwen4.ple_conv import ple_short_conv_
+from flaggems_vllm.ops.qwen4.ple_conv import NULL_BLOCK_ID, ple_conv, ple_short_conv_
 from flaggems_vllm.ops.qwen4.ple_fusion import (
     can_use_ple_gate_norm_triton,
     can_use_ple_prefill_conv_triton,
@@ -43,12 +46,17 @@ from flaggems_vllm.ops.qwen4.qsa import (
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
 )
-from flaggems_vllm.ops.qwen4.qsa_attention import (
+from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
+from flaggems_vllm.ops.qwen4.qsa_sparse_paged_attention import (
     qsa_sparse_paged_attention,
-    qsa_sparse_split_count,
 )
 
 __all__ = [
+    "grouped_gemma_rmsnorm",
+    "hc_combine",
+    "hc_down_silu",
+    "NULL_BLOCK_ID",
+    "ple_conv",
     "ple_short_conv_",
     "qwen4_hc_combine_norm",
     "ple_gate_norm_",
@@ -60,7 +68,6 @@ __all__ = [
     "qsa_compress_groups_with_ratio",
     "qsa_compress_norm_mrope_store_groups",
     "qsa_sparse_paged_attention",
-    "qsa_sparse_split_count",
     "can_use_hc_combine_norm_triton",
     "can_use_ple_gate_norm_triton",
     "can_use_ple_prefill_conv_triton",
@@ -77,4 +84,5 @@ __all__ = [
     "qwen4_vendor_compress_qsa_groups",
     "qwen4_vendor_qsa_mqa_paged",
     "qwen4_vendor_store_qsa_rows",
+    "qsa_prepare",
 ]

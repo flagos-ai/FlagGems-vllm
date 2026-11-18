@@ -9,7 +9,7 @@ Add support for new hardware backends in FlagGems-vllm.
 
 ## Overview
 
-FlagGems-vllm supports 18+ hardware backends. Each backend has:
+FlagGems-vllm supports 17 hardware backends. Each backend has:
 - Device detection logic
 - Optional autotune configuration
 - Architecture-specific tuning (e.g., NVIDIA Ampere vs Hopper)
@@ -39,6 +39,44 @@ backend/
 
 ## Adding a New Backend
 
+### Step 0: Add a Setup Profile
+
+Add an entry to `src/flaggems_vllm/backends.yaml` so `tools/setup.sh` can build the vendor
+environment. The registry records the Python version, vendor torch/accelerator
+packages, Triton/FlagTree builds, vLLM source, environment variables, vendor
+env scripts and backend-specific test dependencies:
+
+```yaml
+backends:
+  myvendor-myhw:
+    vendor: myvendor
+    python: "3.12"
+    deps:
+      - torch==2.10.0+myvendor
+      - myvendor-torch==1.2.3
+    triton: triton==3.6.0+myvendor
+    flagtree: flagtree==0.7.0+myvendor
+    # Omit vllm if the vendor image provides it; use --no-venv there.
+    vllm:
+      - vllm-myvendor==0.24.0
+    env:
+      MYVENDOR_HOME: /opt/myvendor
+      LD_LIBRARY_PATH: $MYVENDOR_HOME/lib:$LD_LIBRARY_PATH
+    env_source:
+      - /opt/myvendor/set_env.sh
+    # Optional backend-specific test packages (NVIDIA uses this for cupy).
+    test_deps:
+      - "some-vendor-test-helper>=1.0"
+```
+
+Add a short alias under `aliases:` if the vendor name alone should select this
+profile. Then verify with:
+
+```bash
+bash tools/setup.sh --list
+bash tools/setup.sh --dry-run myvendor
+```
+
 ### Step 1: Create Backend Directory
 
 ```bash
@@ -46,23 +84,17 @@ mkdir src/flaggems_vllm/runtime/backend/_myvendor
 touch src/flaggems_vllm/runtime/backend/_myvendor/__init__.py
 ```
 
-### Step 2: Add Device Detection
+### Step 2: Register Vendor and Add Device Detection
 
-Edit `src/flaggems_vllm/runtime/device_finder.py`:
+1. Register vendor information in `src/flaggems_vllm/runtime/common.py`:
+   - Add `VendorInfo` (vendor name, device name, dispatch key, features like bf16/fp64 support)
+   - Add entry to `_VENDOR_TORCH_ATTR` or shell check scripts in `tools/`
+
+2. If needed, customize detection in `src/flaggems_vllm/runtime/backend/device_finder.py`:
 
 ```python
-def detect_vendor():
-    # Existing detection logic...
-
-    # Add your backend
-    try:
-        import myvendor_torch  # Vendor's PyTorch extension
-        if myvendor_torch.is_available():
-            return "myvendor"
-    except ImportError:
-        pass
-
-    return "nvidia"  # default
+# DeviceDetector detects vendor from environment variable DNN_VENDOR,
+# vendor check scripts, or PyTorch device modules.
 ```
 
 ### Step 3: Implement Backend Module
@@ -216,24 +248,31 @@ def get_architecture():
 
 ## CI Integration
 
-Add CI job for your backend (if runners available):
+Backend CI is driven by data files, not by a per-vendor job in the workflow.
+Do not add a job to `.github/workflows/unittest.yaml`. To enroll a backend:
 
-`.github/workflows/basic-ci.yml`:
+1. Add a profile to `src/flaggems_vllm/backends.yaml` so `tools/setup.sh` can
+   build its environment.
+2. Add an entry (`backend`, `runner_label`, `label`, `gpu_check`, `enabled`) to
+   `.github/backends.json` and a health script `tools/gpu_check_<vendor>.sh`.
+3. List the tests proven on the backend in `.github/backend-capabilities.json`.
+   Until `auto_select` is `true` there, only an explicit `vendor/*` label
+   schedules the backend; a path change alone does not.
 
-```yaml
-myvendor-tests:
-  runs-on: myvendor-runner
-  steps:
-    - uses: actions/checkout@v4
-    - name: Setup
-      run: |
-        pip install myvendor-torch
-        pip install --no-build-isolation -e '.[test]'
-    - name: Tests
-      run: |
-        export DNN_VENDOR=myvendor
-        pytest -q tests --quick
-```
+How a pull request reaches a backend:
+
+- `unittest.yaml` starts with a `preprocess` job. It waits for the triage
+  workflow, reads the PR labels, and selects tests (`tools/select_tests.py`)
+  and backends (`tools/select_backends.py`, `tools/select_ci_backends.py`).
+- A backend runs when the PR changes `src/flaggems_vllm/runtime/backend/_<vendor>/`
+  (only if `auto_select` is `true`), or when a maintainer adds its `vendor/*`
+  label. `ci/all-vendors` selects every enabled backend.
+- The H20 job (`python-op`) runs for pull requests from this repository. A
+  maintainer opts in a fork pull request with the `ci/nvidia` label.
+- `unittest-required` is the only check to require in branch protection. It
+  fails if a job that should have run was skipped, or if any job failed.
+
+See `.github/MULTI_BACKEND_CI.md` for runner setup and the trust model.
 
 ## Example: Minimal Backend
 
@@ -301,6 +340,6 @@ PR checklist:
 
 ## Next Steps
 
-- [Contribution overview](/FlagGems-vllm/contribution/overview/)
-- [Operator development protocol](/FlagGems-vllm/contribution/workflow/)
-- [Testing guide](/FlagGems-vllm/testing/unittest/)
+- [Contribution overview](overview.md)
+- [Operator development protocol](workflow.md)
+- [Testing guide](../testing/unittest.md)

@@ -125,6 +125,10 @@ class BenchmarkMetrics:
     # Why the baseline comparison was skipped (op/shape/dtype missing).
     # None means "matched" or "--base-data not enabled". Excluded from metrics.
     base_miss_reason: Optional[str] = None
+    # GPU time share from model profiling YAML (--model-profile).
+    # Format: {"prefill": {"pct": 1.44, "calls": 3240}, "decode": {...}}
+    # None when --model-profile is not provided.
+    time_share: Optional[dict] = None
     # Error message
     error_msg: Optional[str] = None
 
@@ -133,6 +137,7 @@ ALL_AVAILABLE_METRICS = set(map(lambda x: x.name, fields(BenchmarkMetrics))) - {
     "legacy_shape",
     "shape_detail",
     "base_miss_reason",
+    "time_share",
 }
 
 DEFAULT_METRICS = [
@@ -430,13 +435,13 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant=None)
     try:
         op_entry = _resolve_op_entry(base_data, op_name, variant)
         if not op_entry:
-            return None, f"baseline 中没有算子 '{op_name}'"
+            return None, f"operator '{op_name}' not found in baseline"
         shapes = op_entry.get("shapes", {})
         first_shape = _first_tensor_shape(shape_detail)
         if first_shape is None:
             return None, (
-                f"算子 '{op_name}' 的 shape 无法表达为张量维度 "
-                f"(shape_detail={shape_detail})"
+                f"operator '{op_name}' shape cannot be expressed as tensor "
+                f"dims (shape_detail={shape_detail})"
             )
         # 优先按原始 key（str(第一个张量 shape)）直查——简单算子的 key_shape 恰为
         # 第一个张量 shape，命中率高且无歧义。
@@ -461,15 +466,15 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant=None)
             and shapes[str(first_shape)].get(str(dtype)) is None
         ):
             return None, (
-                f"算子 '{op_name}' shape {first_shape} 在 baseline 中没有 "
-                f"对应的 dtype {dtype}"
+                f"operator '{op_name}' shape {first_shape} has no matching "
+                f"dtype {dtype} in baseline"
             )
         return None, (
-            f"算子 '{op_name}' 在 baseline 中没有匹配的 shape"
-            f"（第一个张量={first_shape}，已尝试张量签名回退）"
+            f"operator '{op_name}' has no matching shape in baseline "
+            f"(first tensor={first_shape}, tensor-signature fallback tried)"
         )
     except (AttributeError, TypeError) as e:
-        return None, f"baseline 查找 '{op_name}' 时出错: {e}"
+        return None, f"error looking up '{op_name}' in baseline: {e}"
 
 
 def lookup_base_record(base_data, op_name, dtype, shape_detail, variant=None):
@@ -589,18 +594,26 @@ class BenchmarkResult:
         if self.result[0].gbps is not None:
             col_names.append(f"{'Torch GBPS ':>20}")
             col_names.append(f"{'Gems GBPS ':>20}")
+        # Show Time Share column only when profiling data is attached.
+        show_time_share = any(m.time_share is not None for m in self.result)
+        if show_time_share:
+            col_names.append(f"{'Time Share (prefill/decode)':>30}")
         col_names.append(f"{'Size Detail':>20}\n")
         header_col_names = " ".join(col_names)
         header_break = "-" * len(header_col_names) + "\n"
         header = header_title + header_col_names + header_break
 
         metrics_lines = "".join(
-            self._format_metrics(ele, show_vs_base) for ele in self.result
+            self._format_metrics(ele, show_vs_base, show_time_share)
+            for ele in self.result
         )
         return header + metrics_lines
 
     def _format_metrics(
-        self, metrics: BenchmarkMetrics, show_vs_base: bool = False
+        self,
+        metrics: BenchmarkMetrics,
+        show_vs_base: bool = False,
+        show_time_share: bool = False,
     ) -> str:
         # self.gen_legacy_shape(metrics)
         # legacy_shape_str = (
@@ -640,9 +653,34 @@ class BenchmarkResult:
             data_line += f"{tflops_str:>20}"
         if metrics.gbps is not None:
             data_line += f"{torch_gbps_str:>20}{gems_gbps_str:>20}"
+        if show_time_share:
+            data_line += f"{self._format_time_share(metrics.time_share):>30}"
         data_line += " " * 10
         data_line += f"{shape_detail_str}\n"
         return data_line
+
+    @staticmethod
+    def _format_time_share(time_share: Optional[dict]) -> str:
+        """Render profiling metadata as 'pf {pct}%/{calls}x | dc {pct}%/{calls}x'.
+
+        A missing phase shows '-' for both fields.
+        """
+        if not time_share:
+            return "N/A"
+
+        def _phase(key):
+            block = time_share.get(key)
+            if not isinstance(block, dict):
+                return "-", "-"
+            pct = block.get("pct")
+            calls = block.get("calls")
+            pct_s = f"{pct:.2f}%" if isinstance(pct, (int, float)) else "-"
+            calls_s = f"{int(calls)}x" if isinstance(calls, int) else "-"
+            return pct_s, calls_s
+
+        pf_pct, pf_calls = _phase("prefill")
+        dc_pct, dc_calls = _phase("decode")
+        return f"pf {pf_pct}/{pf_calls} | dc {dc_pct}/{dc_calls}"
 
     def gen_legacy_shape(self, metrics: BenchmarkMetrics) -> Optional[int]:
         first_shape = (

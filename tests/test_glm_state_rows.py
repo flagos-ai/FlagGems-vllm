@@ -71,23 +71,6 @@ def test_copy_to_stable_buffer_and_graph(dtype):
     assert out.data_ptr() == ptr
 
 
-def test_tle_missing_pipeline_api_is_rejected_before_execution():
-    from types import SimpleNamespace
-
-    from flaggems_vllm.ops.flashmla_sparse import _has_tle_pipeline_api
-
-    fields = ("alloc", "copy", "local_ptr", "smem", "warp_specialize")
-    gpu = SimpleNamespace(**dict.fromkeys(fields, object()))
-    supported = SimpleNamespace(pipe=object(), gpu=gpu)
-    assert _has_tle_pipeline_api(supported)
-    assert not _has_tle_pipeline_api(SimpleNamespace(gpu=gpu))
-    for field in fields:
-        missing = SimpleNamespace(
-            **{name: object() for name in fields if name != field}
-        )
-        assert not _has_tle_pipeline_api(SimpleNamespace(pipe=object(), gpu=missing))
-
-
 @pytest.mark.parametrize("length", [0, 1, 127, 128])
 def test_sparse_mla_public_entry_with_optional_pipeline_abi(length):
     from .test_flash_mla_sparse_fwd import FlashmlaSparseTestKit

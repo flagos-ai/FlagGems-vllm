@@ -211,15 +211,14 @@ def test_fp8_fp4_mqa_logits(M, N, clean_logits, use_fp4):
         )
         ref_out = to_reference(ref_out)
 
-    with flaggems_vllm.use_gems():
-        res_out = fp8_fp4_mqa_logits(
-            q=(q_values, q_scale),
-            kv=(k_fp8, k_scale),
-            weights=weights,
-            cu_seqlen_ks=ks,
-            cu_seqlen_ke=ke,
-            clean_logits=clean_logits,
-        )
+    res_out = fp8_fp4_mqa_logits(
+        q=(q_values, q_scale),
+        kv=(k_fp8, k_scale),
+        weights=weights,
+        cu_seqlen_ks=ks,
+        cu_seqlen_ke=ke,
+        clean_logits=clean_logits,
+    )
 
     # FP4 has lower precision than FP8, so use a wider tolerance
     atol = 0.15 if use_fp4 else 5e-2

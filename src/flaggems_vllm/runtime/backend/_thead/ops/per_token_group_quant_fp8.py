@@ -250,6 +250,7 @@ def per_token_group_quant_fp8(
     fast_cvt = fp8_dtype == torch.float8_e4m3fn
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    x_q_kernel = x_q.view(torch.uint8) if fast_cvt else x_q
     num_groups = x.numel() // group_size
     groups_per_row = x.shape[-1] // group_size
 
@@ -269,7 +270,7 @@ def per_token_group_quant_fp8(
     if column_major_scales:
         _per_token_group_quant_fp8_colmajor_vec[grid](
             x,
-            x_q,
+            x_q_kernel,
             x_s,
             row_stride,
             x_s.stride(1),
@@ -290,7 +291,7 @@ def per_token_group_quant_fp8(
     else:
         _per_token_group_quant_fp8_vec[grid](
             x,
-            x_q,
+            x_q_kernel,
             x_s,
             row_stride,
             eps,

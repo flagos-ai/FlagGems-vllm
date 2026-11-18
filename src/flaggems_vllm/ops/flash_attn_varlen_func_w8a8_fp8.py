@@ -1413,12 +1413,13 @@ def flash_fwd_splitkv_combine_kernel(
     BLOCK_K: tl.constexpr,
     q_total,
     MAX_N_SPLITS: tl.constexpr,
+    num_heads,
+    seqlen_q,
 ):
     pid = tl.program_id(0)
     lse_splits_ptr += pid * BLOCK_M
     lse_ptr += pid * BLOCK_M
     out_splits_ptr += pid * BLOCK_M * head_size
-    out_ptr += pid * BLOCK_M * head_size
 
     # Subtracting maximum from each of the split lse's for better numerical stability
     lse_split_offset = (
@@ -1459,8 +1460,20 @@ def flash_fwd_splitkv_combine_kernel(
     out = tl.sum(Zi_Z[:, :, None] * out_splits, 1)
     out = out.to(out_ptr.type.element_ty)
 
-    # Write back output
-    out_offset = tl.arange(0, BLOCK_M)[:, None] * out_s_stride + tl.arange(0, BLOCK_K)
+    # Write back output.
+    # The split buffers flatten [batch, head, query], but `out` is a BSHD view
+    # whose storage order need not follow that flattening. Decode each row into
+    # batch/head/query and use the real output strides.
+    row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    batch = row // (num_heads * seqlen_q)
+    head = (row // seqlen_q) % num_heads
+    query = row % seqlen_q
+    out_offset = (
+        batch[:, None] * out_b_stride
+        + head[:, None] * out_h_stride
+        + query[:, None] * out_s_stride
+        + tl.arange(0, BLOCK_K)[None, :]
+    )
     dmask = tl.arange(0, BLOCK_K) < head_size
     tl.store(out_ptr + out_offset, out, mask=out_mask[:, None] & dmask[None, :])
 
@@ -2845,7 +2858,9 @@ def mha_varlan_fwd(
         kernel = cfg_params.pop("kernel", flash_varlen_fwd_kernel)[grid]
 
         logger.debug("Running flash_varlen_fwd_kernel with config: %s", cfg_params)
-        if max_seqlen_k <= 128:
+        if not cfg_params.pop("split_short_k", True):
+            short_k_modes = (False,)
+        elif max_seqlen_k <= 128:
             short_k_modes = (True,)
         elif (
             not is_paged
@@ -3128,7 +3143,9 @@ def mha_fwd(
                         "lse_split_stride": lse_splits.stride(0),
                         "out_b_stride": out.stride(0),
                         "out_s_stride": out.stride(-3),
-                        "out_h_stride": out.stride(-1),
+                        # Head stride is the second-to-last dim of the BSHD view;
+                        # stride(-1) is the contiguous head-size stride.
+                        "out_h_stride": out.stride(-2),
                         "out_splits_ptr": out_splits,
                         "lse_splits_ptr": lse_splits,
                         "n_splits": n_splits,
@@ -3136,6 +3153,8 @@ def mha_fwd(
                         "BLOCK_K": BLOCK_K,
                         "q_total": B * H * Q,
                         "MAX_N_SPLITS": triton.next_power_of_2(n_splits),
+                        "num_heads": H,
+                        "seqlen_q": Q,
                     }
                     combine_kernel(**combine_args)
                     return kernel
