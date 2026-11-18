@@ -27,6 +27,7 @@ from flaggems_vllm.ops.cast_sigmoid import cast_sigmoid
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
+from flaggems_vllm.ops.fused_kimi_k3_mla_kv_concat import fused_kimi_k3_mla_kv_concat
 from flaggems_vllm.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
@@ -55,6 +56,7 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
+    fused_recurrent_kda,
 )
 from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
@@ -127,7 +129,7 @@ from flaggems_vllm.ops.ihc import (
     ihc_post_ref,
     triton_ihc_post,
     ihc_pre,
-    ihc_pre_ref,
+    triton_ihc_pre,
 )
 from flaggems_vllm.ops.mhc import (
     MixLayout,
@@ -254,7 +256,6 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
-    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -346,6 +347,7 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
+    "fused_kimi_k3_mla_kv_concat",
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
@@ -375,7 +377,6 @@ __all__ = [
     "ihc_post",
     "ihc_post_ref",
     "ihc_pre",
-    "ihc_pre_ref",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "instance_norm",
@@ -468,6 +469,7 @@ __all__ = [
     "topk_softmax",
     "topk_softplus_sqrt",
     "triton_ihc_post",
+    "triton_ihc_pre",
     "triton_reshape_and_cache_flash",
     "triton_scaled_mm",
     "triton_unified_attention",
