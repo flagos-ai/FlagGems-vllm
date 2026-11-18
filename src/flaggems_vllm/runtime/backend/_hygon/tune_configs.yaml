@@ -351,14 +351,35 @@ chunk_kda_fwd_intra_token_parallel:
       - 8
     stages:
       - 1
-# Start with the NVIDIA candidate warp counts, using synchronous Hygon loads.
-apply_bad_words:
-  - META: {}
-    num_warps: 1
+
+fused_kimi_k3_mla_kv_concat:
+  - META: {BLOCK: 1, ROW_LAYOUT: false}
+    num_warps: 4
     num_stages: 1
-  - META: {}
-    num_warps: 2
+  - META: {BLOCK: 8, ROW_LAYOUT: false}
+    num_warps: 4
     num_stages: 1
-  - META: {}
+  - META: {BLOCK: 256, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: true}
     num_warps: 4
     num_stages: 1
