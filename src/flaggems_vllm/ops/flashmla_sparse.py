@@ -41,11 +41,34 @@ TLE_FLASHMLA_PREFILL_PAIR_BLOCKS = 2
 TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS = 4
 
 
+def _glm53_tile_configs():
+    """GLM53_SMALL_TILES: tile sizes for the fallback sparse-MLA kernel.
+
+    The original 64x64 tiles need ~160 KB of shared memory per block, which
+    only fits NVIDIA H100-class parts (228 KB). Devices with 64 KB of shared
+    memory -- MetaX C550 among them -- cannot launch them at all, so keep the
+    fast tiles for large-shared devices and add smaller ones that fit.
+    Triton's autotune skips configs that raise OutOfResources.
+    """
+    override = os.environ.get("GLM53_FLASHMLA_TILE", "").strip().lower()
+    presets = {
+        "64x64": [(64, 64, 8, 2), (64, 64, 8, 4)],
+        "32x32": [(32, 32, 8, 1)],
+        "16x32": [(16, 32, 4, 1)],
+    }
+    if override in presets:
+        chosen = presets[override]
+    else:
+        # large tiles first (fast when they fit), then the small ones
+        chosen = presets["64x64"] + presets["32x32"] + presets["16x32"]
+    return [
+        triton.Config({"BK": bk, "BH": bh}, num_warps=nw, num_stages=ns)
+        for bk, bh, nw, ns in chosen
+    ]
+
+
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": 64, "BH": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BK": 64, "BH": 64}, num_warps=8, num_stages=4),
-    ],
+    configs=_glm53_tile_configs(),
     key=["SQ", "HQ", "DQK", "SKV", "TOPK", "HAVE_ATTN_SINK", "HAVE_TOPK_LENGTH"],
 )
 @triton.jit
