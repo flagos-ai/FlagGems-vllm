@@ -125,7 +125,14 @@ def _recurrent_kda_body(
             k = tl.load(
                 Kp + batch * KS[0] + t * KS[1] + h * KS[2] + rk * KS[3], key_mask, 0
             ).to(tl.float32)
-            if do_normalize:
+            if NORMALIZE is None and FAST:
+                # A vector select avoids a runtime control-flow merge while
+                # sharing one binary between normalized and raw inputs.
+                qn = q / tl.sqrt(tl.sum(q * q, 0) + 1.0e-6)
+                kn = k / tl.sqrt(tl.sum(k * k, 0) + 1.0e-6)
+                q = tl.where(do_normalize, qn, q)
+                k = tl.where(do_normalize, kn, k)
+            elif do_normalize:
                 q /= tl.sqrt(tl.sum(q * q, 0) + 1.0e-6)
                 k /= tl.sqrt(tl.sum(k * k, 0) + 1.0e-6)
             q *= scale
@@ -355,7 +362,7 @@ def fused_recurrent_kda(
         ssm_state_indices is not None and ssm_state_indices.ndim == 2,
         inplace_final_state,
         beta.ndim == 4,
-        normalize if fast else None,
+        None,
         triton.next_power_of_2(dk),
         bv,
         fast,
@@ -385,26 +392,17 @@ def fused_recurrent_kda(
         cores = min(total, _vector_core_count(device.index))
         blocks, extra = divmod(total, cores)
         grid = (cores,)
-        if fast and normalize:
-            _ascend_recurrent_kda_specialized[grid](
-                *args,
-                (*meta, pool, blocks, extra),
-                num_warps=warps,
-                num_stages=stages,
-                enable_fp_fusion=False,
-            )
-        else:
-            _ascend_recurrent_kda_kernel[grid](
-                *args,
-                pool,
-                blocks,
-                extra,
-                int(normalize),
-                meta,
-                num_warps=warps,
-                num_stages=stages,
-                enable_fp_fusion=False,
-            )
+        _ascend_recurrent_kda_kernel[grid](
+            *args,
+            pool,
+            blocks,
+            extra,
+            int(normalize),
+            meta,
+            num_warps=warps,
+            num_stages=stages,
+            enable_fp_fusion=False,
+        )
     return out, final
 
 
