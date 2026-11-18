@@ -52,6 +52,17 @@ def _make_inputs(shape, dtype, state_dtype, device, strided=False, invalid=True)
 
 def _reference(inputs, normalize=False):
     """Independent FP32 CPU math, including the old beta rounding boundary."""
+    threads = torch.get_num_threads()
+    if threads == 1:
+        return _reference_cpu(inputs, normalize)
+    torch.set_num_threads(1)
+    try:
+        return _reference_cpu(inputs, normalize)
+    finally:
+        torch.set_num_threads(threads)
+
+
+def _reference_cpu(inputs, normalize=False):
     mixed = inputs["mixed_qkv"].detach().cpu().float()
     state = inputs["initial_state"].detach().cpu().clone()
     B = mixed.shape[0]
