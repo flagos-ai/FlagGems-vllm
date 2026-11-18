@@ -161,6 +161,10 @@ def _ihc_post(x, residual, post):
     layout_tag = sum(
         (not t.is_contiguous()) << i for i, t in enumerate((x, residual, post))
     )
+    if runtime.device.vendor_name == "ascend":
+        # The kernel only sees the contiguous copies below. Reuse compilation
+        # and tuning across input layouts that produce the same kernel inputs.
+        layout_tag = 0
     x = x.contiguous()
     residual = residual.contiguous()
     post = post.contiguous()
@@ -179,7 +183,7 @@ def _ihc_post(x, residual, post):
         from flaggems_vllm.runtime.backend._metax.ops.ihc_post import (
             _ihc_post_kernel as kernel,
         )
-    elif runtime.device.vendor_name == "mthreads" and x.dtype == torch.float16:
+    elif runtime.device.vendor_name == "mthreads":
         from flaggems_vllm.runtime.backend._mthreads.ops.ihc_post import (
             _ihc_post_kernel as kernel,
         )

@@ -11,3 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+cooperative_topk_iluvatar_small:
+  - META:
+      TILE: 4096
+      BINS: 1024
+    num_warps: 16
+    num_stages: 1
+  - META:
+      TILE: 8192
+      BINS: 2048
+    num_warps: 32
+    num_stages: 1
+
+cooperative_topk_iluvatar_histogram:
+  - META:
+      BLOCK: 2048
+    num_warps: 8
+    num_stages: 1
+
+cooperative_topk_iluvatar_compact:
+  - META:
+      BLOCK: 2048
+    num_warps: 8
+    num_stages: 1
+
+cooperative_topk_iluvatar_finish:
+  - META:
+      BLOCK: 2048
+    num_warps: 4
+    num_stages: 1
