@@ -925,6 +925,68 @@ def _moe_align_small_routes(
     tl.store(EXPERTS + e, -1, (e >= total // BM) & (e < EXPERT_CAPACITY))
 
 
+def moe_align_block_size_compact(topk_ids, block_size, num_experts, *, out=None):
+    """Align a small MetaX routing batch without materializing unused tails.
+
+    IDs must lie in [0, num_experts). Return flat int32 (sorted_ids,
+    block_experts, padded_count). Only the first padded_count entries of
+    sorted_ids and padded_count // block_size entries of block_experts are
+    defined. Padding entries in sorted_ids contain topk_ids.numel().
+    Optional out buffers must be contiguous, on the input device and use
+    separate storage. Their capacities are checked without reading device data.
+    """
+    if runtime.device.vendor_name != "metax" or not topk_ids.is_cuda:
+        raise NotImplementedError("Compact route alignment is qualified on MetaX")
+    if (
+        topk_ids.ndim != 2
+        or topk_ids.shape[1] != 16
+        or not 2 <= topk_ids.shape[0] <= 64
+        or block_size != 16
+        or num_experts not in (896, 1024)
+    ):
+        raise ValueError(
+            "Expected 2..64 tokens, top16, block16 and 896 or 1024 experts"
+        )
+    if topk_ids.dtype not in (torch.int32, torch.int64) or not topk_ids.is_contiguous():
+        raise ValueError("Expected contiguous int32 or int64 route IDs")
+
+    routes = topk_ids.numel()
+    active = min(routes, num_experts)
+    blocks = active + (routes - active) // block_size
+    sizes = (blocks * block_size, blocks, 1)
+    if out is None:
+        out = tuple(
+            torch.empty(size, dtype=torch.int32, device=topk_ids.device)
+            for size in sizes
+        )
+    else:
+        if len(out) != 3 or any(
+            t.ndim != 1
+            or t.dtype != torch.int32
+            or t.device != topk_ids.device
+            or not t.is_contiguous()
+            or t.numel() < size
+            for t, size in zip(out, sizes)
+        ):
+            raise ValueError(
+                "Expected three sufficiently large contiguous int32 output buffers"
+            )
+        if len({t.untyped_storage().data_ptr() for t in (topk_ids, *out)}) != 4:
+            raise ValueError("Route IDs and compact outputs must use separate storage")
+
+    _moe_align_small_routes_compact[(1,)](
+        topk_ids,
+        *out,
+        routes,
+        num_experts,
+        block_size,
+        triton.next_power_of_2(routes),
+        triton.next_power_of_2(num_experts),
+        num_warps=4,
+    )
+    return out
+
+
 def _small_routes_eligible(topk_ids, block_size, num_experts, expert_map, workspace):
     return (
         runtime.device.vendor_name == "metax"

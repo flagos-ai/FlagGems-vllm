@@ -288,6 +288,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/moe_align_block_size.py": [
         "tests/test_moe_align_block_size.py",
         "tests/test_moe_align_small_routes.py",
+        "tests/test_moe_align_compact_out.py",
     ],
 }
 
