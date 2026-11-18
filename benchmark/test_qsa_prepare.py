@@ -14,18 +14,29 @@
 
 """Performance of the QSA fused prepare operator.
 
-The baseline is the upstream vLLM operator, driven with identical inputs.  It
-only exists in the NVIDIA build today; elsewhere the benchmark still runs and
-reports the frozen-baseline ratio instead of a local speedup.
+On CUDA builds the baseline is the upstream vLLM operator, driven with
+identical inputs. Ascend has no equivalent fused operator, so the Ascend
+baseline composes the vllm-ascend operators that cover the same work: the main
+split/norm/rope kernel, ``_gemma_rmsnorm``, ``apply_qsa_rope``,
+``qsa_compress_groups_with_ratio`` and ``qsa_store_cache_rows`` for every cache
+store (main K/V per head, raw ring, ring rope tail). Only metadata preparation
+and the ``.contiguous()`` the vendor kernel requires stay on torch - the same
+split the cross-validated baseline uses. Set ``QSA_ASCEND_BASELINE_IO=torch``
+to write those stores with torch indexing instead (the older, slower form).
+That row is still an ***approximate*** baseline; the reported speedup uses it
+as the denominator and is labelled ``baseline=composed``.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 import torch
 
 import flaggems_vllm
 from flaggems_vllm import qsa_prepare
+from tests.qsa_vendor_baseline import build_ascend_baseline
 from tests.test_qsa_prepare import (
     COMPRESS_RATIO,
     HEAD_DIM,
@@ -35,24 +46,6 @@ from tests.test_qsa_prepare import (
 
 from . import base
 
-VENDOR = flaggems_vllm.vendor_name
-# Only the NVIDIA build ships an upstream qwen4_exp implementation today.
-VLLM_NATIVE_VENDORS = {"nvidia"}
-
-if VENDOR in VLLM_NATIVE_VENDORS:
-    from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import (
-        qsa_prepare as _vllm_native_qsa_prepare,
-    )
-
-
-def _get_baseline_op():
-    """Return the vendor-native implementation, or None when there is none."""
-
-    if VENDOR in VLLM_NATIVE_VENDORS:
-        return _vllm_native_qsa_prepare
-    return None
-
-
 # Each entry is a batch scenario, not a tensor size: _input_fn expands one entry
 # into about two dozen operands whose shapes are unrelated to each other, from
 # (128,) norm weights up to a (32768, 64) rope table. The head counts, head dims,
@@ -61,6 +54,13 @@ def _get_baseline_op():
 # path (state_size and the indexer dtype).
 
 FP8 = torch.float8_e4m3fn
+VENDOR = flaggems_vllm.vendor_name
+
+# Buffers with a float8 indexer dtype cannot even be zero-initialised on a
+# backend without native float8 support, so those shapes are dropped there.
+HAS_NATIVE_FP8 = hasattr(torch, "float8_e4m3fn") and (
+    flaggems_vllm.SUPPORTED_FP8_DTYPE == torch.float8_e4m3fn
+)
 
 
 def _single(tokens, **overrides):
@@ -108,6 +108,44 @@ SHAPES = [
     _single(4097, indexer_dtype=FP8),
 ]
 
+if not HAS_NATIVE_FP8:
+    SHAPES = [shape for shape in SHAPES if shape[3].get("indexer_dtype") is not FP8]
+
+# ------------------------------------------------------------------ baselines
+HAS_VLLM_NATIVE = False
+try:  # upstream vLLM ships the fused operator on CUDA builds only
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import (
+        qsa_prepare as _vllm_qsa_prepare,
+    )
+
+    HAS_VLLM_NATIVE = True
+except Exception:  # noqa: BLE001 - any import failure means "not available"
+    _vllm_qsa_prepare = None
+
+
+_BASELINE_IO = os.environ.get("QSA_ASCEND_BASELINE_IO", "vendor").strip().lower()
+_composed_baseline = build_ascend_baseline(_BASELINE_IO != "torch")
+
+if VENDOR == "ascend":
+    # vLLM's native qsa_prepare kernel is CUDA-only, and newer vendor builds drop
+    # _gemma_rmsnorm, so the composition may be unavailable: report absolute
+    # latency instead of falling back to the unrunnable native baseline.
+    if _composed_baseline is not None:
+        BASELINE_KIND = "composed" if _BASELINE_IO != "torch" else "composed-torch"
+        BASELINE_OP = _composed_baseline
+    else:
+        BASELINE_KIND = "none"
+        BASELINE_OP = None
+elif HAS_VLLM_NATIVE:
+    BASELINE_KIND = "native"
+    BASELINE_OP = _vllm_qsa_prepare
+elif _composed_baseline is not None:
+    BASELINE_KIND = "composed" if _BASELINE_IO != "torch" else "composed-torch"
+    BASELINE_OP = _composed_baseline
+else:
+    BASELINE_KIND = "none"
+    BASELINE_OP = None
+
 
 class QsaPrepareBenchmark(base.GenericBenchmark):
     """Use the common runner with the QSA prepare batch layouts."""
@@ -117,26 +155,8 @@ class QsaPrepareBenchmark(base.GenericBenchmark):
         self.shapes = list(SHAPES)
         self.shape_desc = "seq_lens / query_lens / history_lens"
 
-    def init_user_config(self):
-        super().init_user_config()
-        if self.torch_op is None:
-            # No vendor-native kernel on this platform: timing it would raise,
-            # and a gems-vs-gems ratio says nothing. compared_speedup is still
-            # produced from the frozen baseline outside this metric list.
-            self.to_bench_metrics = [
-                metric
-                for metric in self.to_bench_metrics
-                if metric not in ("latency_base", "speedup")
-            ]
-
     def record_shapes(self, *args, **kwargs):
-        """Report the batch layout rather than every operand.
-
-        The tensor shapes stay as torch.Size on purpose: the frozen-baseline
-        lookup matches on the multiset of shapes found here, and the seven
-        T=16384 layouts share their first two tensors, so state_cache (it carries
-        num_requests) and main_kv_cache are what make every entry unique.
-        """
+        """Report the batch layout rather than every operand."""
 
         query = args[0]
         state_cache = args[8]
@@ -144,10 +164,9 @@ class QsaPrepareBenchmark(base.GenericBenchmark):
         reported = {
             "requests": int(state_cache.shape[0]),
             "tokens": int(query.shape[0]),
-            "query": query.shape,
-            "state_cache": state_cache.shape,
-            "main_qkv": kwargs["main_qkv"].shape,
-            "main_kv_cache": kv_cache.shape,
+            "query": list(query.shape),
+            "main_qkv": list(kwargs["main_qkv"].shape),
+            "baseline": BASELINE_KIND,
         }
         if int(state_cache.shape[1]) != 4:
             reported["state_size"] = int(state_cache.shape[1])
@@ -181,21 +200,18 @@ def _input_fn(shape, dtype, device):
 
 @pytest.mark.qsa_prepare
 def test_qsa_prepare():
-    """The shipped kernel against the upstream implementation."""
+    """The shipped kernel against the vendor operator or its composition."""
 
     bench = QsaPrepareBenchmark(
         input_fn=_input_fn,
         op_name="qsa_prepare",
-        torch_op=_get_baseline_op(),
+        torch_op=BASELINE_OP,
         gems_op=qsa_prepare,
         dtypes=[torch.bfloat16],
     )
     bench.run()
 
 
-# ``flaggems_vllm.device`` already names the active accelerator ("cuda", "musa",
-# "npu", ...), so a CUDA-specific probe would skip the whole module on every
-# other backend.
 pytestmark = pytest.mark.skipif(
     flaggems_vllm.device == "cpu",
     reason="QSA prepare benchmark requires an accelerator",
