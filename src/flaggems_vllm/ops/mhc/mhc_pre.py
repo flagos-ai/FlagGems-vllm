@@ -21,7 +21,7 @@ Key optimizations:
   Two passes over residual: pass 1 computes sqrsum, pass 2 does weighted sum
 """
 
-import importlib
+import enum
 import os
 import warnings
 import weakref
@@ -30,11 +30,16 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.runtime import device as _device
+
 _MHC_PRE_MIX_PAD = tl.constexpr(32)
 
-_VENDOR = None
+_VENDOR = _device.vendor_name
 
-_HYGON = None
+
+if _VENDOR == "mthreads":
+    # Has to be set before this module's kernels are first compiled.
+    os.environ.setdefault("TRITON_MUSA_ENABLE_LLC_OPT", "1")
 
 
 _MHC_FN_CACHE: dict[int, tuple[weakref.ref, int, int, dict]] = {}
@@ -87,6 +92,8 @@ def _get_fn_bf16_cached(fn: torch.Tensor):
         triton.Config({"BLOCK_M": 64, "BLOCK_K": 128}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+        # Ascend prefers wide tiles: 256/256 measured best on 910B4.
+        triton.Config({"BLOCK_M": 256, "BLOCK_K": 256}, num_warps=8, num_stages=2),
     ],
     key=["num_tokens", "hc_hidden_size", "HC_MULT3"],
 )
@@ -1372,7 +1379,12 @@ def _mhc_recip_fast(x):
     return _mhc_fast_div(1.0, x)
 
 
-_mhc_recip = _mhc_recip_exact
+# libdevice's fast reciprocal only exists where the backend provides it (thead).
+_mhc_recip = (
+    _mhc_recip_fast
+    if _VENDOR == "thead" and _mhc_fast_div is not None
+    else _mhc_recip_exact
+)
 
 
 @triton.jit
@@ -1784,25 +1796,37 @@ def _mhc_reader_divides(num_tokens, hidden_size):
     return hc_hidden % (s4 * 128) == 0
 
 
-_VARIANT_MM_FUSE = 0
-_VARIANT_SPLIT_PASS = 7
-_VARIANT_MM_FUSE_TILED = 10
-_VARIANT_PACKED_READER = 21
+class _MhcVariant(enum.IntEnum):
+    """Kernel variant to run for a shape; the values stay stable for recorded output."""
+
+    MM_FUSE = 0
+    SPLIT_PASS = 7
+    MM_FUSE_TILED = 10
+    ASCEND_TILED = 12
+    PACKED_READER = 21
+
+
 _SPLIT_MIN_K = 1280
-_MHC_PRE_VARIANT_CACHE: dict[tuple[int, int, int], int] = {}
+_MHC_PRE_VARIANT_CACHE: dict[tuple[int, int, int], _MhcVariant] = {}
 
 
 def _mhc_pre_default_variant(num_tokens, hidden_size, hc_hidden_size):
-    """Structure to run, as a threshold decision on the inputs."""
+    """Variant to run, as a threshold decision on the inputs."""
     key = (num_tokens, hidden_size, hc_hidden_size)
     cached = _MHC_PRE_VARIANT_CACHE.get(key)
     if cached is not None:
         return cached
 
-    if _HYGON is not None and hidden_size % 256 == 0:
+    if _VENDOR == "hygon" and hidden_size % 256 == 0:
         if hc_hidden_size <= 16384:
-            _MHC_PRE_VARIANT_CACHE[key] = _VARIANT_SPLIT_PASS
-            return _VARIANT_SPLIT_PASS
+            _MHC_PRE_VARIANT_CACHE[key] = _MhcVariant.SPLIT_PASS
+            return _MhcVariant.SPLIT_PASS
+
+    if _VENDOR == "ascend":
+        # Only hc_mult == 4 reaches the dispatch; flagtree crashes on the
+        # packed-reader / mm-fuse kernels and mm-fuse-tiled costs ~13us/token.
+        _MHC_PRE_VARIANT_CACHE[key] = _MhcVariant.ASCEND_TILED
+        return _MhcVariant.ASCEND_TILED
 
     reader_ok = (
         num_tokens % 128 == 0
@@ -1812,53 +1836,13 @@ def _mhc_pre_default_variant(num_tokens, hidden_size, hc_hidden_size):
 
     _reader_from = 2048 if _VENDOR == "hygon" else 0
     if reader_ok and num_tokens >= _reader_from:
-        variant = _VARIANT_PACKED_READER
+        variant = _MhcVariant.PACKED_READER
     elif num_tokens > 512 and num_tokens % 2 == 0:
-        variant = _VARIANT_MM_FUSE_TILED
+        variant = _MhcVariant.MM_FUSE_TILED
     else:
-        variant = _VARIANT_MM_FUSE
+        variant = _MhcVariant.MM_FUSE
     _MHC_PRE_VARIANT_CACHE[key] = variant
     return variant
-
-
-_MHC_PRE_SETUP_DONE = False
-
-
-def _mhc_pre_setup():
-    """Resolve the vendor once, then do what that vendor needs done once."""
-    global _VENDOR, _MHC_PRE_SETUP_DONE, _mhc_recip
-    if _MHC_PRE_SETUP_DONE:
-        return
-    try:
-        import flaggems_vllm
-
-        _VENDOR = flaggems_vllm.vendor_name
-    except Exception:  # noqa: BLE001 - stay generic, retry on the next call
-        return
-    if _VENDOR == "mthreads":
-        os.environ.setdefault("TRITON_MUSA_ENABLE_LLC_OPT", "1")
-    elif _VENDOR == "thead":
-        if _mhc_fast_div is not None:
-            _mhc_recip = _mhc_recip_fast
-    elif _VENDOR == "hygon":
-        global _HYGON
-        try:
-            _HYGON = importlib.import_module(
-                "flaggems_vllm.runtime.backend._hygon.ops.mhc_pre"
-            )
-        except Exception as exc:  # noqa: BLE001 - fall back to the generic structures
-            _HYGON = None
-            _MHC_PRE_SETUP_DONE = True
-            warnings.warn(
-                f"mhc_pre: hygon fast path unavailable ({exc!r}); "
-                "running the generic structures without fast launch",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return
-
-        _HYGON.install_fastlaunch(globals(), _HYGON.KERNELS)
-    _MHC_PRE_SETUP_DONE = True
 
 
 def mhc_pre(
@@ -1876,7 +1860,8 @@ def mhc_pre(
     """
     Optimized mHC pre block.
 
-    - hc_mult == 4: specialized fused Triton kernel
+    - hc_mult == 4: specialized variant kernels, per vendor (see
+      ``_mhc_pre_default_variant``)
     - hc_mult != 4: generic Triton kernel aligned to reference math
     """
     assert residual.dtype == torch.bfloat16
@@ -1892,8 +1877,6 @@ def mhc_pre(
             RuntimeWarning,
             stacklevel=2,
         )
-    _mhc_pre_setup()
-
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
@@ -1942,7 +1925,7 @@ def mhc_pre(
     )
 
     def _dispatch(variant):
-        if variant == _VARIANT_PACKED_READER:
+        if variant == _MhcVariant.PACKED_READER:
 
             bm21 = 64 if num_tokens >= 256 else 32
             s4 = _mhc_pre_reader_s4(num_tokens, bm21, 128, hc_hidden_size)
@@ -1996,7 +1979,7 @@ def mhc_pre(
                 HC_MULT3=hc_mult3,
                 N_SPLITS=s4,
             )
-        elif variant == _VARIANT_SPLIT_PASS:
+        elif variant == _MhcVariant.SPLIT_PASS:
 
             if hc_mult != 4 or hidden_size % 256:
                 raise ValueError(
@@ -2053,7 +2036,78 @@ def mhc_pre(
                 TOKEN_TILE=tile7,
                 BLOCK_H=bh7,
             )
-        elif variant == _VARIANT_MM_FUSE_TILED:
+        elif variant == _MhcVariant.ASCEND_TILED:
+
+            # The projection also emits the row sum of squares.
+            if fn.shape[0] <= _MHC_PRE_MIX_PAD.value:
+                bt = _mhc_pre_fn_packed_cached(fn)  # (hc_hidden, 32), zero padded
+            else:
+                bt = _get_fn_bf16_cached(fn)[0].t()  # wider mix row: no packed form
+            block_n = 16
+            while block_n < hc_mult3:
+                block_n *= 2
+            gemm_out = torch.empty(
+                num_tokens, hc_mult3, dtype=torch.float32, device=device
+            )
+            sqrsum = torch.empty(num_tokens, dtype=torch.float32, device=device)
+            mhc_pre_ascend_proj_kernel[
+                lambda meta: (triton.cdiv(num_tokens, meta["BLOCK_M"]),)
+            ](
+                x_flat,
+                bt,
+                gemm_out,
+                sqrsum,
+                num_tokens,
+                hc_hidden_size,
+                x_flat.stride(0),
+                bt.stride(0),
+                bt.stride(1),
+                HC_MULT3=hc_mult3,
+                BLOCK_N=block_n,
+                # Padded weight: skipping the column mask is worth 3.5x at large K.
+                BT_PADDED=fn.shape[0] <= _MHC_PRE_MIX_PAD.value,
+            )
+            mhc_pre_ascend_mix_kernel[
+                lambda meta: (triton.cdiv(num_tokens, meta["BLOCK_N"]),)
+            ](
+                gemm_out,
+                sqrsum,
+                hc_scale,
+                hc_base,
+                post_mix,
+                comb_mix,
+                num_tokens,
+                hc_hidden_size,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+                HC=hc_mult,
+            )
+            mhc_pre_ascend_reduce_kernel[
+                lambda meta: (triton.cdiv(num_tokens, meta["BLOCK_T"]),)
+            ](
+                gemm_out,
+                sqrsum,
+                hc_scale,
+                hc_base,
+                residual_flat,
+                layer_input,
+                num_tokens,
+                num_tokens_bucket,
+                residual_flat.stride(0),
+                residual_flat.stride(1),
+                residual_flat.stride(2),
+                layer_input.stride(0),
+                layer_input.stride(1),
+                hidden_size,
+                hc_hidden_size,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                HC=hc_mult,
+            )
+        elif variant == _MhcVariant.MM_FUSE_TILED:
 
             gemm_out = _mhc_project(
                 x_flat, fn, num_tokens, hc_hidden_size, hc_mult3, device
@@ -2153,48 +2207,14 @@ def mhc_pre(
     return post_mix, comb_mix, layer_input
 
 
-def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
-    x = x.softmax(-1) + eps
-    x = x / (x.sum(-2, keepdim=True) + eps)
-    for _ in range(repeat - 1):
-        x = x / (x.sum(-1, keepdim=True) + eps)
-        x = x / (x.sum(-2, keepdim=True) + eps)
-    return x
+# Imported last: the hygon companion imports this module's kernels (circular otherwise).
+if _VENDOR == "ascend":
+    from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import (
+        mhc_pre_ascend_mix_kernel,
+        mhc_pre_ascend_proj_kernel,
+        mhc_pre_ascend_reduce_kernel,
+    )
+elif _VENDOR == "hygon":
+    from flaggems_vllm.runtime.backend._hygon.ops import mhc_pre as _HYGON
 
-
-def mhc_pre_ref(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """PyTorch reference."""
-    hc_mult = residual.shape[-2]
-    residual_flat = residual.flatten(-2, -1).float()
-    sqrsum = residual_flat.square().sum(-1)
-    mixes = (
-        residual_flat @ fn.T * (sqrsum.unsqueeze(-1) / fn.shape[-1] + rms_eps).rsqrt()
-    )
-    hc_scale_expanded = torch.cat(
-        [
-            hc_scale[0].expand(hc_mult),
-            hc_scale[1].expand(hc_mult),
-            hc_scale[2].expand(hc_mult * hc_mult),
-        ]
-    )
-    mixes = mixes * hc_scale_expanded + hc_base
-    pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
-    post_mix = (
-        mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
-    ).unsqueeze(-1)
-    res_mix = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
-    res_mix = sinkhorn_normalize_ref(
-        res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
-    )
-    layer_input = (residual * pre_mix).sum(-2).bfloat16()
-    return post_mix, res_mix, layer_input
+    _HYGON.install_fastlaunch(globals(), _HYGON.KERNELS)

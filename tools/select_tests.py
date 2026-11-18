@@ -36,15 +36,18 @@ NON_TEST_FILES = {
 }
 
 ENV_SMOKE_TRIGGER_FILES = {
+    ".github/actions/setup-flaggems/action.yml",
     ".github/backend-capabilities.json",
+    ".github/backends.json",
     ".github/configs/ci-backends.yaml",
-    ".github/workflows/basic-ci.yml",
+    ".github/workflows/backend-test.yaml",
+    ".github/workflows/unittest.yaml",
     "benchmark/conftest.py",
+    "src/flaggems_vllm/backends.yaml",
     "pyproject.toml",
     "pytest.ini",
     "tests/conftest.py",
     "tools/check_backend_env.py",
-    "tools/check_ci_pins.py",
     "tools/prepare-flaggems-ci-env.sh",
     "tools/run-multi-backend-tests.sh",
     "tools/run_ci_targets.py",
@@ -52,6 +55,7 @@ ENV_SMOKE_TRIGGER_FILES = {
     "tools/select_ci_backends.py",
     "tools/select_tests.py",
     "tools/setup.sh",
+    "tools/source_env_bash.sh",
 }
 
 ENV_SMOKE_TRIGGER_PREFIXES = (
@@ -85,12 +89,66 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "conftest.py": ["tests/test_fused_matmul_reduce_scatter.py"],
+    "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
+        "tests/test_fused_matmul_reduce_scatter.py"
+    ],
+    "src/flaggems_vllm/runtime/symm_mem.py": [
+        "tests/test_fused_matmul_reduce_scatter.py",
+    ],
+    **{
+        f"src/flaggems_vllm/ops/{name}.py": [
+            "tests/test_fused_matmul_reduce_scatter.py"
+        ]
+        for name in (
+            "_fused_matmul_reduce_scatter_tle",
+            "_fused_matmul_reduce_scatter_runtime",
+        )
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
+        "tests/test_gdn_w8a16.py"
+    ],
     "src/flaggems_vllm/ops/flash_mla.py": [
         "tests/test_flash_mla.py",
         "tests/test_flash_mla_with_kvcache_w8a8.py",
     ],
+    "src/flaggems_vllm/testing/megamoe_hygon_baseline.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_host.hip": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "tests/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "tests/test_megamoe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "tests/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
+        "tests/test_mhc_post.py",
+    ],
+    # The test does not follow the source-stem convention because the operator
+    # is named after what it does (it clamps before the Sinkhorn rounds).
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_pre.py": [
+        "tests/test_npu_mhc_pre_clamp_sinkhorn.py",
     ],
     "benchmark/test_bmm_w8a8.py": ["tests/test_bmm_w8a8.py"],
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
@@ -143,6 +201,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/mhc/mhc_pre.py": [
         "tests/test_mhc_ops.py",
         "tests/test_mhc_with_norm.py",
+    ],
+    "src/flaggems_vllm/ops/mhc/mhc_pre_broadcast.py": [
+        "tests/test_mhc_pre_broadcast.py",
     ],
     "src/flaggems_vllm/ops/mhc_with_norm.py": [
         "tests/test_mhc_with_norm.py",
@@ -222,13 +283,60 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "conftest.py": ["benchmark/test_fused_matmul_reduce_scatter.py"],
+    "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
+        "benchmark/test_fused_matmul_reduce_scatter.py"
+    ],
+    "src/flaggems_vllm/runtime/symm_mem.py": [
+        "benchmark/test_fused_matmul_reduce_scatter.py"
+    ],
+    **{
+        f"src/flaggems_vllm/ops/{name}.py": [
+            "benchmark/test_fused_matmul_reduce_scatter.py"
+        ]
+        for name in (
+            "_fused_matmul_reduce_scatter_tle",
+            "_fused_matmul_reduce_scatter_runtime",
+        )
+    },
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
+        "benchmark/test_gdn_w8a16.py"
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/gdn_w8a16_int8.py": [
+        "benchmark/test_gdn_w8a16.py"
+    ],
     "src/flaggems_vllm/ops/flash_mla.py": [
         "benchmark/test_flash_mla.py",
         "benchmark/test_flash_mla_with_kvcache_w8a8.py",
     ],
+    "src/flaggems_vllm/testing/megamoe_hygon_baseline.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/testing/megamoe_hygon_host.hip": ["benchmark/test_megamoe.py"],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/__init__.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/api.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/mega/megamoe/kernel.py": [
+        "benchmark/test_megamoe.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/megamoe.py": [
+        "benchmark/test_megamoe.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/ops/sparse_flash_attention/{name}.py": [
+            "benchmark/test_sparse_flash_attention.py"
+        ]
+        for name in ("__init__", "common", "attention", "pipeline")
+    },
     "src/flaggems_vllm/runtime/backend/_thead/ops/bmm_w8a8_int8.py": [
         "benchmark/test_bmm_w8a8.py",
     ],

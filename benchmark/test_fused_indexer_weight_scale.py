@@ -17,7 +17,6 @@ import torch
 
 import flaggems_vllm
 from tests import test_fused_indexer_weight_scale as indexer_tests
-from tests.accuracy_utils import gems_assert_close
 
 from . import base
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
@@ -42,15 +41,10 @@ class IndexerWeightScaleBenchmark(ParallelBenchmarkMixin, base.GenericBenchmark)
 
     def get_input_iter(self, dtype):
         for index, inputs in enumerate(super().get_input_iter(dtype)):
-            expected = self.torch_op(*inputs)
-            output = self.gems_op(*inputs)
-            gems_assert_close(output, expected, torch.float32, atol=1e-6)
-            if index or flaggems_vllm.vendor_name != "mthreads":
-                yield inputs
-                continue
-            # Prime first-use setup equally for the compiled MThreads baseline.
-            self.get_latency(self.torch_op, *inputs)
-            self.get_latency(self.gems_op, *inputs)
+            if index == 0 and flaggems_vllm.vendor_name == "mthreads":
+                # Prime first-use setup equally for the compiled MThreads baseline.
+                self.get_latency(self.torch_op, *inputs)
+                self.get_latency(self.gems_op, *inputs)
             yield inputs
 
 

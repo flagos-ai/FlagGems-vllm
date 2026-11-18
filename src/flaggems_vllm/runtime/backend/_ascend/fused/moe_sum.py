@@ -73,7 +73,7 @@ def _ascend_moe_sum_pair_kernel(
     total = num_tokens * num_h_blocks
 
     for flat in range(pid, total, num_pids):
-        token_idx = flat // num_h_blocks
+        token_idx = (flat // num_h_blocks).to(tl.int64)
         hidden_block_idx = flat % num_h_blocks
         hidden_offsets = hidden_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
@@ -154,7 +154,7 @@ if HAS_TLE:
         pid_hidden = tl.program_id(0)
         pid_token = tl.program_id(1)
 
-        token_offsets = pid_token * TOKENS + tl.arange(0, TOKENS)
+        token_offsets = (pid_token * TOKENS + tl.arange(0, TOKENS)).to(tl.int64)
         hidden_offsets = pid_hidden * BLOCK_H + tl.arange(0, BLOCK_H)
         hidden_offsets = tl.max_contiguous(
             tl.multiple_of(hidden_offsets, BLOCK_H), BLOCK_H
@@ -275,7 +275,9 @@ if HAS_TLE:
             token_block_idx = flat // num_h_blocks
             hidden_block_idx = flat % num_h_blocks
 
-            token_offsets = token_block_idx * TOKENS + tl.arange(0, TOKENS)
+            token_offsets = (token_block_idx * TOKENS + tl.arange(0, TOKENS)).to(
+                tl.int64
+            )
             hidden_offsets = hidden_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
             hidden_offsets = tl.max_contiguous(
                 tl.multiple_of(hidden_offsets, BLOCK_H), BLOCK_H
@@ -361,7 +363,7 @@ def _ascend_moe_sum_topk2_fused_kernel(
     pid_hidden = tl.program_id(0)
     pid_token = tl.program_id(1)
 
-    row_offsets = pid_token * (2 * TOKENS) + tl.arange(0, 2 * TOKENS)
+    row_offsets = (pid_token * (2 * TOKENS) + tl.arange(0, 2 * TOKENS)).to(tl.int64)
     row_mask = row_offsets < 2 * num_tokens
     hidden_offsets = pid_hidden * BLOCK_H + tl.arange(0, BLOCK_H)
     hidden_offsets = tl.max_contiguous(tl.multiple_of(hidden_offsets, BLOCK_H), BLOCK_H)
@@ -384,7 +386,7 @@ def _ascend_moe_sum_topk2_fused_kernel(
 
     acc = tl.sum(x, axis=1)
 
-    token_offsets = pid_token * TOKENS + tl.arange(0, TOKENS)
+    token_offsets = (pid_token * TOKENS + tl.arange(0, TOKENS)).to(tl.int64)
     token_mask = token_offsets < num_tokens
     output_ptrs = (
         output_ptr + token_offsets[:, None] * hidden_size + hidden_offsets[None, :]
@@ -434,7 +436,7 @@ def _ascend_moe_sum_general_kernel(
     total = num_tokens * num_h_blocks
 
     for flat in range(pid, total, num_pids):
-        token_idx = flat // num_h_blocks
+        token_idx = (flat // num_h_blocks).to(tl.int64)
         hidden_block_idx = flat % num_h_blocks
         hidden_offsets = hidden_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         hidden_mask = hidden_offsets < hidden_size
