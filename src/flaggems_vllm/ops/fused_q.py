@@ -1,11 +1,27 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Consolidated H20 fused_q with the baseline public input/output contract.
+# Copyright 2026 FlagOS Contributors
+# Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Only the validated full H20 BF16 shapes use round-three scheduling: compact
-CTAs for H=16/32, the original grid for H=64, and PDL disabled. Other inputs
-retain the original grid and architecture PDL policy. No experiment selector,
-latency table, scale probe or arithmetic change is included.
+"""NVIDIA fused_q with the baseline public input/output contract.
+
+The validated NVIDIA BF16 workloads use compact task grids for H=16/32,
+the original grid for H=64, and PDL disabled. Other inputs retain the
+original grid and architecture PDL policy.
+
+Explicit no-autotune exemption: retain the validated one-warp launch and
+deterministic grid/PDL policy. Runtime tuning would change the measured
+entry point; this fixed-launch exemption remains subject to maintainer review.
 """
 
 from functools import cache
