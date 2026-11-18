@@ -201,6 +201,9 @@ from flaggems_vllm.ops.reglu import dreglu, reglu
 from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
+from flaggems_vllm.ops.reshape_and_cache_flash_strided import (
+    reshape_and_cache_flash_strided,
+)
 from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
@@ -446,6 +449,7 @@ __all__ = [
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",
+    "reshape_and_cache_flash_strided",
     "router_gemm",
     "rwkv_ka_fusion",
     "rwkv_mm_sparsity",
