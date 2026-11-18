@@ -255,9 +255,6 @@ from flaggems_vllm.ops.data_movement import (
     scatter_state_rows,
     zero_state_rows,
 )
-from flaggems_vllm.ops.flash_mla_with_kvcache_sparse_w8a8_fp8 import (
-    flash_mla_with_kvcache_sparse_w8a8_fp8,
-)
 from flaggems_vllm.ops.fp32_router_gemm import fp32_router_gemm
 from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
     fused_minimax_m3_qknorm_rope_kv_insert,
@@ -343,7 +340,6 @@ __all__ = [
     "flash_mla_sparse_fwd",
     "flash_mla_sparse_fwd_w8a8",
     "flash_mla_with_kvcache",
-    "flash_mla_with_kvcache_sparse_w8a8_fp8",
     "flash_mla_with_kvcache_w8a8",
     "fp32_router_gemm",
     "fp8_einsum",

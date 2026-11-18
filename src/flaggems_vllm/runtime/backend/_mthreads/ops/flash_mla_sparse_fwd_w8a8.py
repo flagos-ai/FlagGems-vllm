@@ -7,6 +7,7 @@ from typing import Callable, Optional
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
@@ -174,9 +175,12 @@ def _sparse_fp8_row(
 _sparse_fp8_row_outlined = triton.jit(_sparse_fp8_row.fn, noinline=True)
 
 
+_SPARSE_MLA_CONFIGS = runtime.get_tuned_config("mthreads_sparse_fp8_mla")
+
+
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("mthreads_sparse_fp8_mla"),
+    configs=_SPARSE_MLA_CONFIGS,
     key=["ROWS", "H", "K", "ROPE", "SPLITS"],
 )
 @triton.jit
@@ -443,7 +447,7 @@ def flagged_sparse_fp8(
                 request = ROWS
 
 
-def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
+def prepare_flash_mla_sparse_fwd_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,
@@ -501,6 +505,8 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
         or indices.shape[-1] > 65536
     ):
         raise ValueError("indices must be INT32 [batch, queries, topk <= 65536]")
+    if topk_length is not None and topk_length.shape == (batch,) and queries == 1:
+        topk_length = topk_length[:, None]
     if topk_length is not None and (
         topk_length.shape != (batch, queries) or topk_length.dtype != torch.int32
     ):
@@ -710,31 +716,49 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
             (rows, splits, heads, 2), dtype=torch.float32, device=q_nope.device
         )
 
+    launch_mla = sparse_fp8_mla[
+        lambda meta: (rows, triton.cdiv(heads, meta["BH"]), splits)
+    ]
+    launch_options = {}
+    mla_args = (
+        *inputs[:6],
+        indices,
+        topk_length,
+        partial,
+        stats,
+        output,
+        lse,
+        attn_sink,
+        rows,
+        heads,
+        queries,
+        topk,
+        k_nope.shape[0] * 64,
+        q_rope.shape[-1],
+        scale,
+        topk_length is not None,
+        attn_sink is not None,
+        splits,
+        chunk,
+    )
+
     def run() -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal launch_mla, launch_options
         if rows == 0 or heads == 0:
             return output, lse
         with runtime.torch_device_fn.device(q_nope.device):
-            sparse_fp8_mla[lambda meta: (rows, triton.cdiv(heads, meta["BH"]), splits)](
-                *inputs[:6],
-                indices,
-                topk_length,
-                partial,
-                stats,
-                output,
-                lse,
-                attn_sink,
-                rows,
-                heads,
-                queries,
-                topk,
-                k_nope.shape[0] * 64,
-                q_rope.shape[-1],
-                scale,
-                topk_length is not None,
-                attn_sink is not None,
-                splits,
-                chunk,
-            )
+            try:
+                launch_mla(*mla_args, **launch_options)
+            except OutOfResources:
+                # The cached tile may exceed shared memory on another compiler.
+                config = min(
+                    _SPARSE_MLA_CONFIGS,
+                    key=lambda c: (c.kwargs["BH"] * c.kwargs["BN"], c.num_warps),
+                )
+                launch_options = config.all_kwargs()
+                grid = (rows, triton.cdiv(heads, launch_options["BH"]), splits)
+                launch_mla = sparse_fp8_mla.jit_function[grid]
+                launch_mla(*mla_args, **launch_options)
             if splits > 1:
                 combine_sparse_fp8[lambda meta: (rows, heads, 512 // meta["BV"])](
                     partial,
@@ -754,31 +778,31 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
     return run, run()
 
 
-def flash_mla_with_kvcache_sparse_w8a8_fp8(
+def flash_mla_sparse_fwd_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     indices: torch.Tensor,
-    *,
     softmax_scale: Optional[float] = None,
-    topk_length: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    *,
     out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, output = prepare_flash_mla_with_kvcache_sparse_w8a8_fp8(
+    _, output = prepare_flash_mla_sparse_fwd_w8a8(
         q_nope,
         q_rope,
-        k_nope,
-        k_rope,
+        k_cache_lora,
+        k_cache_rope,
         q_scale,
         k_scale,
         indices,
         softmax_scale=softmax_scale,
-        topk_length=topk_length,
         attn_sink=attn_sink,
+        topk_length=topk_length,
         out=out,
     )
     return output

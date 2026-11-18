@@ -141,20 +141,20 @@ class FlashmlaSparseTestKit:
         P *= sm_scale
         P[invalid_mask.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
 
-        orig_lse = torch.logsumexp(P, dim=-1)
+        empty = invalid_mask.all(dim=-1, keepdim=True)
+        orig_lse = torch.logsumexp(P.masked_fill(empty[..., None], 0.0), dim=-1)
+        orig_lse = orig_lse.masked_fill(empty, -torch.inf)
         max_logits = P.max(dim=-1).values
 
         lse_for_o = FlashmlaSparseTestKit._merge_two_lse(orig_lse, attn_sink, s_q, h_q)
-        if not torch.is_inference_mode_enabled():
-            lse_for_o = lse_for_o.clone()
-        lse_for_o[lse_for_o == float("-inf")] = float(
-            "+inf"
-        )  # So that corresponding O will be 0
+        if attn_sink is not None:
+            lse_for_o = torch.where(torch.isneginf(attn_sink), orig_lse, lse_for_o)
+            lse_for_o = lse_for_o.masked_fill(torch.isposinf(attn_sink), torch.inf)
+        lse_for_o = lse_for_o.masked_fill(empty, torch.inf)
         s_for_o = torch.exp(P - lse_for_o.unsqueeze(-1))
         out = s_for_o @ gathered_kv[..., :d_v]
 
-        lonely_q_mask = orig_lse == float("-inf")
-        orig_lse[lonely_q_mask] = float("+inf")
+        orig_lse = orig_lse.masked_fill(empty, torch.inf)
         return (out.to(output_dtype), max_logits, orig_lse)
 
     @staticmethod

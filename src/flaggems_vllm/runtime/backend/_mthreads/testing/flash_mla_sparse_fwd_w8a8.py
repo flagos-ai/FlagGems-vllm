@@ -4,7 +4,7 @@
 import torch
 
 
-def prepare_baseline(inputs, query):
+def prepare_baseline(inputs, query, *, attn_sink=None, topk_length=None):
     """Prepare native MODEL1 D512 or V3.2 D576 MATE FP8 cache.
 
     Power-of-two fixture scales preserve the dequantized FP8 mathematical input
@@ -55,9 +55,10 @@ def prepare_baseline(inputs, query):
     scale = (512 + qrope.shape[-1]) ** -0.5
     # muDNN FillOp fails for some real batch sizes. Prepare the equivalent
     # explicit lengths by host-to-device copy before either path is timed.
-    topk_length = torch.full(
-        (batch,), indices.shape[-1], dtype=torch.int32, device="cpu"
-    ).to(query.device)
+    if topk_length is None:
+        topk_length = torch.full(
+            (batch,), indices.shape[-1], dtype=torch.int32, device="cpu"
+        ).to(query.device)
     if qrope.shape[-1] == 0:
         extra_topk_length = torch.zeros((batch,), dtype=torch.int32, device="cpu").to(
             query.device
@@ -107,6 +108,7 @@ def prepare_baseline(inputs, query):
                 metadata,
                 splits,
                 softmax_scale=scale,
+                attn_sink=attn_sink,
                 is_fp8_kvcache=True,
                 indices=indices[first:last],
                 topk_length=topk_length[first:last],
