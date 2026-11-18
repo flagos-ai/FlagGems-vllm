@@ -55,6 +55,7 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
+    fused_recurrent_kda,
 )
 from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
@@ -87,6 +88,15 @@ from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
 from flaggems_vllm.ops.fused_allreduce_rms_norm import (
     fused_allreduce_rms_norm,
+)
+from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
+    GemmReduceScatterConfig,
+    clear_fused_matmul_reduce_scatter_cache,
+    configure_fused_matmul_reduce_scatter,
+    fused_matmul_reduce_scatter,
+)
+from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
 )
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
@@ -122,17 +132,19 @@ from flaggems_vllm.ops.ihc import (
 from flaggems_vllm.ops.mhc import (
     MixLayout,
     hc_head_fused_kernel,
-    hc_head_fused_kernel_ref,
+    hc_split_sinkhorn,
     mhc_bwd,
-    mhc_bwd_ref,
     mhc_post,
     mhc_pre,
+    mhc_pre_broadcast,
     mhc_shifted_post_pre,
-    sinkhorn_forward,
 )
+from flaggems_vllm.ops.min_p import apply_min_p
 from flaggems_vllm.ops.qwen4 import (
+    NULL_BLOCK_ID,
     grouped_gemma_rmsnorm,
     hc_combine,
+    ple_conv,
     ple_short_conv_,
     ple_gate_norm,
     ple_gate_norm_,
@@ -197,6 +209,9 @@ from flaggems_vllm.ops.router_gemm import router_gemm
 from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
 from flaggems_vllm.ops.rwkv_mm_sparsity import rwkv_mm_sparsity
 from flaggems_vllm.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.ops.select_candidate_blocks_cooperative import (
+    select_candidate_blocks_cooperative,
+)
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul, silu_and_mul_out
 from flaggems_vllm.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
@@ -208,6 +223,7 @@ from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
     stage_deepseek_v4_mega_moe_inputs,
 )
 from flaggems_vllm.ops.swiglu import dswiglu, swiglu
+from flaggems_vllm.ops.thinking_budget import apply_thinking_budget
 from flaggems_vllm.ops.top_k_per_row_decode import top_k_per_row_decode
 from flaggems_vllm.ops.top_k_per_row_prefill import top_k_per_row_prefill
 from flaggems_vllm.ops.topk_softmax import topk_softmax
@@ -241,7 +257,6 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
-    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -269,8 +284,10 @@ from flaggems_vllm.ops.vit_attention import (
 __all__ = [
     "act_quant_triton",
     "add_rms_norm",
+    "apply_min_p",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
+    "apply_thinking_budget",
     "attn_res",
     "beam_search_score",
     "beam_search_score_",
@@ -287,11 +304,13 @@ __all__ = [
     "chunk_kda_scaled_dot_kkt_fwd",
     "chunk_kda_with_fused_gate",
     "chunk_kda_with_safe_gate",
+    "clear_fused_matmul_reduce_scatter_cache",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
     "concat_and_cache_mla",
     "concat_mla_q",
     "concat_query",
+    "configure_fused_matmul_reduce_scatter",
     "contiguous_copy",
     "cooperative_topk",
     "copy_to",
@@ -322,6 +341,7 @@ __all__ = [
     "fp8_fp4_paged_mqa_logits_graph",
     "fused_add_rms_norm",
     "fused_allreduce_rms_norm",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
     "fused_indexer_k_norm",
@@ -329,6 +349,7 @@ __all__ = [
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
     "fused_marlin_moe",
+    "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
@@ -344,13 +365,14 @@ __all__ = [
     "geglu",
     "gelu_and_mul",
     "gemma_rms_norm",
+    "GemmReduceScatterConfig",
     "get_num_sampled_and_rejected",
     "grouped_gemma_rmsnorm",
     "grouped_topk",
     "hadamard128",
     "hc_combine",
     "hc_head_fused_kernel",
-    "hc_head_fused_kernel_ref",
+    "hc_split_sinkhorn",
     "ihc_post",
     "ihc_post_ref",
     "ihc_pre",
@@ -363,10 +385,10 @@ __all__ = [
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
     "mhc_bwd",
-    "mhc_bwd_ref",
     "mhc_fused_post_pre_with_norm",
     "mhc_post",
     "mhc_pre",
+    "mhc_pre_broadcast",
     "mhc_pre_with_norm",
     "mhc_rms_norm",
     "mhc_shifted_post_pre",
@@ -381,6 +403,7 @@ __all__ = [
     "mul",
     "mul_",
     "mv",
+    "NULL_BLOCK_ID",
     "outer",
     "outplace_fused_experts",
     "pack_seq_triton",
@@ -393,6 +416,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "permute_copy",
     "persistent_topk",
+    "ple_conv",
     "ple_gate_norm",
     "ple_gate_norm_",
     "ple_prefill_short_conv_",
@@ -429,11 +453,11 @@ __all__ = [
     "scaled_int8_quant",
     "scatter_decode_tokens",
     "scatter_state_rows",
+    "select_candidate_blocks_cooperative",
     "silu_and_mul",
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
-    "sinkhorn_forward",
     "skip_layer_norm",
     "sparse_attn_triton",
     "stage_deepseek_v4_mega_moe_inputs",
