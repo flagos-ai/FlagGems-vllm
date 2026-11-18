@@ -29,7 +29,7 @@ try:
     )
 
     HAS_VLLM = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_VLLM = False
 
 # Operators come from the package namespace, never from their module paths: a
