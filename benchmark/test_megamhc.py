@@ -10,6 +10,32 @@ import flaggems_vllm as gems
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout
 from tests.test_megamhc import EPS, candidate, make_inputs
 
+# Normal BF16 token buckets shared with the NVIDIA and Ascend MegaMHC PRs,
+# plus the aligned 4K, 8K, and 32K prefill cases.
+PREPACKED_TOKENS = sorted(
+    {
+        1,
+        2,
+        4,
+        8,
+        16,
+        *range(24, 257, 8),
+        *range(272, 513, 16),
+        1028,
+        2048,
+        3076,
+        3805,
+        4096,
+        4100,
+        8192,
+        12991,
+        13005,
+        13021,
+        16384,
+        32768,
+    }
+)
+
 pytestmark = [
     pytest.mark.megamhc,
     pytest.mark.skipif(
@@ -64,7 +90,7 @@ def test_mega_mhc(tokens):
 
 
 @pytest.mark.parametrize("implementation", ["auto", "triton"])
-@pytest.mark.parametrize("tokens", [4096, 8192, 16384, 32768])
+@pytest.mark.parametrize("tokens", PREPACKED_TOKENS)
 def test_mega_mhc_prepacked(tokens, implementation):
     args = make_inputs(tokens, 4096, 4)
     # Both operators prepare their weights before capture. Keep the packed
