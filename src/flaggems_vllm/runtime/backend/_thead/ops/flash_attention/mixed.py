@@ -106,45 +106,49 @@ def stage_norm(
         return
     ds = tl.arange(0, 256)
     if tile < KW:
-        rows = tile * PAGE + tl.arange(0, PAGE)
-        page = tl.load(
-            TABLE + batch.to(tl.int64) * TS + tile, tile * PAGE < klen, 0
-        ).to(tl.int64)
-        kval = tl.load(
-            K
-            + page * KP
-            + (rows[:, None] % PAGE).to(tl.int64) * KS
-            + head * KH
-            + ds[None, :],
-            rows[:, None] < klen,
-            0,
-        )
-        kf = kval.to(tl.float32)
-        squares = tl.sum(kf * kf, 1)
-        kmax = tl.max(tl.where(squares == squares, squares, float("inf")), 0)
-        tl.store(KPART + (batch * HK + head) * KW + tile, kmax)
-        copy = not (qlen <= SHORT and klen >= 8192)
-        if EARLY:
-            copy = copy & (tile * PAGE < klen)
-        if copy:
-            vval = tl.load(
-                V
-                + page * VP
-                + (rows[:, None] % PAGE).to(tl.int64) * VS
-                + head * VH
+        kmax = 0.0
+        if tile * PAGE < klen:
+            rows = tile * PAGE + tl.arange(0, PAGE)
+            page = tl.load(
+                TABLE + batch.to(tl.int64) * TS + tile, tile * PAGE < klen, 0
+            ).to(tl.int64)
+            kval = tl.load(
+                K
+                + page * KP
+                + (rows[:, None] % PAGE).to(tl.int64) * KS
+                + head * KH
                 + ds[None, :],
                 rows[:, None] < klen,
                 0,
             )
-            dest = (
-                (batch.to(tl.int64) * KW * PAGE + rows[:, None].to(tl.int64)) * HK * 256
-                + head * 256
-                + ds[None, :]
-            )
-            tl.store(PK + dest, kval)
-            tl.store(PV + dest, vval)
-            if head == 0:
-                tl.store(PT + batch * KW + tile, batch * KW + tile)
+            kf = kval.to(tl.float32)
+            squares = tl.sum(kf * kf, 1)
+            kmax = tl.max(tl.where(squares == squares, squares, float("inf")), 0)
+            copy = not (qlen <= SHORT and klen >= 8192)
+            if EARLY:
+                copy = copy & (tile * PAGE < klen)
+            if copy:
+                vval = tl.load(
+                    V
+                    + page * VP
+                    + (rows[:, None] % PAGE).to(tl.int64) * VS
+                    + head * VH
+                    + ds[None, :],
+                    rows[:, None] < klen,
+                    0,
+                )
+                dest = (
+                    (batch.to(tl.int64) * KW * PAGE + rows[:, None].to(tl.int64))
+                    * HK
+                    * 256
+                    + head * 256
+                    + ds[None, :]
+                )
+                tl.store(PK + dest, kval)
+                tl.store(PV + dest, vval)
+                if head == 0:
+                    tl.store(PT + batch * KW + tile, batch * KW + tile)
+        tl.store(KPART + (batch * HK + head) * KW + tile, kmax)
     if tile < QW:
         flat = tile * 32 + tl.arange(0, 32)
         group: tl.constexpr = HQ // HK

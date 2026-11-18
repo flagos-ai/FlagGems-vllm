@@ -12,9 +12,13 @@ from flaggems_vllm.runtime.backend._thead.ops.flash_attention import (
     direct,
     mixed,
     prefill,
-    prefill_tle,
     scheduling,
 )
+
+if common.gpu is not None:
+    from flaggems_vllm.runtime.backend._thead.ops.flash_attention import prefill_tle
+else:
+    prefill_tle = None
 
 
 def long_prefill_prepare_flags(
@@ -1327,7 +1331,7 @@ def launch_tp2_mixed(
         write_lse=write_lse,
         fold=4,
         order=1,
-        mode=2,
+        mode=2 if common.supports_tle() else 0,
         short=short,
         early=True,
         norm_short=1 if use_medium else 64,
@@ -1445,6 +1449,8 @@ def launch_attention(
         max_seqlen_q,
         max_seqlen_k,
     )
+    if block_table is not None:
+        block_table = block_table[:, : triton.cdiv(max_seqlen_k, k.shape[1])]
     window = (-1, -1) if window_size is None else tuple(window_size)
     if len(window) != 2 or any((not isinstance(x, int) or x < -1 for x in window)):
         raise ValueError("window_size must contain two integers >= -1")
@@ -1500,6 +1506,7 @@ def launch_attention(
     if (
         fast_paged
         and not small_fp16
+        and common.supports_tle()
         and 512 <= max_seqlen_q <= 16384
         and (1 <= batches <= 128)
     ):
@@ -1537,6 +1544,7 @@ def launch_attention(
     if (
         fast_paged
         and q.dtype == torch.bfloat16
+        and common.supports_tle()
         and 512 <= max_seqlen_q <= 2048
         and (max_seqlen_k <= 2048)
         and (2 <= batches <= 128)

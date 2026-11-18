@@ -129,101 +129,6 @@ def linear_metadata_combine_norms(
             tl.store(META + 5 * CAP, total)
 
 
-@libentry()
-@triton.jit
-def linear_stage_copy_pages(
-    K,
-    V,
-    TABLE,
-    USED,
-    CUQ,
-    PK,
-    PV,
-    PT,
-    KP: tl.constexpr,
-    KS: tl.constexpr,
-    KH: tl.constexpr,
-    VP: tl.constexpr,
-    VS: tl.constexpr,
-    VH: tl.constexpr,
-    PP: tl.constexpr,
-    PS: tl.constexpr,
-    PH: tl.constexpr,
-    TS: tl.constexpr,
-    NP: tl.constexpr,
-    PAGE: tl.constexpr,
-    D: tl.constexpr,
-    SHORT_LIMIT: tl.constexpr,
-):
-    slot, batch, head = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
-    head64 = head.to(tl.int64)
-    klen = tl.load(USED + batch)
-    qlen = tl.load(CUQ + batch + 1) - tl.load(CUQ + batch)
-    if SHORT_LIMIT and qlen <= SHORT_LIMIT and (klen >= 8192):
-        return
-    logical = batch * NP + slot
-    rows = slot * PAGE + tl.arange(0, PAGE)
-    ds = tl.arange(0, D)
-    page = tl.load(TABLE + batch.to(tl.int64) * TS + slot, slot * PAGE < klen, 0).to(
-        tl.int64
-    )
-    offset = (rows % PAGE).to(tl.int64)
-    kval = tl.load(
-        K + page * KP + offset[:, None] * KS + head64 * KH + ds[None, :],
-        rows[:, None] < klen,
-        0,
-    )
-    vval = tl.load(
-        V + page * VP + offset[:, None] * VS + head64 * VH + ds[None, :],
-        rows[:, None] < klen,
-        0,
-    )
-    dest = logical.to(tl.int64) * PP + offset[:, None] * PS + head64 * PH + ds[None, :]
-    tl.store(PK + dest, kval)
-    tl.store(PV + dest, vval)
-    if head == 0:
-        tl.store(PT + batch * NP + slot, logical)
-
-
-def linear_stage_prepare(k, v, table, used, cuq, layout, short_limit):
-    batch, hk, dim = (used.numel(), k.shape[-2], k.shape[-1])
-    page, npages = (k.shape[1], max(1, table.shape[1]))
-    assert dim == 256 and page in (16, 32)
-    assert k.stride(-1) == v.stride(-1) == 1
-    physical = batch * npages
-    shape = (physical, page, hk, dim)
-    if layout == "interleaved":
-        strides = (page * hk * dim, hk * dim, dim, 1)
-    elif layout == "head_major":
-        strides = (page * dim, dim, physical * page * dim, 1)
-    else:
-        raise ValueError(layout)
-    pk = torch.empty_strided(shape, strides, dtype=k.dtype, device=k.device)
-    pv = torch.empty_strided(shape, strides, dtype=v.dtype, device=v.device)
-    pt = torch.empty((batch, npages), dtype=table.dtype, device=table.device)
-    linear_stage_copy_pages[npages, batch, hk](
-        k,
-        v,
-        table,
-        used,
-        cuq,
-        pk,
-        pv,
-        pt,
-        *k.stride()[:3],
-        *v.stride()[:3],
-        *pk.stride()[:3],
-        table.stride(0),
-        npages,
-        page,
-        dim,
-        short_limit,
-        num_warps=4,
-        num_stages=1,
-    )
-    return (pk, pv, pt)
-
-
 @triton.jit
 def linear_prefill_step(
     q,
@@ -1655,6 +1560,8 @@ def async_stage_copy_pages(
         return
     if SHORT_LIMIT and qlen <= SHORT_LIMIT and (klen >= 8192):
         return
+    if slot * PAGE >= klen:
+        return
     logical = batch * NP + slot
     rows = slot * PAGE + tl.arange(0, PAGE)
     ds = tl.arange(0, D)
@@ -1719,3 +1626,7 @@ def async_stage_prepare(
         num_stages=1,
     )
     return (pk, pv, pt)
+
+
+linear_stage_copy_pages = async_stage_copy_pages
+linear_stage_prepare = async_stage_prepare

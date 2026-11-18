@@ -17,8 +17,8 @@ import math
 from functools import partial
 from numbers import Integral
 
+import flag_gems
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -1266,9 +1266,9 @@ def flash_attention_forward(
             padded_head_dim is not None
         ), f"Unsupported head dim {HEAD_DIM_K}, max supported is {supported_head_dims[-1]}"
         pad = padded_head_dim - HEAD_DIM_K
-        query = F.pad(query, (0, pad))
-        key = F.pad(key, (0, pad))
-        value = F.pad(value, (0, pad))
+        query = flag_gems.pad(query, (0, pad))
+        key = flag_gems.pad(key, (0, pad))
+        value = flag_gems.pad(value, (0, pad))
         HEAD_DIM_K = padded_head_dim
 
     softmax_scale = scale or 1.0 / (original_head_dim**0.5)

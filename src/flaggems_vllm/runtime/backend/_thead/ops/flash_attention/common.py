@@ -4,7 +4,25 @@
 import torch
 import triton
 import triton.language as tl
-from triton.experimental.tle.language import gpu
+from triton.compiler.compiler import make_backend
+
+try:
+    import triton.experimental.tle as tle_api
+    from triton.experimental.tle.language import gpu
+except ImportError:
+    tle_api = gpu = None
+
+
+def supports_tle():
+    if tle_api is None:
+        return False
+    features = ("gpu.alloc", "gpu.local_ptr")
+    if hasattr(tle_api, "is_tle_supported"):
+        return tle_api.is_tle_supported(features)
+    target = triton.runtime.driver.active.get_current_target()
+    backend = type(make_backend(target)).__module__.split(".")[-2]
+    supported = tle_api.get_supported_primitives(backend)
+    return all(feature in supported for feature in features)
 
 
 def validate_inputs(q, k, v, cuq, cuk, usedk, table, out, alibi, maxq, maxk):
@@ -295,314 +313,43 @@ def q_fragment(BUF, col, token, TRANS: tl.constexpr, ROW):
 
 @triton.jit
 def load_q(Q, BUF, qstart, qlen, tile, group, QS: tl.constexpr, QH: tl.constexpr):
-    thread = tl.arange(0, 128)
-    warp = thread // 32
-    qp0_0 = tl.zeros((128,), tl.uint32)
-    qp0_1 = tl.zeros((128,), tl.uint32)
-    qp0_2 = tl.zeros((128,), tl.uint32)
-    qp0_3 = tl.zeros((128,), tl.uint32)
-    qp1_0 = tl.zeros((128,), tl.uint32)
-    qp1_1 = tl.zeros((128,), tl.uint32)
-    qp1_2 = tl.zeros((128,), tl.uint32)
-    qp1_3 = tl.zeros((128,), tl.uint32)
-    qp2_0 = tl.zeros((128,), tl.uint32)
-    qp2_1 = tl.zeros((128,), tl.uint32)
-    qp2_2 = tl.zeros((128,), tl.uint32)
-    qp2_3 = tl.zeros((128,), tl.uint32)
-    qp3_0 = tl.zeros((128,), tl.uint32)
-    qp3_1 = tl.zeros((128,), tl.uint32)
-    qp3_2 = tl.zeros((128,), tl.uint32)
-    qp3_3 = tl.zeros((128,), tl.uint32)
-    qp4_0 = tl.zeros((128,), tl.uint32)
-    qp4_1 = tl.zeros((128,), tl.uint32)
-    qp4_2 = tl.zeros((128,), tl.uint32)
-    qp4_3 = tl.zeros((128,), tl.uint32)
-    qp5_0 = tl.zeros((128,), tl.uint32)
-    qp5_1 = tl.zeros((128,), tl.uint32)
-    qp5_2 = tl.zeros((128,), tl.uint32)
-    qp5_3 = tl.zeros((128,), tl.uint32)
-    qp6_0 = tl.zeros((128,), tl.uint32)
-    qp6_1 = tl.zeros((128,), tl.uint32)
-    qp6_2 = tl.zeros((128,), tl.uint32)
-    qp6_3 = tl.zeros((128,), tl.uint32)
-    qp7_0 = tl.zeros((128,), tl.uint32)
-    qp7_1 = tl.zeros((128,), tl.uint32)
-    qp7_2 = tl.zeros((128,), tl.uint32)
-    qp7_3 = tl.zeros((128,), tl.uint32)
-    qp8_0 = tl.zeros((128,), tl.uint32)
-    qp8_1 = tl.zeros((128,), tl.uint32)
-    qp8_2 = tl.zeros((128,), tl.uint32)
-    qp8_3 = tl.zeros((128,), tl.uint32)
-    qp9_0 = tl.zeros((128,), tl.uint32)
-    qp9_1 = tl.zeros((128,), tl.uint32)
-    qp9_2 = tl.zeros((128,), tl.uint32)
-    qp9_3 = tl.zeros((128,), tl.uint32)
-    qp10_0 = tl.zeros((128,), tl.uint32)
-    qp10_1 = tl.zeros((128,), tl.uint32)
-    qp10_2 = tl.zeros((128,), tl.uint32)
-    qp10_3 = tl.zeros((128,), tl.uint32)
-    qp11_0 = tl.zeros((128,), tl.uint32)
-    qp11_1 = tl.zeros((128,), tl.uint32)
-    qp11_2 = tl.zeros((128,), tl.uint32)
-    qp11_3 = tl.zeros((128,), tl.uint32)
-    qp12_0 = tl.zeros((128,), tl.uint32)
-    qp12_1 = tl.zeros((128,), tl.uint32)
-    qp12_2 = tl.zeros((128,), tl.uint32)
-    qp12_3 = tl.zeros((128,), tl.uint32)
-    qp13_0 = tl.zeros((128,), tl.uint32)
-    qp13_1 = tl.zeros((128,), tl.uint32)
-    qp13_2 = tl.zeros((128,), tl.uint32)
-    qp13_3 = tl.zeros((128,), tl.uint32)
-    qp14_0 = tl.zeros((128,), tl.uint32)
-    qp14_1 = tl.zeros((128,), tl.uint32)
-    qp14_2 = tl.zeros((128,), tl.uint32)
-    qp14_3 = tl.zeros((128,), tl.uint32)
-    qp15_0 = tl.zeros((128,), tl.uint32)
-    qp15_1 = tl.zeros((128,), tl.uint32)
-    qp15_2 = tl.zeros((128,), tl.uint32)
-    qp15_3 = tl.zeros((128,), tl.uint32)
+    warp = tl.arange(0, 128) // 32
+    fragments = ()
+    for index in tl.static_range(64):
+        fragments += (tl.zeros((128,), tl.uint32),)
     if qlen > 0:
-        issue_copy(
-            Q, BUF, qstart + tile * 16, qstart + qlen, QS, 0, (group * 4 + 0) * QH
-        )
-        issue_copy(
-            Q, BUF, qstart + tile * 16, qstart + qlen, QS, 32, (group * 4 + 1) * QH
-        )
-        commit_copies()
-        token = wait_copies() + tl.zeros((128,), tl.int32)
-        a0, a1, a2, a3 = q_fragment(BUF, 0, token, False, ROW=warp % 2 * 32)
-        qp0_0 = tl.where(warp // 2 == 0, a0, qp0_0)
-        qp0_1 = tl.where(warp // 2 == 0, a1, qp0_1)
-        qp0_2 = tl.where(warp // 2 == 0, a2, qp0_2)
-        qp0_3 = tl.where(warp // 2 == 0, a3, qp0_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 16, token, False, ROW=warp % 2 * 32)
-        qp1_0 = tl.where(warp // 2 == 0, a0, qp1_0)
-        qp1_1 = tl.where(warp // 2 == 0, a1, qp1_1)
-        qp1_2 = tl.where(warp // 2 == 0, a2, qp1_2)
-        qp1_3 = tl.where(warp // 2 == 0, a3, qp1_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 32, token, False, ROW=warp % 2 * 32)
-        qp2_0 = tl.where(warp // 2 == 0, a0, qp2_0)
-        qp2_1 = tl.where(warp // 2 == 0, a1, qp2_1)
-        qp2_2 = tl.where(warp // 2 == 0, a2, qp2_2)
-        qp2_3 = tl.where(warp // 2 == 0, a3, qp2_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 48, token, False, ROW=warp % 2 * 32)
-        qp3_0 = tl.where(warp // 2 == 0, a0, qp3_0)
-        qp3_1 = tl.where(warp // 2 == 0, a1, qp3_1)
-        qp3_2 = tl.where(warp // 2 == 0, a2, qp3_2)
-        qp3_3 = tl.where(warp // 2 == 0, a3, qp3_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 64, token, False, ROW=warp % 2 * 32)
-        qp4_0 = tl.where(warp // 2 == 0, a0, qp4_0)
-        qp4_1 = tl.where(warp // 2 == 0, a1, qp4_1)
-        qp4_2 = tl.where(warp // 2 == 0, a2, qp4_2)
-        qp4_3 = tl.where(warp // 2 == 0, a3, qp4_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 80, token, False, ROW=warp % 2 * 32)
-        qp5_0 = tl.where(warp // 2 == 0, a0, qp5_0)
-        qp5_1 = tl.where(warp // 2 == 0, a1, qp5_1)
-        qp5_2 = tl.where(warp // 2 == 0, a2, qp5_2)
-        qp5_3 = tl.where(warp // 2 == 0, a3, qp5_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 96, token, False, ROW=warp % 2 * 32)
-        qp6_0 = tl.where(warp // 2 == 0, a0, qp6_0)
-        qp6_1 = tl.where(warp // 2 == 0, a1, qp6_1)
-        qp6_2 = tl.where(warp // 2 == 0, a2, qp6_2)
-        qp6_3 = tl.where(warp // 2 == 0, a3, qp6_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 112, token, False, ROW=warp % 2 * 32)
-        qp7_0 = tl.where(warp // 2 == 0, a0, qp7_0)
-        qp7_1 = tl.where(warp // 2 == 0, a1, qp7_1)
-        qp7_2 = tl.where(warp // 2 == 0, a2, qp7_2)
-        qp7_3 = tl.where(warp // 2 == 0, a3, qp7_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 128, token, False, ROW=warp % 2 * 32)
-        qp8_0 = tl.where(warp // 2 == 0, a0, qp8_0)
-        qp8_1 = tl.where(warp // 2 == 0, a1, qp8_1)
-        qp8_2 = tl.where(warp // 2 == 0, a2, qp8_2)
-        qp8_3 = tl.where(warp // 2 == 0, a3, qp8_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 144, token, False, ROW=warp % 2 * 32)
-        qp9_0 = tl.where(warp // 2 == 0, a0, qp9_0)
-        qp9_1 = tl.where(warp // 2 == 0, a1, qp9_1)
-        qp9_2 = tl.where(warp // 2 == 0, a2, qp9_2)
-        qp9_3 = tl.where(warp // 2 == 0, a3, qp9_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 160, token, False, ROW=warp % 2 * 32)
-        qp10_0 = tl.where(warp // 2 == 0, a0, qp10_0)
-        qp10_1 = tl.where(warp // 2 == 0, a1, qp10_1)
-        qp10_2 = tl.where(warp // 2 == 0, a2, qp10_2)
-        qp10_3 = tl.where(warp // 2 == 0, a3, qp10_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 176, token, False, ROW=warp % 2 * 32)
-        qp11_0 = tl.where(warp // 2 == 0, a0, qp11_0)
-        qp11_1 = tl.where(warp // 2 == 0, a1, qp11_1)
-        qp11_2 = tl.where(warp // 2 == 0, a2, qp11_2)
-        qp11_3 = tl.where(warp // 2 == 0, a3, qp11_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 192, token, False, ROW=warp % 2 * 32)
-        qp12_0 = tl.where(warp // 2 == 0, a0, qp12_0)
-        qp12_1 = tl.where(warp // 2 == 0, a1, qp12_1)
-        qp12_2 = tl.where(warp // 2 == 0, a2, qp12_2)
-        qp12_3 = tl.where(warp // 2 == 0, a3, qp12_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 208, token, False, ROW=warp % 2 * 32)
-        qp13_0 = tl.where(warp // 2 == 0, a0, qp13_0)
-        qp13_1 = tl.where(warp // 2 == 0, a1, qp13_1)
-        qp13_2 = tl.where(warp // 2 == 0, a2, qp13_2)
-        qp13_3 = tl.where(warp // 2 == 0, a3, qp13_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 224, token, False, ROW=warp % 2 * 32)
-        qp14_0 = tl.where(warp // 2 == 0, a0, qp14_0)
-        qp14_1 = tl.where(warp // 2 == 0, a1, qp14_1)
-        qp14_2 = tl.where(warp // 2 == 0, a2, qp14_2)
-        qp14_3 = tl.where(warp // 2 == 0, a3, qp14_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 240, token, False, ROW=warp % 2 * 32)
-        qp15_0 = tl.where(warp // 2 == 0, a0, qp15_0)
-        qp15_1 = tl.where(warp // 2 == 0, a1, qp15_1)
-        qp15_2 = tl.where(warp // 2 == 0, a2, qp15_2)
-        qp15_3 = tl.where(warp // 2 == 0, a3, qp15_3)
-        wait_copies()
-        issue_copy(
-            Q, BUF, qstart + tile * 16, qstart + qlen, QS, 0, (group * 4 + 2) * QH
-        )
-        issue_copy(
-            Q, BUF, qstart + tile * 16, qstart + qlen, QS, 32, (group * 4 + 3) * QH
-        )
-        commit_copies()
-        token = wait_copies() + tl.zeros((128,), tl.int32)
-        a0, a1, a2, a3 = q_fragment(BUF, 0, token, False, ROW=warp % 2 * 32)
-        qp0_0 = tl.where(warp // 2 == 1, a0, qp0_0)
-        qp0_1 = tl.where(warp // 2 == 1, a1, qp0_1)
-        qp0_2 = tl.where(warp // 2 == 1, a2, qp0_2)
-        qp0_3 = tl.where(warp // 2 == 1, a3, qp0_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 16, token, False, ROW=warp % 2 * 32)
-        qp1_0 = tl.where(warp // 2 == 1, a0, qp1_0)
-        qp1_1 = tl.where(warp // 2 == 1, a1, qp1_1)
-        qp1_2 = tl.where(warp // 2 == 1, a2, qp1_2)
-        qp1_3 = tl.where(warp // 2 == 1, a3, qp1_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 32, token, False, ROW=warp % 2 * 32)
-        qp2_0 = tl.where(warp // 2 == 1, a0, qp2_0)
-        qp2_1 = tl.where(warp // 2 == 1, a1, qp2_1)
-        qp2_2 = tl.where(warp // 2 == 1, a2, qp2_2)
-        qp2_3 = tl.where(warp // 2 == 1, a3, qp2_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 48, token, False, ROW=warp % 2 * 32)
-        qp3_0 = tl.where(warp // 2 == 1, a0, qp3_0)
-        qp3_1 = tl.where(warp // 2 == 1, a1, qp3_1)
-        qp3_2 = tl.where(warp // 2 == 1, a2, qp3_2)
-        qp3_3 = tl.where(warp // 2 == 1, a3, qp3_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 64, token, False, ROW=warp % 2 * 32)
-        qp4_0 = tl.where(warp // 2 == 1, a0, qp4_0)
-        qp4_1 = tl.where(warp // 2 == 1, a1, qp4_1)
-        qp4_2 = tl.where(warp // 2 == 1, a2, qp4_2)
-        qp4_3 = tl.where(warp // 2 == 1, a3, qp4_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 80, token, False, ROW=warp % 2 * 32)
-        qp5_0 = tl.where(warp // 2 == 1, a0, qp5_0)
-        qp5_1 = tl.where(warp // 2 == 1, a1, qp5_1)
-        qp5_2 = tl.where(warp // 2 == 1, a2, qp5_2)
-        qp5_3 = tl.where(warp // 2 == 1, a3, qp5_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 96, token, False, ROW=warp % 2 * 32)
-        qp6_0 = tl.where(warp // 2 == 1, a0, qp6_0)
-        qp6_1 = tl.where(warp // 2 == 1, a1, qp6_1)
-        qp6_2 = tl.where(warp // 2 == 1, a2, qp6_2)
-        qp6_3 = tl.where(warp // 2 == 1, a3, qp6_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 112, token, False, ROW=warp % 2 * 32)
-        qp7_0 = tl.where(warp // 2 == 1, a0, qp7_0)
-        qp7_1 = tl.where(warp // 2 == 1, a1, qp7_1)
-        qp7_2 = tl.where(warp // 2 == 1, a2, qp7_2)
-        qp7_3 = tl.where(warp // 2 == 1, a3, qp7_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 128, token, False, ROW=warp % 2 * 32)
-        qp8_0 = tl.where(warp // 2 == 1, a0, qp8_0)
-        qp8_1 = tl.where(warp // 2 == 1, a1, qp8_1)
-        qp8_2 = tl.where(warp // 2 == 1, a2, qp8_2)
-        qp8_3 = tl.where(warp // 2 == 1, a3, qp8_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 144, token, False, ROW=warp % 2 * 32)
-        qp9_0 = tl.where(warp // 2 == 1, a0, qp9_0)
-        qp9_1 = tl.where(warp // 2 == 1, a1, qp9_1)
-        qp9_2 = tl.where(warp // 2 == 1, a2, qp9_2)
-        qp9_3 = tl.where(warp // 2 == 1, a3, qp9_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 160, token, False, ROW=warp % 2 * 32)
-        qp10_0 = tl.where(warp // 2 == 1, a0, qp10_0)
-        qp10_1 = tl.where(warp // 2 == 1, a1, qp10_1)
-        qp10_2 = tl.where(warp // 2 == 1, a2, qp10_2)
-        qp10_3 = tl.where(warp // 2 == 1, a3, qp10_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 176, token, False, ROW=warp % 2 * 32)
-        qp11_0 = tl.where(warp // 2 == 1, a0, qp11_0)
-        qp11_1 = tl.where(warp // 2 == 1, a1, qp11_1)
-        qp11_2 = tl.where(warp // 2 == 1, a2, qp11_2)
-        qp11_3 = tl.where(warp // 2 == 1, a3, qp11_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 192, token, False, ROW=warp % 2 * 32)
-        qp12_0 = tl.where(warp // 2 == 1, a0, qp12_0)
-        qp12_1 = tl.where(warp // 2 == 1, a1, qp12_1)
-        qp12_2 = tl.where(warp // 2 == 1, a2, qp12_2)
-        qp12_3 = tl.where(warp // 2 == 1, a3, qp12_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 208, token, False, ROW=warp % 2 * 32)
-        qp13_0 = tl.where(warp // 2 == 1, a0, qp13_0)
-        qp13_1 = tl.where(warp // 2 == 1, a1, qp13_1)
-        qp13_2 = tl.where(warp // 2 == 1, a2, qp13_2)
-        qp13_3 = tl.where(warp // 2 == 1, a3, qp13_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 224, token, False, ROW=warp % 2 * 32)
-        qp14_0 = tl.where(warp // 2 == 1, a0, qp14_0)
-        qp14_1 = tl.where(warp // 2 == 1, a1, qp14_1)
-        qp14_2 = tl.where(warp // 2 == 1, a2, qp14_2)
-        qp14_3 = tl.where(warp // 2 == 1, a3, qp14_3)
-        a0, a1, a2, a3 = q_fragment(BUF, 240, token, False, ROW=warp % 2 * 32)
-        qp15_0 = tl.where(warp // 2 == 1, a0, qp15_0)
-        qp15_1 = tl.where(warp // 2 == 1, a1, qp15_1)
-        qp15_2 = tl.where(warp // 2 == 1, a2, qp15_2)
-        qp15_3 = tl.where(warp // 2 == 1, a3, qp15_3)
-        wait_copies()
-    return (
-        qp0_0,
-        qp0_1,
-        qp0_2,
-        qp0_3,
-        qp1_0,
-        qp1_1,
-        qp1_2,
-        qp1_3,
-        qp2_0,
-        qp2_1,
-        qp2_2,
-        qp2_3,
-        qp3_0,
-        qp3_1,
-        qp3_2,
-        qp3_3,
-        qp4_0,
-        qp4_1,
-        qp4_2,
-        qp4_3,
-        qp5_0,
-        qp5_1,
-        qp5_2,
-        qp5_3,
-        qp6_0,
-        qp6_1,
-        qp6_2,
-        qp6_3,
-        qp7_0,
-        qp7_1,
-        qp7_2,
-        qp7_3,
-        qp8_0,
-        qp8_1,
-        qp8_2,
-        qp8_3,
-        qp9_0,
-        qp9_1,
-        qp9_2,
-        qp9_3,
-        qp10_0,
-        qp10_1,
-        qp10_2,
-        qp10_3,
-        qp11_0,
-        qp11_1,
-        qp11_2,
-        qp11_3,
-        qp12_0,
-        qp12_1,
-        qp12_2,
-        qp12_3,
-        qp13_0,
-        qp13_1,
-        qp13_2,
-        qp13_3,
-        qp14_0,
-        qp14_1,
-        qp14_2,
-        qp14_3,
-        qp15_0,
-        qp15_1,
-        qp15_2,
-        qp15_3,
-    )
+        for pair in tl.static_range(2):
+            issue_copy(
+                Q,
+                BUF,
+                qstart + tile * 16,
+                qstart + qlen,
+                QS,
+                0,
+                (group * 4 + pair * 2) * QH,
+            )
+            issue_copy(
+                Q,
+                BUF,
+                qstart + tile * 16,
+                qstart + qlen,
+                QS,
+                32,
+                (group * 4 + pair * 2 + 1) * QH,
+            )
+            commit_copies()
+            token = wait_copies() + tl.zeros((128,), tl.int32)
+            updated = ()
+            for column in tl.static_range(16):
+                fragment = q_fragment(BUF, column * 16, token, False, ROW=warp % 2 * 32)
+                for word in tl.static_range(4):
+                    updated += (
+                        tl.where(
+                            warp // 2 == pair,
+                            fragment[word],
+                            fragments[column * 4 + word],
+                        ),
+                    )
+            fragments = updated
+            wait_copies()
+    return fragments
