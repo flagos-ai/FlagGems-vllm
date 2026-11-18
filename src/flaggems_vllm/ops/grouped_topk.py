@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from typing import Optional
 
 import torch
 import triton
@@ -59,11 +60,18 @@ def topk_with_k2_triton(
     stride_group_scores_token,
     BLOCK_SIZE: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
+    padding_ptr,
+    HAS_PADDING: tl.constexpr,
+    MASKED_SIGMOID: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
     token_id = pid // n_group
     group_id = pid % n_group
+
+    if HAS_PADDING:
+        if tl.load(padding_ptr + token_id):
+            return  # Masked output CTA never reads this workspace row.
 
     lane = tl.arange(0, BLOCK_SIZE)
     mask = lane < num_experts_per_group
@@ -76,6 +84,10 @@ def topk_with_k2_triton(
         mask=mask,
         other=-float("inf"),
     )
+
+    if MASKED_SIGMOID:
+        x = _legacy_sigmoid(x, INPUT_DTYPE)
+        x = tl.where(mask, x, -float("inf"))
 
     b = tl.load(
         bias_ptr + bias_offset + lane,
@@ -129,10 +141,19 @@ def group_idx_and_topk_triton(
     BLOCK_EXPERT: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
     renormalize: tl.constexpr,
+    padding_ptr,
+    HAS_PADDING: tl.constexpr,
+    MASKED_SIGMOID: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     if pid >= num_tokens:
         return
+
+    if HAS_PADDING:
+        if tl.load(padding_ptr + pid):
+            _write_padding(topk_values_ptr, topk_indices_ptr, pid, TOPK, TOPK_BLOCK)
+            return
 
     neg_inf = -float("inf")
 
@@ -204,6 +225,9 @@ def group_idx_and_topk_triton(
         other=neg_inf,
     )
 
+    if MASKED_SIGMOID:
+        scored = _legacy_sigmoid(scored, INPUT_DTYPE)
+
     expert_bias = tl.load(
         bias_ptr + expert_offsets,
         mask=valid_expert,
@@ -218,9 +242,9 @@ def group_idx_and_topk_triton(
         neg_inf,
     )
 
-    topk_vals = tl.full([TOPK], 0.0, tl.float32)
-    topk_idx = tl.full([TOPK], 0, tl.int32)
-    pos_range = tl.arange(0, TOPK)
+    topk_vals = tl.full([TOPK_BLOCK], 0.0, tl.float32)
+    topk_idx = tl.full([TOPK_BLOCK], 0, tl.int32)
+    pos_range = tl.arange(0, TOPK_BLOCK)
 
     for i in range(TOPK):
         max_val = tl.max(selection_scores, axis=0)
@@ -233,7 +257,10 @@ def group_idx_and_topk_triton(
             scores_ptr + pid * stride_scores_token + selected_idx,
             mask=selected_idx < num_experts,
             other=neg_inf,
-        ).to(tl.float32)
+        )
+        if MASKED_SIGMOID:
+            selected_score = _legacy_sigmoid(selected_score, INPUT_DTYPE)
+        selected_score = selected_score.to(tl.float32)
 
         topk_vals = tl.where(pos_range == i, selected_score, topk_vals)
         topk_idx = tl.where(pos_range == i, selected_idx.to(tl.int32), topk_idx)
@@ -251,7 +278,7 @@ def group_idx_and_topk_triton(
     topk_vals = topk_vals * scale
 
     default_idx = pos_range.to(tl.int32)
-    default_vals = tl.full([TOPK], 1.0 / topk, tl.float32)
+    default_vals = tl.full([TOPK_BLOCK], 1.0 / topk, tl.float32)
 
     final_vals = tl.where(if_proceed, topk_vals, default_vals)
     final_idx = tl.where(if_proceed, topk_idx, default_idx)
@@ -321,12 +348,18 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
     GROUP_SIZE_PAD: tl.constexpr,
     FULL_SHAPE: tl.constexpr,
     USE_GROUPS: tl.constexpr,
+    padding_ptr,
+    HAS_PADDING: tl.constexpr,
 ):
     WARP_SIZE: tl.constexpr = 32
     neg_inf: tl.constexpr = float("-inf")
     MAX_IDX: tl.constexpr = 65535
 
     token_id = tl.program_id(0)
+    if HAS_PADDING:
+        if tl.load(padding_ptr + token_id):
+            _write_padding(topk_values_ptr, topk_indices_ptr, token_id, topk, WARP_SIZE)
+            return
     scores_ptr += token_id * scores_stride0
     topk_values_ptr += token_id * topk
     topk_indices_ptr += token_id * topk
@@ -352,8 +385,10 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         s_score_sigmoid_ptr = tle.gpu.local_ptr(s_score_sigmoid, (0, 0))
         s_score_bias_ptr = tle.gpu.local_ptr(s_score_bias, (0, 0))
     else:
-        s_score_sigmoid_ptr = g_score_sigmoid_ptr + token_id * scores_stride0
-        s_score_bias_ptr = g_score_bias_ptr + token_id * scores_stride0
+        # Masked scores may have a padded row stride, but this scratch is dense.
+        scratch_stride = num_experts if HAS_PADDING else scores_stride0
+        s_score_sigmoid_ptr = g_score_sigmoid_ptr + token_id * scratch_stride
+        s_score_bias_ptr = g_score_bias_ptr + token_id * scratch_stride
 
     # step1: load score/bias, get score_sigmoid/score_bias
     offs = groups[:, None] * num_experts_per_group + group_experts[None, :]
@@ -827,6 +862,119 @@ def _single_group_sigmoid_topk(
     tl.store(I + token * 16 + pos, tl.where(proceed, idxs, pos))
 
 
+@triton.jit
+def _legacy_sigmoid(x, dtype: tl.constexpr):
+    # Match the legacy grouped path: separate same-dtype half/tanh/half/add.
+    half = (x.to(tl.float32) * 0.5).to(dtype)
+    t = tl_extra_shim.tanh(half.to(tl.float32)).to(dtype)
+    half_t = (t.to(tl.float32) * 0.5).to(dtype)
+    return (half_t.to(tl.float32) + 0.5).to(dtype)
+
+
+@triton.jit
+def _write_padding(weights, ids, token, topk: tl.constexpr, block: tl.constexpr):
+    slot = tl.arange(0, block)
+    tl.store(weights + token * topk + slot, 0.0, slot < topk)
+    tl.store(ids + token * topk + slot, -1, slot < topk)
+
+
+@triton.jit
+def _masked_single_group_kernel(
+    scores,
+    bias,
+    padding,
+    out_weights,
+    out_ids,
+    num_tokens,
+    num_experts: tl.constexpr,
+    topk: tl.constexpr,
+    stride_score,
+    routed_scaling_factor,
+    RENORMALIZE: tl.constexpr,
+    SCORING_FUNC: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
+    USE_FAST_SIGMOID: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if HAS_PADDING:
+        if tl.load(padding + row):
+            _write_padding(out_weights, out_ids, row, topk, BLOCK_TOPK)
+            return
+    expert = tl.arange(0, BLOCK_EXPERTS)
+    unb = tl.load(scores + row * stride_score + expert, expert < num_experts, 0.0)
+    if SCORING_FUNC == 1:
+        if USE_FAST_SIGMOID:
+            unb = _sigmoid(unb.to(tl.float32)).to(INPUT_DTYPE)
+        else:
+            unb = _legacy_sigmoid(unb, INPUT_DTYPE)
+    b = tl.load(bias + expert, expert < num_experts, 0.0).to(INPUT_DTYPE)
+    s = (unb + b).to(tl.float32)
+    s = tl.where(s == 0.0, 0.0, s)  # Signed zeros compare equal on the legacy path.
+    # Zero key for invalid lanes sorts behind every valid expert including -inf.
+    keys = tl.where(expert < num_experts, _pack_val_idx_fp32(s, expert), 0)
+    winners = tl.topk(keys, BLOCK_TOPK)
+    chosen, ids = _unpack_val_idx_fp32(winners)
+    slot = tl.arange(0, BLOCK_TOPK)
+    vals = tl.load(scores + row * stride_score + ids, slot < topk, 0.0)
+    if SCORING_FUNC == 1:
+        if USE_FAST_SIGMOID:
+            vals = _sigmoid(vals.to(tl.float32)).to(INPUT_DTYPE)
+        else:
+            vals = _legacy_sigmoid(vals, INPUT_DTYPE)
+    vals = tl.where(slot < topk, vals.to(tl.float32), 0.0)
+    scale = routed_scaling_factor
+    if RENORMALIZE:
+        scale = scale / (tl.sum(vals) + 1e-20)
+    # Old generic routing emits uniform weights when the single group is invalid.
+    group_score = tl.sum(tl.where(slot < 2, chosen, 0.0)).to(INPUT_DTYPE).to(tl.float32)
+    valid = (group_score > -float("inf")) & (group_score < float("inf"))
+    tl.store(
+        out_weights + row * topk + slot,
+        tl.where(valid, vals * scale, 1.0 / topk),
+        slot < topk,
+    )
+    tl.store(out_ids + row * topk + slot, tl.where(valid, ids, slot), slot < topk)
+
+
+def _validate_padding(scores, bias, is_padding, n_group, topk_group, topk):
+    if runtime.device.vendor_name != "nvidia" or scores.device.type != "cuda":
+        raise NotImplementedError("grouped_topk padding requires NVIDIA CUDA")
+    rows, experts = scores.shape
+    if (
+        is_padding.dtype != torch.bool
+        or is_padding.shape != (rows,)
+        or is_padding.device != scores.device
+        or not is_padding.is_contiguous()
+    ):
+        raise ValueError(
+            "is_padding must be contiguous bool [num_tokens] on the scores device"
+        )
+    if (
+        bias.shape != (experts,)
+        or bias.device != scores.device
+        or not bias.is_contiguous()
+        or scores.stride(1) != 1
+        or scores.stride(0) < experts
+    ):
+        raise ValueError(
+            "masked grouped_topk needs row-major scores and contiguous same-device bias"
+        )
+    if not 1 <= topk_group <= n_group <= 32 or not 1 <= topk <= 32:
+        raise ValueError("expected valid group counts and topk in [1, 32]")
+    if (
+        experts // n_group < 2
+        or experts > 4096
+        or topk > (experts // n_group) * topk_group
+    ):
+        raise ValueError(
+            "masked grouped_topk needs at least 2 experts per group, at most 4096 "
+            "experts, and at least topk candidates after group selection"
+        )
+
+
 def grouped_topk(
     scores: torch.Tensor,
     n_group: int,
@@ -836,13 +984,18 @@ def grouped_topk(
     routed_scaling_factor: float,
     bias: torch.Tensor,
     scoring_func: int = 0,
+    is_padding: Optional[torch.Tensor] = None,
     *,
     sigmoid_mode: str = "native",
 ):
+    """Route scores; optional CUDA padding rows emit zero weights and -1 IDs."""
     logger.debug("GEMS GROUPED TOPK")
     if scores.ndim != 2:
         raise ValueError("scores must be a 2D Tensor")
     num_tokens, num_experts = scores.shape
+    has_padding = is_padding is not None
+    if has_padding:
+        _validate_padding(scores, bias, is_padding, n_group, topk_group, topk)
     if num_experts % n_group != 0:
         raise ValueError("num_experts must be divisible by n_group")
     if n_group > 32:
@@ -932,6 +1085,34 @@ def grouped_topk(
         & (topk <= 8)
         & (topk_group <= 4)
     )
+    if has_padding and (num_tokens == 0 or (n_group == 1 and not is_single_group)):
+        shape = (num_tokens, topk)
+        topk_values = torch.empty(shape, device=scores.device, dtype=torch.float32)
+        topk_indices = torch.empty(shape, device=scores.device, dtype=torch.int32)
+        if num_tokens:
+            _masked_single_group_kernel[(num_tokens,)](
+                scores,
+                bias,
+                is_padding,
+                topk_values,
+                topk_indices,
+                num_tokens,
+                num_experts,
+                topk,
+                scores.stride(0),
+                routed_scaling_factor,
+                RENORMALIZE=renormalize,
+                SCORING_FUNC=scoring_func,
+                HAS_PADDING=True,
+                USE_FAST_SIGMOID=False,
+                INPUT_DTYPE=INPUT_DTYPE,
+                BLOCK_EXPERTS=triton.next_power_of_2(num_experts),
+                BLOCK_TOPK=triton.next_power_of_2(max(2, topk)),
+                # Use the native JIT binder, not LibEntry's 3.7 cache-hit launcher.
+                num_warps=4,
+            )
+        return topk_values, topk_indices
+
     if is_single_group | is_multi_group:
         topk_values = torch.empty(
             (num_tokens, topk),
@@ -983,12 +1164,14 @@ def grouped_topk(
             FULL_SHAPE=num_experts_per_group == group_size_pad
             and n_group == n_group_pad,
             USE_GROUPS=is_multi_group,
+            padding_ptr=is_padding,
+            HAS_PADDING=has_padding,
             num_warps=1,
         )
 
         return topk_values, topk_indices
 
-    if scoring_func == 1:
+    if scoring_func == 1 and not has_padding:
         from flaggems_vllm.ops.tanh import tanh as gems_tanh
 
         scores_processed = 0.5 * gems_tanh(0.5 * scores) + 0.5
@@ -1026,6 +1209,9 @@ def grouped_topk(
         group_scores.stride(0),
         BLOCK_SIZE=BLOCK1,
         INPUT_DTYPE=INPUT_DTYPE,
+        padding_ptr=is_padding,
+        HAS_PADDING=has_padding,
+        MASKED_SIGMOID=has_padding and scoring_func == 1,
     )
 
     BLOCK_GROUP = triton.next_power_of_2(n_group)
@@ -1055,6 +1241,10 @@ def grouped_topk(
         BLOCK_EXPERT=BLOCK_EXPERT,
         INPUT_DTYPE=INPUT_DTYPE,
         renormalize=int(renormalize),
+        padding_ptr=is_padding,
+        HAS_PADDING=has_padding,
+        MASKED_SIGMOID=has_padding and scoring_func == 1,
+        TOPK_BLOCK=triton.next_power_of_2(topk) if has_padding else topk,
     )
 
     return topk_values, topk_indices
