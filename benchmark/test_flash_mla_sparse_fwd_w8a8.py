@@ -27,8 +27,7 @@ from tests.test_flash_mla_sparse_fwd_w8a8 import (
     flashmla_reference,
     make_sparse_inputs,
     prepare_sparse_int8,
-    quantize_sparse_fp8_fixture,
-    quantize_sparse_int8_fixture,
+    quantize_sparse_fixture,
 )
 
 from . import base
@@ -55,10 +54,11 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
                     "optionally followed by sink,topk_length,seed"
                 )
             inputs = make_sparse_inputs(shape, dtype=dtype)
+            packed, query, cache = quantize_sparse_fixture(*inputs)
             if HAS_INT8_MLA:
-                yield *self.prepare_metax_inputs(inputs), shape
+                native, handle = self.prepare_metax_inputs(packed, query, cache)
+                yield native, handle, shape
                 continue
-            packed = quantize_sparse_fp8_fixture(*inputs)
             reference, _, reference_lse = self.torch_op(*inputs)
             output, lse = self.gems_op(*packed)
             assert_sparse_fixture_close(
@@ -66,10 +66,9 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             )
             yield inputs, packed, shape
 
-    def prepare_metax_inputs(self, inputs):
+    def prepare_metax_inputs(self, packed, query, cache):
         import flash_mla
 
-        packed, query, cache = quantize_sparse_int8_fixture(*inputs)
         scale, sink, lengths = packed[7:]
         handle, actual = prepare_sparse_int8(
             *packed[:7], softmax_scale=scale, attn_sink=sink, topk_length=lengths
