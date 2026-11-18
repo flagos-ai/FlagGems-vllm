@@ -21,20 +21,14 @@ if flaggems_vllm.vendor_name == "hygon":
 
     Baseline uses vLLM fused postprocessing with the Hygon norm precision adapter
     and the official FL cache update. Default AG/GEMM uses RCCL and vLLM BF16 linear;
-    MPA_BASELINE_AG=dushmem selects the NV-style two-stream peer-copy/BLAS
-    decomposition. Source hashes, selected paths, and differences are recorded;
+    Source hashes, selected paths, and differences are recorded;
     no cross-hardware NV-equivalent speedup is inferred.
     """
-    import ctypes
-    import fcntl
     import hashlib
     import importlib.metadata
     import inspect
     import json
     import os
-    import subprocess
-    import tempfile
-    from datetime import timedelta
     from pathlib import Path
     from types import SimpleNamespace
 
@@ -264,221 +258,6 @@ if flaggems_vllm.vendor_name == "hygon":
         )
         return q_out, k_out, gate_out
 
-    _SESSION = None
-
-    def _library():
-        source = Path(__file__).resolve().with_name("megapreattention_dushmem.hip")
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        output = Path(tempfile.gettempdir()) / f"mpa-dushmem-{digest[:16]}.so"
-        with output.with_suffix(".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            if not output.exists():
-                subprocess.run(
-                    [
-                        "/opt/dtk/bin/hipcc",
-                        "-shared",
-                        "-fPIC",
-                        "-fgpu-rdc",
-                        "-mcode-object-version=4",
-                        "-O2",
-                        "--offload-arch=gfx936",
-                        "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
-                        "-I/opt/dtk/include/dushmem",
-                        "-L/opt/dtk/lib/dushmem",
-                        "-Wl,-rpath,/opt/dtk/lib/dushmem",
-                        str(source),
-                        "-ldushmem_host",
-                        "-ldushmem_device",
-                        "-o",
-                        str(output),
-                    ],
-                    check=True,
-                    timeout=120,
-                    capture_output=False,
-                    text=True,
-                )
-        lib = ctypes.CDLL(str(output))
-        signatures = {
-            "mpa_uid_size": ([], ctypes.c_size_t),
-            "mpa_uid": ([ctypes.c_void_p], ctypes.c_int),
-            "mpa_init": ([ctypes.c_int] * 3 + [ctypes.c_void_p], ctypes.c_int),
-            "mpa_rank": ([], ctypes.c_int),
-            "mpa_world": ([], ctypes.c_int),
-            "mpa_local_world": ([], ctypes.c_int),
-            "mpa_alloc": ([ctypes.c_size_t], ctypes.c_void_p),
-            "mpa_peer": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_void_p),
-            "mpa_copy": (
-                [ctypes.c_void_p] * 2 + [ctypes.c_size_t, ctypes.c_void_p],
-                ctypes.c_int,
-            ),
-            "mpa_barrier": ([ctypes.c_void_p], ctypes.c_int),
-            "mpa_free": ([ctypes.c_void_p], None),
-            "mpa_finalize": ([], None),
-        }
-        for name, (args, result) in signatures.items():
-            function = getattr(lib, name)
-            function.argtypes, function.restype = args, result
-        return lib, digest
-
-    def _check(status, operation):
-        if status:
-            raise RuntimeError(f"duSHMEM/HIP {operation} failed: {status}")
-
-    class _Session:
-        def __init__(self, inputs):
-            if inputs.group is not dist.group.WORLD:
-                raise NotImplementedError(
-                    "baseline duSHMEM requires the full WORLD group"
-                )
-            self.rank = dist.get_rank(inputs.group)
-            self.world = dist.get_world_size(inputs.group)
-            self.control = dist.new_group(backend="gloo", timeout=timedelta(seconds=90))
-            if os.environ.get("DUSHMEM_REMOTE_TRANSPORT", "none") != "none":
-                raise ValueError(
-                    "same-node baseline requires DUSHMEM_REMOTE_TRANSPORT=none"
-                )
-            os.environ.setdefault("DUSHMEM_REMOTE_TRANSPORT", "none")
-            os.environ.setdefault("DUSHMEM_IB_ENABLE_IBGDA", "false")
-            os.environ.setdefault("DUSHMEM_SYMMETRIC_SIZE", "512M")
-            os.environ.setdefault("DUSHMEM_DEBUG", "WARN")
-            self.lib, self.source_sha256 = _library()
-            size = self.lib.mpa_uid_size()
-            if not 0 < size <= 4096:
-                raise RuntimeError(f"invalid duSHMEM unique ID size: {size}")
-            uid = ctypes.create_string_buffer(size)
-            error = None
-            if self.rank == 0:
-                status = self.lib.mpa_uid(uid)
-                error = f"unique ID error {status}" if status else None
-            state = [error, bytes(uid)]
-            dist.broadcast_object_list(state, src=0, group=self.control)
-            if state[0]:
-                raise RuntimeError(state[0])
-            uid.raw = state[1]
-            print(self.rank, "duSHMEM init begin", flush=True)
-            _check(
-                self.lib.mpa_init(
-                    self.rank, self.world, inputs.hidden.device.index, uid
-                ),
-                "init",
-            )
-            if (
-                self.lib.mpa_rank(),
-                self.lib.mpa_world(),
-                self.lib.mpa_local_world(),
-            ) != (
-                self.rank,
-                self.world,
-                self.world,
-            ):
-                raise RuntimeError("duSHMEM rank/world/same-node identity mismatch")
-            self.active = 0
-            print(self.rank, "duSHMEM init ready", flush=True)
-
-    def close_vendor_session():
-        global _SESSION
-        if _SESSION is not None:
-            if _SESSION.active:
-                raise RuntimeError("duSHMEM allocations are still live")
-            torch.cuda.synchronize()
-            dist.barrier(group=_SESSION.control)
-            _SESSION.lib.mpa_finalize()
-            dist.destroy_process_group(_SESSION.control)
-            _SESSION = None
-
-    class VendorAllGatherMatmul:
-        def __init__(self, inputs):
-            global _SESSION
-            if _SESSION is None:
-                _SESSION = _Session(inputs)
-            self.session = _SESSION
-            self.rank, self.world = self.session.rank, self.session.world
-            self.lib = self.session.lib
-            self.nbytes = inputs.hidden.numel() * inputs.hidden.element_size()
-            print(self.rank, "duSHMEM allocation begin", self.nbytes, flush=True)
-            self.allocation = self.lib.mpa_alloc(self.nbytes)
-            if not self.allocation:
-                raise RuntimeError("duSHMEM allocation returned null")
-            self.session.active += 1
-            self.peer_ptrs = [
-                self.lib.mpa_peer(self.allocation, r) for r in range(self.world)
-            ]
-            if not all(self.peer_ptrs):
-                raise RuntimeError(
-                    "duSHMEM did not establish every same-node P2P mapping"
-                )
-            dist.barrier(group=self.session.control)
-            self.stream = torch.cuda.Stream(device=inputs.hidden.device)
-            self.gathered = torch.empty(
-                (inputs.hidden.shape[0] * self.world, inputs.hidden.shape[1]),
-                dtype=inputs.hidden.dtype,
-                device=inputs.hidden.device,
-            )
-            self.products = torch.empty(
-                (self.gathered.shape[0], inputs.weight.shape[0]),
-                dtype=inputs.hidden.dtype,
-                device=inputs.hidden.device,
-            )
-            self.shards = self.gathered.chunk(self.world)
-            self.out_shards = self.products.chunk(self.world)
-            self.evidence = {
-                "baseline_kind": "vllm-fl-vendor-dushmem-pipelined",
-                "communication_gemm": "duSHMEM peer mapping + HIP P2P copy + ATen HIP BLAS, two-stream rank pipeline",
-                "overlaps_communication_gemm": True,
-                "overlap_evidence": "GPU timeline verified: 27B TP2/32K; actual overlap amount is shape-dependent",
-                "nv_schedule": (
-                    "torch2.11 _pipelined_multi_all_gather_and_consume; "
-                    "local publish, barrier, alternating copy/GEMM, join, barrier"
-                ),
-                "vendor_shim_sha256": self.session.source_sha256,
-                "custom_gpu_compute_or_sync_kernel": False,
-                "python_epoch": False,
-                "duSHMEM_heap_bytes": os.environ["DUSHMEM_SYMMETRIC_SIZE"],
-            }
-            print(self.rank, "duSHMEM mappings ready", flush=True)
-
-        def _barrier(self, stream):
-            _check(self.lib.mpa_barrier(stream.cuda_stream), "stream barrier")
-
-        def _copy(self, dst, src, stream):
-            _check(self.lib.mpa_copy(dst, src, self.nbytes, stream.cuda_stream), "copy")
-
-        def __call__(self, inputs):
-            main = torch.cuda.current_stream(inputs.hidden.device)
-            self._barrier(main)
-            self._copy(self.allocation, inputs.hidden.data_ptr(), main)
-            self._barrier(main)
-            self.stream.wait_stream(main)
-            weight_t = inputs.weight.t()
-            torch.mm(inputs.hidden, weight_t, out=self.out_shards[self.rank])
-            for step in range(1, self.world):
-                stream = self.stream if step % 2 else main
-                peer = (self.rank + step) % self.world
-                with torch.cuda.stream(stream):
-                    self._copy(
-                        self.shards[peer].data_ptr(), self.peer_ptrs[peer], stream
-                    )
-                    torch.mm(self.shards[peer], weight_t, out=self.out_shards[peer])
-            # Match NV's returned gathered A, even though the projection only needs C.
-            local_stream = self.stream if self.world % 2 == 0 else main
-            with torch.cuda.stream(local_stream):
-                self._copy(
-                    self.shards[self.rank].data_ptr(),
-                    inputs.hidden.data_ptr(),
-                    local_stream,
-                )
-            main.wait_stream(self.stream)
-            self._barrier(main)
-            return self.gathered, self.products
-
-        def close(self):
-            if self.allocation:
-                torch.cuda.synchronize()
-                dist.barrier(group=self.session.control)
-                self.lib.mpa_free(self.allocation)
-                self.allocation = None
-                self.session.active -= 1
-
     def _compiled_method_bridge(method):
         """Keep the precision-adapted vLLM Triton kernel opaque to torch2.9 functionalization.
 
@@ -567,7 +346,7 @@ if flaggems_vllm.vendor_name == "hygon":
 
     def _baseline_policy():
         requested = os.environ.get("MPA_BASELINE_AG", "vllm-rccl")
-        if requested not in ("vllm-rccl", "serial-rccl", "dushmem"):
+        if requested not in ("vllm-rccl", "serial-rccl"):
             raise ValueError(f"unknown MPA_BASELINE_AG={requested!r}")
         return (
             requested,
@@ -671,9 +450,6 @@ if flaggems_vllm.vendor_name == "hygon":
             )
             self.key_cache, self.value_cache = self.kv_cache.unbind(0)
             self.reset_cache(inputs)
-            self.ag = None
-            if ag_kind == "dushmem":
-                self.ag = VendorAllGatherMatmul(inputs)
             self.evidence = {
                 "norm_precision": {
                     "version": "hygon-bf16-d256-fp32-tree-fp64-scalar-rsqrt-v1",
@@ -744,14 +520,8 @@ if flaggems_vllm.vendor_name == "hygon":
                 "cache_stride_adapter_timed": False,
             }
 
-            if self.ag is not None:
-                self.evidence.update(self.ag.evidence)
             self.evidence.update(selection)
             self.evidence["baseline_ag_selected"] = ag_kind
-
-        def close(self):
-            if self.ag is not None:
-                self.ag.close()
 
         def _project(self, qkv, positions):
             return self.method(self.context, qkv, positions)
@@ -770,16 +540,13 @@ if flaggems_vllm.vendor_name == "hygon":
             )
 
         def __call__(self, inputs):
-            if self.ag is None:
-                gathered = torch.empty(
-                    (inputs.positions.shape[1], inputs.hidden.shape[1]),
-                    device=inputs.hidden.device,
-                    dtype=inputs.hidden.dtype,
-                )
-                dist.all_gather_into_tensor(gathered, inputs.hidden, group=inputs.group)
-                product = self.linear_method.apply(self.linear_layer, gathered)
-            else:
-                gathered, product = self.ag(inputs)
+            gathered = torch.empty(
+                (inputs.positions.shape[1], inputs.hidden.shape[1]),
+                device=inputs.hidden.device,
+                dtype=inputs.hidden.dtype,
+            )
+            dist.all_gather_into_tensor(gathered, inputs.hidden, group=inputs.group)
+            product = self.linear_method.apply(self.linear_layer, gathered)
             q, k, v, gate = self.post(product, inputs.positions)
             self.cache_method(
                 self.cache_context,

@@ -701,8 +701,6 @@ if flaggems_vllm.vendor_name == "hygon":
                 calls.clear()
                 torch.cuda.synchronize()
                 dist.barrier()
-                if native is not None:
-                    native.close()
                 impl.clear_megapreattention_cache()
                 if check_only and case_id.endswith("_t4096"):
                     _check_growth(x)
@@ -715,10 +713,6 @@ if flaggems_vllm.vendor_name == "hygon":
                         flush=True,
                     )
                 del x, sources, functions, expected, actual
-            if not check_only or check_baseline:
-                from benchmark.test_megapreattention import close_vendor_session
-
-                close_vendor_session()
             if rank == 0:
                 (Path(directory) / "report.json").write_text(
                     json.dumps(reports, indent=2)
@@ -846,11 +840,14 @@ if flaggems_vllm.vendor_name == "hygon":
 
     def test_megapreattention_exports():
         import flaggems_vllm
-        from flaggems_vllm.ops import clear_megapreattention_cache, megapreattention
+        from flaggems_vllm import ops
 
-        assert callable(flaggems_vllm.megapreattention)
-        assert callable(flaggems_vllm.clear_megapreattention_cache)
-        assert callable(megapreattention) and callable(clear_megapreattention_cache)
+        impl = implementation()
+        assert flaggems_vllm.megapreattention is impl.megapreattention
+        assert ops.megapreattention is impl.megapreattention
+        assert callable(impl.clear_megapreattention_cache)
+        assert not hasattr(flaggems_vllm, "clear_megapreattention_cache")
+        assert not hasattr(ops, "clear_megapreattention_cache")
 
     @pytest.mark.parametrize("edge", [False, True])
     def test_megapreattention(tp, edge, request):

@@ -21,7 +21,11 @@ import torch
 import torch.distributed as dist
 import triton
 
-from .megapreattention_kernel import _fill_buffer, _init_metadata, _persistent
+from flaggems_vllm.runtime.backend._hygon.mega.megapreattention.megapreattention_kernel import (
+    _fill_buffer,
+    _init_metadata,
+    _persistent,
+)
 
 __all__ = ["megapreattention", "clear_megapreattention_cache"]
 

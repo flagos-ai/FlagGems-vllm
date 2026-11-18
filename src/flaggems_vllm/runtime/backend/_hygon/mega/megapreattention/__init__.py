@@ -14,6 +14,9 @@
 
 """Hygon MegaPreAttention operator."""
 
-from .api import clear_megapreattention_cache, megapreattention
+from flaggems_vllm.runtime.backend._hygon.mega.megapreattention.api import (
+    clear_megapreattention_cache,
+    megapreattention,
+)
 
 __all__ = ["clear_megapreattention_cache", "megapreattention"]
