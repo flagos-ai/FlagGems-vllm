@@ -83,8 +83,8 @@ def test_public_contract(gpu):
     assert Path(inspect.getfile(gems.matmul_persistent)).resolve() == expected
     assert gems.matmul_persistent is impl.matmul_persistent
     assert str(inspect.signature(gems.matmul_persistent)) == "(a, b, *, out=None)"
-    assert "matmul_persistent" in gems._LIBRARY_ONLY_OPS
-    assert "matmul_persistent" not in dict(gems._FULL_CONFIG)
+    ops = importlib.import_module("flaggems_vllm.ops")
+    assert "matmul_persistent" in ops.__all__
 
 
 @pytest.mark.matmul_persistent
