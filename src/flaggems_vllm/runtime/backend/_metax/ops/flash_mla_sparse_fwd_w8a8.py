@@ -25,8 +25,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
 from triton.language.core import extern
 from triton.runtime.cache import get_cache_manager
 
@@ -222,56 +220,38 @@ def merge_int8_probabilities(
     ROWS: tl.constexpr,
     SPLITS: tl.constexpr,
     ADAPTIVE: tl.constexpr,
-    QUANTIZED_CACHE: tl.constexpr,
     SORT_BATCHES: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * 32 + tl.arange(0, 32)
-    if QUANTIZED_CACHE:
-        positions = tl.arange(0, SPLITS * 4)
-        row_batches = rows // (H * SQ)
-        row_heads = rows % (H * SQ)
-        offsets = (
-            (
-                row_batches[:, None].to(tl.int64) * SPLITS * 3
-                + (positions[None, :] // 4) * 3
-            )
-            * 4
-            + positions[None, :] % 4
-        ) * H * SQ + row_heads[:, None]
-        maxima = tl.load(Stats + offsets, rows[:, None] < ROWS, -float("inf"))
-        weighted_maxima = tl.load(
-            Stats + offsets + 4 * H * SQ, rows[:, None] < ROWS, 0.0
-        )
-        local_denominators = tl.load(
-            Stats + offsets + 8 * H * SQ, rows[:, None] < ROWS, 0.0
-        )
-        maximum = tl.max(maxima, 1)
-        safe = tl.where(maximum == -float("inf"), 0.0, maximum)
-        weights = tl.exp2(maxima - safe[:, None])
-        denominator = tl.sum(local_denominators * weights, 1)
-        scale = tl.maximum(tl.max(weighted_maxima * weights, 1), 1.0e-30)
-        output_scale = scale / tl.where(denominator > 0, denominator, 1.0)
-        logsum = tl.where(
-            denominator > 0,
-            maximum * 0.6931471805599453 + tl.log(denominator),
-            float("inf"),
-        )
-        tl.store(
-            LSE + (row_batches * H + row_heads % H) * SQ + row_heads // H,
-            logsum,
-            rows < ROWS,
-        )
-    else:
-        splits = tl.arange(0, SPLITS)
-        offsets = (rows[:, None] * SPLITS + splits[None, :]) * 2
-        maxima = tl.load(Stats + offsets, rows[:, None] < ROWS, -float("inf"))
-        weighted_maxima = tl.load(Stats + offsets + 1, rows[:, None] < ROWS, 0.0)
-        maximum = tl.max(maxima, 1)
-        safe = tl.where(maximum == -float("inf"), 0.0, maximum)
-        weights = tl.exp2(maxima - safe[:, None])
-        weighted = tl.max(weighted_maxima * weights, 1)
-        scale = tl.maximum(weighted * (1.0 / 16129.0), 1.0e-30)
-        output_scale = scale
+    positions = tl.arange(0, SPLITS * 4)
+    row_batches = rows // (H * SQ)
+    row_heads = rows % (H * SQ)
+    offsets = (
+        (row_batches[:, None].to(tl.int64) * SPLITS * 3 + (positions[None, :] // 4) * 3)
+        * 4
+        + positions[None, :] % 4
+    ) * H * SQ + row_heads[:, None]
+    maxima = tl.load(Stats + offsets, rows[:, None] < ROWS, -float("inf"))
+    weighted_maxima = tl.load(Stats + offsets + 4 * H * SQ, rows[:, None] < ROWS, 0.0)
+    local_denominators = tl.load(
+        Stats + offsets + 8 * H * SQ, rows[:, None] < ROWS, 0.0
+    )
+    maximum = tl.max(maxima, 1)
+    safe = tl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = tl.exp2(maxima - safe[:, None])
+    denominator = tl.sum(local_denominators * weights, 1)
+    scale = tl.maximum(tl.max(weighted_maxima * weights, 1), 1.0e-30)
+    output_scale = scale / tl.where(denominator > 0, denominator, 1.0)
+    logsum = tl.where(
+        denominator > 0,
+        maximum * 0.6931471805599453 + tl.log(denominator),
+        float("inf"),
+    )
+    tl.store(
+        LSE + (row_batches * H + row_heads % H) * SQ + row_heads // H,
+        logsum,
+        rows < ROWS,
+    )
     tl.store(Metadata + rows * 2, safe, rows < ROWS)
     tl.store(Metadata + rows * 2 + 1, 1.0 / scale, rows < ROWS)
     tl.store(PS + rows, output_scale, rows < ROWS)
@@ -295,82 +275,38 @@ def merge_int8_probabilities(
 
 
 @libentry()
-@gluon.jit
+@triton.jit
 def merge_int8_values(
     Partial,
-    PartialD,
-    Metadata,
     Scale,
     Output,
-    LSE,
     SplitFlag,
-    B: gl.constexpr,
-    H: gl.constexpr,
-    SQ: gl.constexpr,
-    SPLITS: gl.constexpr,
-    QUANTIZED_CACHE: gl.constexpr = False,
-    MERGE_HEADS: gl.constexpr = 4,
-    UNIFORM_SPLITS: gl.constexpr = 1,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    SQ: tl.constexpr,
+    SPLITS: tl.constexpr,
+    UNIFORM_SPLITS: tl.constexpr,
 ):
-    if UNIFORM_SPLITS > 1 or gl.load(SplitFlag) != 0:
-        parent: gl.constexpr = gl.BlockedLayout(
-            [1, 1, 4], [1, 1, 64], [1, 2, 2], [2, 1, 0]
-        )
-        meta: gl.constexpr = gl.SliceLayout(2, parent)
-        outlayout: gl.constexpr = gl.SliceLayout(0, parent)
-        batch = gl.program_id(0)
-        hs = gl.program_id(1) * MERGE_HEADS
-        splits = gl.arange(0, SPLITS, layout=gl.SliceLayout(1, meta))
-        heads = hs + gl.arange(0, MERGE_HEADS, layout=gl.SliceLayout(0, meta))
-        oh = hs + gl.arange(0, MERGE_HEADS, layout=gl.SliceLayout(1, outlayout))
-        dims = gl.arange(0, 512, layout=gl.SliceLayout(0, outlayout))
-        s2 = gl.expand_dims(splits, 1)
-        h2 = gl.expand_dims(heads, 0)
-        s3 = gl.expand_dims(s2, 2)
-        h3 = gl.expand_dims(h2, 2)
-        d3 = gl.expand_dims(gl.expand_dims(dims, 0), 0)
-        # Native PV writes only active partitions.
-        split_count = SPLITS
-        if UNIFORM_SPLITS > 1 and UNIFORM_SPLITS < SPLITS:
-            split_count = gl.where(gl.load(SplitFlag) != 0, SPLITS, UNIFORM_SPLITS)
-        values = gl.load(
-            Partial + ((s3.to(gl.int64) * B + batch) * H * SQ + h3) * 512 + d3,
-            (h3 < H * SQ) & (s3 < split_count),
-            0.0,
-        )
-        scale = gl.load(Scale + batch * H * SQ + oh, oh < H * SQ, 0.0)
-        if QUANTIZED_CACHE:
-            output = gl.sum(values, 0) * gl.expand_dims(scale, 1)
-        else:
-            denominator = gl.sum(
-                gl.load(
-                    PartialD + (s2 * B + batch) * H * SQ + h2,
-                    (h2 < H * SQ) & (s2 < split_count),
-                    0.0,
-                ),
-                0,
+    is_variable = tl.load(SplitFlag) != 0
+    if UNIFORM_SPLITS > 1 or is_variable:
+        batch = tl.program_id(0)
+        heads = tl.program_id(1) * 4 + tl.arange(0, 4)
+        dims = tl.arange(0, 512)
+        offsets = (batch.to(tl.int64) * H * SQ + heads[:, None]) * 512 + dims[None, :]
+        split_count = tl.where(is_variable, SPLITS, UNIFORM_SPLITS)
+        accumulator = tl.zeros((4, 512), tl.float32)
+        # Native PV leaves inactive partition buffers unwritten.
+        for split in tl.static_range(SPLITS):
+            values = tl.load(
+                Partial + split * B * H * SQ * 512 + offsets,
+                (heads[:, None] < H * SQ) & (split < split_count),
+                0.0,
             )
-            denom = gl.convert_layout(
-                gl.where(denominator > 0, denominator, 1.0),
-                gl.SliceLayout(1, outlayout),
-            )
-            output = gl.sum(values, 0) * gl.expand_dims(scale / denom, 1)
-        gl.store(
-            Output
-            + (batch.to(gl.int64) * H * SQ + gl.expand_dims(oh, 1)) * 512
-            + gl.expand_dims(dims, 0),
-            output,
-            gl.expand_dims(oh < H * SQ, 1),
+            accumulator += values
+        scale = tl.load(Scale + batch * H * SQ + heads, heads < H * SQ, 0.0)
+        tl.store(
+            Output + offsets, accumulator * scale[:, None], heads[:, None] < H * SQ
         )
-        if not QUANTIZED_CACHE:
-            maximum = gl.load(Metadata + (batch * H * SQ + oh) * 2, oh < H * SQ, 0.0)
-            denominator = gl.convert_layout(denominator, gl.SliceLayout(1, outlayout))
-            logsum = gl.where(
-                denominator > 0,
-                maximum * 0.6931471805599453 + gl.log(denominator),
-                float("inf"),
-            )
-            gl.store(LSE + (batch * H + oh % H) * SQ + oh // H, logsum, oh < H * SQ)
 
 
 @libentry()
@@ -645,9 +581,7 @@ def values_native_fragments(
     Metadata,
     PS,
     Output,
-    LSE,
     Partial,
-    PartialD,
     SplitFlag,
     KV_STRIDES: tl.constexpr,
     TS: tl.constexpr,
@@ -656,15 +590,11 @@ def values_native_fragments(
     H: tl.constexpr,
     SQ: tl.constexpr,
     CAP: tl.constexpr,
-    BH: tl.constexpr = 64,
     SPLITS: tl.constexpr = 1,
     ADAPTIVE: tl.constexpr = False,
-    QUANTIZED_CACHE: tl.constexpr = True,
     SORT_BATCHES: tl.constexpr = False,
     UNIFORM_SPLITS: tl.constexpr = 1,
-    STAGED: tl.constexpr = False,
 ):
-    tl.static_assert(BH == 64 and QUANTIZED_CACHE)
     _values_device(
         tl.cast(KV, tl.int64),
         tl.cast(Table, tl.int64),
@@ -916,13 +846,6 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
         device = tensors[0].device
         self.capacity = tensors[6].shape[1] * 64
         self.head_tile = 64
-        self.pv_head_tile = 64
-        self.prequantized = False
-        self.grouped = False
-        self.quantized_cache = True
-        self.qk_native_statistics = True
-        self.native_barriers = True
-        self.value_staging = True
         self.adaptive = merged <= 64
         self.sort_batches = self.batch <= 256
         self.value_splits = (
@@ -934,7 +857,6 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
             and (self.capacity == 8192 or 16384 <= self.capacity <= 32768)
             else 1
         )
-        self.value_merge_heads = 4 if self.adaptive else 0
         self.score_splits = (
             8 if merged == 64 or (merged <= 128 and self.capacity >= 16384) else 4
         )
@@ -972,9 +894,6 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
         workspace_splits = self.value_splits if self.adaptive else 0
         self.partial = torch.empty(
             (workspace_splits, rows, 512), dtype=torch.float32, device=device
-        )
-        self.partial_denominator = torch.empty(
-            (workspace_splits, rows), dtype=torch.float32, device=device
         )
         self.score_kernel = ScoresKernel(self)
         self.value_kernel = ValuesKernel(256 if merged <= 64 else 512, self)
@@ -1024,7 +943,6 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 rows,
                 self.score_splits,
                 self.adaptive,
-                QUANTIZED_CACHE=True,
                 SORT_BATCHES=self.sort_batches,
                 num_warps=4,
                 num_stages=1,
@@ -1040,9 +958,7 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 self.probability_metadata,
                 self.probability_scale,
                 self.output,
-                self.lse,
                 self.partial,
-                self.partial_denominator,
                 self.split_flag,
                 kv.stride(),
                 table.stride(0),
@@ -1051,28 +967,21 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 self.heads,
                 self.queries,
                 self.capacity,
-                BH=64,
                 SPLITS=self.value_splits,
                 ADAPTIVE=self.adaptive,
                 UNIFORM_SPLITS=self.uniform_value_splits,
-                QUANTIZED_CACHE=True,
                 SORT_BATCHES=self.sort_batches,
-                STAGED=True,
             )
             if self.adaptive:
                 merge_int8_values[(self.batch, triton.cdiv(merged, 4))](
                     self.partial,
-                    self.partial_denominator,
-                    self.probability_metadata,
                     self.probability_scale,
                     self.output,
-                    self.lse,
                     self.split_flag,
                     self.batch,
                     self.heads,
                     self.queries,
                     self.value_splits,
-                    QUANTIZED_CACHE=True,
                     UNIFORM_SPLITS=self.uniform_value_splits,
                     num_warps=4,
                     num_stages=1,

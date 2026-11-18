@@ -433,3 +433,21 @@ def test_sparse_raw_selected_partitions(batch, topk):
     assert_accuracy(
         (actual[0][:4], actual[1][:4]), reference(first_rows, softmax_scale=0.5)
     )
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@requires_int8_mla
+@pytest.mark.parametrize("topk, variable_lengths", [(8192, False), (4096, True)])
+def test_sparse_value_split_merge(topk, variable_lengths):
+    # For D512, 33 rows use the cached path instead of the fused path.
+    batch = 33
+    pages = 32 if variable_lengths else 128
+    inputs = make_int8_inputs(batch, 1, 64, topk, pages=pages, rope_dim=0)
+    lengths = None
+    if variable_lengths:
+        lengths = torch.full(
+            (batch,), pages * 64, dtype=torch.int32, device=inputs[0].device
+        )
+        lengths[0], lengths[1] = 1023, 0
+    packed = (*inputs, 0.5, None, lengths)
+    check_sparse_int8(packed, flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed))
