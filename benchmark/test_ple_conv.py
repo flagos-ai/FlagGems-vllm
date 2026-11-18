@@ -1,90 +1,141 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PLE conv performance. Native baseline is vLLM ple_conv, or None."""
+# Copyright 2026 FlagOS Contributors
+"""Perf coverage for FlagGems PLE short-conv APIs.
 
-import statistics
+Formal NV baseline is ``ple_conv`` via ``baseline.ple_conv.native()``.
+Legacy ``ple_short_conv_`` has no matching installed-vLLM entrypoint, so its
+benchmark measures FlagGems latency only (no torch reference baseline).
+"""
 
 import pytest
 import torch
 
-from baseline import ple_conv as workloads
-from flaggems_vllm import ple_conv
+from baseline import ple_conv as native_workload
+from flaggems_vllm import ple_conv, ple_short_conv_
 
 from . import base
 
-# Scalars published in the H20 config. query_start_loc, has_initial_states,
-# num_accepted_tokens and spec_query_len are real call arguments, but they are
-# not part of that config, so recording them makes --base-data miss.
-_CONFIG_SCALARS = ("mode", "dilation")
 
+class PLEShortConvBenchmark(base.GenericBenchmark):
+    """Legacy FlagGems API smoke latency (no NV native counterpart)."""
 
-class PLEConvBenchmark(base.GenericBenchmark):
+    BASELINE_METRICS = ("latency_base", "speedup")
+
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [tuple(binding["shape"]) for binding in workloads.grid()]
+        self.shapes = [
+            (mode, rows, channels)
+            for channels in (33, 10240)
+            for mode, rows in (
+                ("decode", 1),
+                ("decode", 64),
+                ("prefill", 33),
+                ("prefill", 1024),
+                ("spec", 64),
+            )
+        ]
+        self.shape_desc = "mode,rows,channels"
+
+    def init_user_config(self):
+        super().init_user_config()
+        # No installed-vLLM API matches ple_short_conv_; do not use a torch
+        # reference as latency_base (see test-capability doc §6.1).
+        if self.torch_op is None:
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in self.BASELINE_METRICS
+            ]
+
+
+def short_conv_inputs(shape, dtype, device):
+    mode, rows, channels = shape
+    query_len = 4 if mode == "spec" else 1
+    tokens = rows * query_len
+    indices = torch.arange(rows, dtype=torch.int32, device=device)
+    kwargs = {"dilation": 3}
+    if mode == "prefill":
+        indices = indices[:1]
+        kwargs["max_query_len"] = tokens
+        kwargs["query_start_loc"] = torch.tensor(
+            [0, tokens], dtype=torch.int32, device=device
+        )
+    elif mode == "spec":
+        kwargs.update(
+            query_start_loc=torch.arange(rows + 1, device=device, dtype=torch.int32)
+            * query_len,
+            accepted_tokens=torch.ones(rows, device=device, dtype=torch.int32),
+            max_query_len=query_len,
+        )
+    x = torch.randn(tokens, channels, dtype=dtype, device=device)
+    yield (
+        x,
+        torch.empty_like(x),
+        torch.randn(rows + 1, 12, channels, dtype=dtype, device=device).transpose(1, 2),
+        torch.randn(channels, 4, dtype=dtype, device=device),
+        indices,
+        kwargs,
+    )
+
+
+class PLEConvNativeBenchmark(base.Benchmark):
+    """Upstream-compatible ``ple_conv`` vs installed vLLM native."""
+
+    BASELINE_METRICS = ("latency_base", "speedup")
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            tuple(native_workload.key_shape(b)) for b in native_workload.grid()
+        ]
         self.shape_desc = "mode,rows,channels,fuse,kernel,dilation"
 
-    def record_shapes(self, *args, **kwargs):
-        visible = {key: kwargs[key] for key in _CONFIG_SCALARS if key in kwargs}
-        return super().record_shapes(*args, **visible)
+    def get_input_iter(self, dtype):
+        for shape in self.shapes:
+            binding = dict(
+                zip(
+                    (
+                        "mode",
+                        "rows",
+                        "channels",
+                        "fuse_residual",
+                        "kernel_size",
+                        "dilation",
+                    ),
+                    shape,
+                )
+            )
+            binding["fuse_residual"] = bool(binding["fuse_residual"])
+            binding["spec_query_len"] = native_workload.SPEC_QUERY_LEN
+            args, kwargs = native_workload.build_inputs(binding, dtype, self.device)
+            yield (*args, kwargs)
 
-    def get_latency(self, op, *args, **kwargs):
-        """Same protocol as the H20 collector for this in-place op.
-
-        Device events, five warmups, 25 samples, median. Mutated tensors are
-        restored outside each timed interval, and the launch is not captured
-        in a CUDA graph.
-        """
-        saved = []
-        for index in workloads.MUTATED_INPUTS:
-            tensor = args[index] if isinstance(index, int) else kwargs[index]
-            saved.append((tensor, tensor.clone()))
-
-        def restore():
-            for tensor, initial in saved:
-                tensor.copy_(initial)
-
-        try:
-            for _ in range(5):
-                restore()
-                op(*args, **kwargs)
-            torch.cuda.synchronize()
-            samples = []
-            for _ in range(25):
-                restore()
-                torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                op(*args, **kwargs)
-                end.record()
-                end.synchronize()
-                samples.append(start.elapsed_time(end))
-            return statistics.median(samples)
-        finally:
-            restore()
-            torch.cuda.synchronize()
+    def init_user_config(self):
+        super().init_user_config()
+        if self.torch_op is None:
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in self.BASELINE_METRICS
+            ]
 
 
-def conv_inputs(shape, dtype, device):
-    args, kwargs = workloads.build_inputs({"shape": list(shape)}, dtype, device)
-    yield (*args, kwargs)
+@pytest.mark.ple_fusion
+def test_ple_short_conv_perf():
+    PLEShortConvBenchmark(
+        input_fn=short_conv_inputs,
+        op_name="ple_short_conv_",
+        torch_op=None,
+        gems_op=ple_short_conv_,
+        dtypes=[torch.bfloat16, torch.float16],
+    ).run()
 
 
 @pytest.mark.ple_conv
 def test_ple_conv_perf():
-    native = workloads.native()
-    if native is None:
-        print(
-            "[ple_conv] no vLLM ple_conv on this image "
-            f"({workloads.NATIVE_UNAVAILABLE_REASON}); measuring FlagGems only. "
-            "Pass --base-data to report the scaled H20 comparison."
-        )
-    PLEConvBenchmark(
-        input_fn=conv_inputs,
-        op_name=workloads.OP_NAME,
-        # Vendor-native callable. None means there is no on-machine baseline;
-        # do not substitute a PyTorch conv1d.
-        torch_op=native,
+    baseline_op = native_workload.native()
+    PLEConvNativeBenchmark(
+        op_name="ple_conv",
+        torch_op=baseline_op,
         gems_op=ple_conv,
-        dtypes=list(workloads.DTYPES),
-        is_inplace=workloads.IS_INPLACE,
+        dtypes=native_workload.DTYPES,
+        is_inplace=native_workload.IS_INPLACE,
     ).run()
