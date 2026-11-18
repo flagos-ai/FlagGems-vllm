@@ -309,10 +309,22 @@ def select_candidate_blocks_cooperative(
         )
     # Rows of at most k blocks take all of them and pad with -1. nblocks bounds
     # every row's length (lengths <= nblocks by construction).
-    topk, needs_finalize = _resolve_block_topk()
-    topk(scores, lengths, out, workspace, k, nblocks)
+    import flaggems_vllm
 
-    if needs_finalize:
-        _finalize_candidates_kernel[(rows, triton.cdiv(k, _FINALIZE_TILE))](
-            out, scores, lengths, nblocks, k, _FINALIZE_TILE
+    if getattr(flaggems_vllm, "vendor_name", None) == "metax":
+        # MetaX: persistent_topk cooperative path needs TLE shared-memory atomics
+        # the metax FlagTree build cannot compile, so use the local pure-Triton
+        # radix select, which emits only valid ids + -1 padding (no finalize).
+        from flaggems_vllm.runtime.backend._metax.ops.select_candidate_block_topk import (
+            block_topk_metax,
         )
+
+        block_topk_metax(scores, lengths, out, k, workspace)
+    else:
+        topk, needs_finalize = _resolve_block_topk()
+        topk(scores, lengths, out, workspace, k, nblocks)
+
+        if needs_finalize:
+            _finalize_candidates_kernel[(rows, triton.cdiv(k, _FINALIZE_TILE))](
+                out, scores, lengths, nblocks, k, _FINALIZE_TILE
+            )
