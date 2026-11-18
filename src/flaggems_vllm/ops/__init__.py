@@ -61,6 +61,7 @@ from flaggems_vllm.ops.FLA import (
 from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.ops.gdn_w8a16 import gdn_w8a16
+from flaggems_vllm.ops.gumbel_sample import gumbel_sample
 from flaggems_vllm.ops.attention import (
     flash_attention_forward,
     flash_attn_varlen_func,
@@ -369,6 +370,7 @@ __all__ = [
     "get_num_sampled_and_rejected",
     "grouped_gemma_rmsnorm",
     "grouped_topk",
+    "gumbel_sample",
     "hadamard128",
     "hc_combine",
     "hc_down_silu",

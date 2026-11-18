@@ -1302,6 +1302,20 @@ ops:
   - MoE
   stages:
   - stable: '5.0'
+- id: gumbel_sample
+  description: |
+    Stateless Murmur3 Gumbel-max sampling from logits for vLLM Model Runner V2,
+    with request temperatures, draft streams, bias and pre-temperature logits cache.
+    NaN logits and invalid device-side indices/temperatures are outside the contract.
+  for:
+    - vllm.v1.worker.gpu.sample.gumbel.gumbel_sample
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - Sampling
+  stages:
+    - alpha: '5.4'
 - id: hc_combine
   description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
   for:

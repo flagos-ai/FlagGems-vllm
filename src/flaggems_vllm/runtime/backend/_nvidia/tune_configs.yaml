@@ -1849,3 +1849,13 @@ cast_sigmoid:
   - META: {BLOCK_SIZE: 8192}
     num_warps: 8
     num_stages: 1
+
+gumbel_sample:
+  # BLOCK_SIZE stays 1024 so every trial shares the same workspace shape.
+  # Cache calls use the first configuration directly, without live-state tuning.
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
