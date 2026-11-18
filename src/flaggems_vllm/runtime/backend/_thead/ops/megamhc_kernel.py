@@ -19,6 +19,21 @@ from flaggems_vllm.ops.mhc.mhc_pre import _mhc_recip
 
 
 @triton.jit
+def _isfinite_f32(value):
+    # The SDK cannot lower vector llvm.is.fpclass. Keep classification in
+    # integer registers rather than changing the compiler or math precision.
+    exponent = tl.inline_asm_elementwise(
+        "and.b32 $0, $1, 0x7f800000;",
+        constraints="=r,r",
+        args=[value.to(tl.uint32, bitcast=True)],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+    return exponent != 0x7F800000
+
+
+@triton.jit
 def mega_mhc_kernel(
     X,
     Residual,
@@ -106,7 +121,37 @@ def mega_mhc_kernel(
             )
             projection = tl.fma(weight, value[None, :], projection)
 
-    logits = tl.sum(projection, 1) * tl.rsqrt(tl.sum(square_sum, 0) / (R * H) + rms_eps)
+    totals = tl.sum(projection, 1)
+    magnitude = tl.sum(tl.abs(projection), 1)
+    retry = (
+        (magnitude > 0)
+        & _isfinite_f32(magnitude)
+        & _isfinite_f32(totals)
+        & (tl.abs(totals) <= 2.0**-20 * magnitude)
+    )
+    # Large cancellation between SIMD partials can expose rounding accumulated
+    # along K. Compensate only those heads, using the rounded BF16 residual.
+    if tl.sum(retry.to(tl.int32), 0) > 0:
+        tl.debug_barrier()
+        for head in range(P):
+            if tl.sum(tl.where(p == head, retry.to(tl.int32), 0), 0) > 0:
+                total = tl.zeros((BLOCK_K,), tl.float32)
+                error = tl.zeros((BLOCK_K,), tl.float32)
+                for start in range(0, R * H, BLOCK_K):
+                    offset = start + k
+                    mask = offset < R * H
+                    value = tl.load(NewResidual + residual_base + offset, mask, 0).to(
+                        tl.float32
+                    )
+                    weight = tl.load(Fn + head * (R * H) + offset, mask, 0)
+                    corrected = value * weight - error
+                    updated = total + corrected
+                    error = (updated - total) - corrected
+                    total = updated
+                replacement = tl.sum(total - error, 0)
+                if _isfinite_f32(replacement):
+                    totals = tl.where(p == head, replacement, totals)
+    logits = totals * tl.rsqrt(tl.sum(square_sum, 0) / (R * H) + rms_eps)
     idx = tl.arange(0, R)
     pre = (
         tl.sigmoid(tl.gather(logits, idx, 0) * tl.load(Scale) + tl.load(Base + idx))

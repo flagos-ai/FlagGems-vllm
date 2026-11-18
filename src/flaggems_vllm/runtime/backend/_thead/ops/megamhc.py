@@ -104,7 +104,8 @@ def mega_mhc(
     For fixed weights, pass the result of pack_mega_mhc_weights(fn) as packed_fn
     to the large-input pipeline. Keep fn and its packed weights consistent and
     keep packed_fn alive for the lifetime of any graph that captures it.
-    The per-token path reads fn directly. Omit packed_fn when updating fn
+    Small grids read fn directly. The default implementation reuses FP32
+    weights across multiple rows in a SIMD tile. Omit packed_fn when updating fn
     between graph replays. Use implementation="triton" to run the fused
     pipeline with Triton postprocessing and CTA synchronization.
     """
@@ -223,6 +224,48 @@ def mega_mhc(
                 return new_residual, *outputs
 
         new_residual = torch.empty_like(residual)
+        # Reuse large FP32 weight matrices across a few rows. SIMD keeps
+        # small queues on the full compute grid without the MMA mode limit.
+        native_simt = (
+            implementation == "auto"
+            and (properties.major, properties.minor) == (8, 0)
+            and multiprocessors < tokens <= 8 * multiprocessors
+            and block_p <= 32
+            and k * block_p >= 4096 * multiprocessors
+            and hidden % 8 == 0
+            and sinkhorn_repeat < 2**32
+            and all(t.data_ptr() % 16 == 0 for t in (x, residual, fn, norm))
+            and has_triton_tle_attrs(("gpu.alloc", "gpu.local_ptr"))
+        )
+        if native_simt:
+            bitcode = device_bitcode()
+            if bitcode is not None:
+                from .megamhc_simt import mega_mhc_simt_kernel
+
+                if tokens <= 2 * multiprocessors:
+                    rows, warps = 2, max(8, block_p)
+                elif tokens <= 4 * multiprocessors:
+                    rows, warps = 2, max(8, block_p // 2)
+                else:
+                    rows, warps = 4, max(8, block_p // 4)
+                mega_mhc_simt_kernel[(triton.cdiv(tokens, rows),)](
+                    *inputs,
+                    new_residual,
+                    *outputs,
+                    *scalars,
+                    tokens,
+                    hidden,
+                    streams,
+                    has_norm,
+                    rows,
+                    warps,
+                    num_warps=warps,
+                    num_stages=1,
+                    enable_fp_fusion=False,
+                    extern_libs={"megamhc": bitcode},
+                )
+                return new_residual, *outputs
+
         # With only one CTA per token, use a wider K tile at low occupancy.
         # More waves favor fewer registers per CTA. Bound the accumulator for
         # larger stream counts as its size is proportional to the mix width.

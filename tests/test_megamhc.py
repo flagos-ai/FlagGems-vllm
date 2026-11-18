@@ -100,9 +100,10 @@ def verify(result, expected):
         (4097, 259, 4),
     ],
 )
+@pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.megamhc
-def test_mega_mhc(tokens, hidden, streams):
-    args = make_inputs(tokens, hidden, streams, strided=True)
+def test_mega_mhc(tokens, hidden, streams, strided):
+    args = make_inputs(tokens, hidden, streams, strided=strided)
     verify(candidate(args), reference(args))
 
 
@@ -121,10 +122,13 @@ def test_mega_mhc_graph_replay():
 
 
 @pytest.mark.parametrize("implementation", ["auto", "triton"])
-@pytest.mark.parametrize("tokens", [4097, 8193])
+@pytest.mark.parametrize(
+    "tokens,hidden",
+    [(128, 4096), (256, 4096), (384, 4096), (512, 4096), (4097, 521), (8193, 521)],
+)
 @pytest.mark.megamhc
-def test_mega_mhc_projection_cancellation(tokens, implementation):
-    hidden, streams = 521, 4
+def test_mega_mhc_projection_cancellation(tokens, hidden, implementation):
+    streams = 4
     args = make_inputs(tokens, hidden, streams)
     x, residual, post, comb, fn, scale, base, norm = args
     x.zero_()
@@ -220,3 +224,29 @@ def test_mega_mhc_empty():
         (0, 4, 4),
         (0, 127),
     ]
+
+
+@pytest.mark.parametrize("implementation", ["auto", "triton"])
+@pytest.mark.parametrize(
+    "tokens,hidden,streams,use_norm",
+    [
+        (127, 3072, 4, True),
+        (129, 4104, 4, False),
+        (257, 4096, 4, True),
+        (385, 4096, 4, True),
+        (129, 16384, 2, True),
+    ],
+)
+@pytest.mark.megamhc
+def test_mega_mhc_short_graph_replay(tokens, hidden, streams, use_norm, implementation):
+    args = make_inputs(tokens, hidden, streams, strided=True)
+    graph = torch.cuda.CUDAGraph()
+    # Warm up the device helper and Triton compilation before capture.
+    candidate(args, use_norm=use_norm, implementation=implementation)
+    with torch.cuda.graph(graph):
+        outputs = candidate(args, use_norm=use_norm, implementation=implementation)
+    for _ in range(3):
+        args[0].mul_(-0.75)
+        args[4].mul_(-0.5)
+        graph.replay()
+        verify(outputs, reference(args, use_norm=use_norm))
