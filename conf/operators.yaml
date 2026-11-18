@@ -1153,7 +1153,7 @@ ops:
     stages:
       - alpha: '5.4'
   - id: matmul_persistent
-    description: vLLM batch-invariant matmul with bounded H20 small-matrix optimization.
+    description: vLLM batch-invariant matmul with bounded NVIDIA small-matrix optimization.
     for:
       - vllm.model_executor.determinism.batch_invariant.matmul_batch_invariant
     labels:
