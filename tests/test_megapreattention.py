@@ -19,9 +19,9 @@ import flaggems_vllm
 if flaggems_vllm.vendor_name == "hygon":
     """Independent torch oracle and Hygon layer3 test adapter (test-only).
 
-Oracle is derived from frozen NV PR #1007; it gathers original hidden shards
-and never reads candidate communication buffers or intermediate projections.
-"""
+    Oracle is derived from frozen NV PR #1007; it gathers original hidden shards
+    and never reads candidate communication buffers or intermediate projections.
+    """
     import hashlib
     import json
     import os
@@ -49,7 +49,6 @@ and never reads candidate communication buffers or intermediate projections.
     BF16_ATOLS = (0.001, 0.002, 0.003, 0.004, 0.005)
     BF16_RTOL = 0.016
 
-
     @dataclass(frozen=True)
     class Config:
         num_q_heads: int
@@ -72,7 +71,6 @@ and never reads candidate communication buffers or intermediate projections.
         def packed_size(self):
             return 2 * (self.q_size + self.kv_size)
 
-
     @dataclass
     class Inputs:
         hidden: torch.Tensor
@@ -87,7 +85,6 @@ and never reads candidate communication buffers or intermediate projections.
         group: object
         config: Config
 
-
     @dataclass
     class Output:
         query: torch.Tensor
@@ -99,7 +96,6 @@ and never reads candidate communication buffers or intermediate projections.
         def tensors(self):
             return self.query, self.key, self.value, self.gate
 
-
     def file_sha(path):
         digest = hashlib.sha256()
         with Path(path).open("rb") as stream:
@@ -107,12 +103,10 @@ and never reads candidate communication buffers or intermediate projections.
                 digest.update(chunk)
         return digest.hexdigest()
 
-
     def tensor_sha(tensor):
         return hashlib.sha256(
             tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
         ).hexdigest()
-
 
     def tensor_info(tensor):
         return {
@@ -120,7 +114,6 @@ and never reads candidate communication buffers or intermediate projections.
             "dtype": str(tensor.dtype).removeprefix("torch."),
             "sha256": tensor_sha(tensor),
         }
-
 
     def packed_weight(weights, dims, tp, rank):
         _, q_heads, kv_heads = dims
@@ -135,7 +128,6 @@ and never reads candidate communication buffers or intermediate projections.
                 weights["v_proj.weight"][kv_start : kv_start + kvwidth],
             ]
         )
-
 
     class Dataset:
         """Portable replay loader. Load/allocate before warmup or graph capture."""
@@ -157,7 +149,10 @@ and never reads candidate communication buffers or intermediate projections.
             path = self.root / relative
             info = self.manifest["files"][relative]
             if relative not in self._checked:
-                if path.stat().st_size != info["bytes"] or file_sha(path) != info["sha256"]:
+                if (
+                    path.stat().st_size != info["bytes"]
+                    or file_sha(path) != info["sha256"]
+                ):
                     raise ValueError(f"File hash mismatch: {relative}")
             value = torch.load(path, map_location="cpu", weights_only=True)
             if relative not in self._checked:
@@ -198,7 +193,9 @@ and never reads candidate communication buffers or intermediate projections.
                 slots=shared["slots"].to(device),
                 q_norm=weights["q_norm.weight"].to(device),
                 k_norm=weights["k_norm.weight"].to(device),
-                rope=self._shared[self.manifest["config"]["rope_file"]]["rope"].to(device),
+                rope=self._shared[self.manifest["config"]["rope_file"]]["rope"].to(
+                    device
+                ),
                 cache=torch.full(
                     case["cache_shape"],
                     case["cache_initial_value"],
@@ -209,7 +206,6 @@ and never reads candidate communication buffers or intermediate projections.
                 group=group,
                 config=config,
             )
-
 
     def independent_reference(inputs):
         """Oracle starts at original shards; never reads candidate scratch/results."""
@@ -257,16 +253,13 @@ and never reads candidate communication buffers or intermediate projections.
         )[valid]
         return Output(query, key.reshape(t, c.kv_size), value, gate)
 
-
     def changed(x, **kw):
         return SimpleNamespace(**{**vars(x), **kw})
-
 
     def implementation():
         from flaggems_vllm.runtime.backend._hygon.mega.megapreattention import api
 
         return api
-
 
     def candidate(x):
         c = x.config
@@ -290,7 +283,6 @@ and never reads candidate communication buffers or intermediate projections.
             )
         )
 
-
     def check_outputs(actual, expected, cache, reference_cache):
         errors = []
         for name, a, b in zip(
@@ -301,7 +293,9 @@ and never reads candidate communication buffers or intermediate projections.
             if not torch.isfinite(a).all():
                 raise AssertionError(f"{name}: nonfinite output")
             error = (a.float() - b.float()).abs()
-            required_atol = (error - BF16_RTOL * b.float().abs()).amax().clamp_min(0).item()
+            required_atol = (
+                (error - BF16_RTOL * b.float().abs()).amax().clamp_min(0).item()
+            )
             errors.append(
                 {
                     "name": name,
@@ -317,10 +311,13 @@ and never reads candidate communication buffers or intermediate projections.
                 }
             )
             torch.testing.assert_close(
-                a, b, atol=BF16_ATOLS[-1], rtol=BF16_RTOL, msg=lambda msg: f"{name}: {msg}"
+                a,
+                b,
+                atol=BF16_ATOLS[-1],
+                rtol=BF16_RTOL,
+                msg=lambda msg: f"{name}: {msg}",
             )
         return errors
-
 
     def edge_inputs(x):
         t = x.positions.shape[1]
@@ -359,7 +356,6 @@ and never reads candidate communication buffers or intermediate projections.
             weight=weight,
         )
 
-
     def check_contract(x):
         # These all fail before communicator creation/kernel launch.
         cases = {
@@ -390,7 +386,6 @@ and never reads candidate communication buffers or intermediate projections.
                 raise AssertionError(f"accepted unsupported input: {label}")
         return list(cases)
 
-
     def distribution(samples):
         v = sorted(samples)
 
@@ -408,7 +403,6 @@ and never reads candidate communication buffers or intermediate projections.
             stable=len(v) >= 10 and span <= 0.05,
         )
 
-
     def summarize_samples(ranks, names, iterations):
         """Average the slowest rank of each paired iteration."""
         metrics = {}
@@ -425,7 +419,6 @@ and never reads candidate communication buffers or intermediate projections.
             )
         return metrics
 
-
     def summarize_accuracy(reports):
         summary = {}
         for rows in reports:
@@ -440,7 +433,9 @@ and never reads candidate communication buffers or intermediate projections.
                                 {
                                     "max_abs": 0.0,
                                     "required_atol": 0.0,
-                                    "atol_passed": {str(atol): True for atol in BF16_ATOLS},
+                                    "atol_passed": {
+                                        str(atol): True for atol in BF16_ATOLS
+                                    },
                                 },
                             )
                             for metric in ("max_abs", "required_atol"):
@@ -448,7 +443,6 @@ and never reads candidate communication buffers or intermediate projections.
                             for atol, passed in error["atol_passed"].items():
                                 value["atol_passed"][atol] &= passed
         return summary
-
 
     def measure(calls, iterations, mode):
         from torch._dynamo.utils import counters
@@ -486,9 +480,10 @@ and never reads candidate communication buffers or intermediate projections.
         finally:
             JITFunction._do_compile = original
         assert not compiled, "measurement triggered Triton JIT"
-        assert before == dict(counters["stats"]), "measurement triggered Dynamo compilation"
+        assert before == dict(
+            counters["stats"]
+        ), "measurement triggered Dynamo compilation"
         return samples
-
 
     def _check_growth(x):
         impl = implementation()
@@ -536,7 +531,6 @@ and never reads candidate communication buffers or intermediate projections.
         out = candidate(irregular)
         torch.cuda.synchronize()
         check_outputs(out, expected, irregular.cache, ref_cache)
-
 
     def _worker(
         rank,
@@ -600,7 +594,9 @@ and never reads candidate communication buffers or intermediate projections.
                     from benchmark.test_megapreattention import NativeWindow
 
                     native = NativeWindow(x)
-                    sources["native"] = changed(x, cache=torch.full_like(x.cache, 0.375))
+                    sources["native"] = changed(
+                        x, cache=torch.full_like(x.cache, 0.375)
+                    )
                     functions["native"] = native
                     baseline_meta = native.evidence
                     result = native(sources["native"])
@@ -629,7 +625,8 @@ and never reads candidate communication buffers or intermediate projections.
                         calls[name] = graph.replay
                 else:
                     calls = {
-                        name: partial(functions[name], sources[name]) for name in functions
+                        name: partial(functions[name], sources[name])
+                        for name in functions
                     }
                 print(rank, "capture ready", flush=True)
                 saved_hidden = x.hidden.clone()
@@ -674,7 +671,9 @@ and never reads candidate communication buffers or intermediate projections.
                 ranks = [None] * tp
                 dist.all_gather_object(ranks, record)
                 metrics = (
-                    {} if check_only else summarize_samples(ranks, functions, iterations)
+                    {}
+                    if check_only
+                    else summarize_samples(ranks, functions, iterations)
                 )
                 reports.append(
                     dict(
@@ -685,7 +684,9 @@ and never reads candidate communication buffers or intermediate projections.
                         timing="wall_ms" if mode == "operator" else "device_ms",
                         rank_aggregation="mean_iteration_rank_max",
                         accuracy=dict(
-                            atol=BF16_ATOLS[-1], rtol=BF16_RTOL, profile_atols=BF16_ATOLS
+                            atol=BF16_ATOLS[-1],
+                            rtol=BF16_RTOL,
+                            profile_atols=BF16_ATOLS,
                         ),
                         edge=edge,
                         baseline=baseline_meta,
@@ -719,11 +720,12 @@ and never reads candidate communication buffers or intermediate projections.
 
                 close_vendor_session()
             if rank == 0:
-                (Path(directory) / "report.json").write_text(json.dumps(reports, indent=2))
+                (Path(directory) / "report.json").write_text(
+                    json.dumps(reports, indent=2)
+                )
         finally:
             faulthandler.cancel_dump_traceback_later()
             dist.destroy_process_group()
-
 
     def run_distributed(
         tp,
@@ -776,7 +778,9 @@ and never reads candidate communication buffers or intermediate projections.
                 try:
                     while not context.join(timeout=1):
                         if time.monotonic() >= deadline:
-                            raise TimeoutError("MegaPreAttention workers exceeded timeout")
+                            raise TimeoutError(
+                                "MegaPreAttention workers exceeded timeout"
+                            )
                     reports.append(json.loads((Path(d) / "report.json").read_text()))
                 finally:
                     for p in context.processes:
@@ -823,13 +827,11 @@ and never reads candidate communication buffers or intermediate projections.
             reports=reports,
         )
 
-
     def pytest_generate_tests(metafunc):
         if "tp" in metafunc.fixturenames:
             metafunc.parametrize(
                 "tp", [2] if metafunc.config.getoption("--quick") else [2, 4]
             )
-
 
     def require_hygon(tp):
         if not torch.version.hip or torch.cuda.device_count() < tp:
@@ -842,7 +844,6 @@ and never reads candidate communication buffers or intermediate projections.
             pytest.skip("layer3 dataset unavailable")
         return root
 
-
     def test_megapreattention_exports():
         import flaggems_vllm
         from flaggems_vllm.ops import clear_megapreattention_cache, megapreattention
@@ -850,7 +851,6 @@ and never reads candidate communication buffers or intermediate projections.
         assert callable(flaggems_vllm.megapreattention)
         assert callable(flaggems_vllm.clear_megapreattention_cache)
         assert callable(megapreattention) and callable(clear_megapreattention_cache)
-
 
     @pytest.mark.parametrize("edge", [False, True])
     def test_megapreattention(tp, edge, request):
@@ -861,7 +861,9 @@ and never reads candidate communication buffers or intermediate projections.
             else (4096, 8192, 16384, 32768)
         )
         cases = [
-            f"{m}_tp{tp}_t{t}" for m in ("Qwen3.6-35B-A3B", "Qwen3.6-27B") for t in tokens
+            f"{m}_tp{tp}_t{t}"
+            for m in ("Qwen3.6-35B-A3B", "Qwen3.6-27B")
+            for t in tokens
         ]
         result = run_distributed(
             tp,
@@ -875,7 +877,6 @@ and never reads candidate communication buffers or intermediate projections.
             warmup=3,
         )
         assert result["correctness_passed"]
-
 
     @pytest.mark.parametrize("sections,eps", [((16, 8, 8), 1e-5), ((8, 12, 12), 1e-4)])
     def test_megapreattention_rope_parameters(sections, eps):
@@ -892,7 +893,6 @@ and never reads candidate communication buffers or intermediate projections.
         )
         assert result["correctness_passed"]
 
-
     def test_megapreattention_rank_aggregation():
         ranks = [
             {"samples_ms": {"native": [1.0, 3.0], "megapreattention": [2.0, 2.0]}},
@@ -902,7 +902,6 @@ and never reads candidate communication buffers or intermediate projections.
         assert metrics["native"]["latency_ms"] == 3.0
         assert metrics["native"]["slowest_rank_mean_ms"] == 2.0
         assert metrics["megapreattention"]["latency_ms"] == 2.0
-
 
     def test_megapreattention_accuracy_tolerances():
         reference = torch.zeros(4, dtype=torch.bfloat16)
@@ -932,7 +931,6 @@ and never reads candidate communication buffers or intermediate projections.
                 large_error,
                 reference,
             )
-
 
     def test_megapreattention_address_offsets():
         if not torch.version.hip or not torch.cuda.is_available():
@@ -993,7 +991,6 @@ else:
 
     pytestmark = pytest.mark.megapreattention
 
-
     @dataclass(frozen=True)
     class Config:
         num_q_heads: int
@@ -1016,7 +1013,6 @@ else:
         def packed_size(self):
             return 2 * (self.q_size + self.kv_size)
 
-
     @dataclass
     class Inputs:
         hidden: torch.Tensor
@@ -1031,7 +1027,6 @@ else:
         group: object
         config: Config
 
-
     @dataclass
     class Output:
         query: torch.Tensor
@@ -1042,7 +1037,6 @@ else:
 
         def tensors(self):
             return self.query, self.key, self.value, self.gate
-
 
     def make_synthetic_weights(model_dims, head_dim):
         hidden_size, q_heads, kv_heads = model_dims
@@ -1056,11 +1050,17 @@ else:
             )
             * 0.02,
             "k_proj.weight": torch.randn(
-                kv_heads * head_dim, hidden_size, generator=generator, dtype=torch.bfloat16
+                kv_heads * head_dim,
+                hidden_size,
+                generator=generator,
+                dtype=torch.bfloat16,
             )
             * 0.02,
             "v_proj.weight": torch.randn(
-                kv_heads * head_dim, hidden_size, generator=generator, dtype=torch.bfloat16
+                kv_heads * head_dim,
+                hidden_size,
+                generator=generator,
+                dtype=torch.bfloat16,
             )
             * 0.02,
             "q_norm.weight": torch.randn(
@@ -1072,7 +1072,6 @@ else:
             )
             * 0.1,
         }
-
 
     def run_candidate(inputs):
         from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megapreattention import (
@@ -1099,7 +1098,6 @@ else:
                 eps=c.eps,
             )
         )
-
 
     def make_inputs(
         tokens,
@@ -1202,7 +1200,6 @@ else:
         )
         return inputs, rope
 
-
     def independent_reference(inputs):
         """Oracle starts at original shards; never reads candidate scratch/results."""
         c, t = inputs.config, inputs.positions.shape[1]
@@ -1249,17 +1246,14 @@ else:
         )[valid]
         return Output(query, key.reshape(t, c.kv_size), value, gate)
 
-
     # Keep the repository BF16 relative tolerance and bound near-zero differences.
     BF16_ATOL = 1e-2
-
 
     def check_outputs(actual, expected, actual_cache, expected_cache):
         for a, b in zip(actual.tensors(), expected.tensors()):
             gems_assert_close(a, b, torch.bfloat16, atol=BF16_ATOL)
             assert torch.isfinite(a).all()
         gems_assert_close(actual_cache, expected_cache, torch.bfloat16, atol=BF16_ATOL)
-
 
     def check_unaligned_inputs(inputs):
         """Exercise cached TMA inputs and Graph replay with only rank zero offset."""
@@ -1290,14 +1284,15 @@ else:
                     if field == "weight" and offset:
                         reference_weight = reference_weight.clone()
                     expected = independent_reference(
-                        replace(candidate, weight=reference_weight, cache=reference_cache)
+                        replace(
+                            candidate, weight=reference_weight, cache=reference_cache
+                        )
                     )
                     graph.replay()
                     torch.cuda.synchronize()
                     check_outputs(actual, expected, candidate.cache, reference_cache)
             finally:
                 graph.reset()
-
 
     def _worker(
         rank,
@@ -1349,7 +1344,9 @@ else:
             with torch.cuda.device(other):
                 result = run_candidate(value)
                 assert torch.cuda.current_device() == other
-            assert all(tensor.device == value.hidden.device for tensor in result.tensors())
+            assert all(
+                tensor.device == value.hidden.device for tensor in result.tensors()
+            )
             assert all(
                 w.communication.device == value.hidden.device
                 for w in impl._windows.values()
@@ -1444,7 +1441,9 @@ else:
                 ),
                 "wrong_heads": replace(
                     value,
-                    config=replace(value.config, num_q_heads=value.config.num_q_heads + 1),
+                    config=replace(
+                        value.config, num_q_heads=value.config.num_q_heads + 1
+                    ),
                 ),
                 "empty": replace(
                     value,
@@ -1460,7 +1459,9 @@ else:
                 except AssertionError:
                     unsupported[name][label] = True
                 else:
-                    raise AssertionError(f"{name} silently accepted unsupported {label}")
+                    raise AssertionError(
+                        f"{name} silently accepted unsupported {label}"
+                    )
             del bad_cases
 
         samples = {name: {"wall": [], "device": []} for name in names}
@@ -1506,7 +1507,6 @@ else:
             )
         dist.destroy_process_group()
         native_context.__exit__(None, None, None)
-
 
     def run_distributed(
         tp,
@@ -1591,13 +1591,11 @@ else:
         }
         return result
 
-
     def require_hopper(tp=1):
         if not torch.cuda.is_available() or torch.cuda.device_count() < tp:
             pytest.skip(f"requires {tp} CUDA GPUs")
         if any(torch.cuda.get_device_capability(i) != (9, 0) for i in range(tp)):
             pytest.skip("requires SM90 GPUs")
-
 
     # The shared worker checks changed-input Graph replay and poisoned transport.
     # Cover each scheduling path without a second private-input test suite.
@@ -1619,7 +1617,6 @@ else:
             ((1024, 32, 16), 4, 1024, "cudagraph", True),
         ]
 
-
     @pytest.mark.parametrize("model_dims,tp,tokens,mode,edge", CASES)
     def test_megapreattention(model_dims, tp, tokens, mode, edge):
         require_hopper(tp)
@@ -1635,7 +1632,6 @@ else:
         )
         assert result["correctness_passed"]
         assert all(len(r["ranks"]) == tp for r in result["reports"])
-
 
     def test_megapreattention_metadata_bounds():
         require_hopper()
@@ -1654,7 +1650,6 @@ else:
         assert flags.cpu().tolist() == [0] * words + [17] * 8
         assert counters.cpu().tolist() == [0] * programs + [17] * 8
 
-
     @triton.jit
     def _probe_packed_input_offsets(
         tiles, vectors, out, TILE_WORDS: tl.constexpr, offset_fn: tl.constexpr
@@ -1662,7 +1657,6 @@ else:
         i = tl.arange(0, 4)
         offsets = offset_fn(tl.load(tiles + i), tl.load(vectors + i), TILE_WORDS)
         tl.store(out + i, offsets)
-
 
     def test_megapreattention_packed_input_offset_bounds():
         require_hopper()
@@ -1691,12 +1685,10 @@ else:
             1048576 * 5120 // 2 - 4,
         ]
 
-
     ROPE_CASES = [
         (2, (16, 8, 8), 1e-5),
         (4, (8, 12, 12), 1e-4),
     ]
-
 
     @pytest.mark.parametrize("tp,sections,eps", ROPE_CASES)
     def test_megapreattention_rope_parameters(tp, sections, eps):

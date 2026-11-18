@@ -19,12 +19,12 @@ import flaggems_vllm
 if flaggems_vllm.vendor_name == "hygon":
     """Paired full-window benchmark in the Hygon vLLM application image.
 
-Baseline uses vLLM fused postprocessing with the Hygon norm precision adapter
-and the official FL cache update. Default AG/GEMM uses RCCL and vLLM BF16 linear;
-MPA_BASELINE_AG=dushmem selects the NV-style two-stream peer-copy/BLAS
-decomposition. Source hashes, selected paths, and differences are recorded;
-no cross-hardware NV-equivalent speedup is inferred.
-"""
+    Baseline uses vLLM fused postprocessing with the Hygon norm precision adapter
+    and the official FL cache update. Default AG/GEMM uses RCCL and vLLM BF16 linear;
+    MPA_BASELINE_AG=dushmem selects the NV-style two-stream peer-copy/BLAS
+    decomposition. Source hashes, selected paths, and differences are recorded;
+    no cross-hardware NV-equivalent speedup is inferred.
+    """
     import ctypes
     import fcntl
     import hashlib
@@ -49,11 +49,12 @@ no cross-hardware NV-equivalent speedup is inferred.
     from .conftest import Config
 
     if flaggems_vllm.vendor_name != "hygon":
-        pytest.skip("MegaPreAttention benchmark requires Hygon", allow_module_level=True)
+        pytest.skip(
+            "MegaPreAttention benchmark requires Hygon", allow_module_level=True
+        )
     else:
         from triton.language.extra.hip import libdevice
         from vllm.triton_utils import tl, triton
-
 
     # The fused postprocessor below is derived from vLLM 0.24.0+flagos.
     # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
@@ -70,7 +71,6 @@ no cross-hardware NV-equivalent speedup is inferred.
         for bit in tl.static_range(2, 8):
             values = values + tl.gather(values, tl.arange(0, 256) ^ (1 << bit), 0)
         return tl.sum(tl.gather(values, tl.full((1,), 0, tl.int32), 0), 0) / 256.0
-
 
     @triton.jit
     def _fused_qk_rmsnorm_rope_gate_kernel(
@@ -172,10 +172,11 @@ no cross-hardware NV-equivalent speedup is inferred.
         # --- Gate copy (q heads only, verbatim) ---
         if not is_k:
             gate_in_base = in_base + head_dim
-            gate_out_base = gate_out_ptr + token * gate_out_stride_t + local_head * head_dim
+            gate_out_base = (
+                gate_out_ptr + token * gate_out_stride_t + local_head * head_dim
+            )
             g = tl.load(gate_in_base + head_offs, mask=head_mask, other=0.0)
             tl.store(gate_out_base + head_offs, g, mask=head_mask)
-
 
     def fused_qk_rmsnorm_rope_gate(
         q_gate: torch.Tensor,
@@ -192,23 +193,23 @@ no cross-hardware NV-equivalent speedup is inferred.
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fused split + QK-RMSNorm + (partial) RoPE + gate copy for Qwen3.5 attn.
 
-    Args:
-        q_gate: (n_tokens, num_q_heads * 2 * head_dim) -- per head: [q|gate]
-        k: (n_tokens, num_kv_heads * head_dim)
-        q_weight: (head_dim,) GemmaRMSNorm effective weight (already +1)
-        k_weight: (head_dim,) GemmaRMSNorm effective weight (already +1)
-        cos_sin_cache: (max_pos, rotary_dim) packed [cos|sin]
-        positions: (n_tokens,) int32 or int64
-        eps: RMSNorm epsilon
-        num_q_heads: number of Q heads (after TP split)
-        num_kv_heads: number of KV heads (after TP split)
-        head_dim: per-head dimension
-        rotary_dim: rotary dimension; must be even and <= head_dim
+        Args:
+            q_gate: (n_tokens, num_q_heads * 2 * head_dim) -- per head: [q|gate]
+            k: (n_tokens, num_kv_heads * head_dim)
+            q_weight: (head_dim,) GemmaRMSNorm effective weight (already +1)
+            k_weight: (head_dim,) GemmaRMSNorm effective weight (already +1)
+            cos_sin_cache: (max_pos, rotary_dim) packed [cos|sin]
+            positions: (n_tokens,) int32 or int64
+            eps: RMSNorm epsilon
+            num_q_heads: number of Q heads (after TP split)
+            num_kv_heads: number of KV heads (after TP split)
+            head_dim: per-head dimension
+            rotary_dim: rotary dimension; must be even and <= head_dim
 
-    Returns:
-        (q_out, k_out, gate_out) -- all contiguous (n_tokens, heads * head_dim).
-        ``gate_out`` is the raw (pre-sigmoid) gate.
-    """
+        Returns:
+            (q_out, k_out, gate_out) -- all contiguous (n_tokens, heads * head_dim).
+            ``gate_out`` is the raw (pre-sigmoid) gate.
+        """
         if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
             raise ValueError(
                 f"rotary_dim must be a positive even integer <= head_dim, "
@@ -263,9 +264,7 @@ no cross-hardware NV-equivalent speedup is inferred.
         )
         return q_out, k_out, gate_out
 
-
     _SESSION = None
-
 
     def _library():
         source = Path(__file__).resolve().with_name("megapreattention_dushmem.hip")
@@ -321,16 +320,16 @@ no cross-hardware NV-equivalent speedup is inferred.
             function.argtypes, function.restype = args, result
         return lib, digest
 
-
     def _check(status, operation):
         if status:
             raise RuntimeError(f"duSHMEM/HIP {operation} failed: {status}")
 
-
     class _Session:
         def __init__(self, inputs):
             if inputs.group is not dist.group.WORLD:
-                raise NotImplementedError("baseline duSHMEM requires the full WORLD group")
+                raise NotImplementedError(
+                    "baseline duSHMEM requires the full WORLD group"
+                )
             self.rank = dist.get_rank(inputs.group)
             self.world = dist.get_world_size(inputs.group)
             self.control = dist.new_group(backend="gloo", timeout=timedelta(seconds=90))
@@ -358,10 +357,16 @@ no cross-hardware NV-equivalent speedup is inferred.
             uid.raw = state[1]
             print(self.rank, "duSHMEM init begin", flush=True)
             _check(
-                self.lib.mpa_init(self.rank, self.world, inputs.hidden.device.index, uid),
+                self.lib.mpa_init(
+                    self.rank, self.world, inputs.hidden.device.index, uid
+                ),
                 "init",
             )
-            if (self.lib.mpa_rank(), self.lib.mpa_world(), self.lib.mpa_local_world()) != (
+            if (
+                self.lib.mpa_rank(),
+                self.lib.mpa_world(),
+                self.lib.mpa_local_world(),
+            ) != (
                 self.rank,
                 self.world,
                 self.world,
@@ -369,7 +374,6 @@ no cross-hardware NV-equivalent speedup is inferred.
                 raise RuntimeError("duSHMEM rank/world/same-node identity mismatch")
             self.active = 0
             print(self.rank, "duSHMEM init ready", flush=True)
-
 
     def close_vendor_session():
         global _SESSION
@@ -381,7 +385,6 @@ no cross-hardware NV-equivalent speedup is inferred.
             _SESSION.lib.mpa_finalize()
             dist.destroy_process_group(_SESSION.control)
             _SESSION = None
-
 
     class VendorAllGatherMatmul:
         def __init__(self, inputs):
@@ -401,7 +404,9 @@ no cross-hardware NV-equivalent speedup is inferred.
                 self.lib.mpa_peer(self.allocation, r) for r in range(self.world)
             ]
             if not all(self.peer_ptrs):
-                raise RuntimeError("duSHMEM did not establish every same-node P2P mapping")
+                raise RuntimeError(
+                    "duSHMEM did not establish every same-node P2P mapping"
+                )
             dist.barrier(group=self.session.control)
             self.stream = torch.cuda.Stream(device=inputs.hidden.device)
             self.gathered = torch.empty(
@@ -450,7 +455,9 @@ no cross-hardware NV-equivalent speedup is inferred.
                 stream = self.stream if step % 2 else main
                 peer = (self.rank + step) % self.world
                 with torch.cuda.stream(stream):
-                    self._copy(self.shards[peer].data_ptr(), self.peer_ptrs[peer], stream)
+                    self._copy(
+                        self.shards[peer].data_ptr(), self.peer_ptrs[peer], stream
+                    )
                     torch.mm(self.shards[peer], weight_t, out=self.out_shards[peer])
             # Match NV's returned gathered A, even though the projection only needs C.
             local_stream = self.stream if self.world % 2 == 0 else main
@@ -472,15 +479,14 @@ no cross-hardware NV-equivalent speedup is inferred.
                 self.allocation = None
                 self.session.active -= 1
 
-
     def _compiled_method_bridge(method):
         """Keep the precision-adapted vLLM Triton kernel opaque to torch2.9 functionalization.
 
-    This FlagTree3.6 image removed specialize_impl, which torch2.9 uses to
-    identify Triton output mutations. Direct tracing silently returns wrong
-    outputs here. A custom-op boundary preserves the fused kernel call;
-    Graph replay adds no GPU kernel and no Python callback.
-    """
+        This FlagTree3.6 image removed specialize_impl, which torch2.9 uses to
+        identify Triton output mutations. Direct tracing silently returns wrong
+        outputs here. A custom-op boundary preserves the fused kernel call;
+        Graph replay adds no GPU kernel and no Python callback.
+        """
         import sys
         from types import FunctionType, ModuleType
 
@@ -557,9 +563,7 @@ no cross-hardware NV-equivalent speedup is inferred.
         module._project_qkv_gate = bridge
         return bridge
 
-
     _BRIDGED_METHOD = None
-
 
     def _baseline_policy():
         requested = os.environ.get("MPA_BASELINE_AG", "vllm-rccl")
@@ -579,14 +583,13 @@ no cross-hardware NV-equivalent speedup is inferred.
             },
         )
 
-
     class NativeWindow:
         """Library AG/GEMM + vLLM projection method + precision-adapted post + FL cache.
 
-    The text baseline enables vLLM's own fast fused norm/RoPE/gate path.
-    The fixed manifest has identical T/H/W position rows; edge layouts are
-    accuracy-only and are rejected by the baseline runner.
-    """
+        The text baseline enables vLLM's own fast fused norm/RoPE/gate path.
+        The fixed manifest has identical T/H/W position rows; edge layouts are
+        accuracy-only and are rejected by the baseline runner.
+        """
 
         def __init__(self, inputs):
             ag_kind, blas, selection = _baseline_policy()
@@ -621,7 +624,9 @@ no cross-hardware NV-equivalent speedup is inferred.
             )
             from vllm.model_executor.layers.linear import UnquantizedLinearMethod
             from vllm.v1.attention.backend import AttentionType
-            from vllm_fl.dispatch.backends.flaggems.impl.attention import AttentionFLImpl
+            from vllm_fl.dispatch.backends.flaggems.impl.attention import (
+                AttentionFLImpl,
+            )
 
             self.linear_method = UnquantizedLinearMethod()
             self.linear_layer = SimpleNamespace(weight=inputs.weight)
@@ -629,7 +634,9 @@ no cross-hardware NV-equivalent speedup is inferred.
             self.cache_context = SimpleNamespace(
                 attn_type=AttentionType.DECODER, kv_cache_dtype="auto"
             )
-            self.cache_layer = SimpleNamespace(_k_scale=inputs.scale, _v_scale=inputs.scale)
+            self.cache_layer = SimpleNamespace(
+                _k_scale=inputs.scale, _v_scale=inputs.scale
+            )
             self.context = SimpleNamespace(
                 use_fused_qk_norm_rope_gate=not edge,
                 attn_output_gate=True,
@@ -758,7 +765,8 @@ no cross-hardware NV-equivalent speedup is inferred.
             # Logical cache normalization belongs only to accuracy checks, never
             # the measured/captured implementation.
             return torch.cat(
-                (self.key_cache.transpose(1, 2), self.value_cache.transpose(1, 2)), dim=-1
+                (self.key_cache.transpose(1, 2), self.value_cache.transpose(1, 2)),
+                dim=-1,
             )
 
         def __call__(self, inputs):
@@ -788,7 +796,6 @@ no cross-hardware NV-equivalent speedup is inferred.
                 gate.view(q.shape[0], self.context.num_heads, self.context.head_dim),
                 (gathered, product),
             )
-
 
     class MegaPreAttentionBenchmark(base.Benchmark):
         DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
@@ -846,7 +853,6 @@ no cross-hardware NV-equivalent speedup is inferred.
             name = "native" if op == self.native else "megapreattention"
             return self.paired_results[key]["summary"][case_id][name]
 
-
     @pytest.mark.megapreattention
     def test_megapreattention():
         benchmark = MegaPreAttentionBenchmark()
@@ -860,10 +866,10 @@ no cross-hardware NV-equivalent speedup is inferred.
 else:
     """Paired TP benchmark using the repository shape/metric/reporting framework.
 
-Each iteration uses the maximum latency across ranks. The benchmark averages
-those samples within each round and then averages five independent rounds.
-Inputs are seeded synthetic tensors. --warmup/--iter are counts.
-"""
+    Each iteration uses the maximum latency across ranks. The benchmark averages
+    those samples within each round and then averages five independent rounds.
+    Inputs are seeded synthetic tensors. --warmup/--iter are counts.
+    """
 
     import hashlib
     import inspect
@@ -883,13 +889,12 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
     from . import base
     from .conftest import Config
 
-
     class NativeWindow:
         """Library AG/GEMM + original vLLM projection method + native cache op.
 
-    The text baseline enables vLLM's own fast fused norm/RoPE/gate path.
-    Multimodal checks use its original non-fused MRoPE path instead.
-    """
+        The text baseline enables vLLM's own fast fused norm/RoPE/gate path.
+        Multimodal checks use its original non-fused MRoPE path instead.
+        """
 
         def __init__(self, inputs, rope, *, edge=False):
             from vllm import _custom_ops
@@ -975,7 +980,6 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
             )
             return Output(*values, (gathered, products[0]))
 
-
     def distribution(samples):
         ordered = sorted(samples)
 
@@ -994,7 +998,6 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
             "stable": len(samples) >= 10 and span <= 0.05,
             "samples_ms": samples,
         }
-
 
     def measure_window(calls, names, iterations):
         from torch._dynamo.utils import counters as dynamo_counters
@@ -1024,7 +1027,9 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
                     calls[name]()
                     end.record()
                     torch.cuda.synchronize()
-                    samples[name]["wall"].append((time.perf_counter_ns() - begin) / 1.0e6)
+                    samples[name]["wall"].append(
+                        (time.perf_counter_ns() - begin) / 1.0e6
+                    )
                     samples[name]["device"].append(start.elapsed_time(end))
         finally:
             JITFunction._do_compile = original_compile
@@ -1034,13 +1039,14 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
         ), "measurement triggered Dynamo recompilation"
         return samples
 
-
     def summarize_samples(ranks, names, iterations):
         metrics = {}
         for name in names:
             metrics[name] = {}
             for kind in ("wall", "device"):
-                per_rank_means = [statistics.mean(r["samples"][name][kind]) for r in ranks]
+                per_rank_means = [
+                    statistics.mean(r["samples"][name][kind]) for r in ranks
+                ]
                 rank_max = [
                     max(r["samples"][name][kind][i] for r in ranks)
                     for i in range(iterations)
@@ -1052,12 +1058,13 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
                 }
         return metrics
 
-
     def summarize_rounds(reports, mode):
         summary = {}
         kind = "wall" if mode == "operator" else "device"
         for name in ("native", "megapreattention"):
-            rank_max = [r["metrics"][name][kind]["rank_max_distribution"] for r in reports]
+            rank_max = [
+                r["metrics"][name][kind]["rank_max_distribution"] for r in reports
+            ]
             times = [samples["mean_ms"] for samples in rank_max]
             summary[name] = {
                 "latency_ms": statistics.mean(times),
@@ -1071,7 +1078,6 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
             summary["native"]["stable_all"] and candidate["stable_all"]
         )
         return summary
-
 
     class MegaPreAttentionBenchmark(base.Benchmark):
         DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
@@ -1150,7 +1156,6 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
                 )
             name = "native" if op == self.native else "megapreattention"
             return self.paired_results[key]["summary"][name]["latency_ms"]
-
 
     @pytest.mark.megapreattention
     def test_megapreattention():

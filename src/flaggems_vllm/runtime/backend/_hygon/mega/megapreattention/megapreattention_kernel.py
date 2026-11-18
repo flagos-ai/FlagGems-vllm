@@ -89,107 +89,71 @@ def _store_half_head(
     cols = tl.arange(0, 256)
     raw = acc.to(tl.bfloat16)
     # Preserve the materialized BF16 projection and norm rounding boundaries.
-    if pid_n < 2 * Q_HEADS and pid_n % 2 == 1:
-        head = pid_n // 2
+    is_key = pid_n >= 2 * Q_HEADS if KV_HEADS > 1 else pid_n == 2 * Q_HEADS
+    head = pid_n // 2
+    weight = tl.load(tl.where(is_key, knorm, qnorm) + cols).to(tl.float32)
+    x = raw.to(tl.float32)
+    scale = _rms_scale(x, EPS, BLOCK_M)
+    normalized = (x * scale[:, None] * (weight[None, :] + 1.0)).to(tl.bfloat16)
+    frequency = tl.arange(0, 32)
+    axis = tl.where(
+        (frequency % 3 == 1) & (frequency < 3 * SECTION_H),
+        1,
+        tl.where((frequency % 3 == 2) & (frequency < 3 * SECTION_W), 2, 0),
+    )
+    pos = tl.load(
+        positions + axis[None, :].to(tl.int64) * POS_AXIS + token[:, None] * POS_TOKEN,
+        valid[:, None],
+        other=0,
+    )
+    co = tl.load(
+        rope + pos * ROPE_STRIDE + frequency[None, :], valid[:, None], other=1
+    ).to(tl.float32)
+    si = tl.load(
+        rope + pos * ROPE_STRIDE + 32 + frequency[None, :], valid[:, None], other=0
+    ).to(tl.float32)
+    # Only the first 64 dimensions rotate; pass the other 192 through.
+    # Static splits avoid a full-width gather and unused rotary arithmetic.
+    low128, high128 = tl.split(normalized.reshape(BLOCK_M, 2, 128).permute(0, 2, 1))
+    low64, high64 = tl.split(low128.reshape(BLOCK_M, 2, 64).permute(0, 2, 1))
+    first, second = tl.split(low64.reshape(BLOCK_M, 2, 32).permute(0, 2, 1))
+    first = first.to(tl.float32)
+    second = second.to(tl.float32)
+    first_out = first * co - second * si
+    second_out = second * co + first * si
+    rotated64 = (
+        tl.join(first_out, second_out)
+        .permute(0, 2, 1)
+        .reshape(BLOCK_M, 64)
+        .to(tl.bfloat16)
+    )
+    result128 = tl.join(rotated64, high64).permute(0, 2, 1).reshape(BLOCK_M, 128)
+    result = tl.join(result128, high128).permute(0, 2, 1).reshape(BLOCK_M, 256)
+    if is_key:
+        kv_head = (pid_n - 2 * Q_HEADS).to(tl.int64) if KV_HEADS > 1 else 0
         tl.store(
-            gate + token[:, None] * (Q_HEADS * 256) + head * 256 + cols[None, :],
-            raw,
-            mask=valid[:, None],
-        )
-    elif pid_n >= 2 * Q_HEADS + KV_HEADS:
-        value_head = (
-            (pid_n - 2 * Q_HEADS - KV_HEADS).to(tl.int64) if KV_HEADS > 1 else 0
-        )
-        tl.store(
-            value
-            + token[:, None] * (KV_HEADS * 256)
-            + value_head * 256
-            + cols[None, :],
-            raw,
+            key + token[:, None] * (KV_HEADS * 256) + kv_head * 256 + cols[None, :],
+            result,
             mask=valid[:, None],
         )
         slot = tl.load(slots + token * SLOT_STRIDE, mask=valid, other=-1).to(tl.int64)
         target = (
             cache
             + (slot // CACHE_BLOCK_SIZE)[:, None] * CACHE_BLOCK
-            + value_head * CACHE_HEAD
+            + kv_head * CACHE_HEAD
             + (slot % CACHE_BLOCK_SIZE)[:, None] * CACHE_TOKEN
         )
         tl.store(
-            target + (256 + cols[None, :].to(tl.int64)) * CACHE_DIM,
-            raw,
+            target + cols[None, :].to(tl.int64) * CACHE_DIM,
+            result,
             mask=(valid & (slot >= 0))[:, None],
         )
     else:
-        is_key = pid_n >= 2 * Q_HEADS if KV_HEADS > 1 else pid_n == 2 * Q_HEADS
-        head = pid_n // 2
-        weight = tl.load(tl.where(is_key, knorm, qnorm) + cols).to(tl.float32)
-        x = raw.to(tl.float32)
-        scale = _rms_scale(x, EPS, BLOCK_M)
-        normalized = (x * scale[:, None] * (weight[None, :] + 1.0)).to(tl.bfloat16)
-        frequency = tl.arange(0, 32)
-        axis = tl.where(
-            (frequency % 3 == 1) & (frequency < 3 * SECTION_H),
-            1,
-            tl.where((frequency % 3 == 2) & (frequency < 3 * SECTION_W), 2, 0),
+        tl.store(
+            query + token[:, None] * (Q_HEADS * 256) + head * 256 + cols[None, :],
+            result,
+            mask=valid[:, None],
         )
-        pos = tl.load(
-            positions
-            + axis[None, :].to(tl.int64) * POS_AXIS
-            + token[:, None] * POS_TOKEN,
-            valid[:, None],
-            other=0,
-        )
-        co = tl.load(
-            rope + pos * ROPE_STRIDE + frequency[None, :], valid[:, None], other=1
-        ).to(tl.float32)
-        si = tl.load(
-            rope + pos * ROPE_STRIDE + 32 + frequency[None, :], valid[:, None], other=0
-        ).to(tl.float32)
-        # Only the first 64 dimensions rotate; pass the other 192 through.
-        # Static splits avoid a full-width gather and unused rotary arithmetic.
-        low128, high128 = tl.split(normalized.reshape(BLOCK_M, 2, 128).permute(0, 2, 1))
-        low64, high64 = tl.split(low128.reshape(BLOCK_M, 2, 64).permute(0, 2, 1))
-        first, second = tl.split(low64.reshape(BLOCK_M, 2, 32).permute(0, 2, 1))
-        first = first.to(tl.float32)
-        second = second.to(tl.float32)
-        first_out = first * co - second * si
-        second_out = second * co + first * si
-        rotated64 = (
-            tl.join(first_out, second_out)
-            .permute(0, 2, 1)
-            .reshape(BLOCK_M, 64)
-            .to(tl.bfloat16)
-        )
-        result128 = tl.join(rotated64, high64).permute(0, 2, 1).reshape(BLOCK_M, 128)
-        result = tl.join(result128, high128).permute(0, 2, 1).reshape(BLOCK_M, 256)
-        if is_key:
-            kv_head = (pid_n - 2 * Q_HEADS).to(tl.int64) if KV_HEADS > 1 else 0
-            tl.store(
-                key + token[:, None] * (KV_HEADS * 256) + kv_head * 256 + cols[None, :],
-                result,
-                mask=valid[:, None],
-            )
-            slot = tl.load(slots + token * SLOT_STRIDE, mask=valid, other=-1).to(
-                tl.int64
-            )
-            target = (
-                cache
-                + (slot // CACHE_BLOCK_SIZE)[:, None] * CACHE_BLOCK
-                + kv_head * CACHE_HEAD
-                + (slot % CACHE_BLOCK_SIZE)[:, None] * CACHE_TOKEN
-            )
-            tl.store(
-                target + cols[None, :].to(tl.int64) * CACHE_DIM,
-                result,
-                mask=(valid & (slot >= 0))[:, None],
-            )
-        else:
-            tl.store(
-                query + token[:, None] * (Q_HEADS * 256) + head * 256 + cols[None, :],
-                result,
-                mask=valid[:, None],
-            )
 
 
 @triton.jit
@@ -225,48 +189,89 @@ def _store_head(
     SECTION_W: tl.constexpr,
     EPS: tl.constexpr = 1.0e-6,
 ):
-    # Keep the GEMM tile intact; shorten live temporaries in norm/RoPE/cache.
-    low, high = tl.split(acc.reshape(2, BLOCK_M // 2, 256).permute(1, 2, 0))
-    if BLOCK_M == 256:
-        low0, low1 = tl.split(low.reshape(2, 64, 256).permute(1, 2, 0))
-        high0, high1 = tl.split(high.reshape(2, 64, 256).permute(1, 2, 0))
-        chunks = (low0, low1, high0, high1)
+    if (pid_n < 2 * Q_HEADS and pid_n % 2 == 1) or pid_n >= 2 * Q_HEADS + KV_HEADS:
+        row = _row_offset(pid_m, BLOCK_M, tl.arange(0, BLOCK_M))
+        token = row_start + row
+        valid = row < LOCAL_T
+        cols = tl.arange(0, 256)
+        raw = acc.to(tl.bfloat16)
+        # Preserve the materialized BF16 projection and norm rounding boundaries.
+        if pid_n < 2 * Q_HEADS and pid_n % 2 == 1:
+            head = pid_n // 2
+            tl.store(
+                gate + token[:, None] * (Q_HEADS * 256) + head * 256 + cols[None, :],
+                raw,
+                mask=valid[:, None],
+            )
+        elif pid_n >= 2 * Q_HEADS + KV_HEADS:
+            value_head = (
+                (pid_n - 2 * Q_HEADS - KV_HEADS).to(tl.int64) if KV_HEADS > 1 else 0
+            )
+            tl.store(
+                value
+                + token[:, None] * (KV_HEADS * 256)
+                + value_head * 256
+                + cols[None, :],
+                raw,
+                mask=valid[:, None],
+            )
+            slot = tl.load(slots + token * SLOT_STRIDE, mask=valid, other=-1).to(
+                tl.int64
+            )
+            target = (
+                cache
+                + (slot // CACHE_BLOCK_SIZE)[:, None] * CACHE_BLOCK
+                + value_head * CACHE_HEAD
+                + (slot % CACHE_BLOCK_SIZE)[:, None] * CACHE_TOKEN
+            )
+            tl.store(
+                target + (256 + cols[None, :].to(tl.int64)) * CACHE_DIM,
+                raw,
+                mask=(valid & (slot >= 0))[:, None],
+            )
     else:
-        chunks = (low, high)
-    for half in tl.static_range(BLOCK_M // 64):
-        part = chunks[half]
-        _store_half_head(
-            part,
-            query,
-            key,
-            value,
-            gate,
-            qnorm,
-            knorm,
-            positions,
-            rope,
-            cache,
-            slots,
-            row_start,
-            (BLOCK_M // 64) * pid_m + half,
-            pid_n,
-            LOCAL_T,
-            Q_HEADS,
-            KV_HEADS,
-            POS_AXIS,
-            POS_TOKEN,
-            ROPE_STRIDE,
-            SLOT_STRIDE,
-            CACHE_BLOCK,
-            CACHE_HEAD,
-            CACHE_TOKEN,
-            CACHE_DIM,
-            CACHE_BLOCK_SIZE,
-            64,
-            SECTION_H,
-            SECTION_W,
-            EPS,
-        )
+        # Keep the GEMM tile intact; shorten live temporaries in norm/RoPE/cache.
+        low, high = tl.split(acc.reshape(2, BLOCK_M // 2, 256).permute(1, 2, 0))
+        if BLOCK_M == 256:
+            low0, low1 = tl.split(low.reshape(2, 64, 256).permute(1, 2, 0))
+            high0, high1 = tl.split(high.reshape(2, 64, 256).permute(1, 2, 0))
+            chunks = (low0, low1, high0, high1)
+        else:
+            chunks = (low, high)
+        for half in tl.static_range(BLOCK_M // 64):
+            part = chunks[half]
+            _store_half_head(
+                part,
+                query,
+                key,
+                value,
+                gate,
+                qnorm,
+                knorm,
+                positions,
+                rope,
+                cache,
+                slots,
+                row_start,
+                (BLOCK_M // 64) * pid_m + half,
+                pid_n,
+                LOCAL_T,
+                Q_HEADS,
+                KV_HEADS,
+                POS_AXIS,
+                POS_TOKEN,
+                ROPE_STRIDE,
+                SLOT_STRIDE,
+                CACHE_BLOCK,
+                CACHE_HEAD,
+                CACHE_TOKEN,
+                CACHE_DIM,
+                CACHE_BLOCK_SIZE,
+                64,
+                SECTION_H,
+                SECTION_W,
+                EPS,
+            )
 
 
 @triton.jit
@@ -282,11 +287,11 @@ def _init_metadata(
     PROGRAMS: tl.constexpr,
     ROWS: tl.constexpr,
 ):
-    i = tl.arange(0, triton.next_power_of_2(max(WORLD * COMM, PROGRAMS + 2, ROWS)))
+    i = tl.arange(0, triton.next_power_of_2(max(WORLD * COMM, PROGRAMS + 3, ROWS)))
     tl.store(flags + i, 0, i < WORLD * COMM)
     tl.store(ready + i, 0, i < ROWS)
     tl.store(staged + i, 0, i < ROWS)
-    tl.store(epochs + i, 0, i < PROGRAMS + 2)
+    tl.store(epochs + i, 0, i < PROGRAMS + 3)
     for rank in tl.static_range(WORLD):
         tl.store(peers + rank, ADDRESSES[rank])
 
@@ -309,10 +314,13 @@ def _block_fence():
 
 
 @triton.jit
-def _wait_ready(pointer, target):
-    seen = tl.load(pointer, volatile=True, cache_modifier=".cv")
+def _wait_ready(pointer, target, SCOPE: tl.constexpr):
+    seen = tl.full((), 0, tl.int64)
     while seen < target:
-        seen = tl.load(pointer, volatile=True, cache_modifier=".cv")
+        # Poll with loads; only the acquire authorizes reading the payload.
+        hint = tl.load(pointer, volatile=True, cache_modifier=".cv")
+        if hint >= target:
+            seen = tl.atomic_add(pointer, 0, sem="acquire", scope=SCOPE)
     _block_fence()
 
 
@@ -327,6 +335,7 @@ def _transport(
     staged,
     rank,
     epoch,
+    lane,
     DATA_WORDS: tl.constexpr,
     M: tl.constexpr,
     HIDDEN: tl.constexpr,
@@ -335,18 +344,19 @@ def _transport(
     BM: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
     ranks = tl.arange(0, WORLD)
     destinations = tl.load(peers + ranks).to(tl.pointer_type(tl.int64))
     tl.atomic_xchg(
-        destinations + DATA_WORDS + pid * WORLD + rank,
+        destinations + DATA_WORDS + lane * WORLD + rank,
         epoch,
         sem="release",
         scope="sys",
     )
     waiting = tl.full((), 1, tl.int32)
     while waiting != 0:
-        seen = tl.atomic_add(flags + pid * WORLD + ranks, 0, sem="acquire", scope="sys")
+        seen = tl.atomic_add(
+            flags + lane * WORLD + ranks, 0, sem="acquire", scope="sys"
+        )
         waiting = tl.sum((seen < epoch).to(tl.int32), 0)
     _block_fence()
     local_rows: tl.constexpr = M // WORLD // BM
@@ -356,7 +366,7 @@ def _transport(
     staging = staging.to(tl.pointer_type(tl.uint64))
     chunk_size: tl.constexpr = BM * HIDDEN // 4
     offsets = tl.arange(0, BLOCK)
-    for chunk in range(pid, local_rows, COMM):
+    for chunk in range(lane, local_rows, COMM):
         output_row = rank * local_rows + chunk
         for block in tl.range(0, tl.cdiv(chunk_size, BLOCK), num_stages=3):
             index = block * BLOCK + offsets
@@ -394,7 +404,7 @@ def _transport(
         for step in tl.static_range(1, WORLD):
             peer = (rank + step) % WORLD
             row = peer * local_rows + chunk
-            _wait_ready(ready + row, epoch)
+            _wait_ready(ready + row, epoch, "sys")
             if WORLD == 4:
                 incoming = tl.load(peers + peer).to(tl.pointer_type(tl.uint64))
             else:
@@ -462,13 +472,27 @@ def _persistent(
     GROUP_M: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    epoch = tl.atomic_add(epochs + pid, 1, sem="relaxed") + 1
-    # The previous invocation has finished on this stream before resetting work.
-    if pid == 0:
-        tl.store(epochs + PROGRAMS, 0)
-        _block_fence()
-        tl.atomic_xchg(epochs + PROGRAMS + 1, epoch, sem="release", scope="gpu")
-    if pid < COMM:
+    epoch = tl.atomic_add(epochs + pid, 1, sem="relaxed", scope="gpu") + 1
+    queue = epochs + PROGRAMS
+    initialized = queue + 1
+    projection_queue = queue + 2
+    # Elect a CTA that is already running. The prior invocation on this stream
+    # finished before any CTA can reset the queue for the new epoch.
+    previous = 2 * (epoch - 1)
+    if (
+        tl.atomic_cas(initialized, previous, previous + 1, sem="relaxed", scope="gpu")
+        == previous
+    ):
+        tl.atomic_xchg(queue, 0, sem="relaxed", scope="gpu")
+        tl.atomic_xchg(projection_queue, 0, sem="relaxed", scope="gpu")
+        tl.atomic_xchg(initialized, previous + 2, sem="release", scope="gpu")
+    _wait_ready(initialized, previous + 2, "gpu")
+
+    # All ranks claim transport lanes in ascending order. Each lane sends its
+    # packet before waiting for the matching lane on peers. The lowest unfinished
+    # lane can therefore advance even if only one CTA per rank is resident.
+    task = tl.atomic_add(queue, 1, sem="relaxed", scope="gpu")
+    while task < COMM:
         _transport(
             hidden,
             buffer,
@@ -479,6 +503,7 @@ def _persistent(
             staged,
             rank,
             epoch,
+            task,
             DATA_WORDS,
             M,
             HIDDEN,
@@ -487,17 +512,21 @@ def _persistent(
             128,
             1024,
         )
-    _wait_ready(epochs + PROGRAMS + 1, epoch)
+        task = tl.atomic_add(queue, 1, sem="relaxed", scope="gpu")
+
     num_m: tl.constexpr = M // BM
     local_m: tl.constexpr = num_m // WORLD
     heads: tl.constexpr = 2 * (Q_HEADS + KV_HEADS)
     rows = tl.arange(0, BM)
     cols = tl.arange(0, 256)
     kk = tl.arange(0, BK)
-    # Consumers alone can cover every tile; producers join after transport.
-    # The bounded surplus claims avoid a second grid-wide reset/barrier.
-    for task in tl.range(0, tl.cdiv(num_m * heads, PROGRAMS - COMM), disable_licm=True):
-        tile = tl.atomic_add(epochs + PROGRAMS, 1, sem="relaxed").to(tl.int32)
+    # Claim inside each iteration so a CTA cannot exit with an unprocessed tile.
+    for _ in tl.range(
+        0, tl.cdiv(num_m * heads, max(1, PROGRAMS - COMM)), disable_licm=True
+    ):
+        tile = tl.atomic_add(projection_queue, 1, sem="relaxed", scope="gpu").to(
+            tl.int32
+        )
         if tile < num_m * heads:
             group = tile // (GROUP_M * heads)
             first_m = group * GROUP_M
@@ -510,7 +539,7 @@ def _persistent(
                 source = hidden + _row_offset(pm - rank * local_m, BM * HIDDEN)
             else:
                 for packet in tl.static_range(BM // 128):
-                    _wait_ready(staged + pm * BM // 128 + packet, epoch)
+                    _wait_ready(staged + pm * BM // 128 + packet, epoch, "gpu")
                 source = staging + _row_offset(pm, BM * HIDDEN)
             a_ptr = source + _row_offset(rows[:, None], HIDDEN, kk[None, :])
             b_ptr = weight + _row_offset(pn * 256 + cols[None, :], HIDDEN, kk[:, None])

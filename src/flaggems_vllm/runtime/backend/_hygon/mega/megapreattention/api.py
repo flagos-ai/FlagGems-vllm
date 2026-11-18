@@ -250,7 +250,7 @@ class _Workspace:
             storage_offset=self.data_words + self.comm * self.world,
         )
         self.epochs = torch.empty(
-            self.programs + 2, device=self.device, dtype=torch.int64
+            self.programs + 3, device=self.device, dtype=torch.int64
         )
         self.staged = torch.empty(self.rows, device=self.device, dtype=torch.int64)
         self.peers = torch.empty(self.world, device=self.device, dtype=torch.uint64)
@@ -286,7 +286,7 @@ class _Workspace:
             (tokens, c.kv_size), dtype=x.hidden.dtype, device=x.hidden.device
         )
         v, gate = torch.empty_like(k), torch.empty_like(q)
-        row_group = 8
+        row_group = 4 if self.world == 2 else 8
         # A 256-row tile reuses each weight panel across two transport packets.
         # On TP4 this pays off for the large 5120-wide Qwen3.6-27B projection.
         wide_tp4 = (
@@ -355,7 +355,7 @@ class _Workspace:
             communication_ctas=self.comm,
             row_group=row_group,
             block_m=block_m,
-            schedule="single persistent grid; producers join shared projection queue",
+            schedule="single persistent grid; separate transport and projection queues",
         )
         return q, k, v, gate.view(tokens, c.num_q_heads, 256)
 
