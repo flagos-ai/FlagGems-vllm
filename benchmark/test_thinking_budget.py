@@ -13,6 +13,17 @@ import statistics
 import pytest
 import torch
 
+try:
+    from vllm.v1.worker.gpu.sample.thinking_budget import (
+        apply_thinking_budget as vllm_reference,
+    )
+except ImportError as exc:
+    raise ImportError(
+        "Failed to import apply_thinking_budget from vLLM. "
+        "Check that the installed vLLM version provides this API "
+        "and its dependencies are installed correctly."
+    ) from exc
+
 from benchmark import base, consts
 from benchmark.conftest import Config
 from flaggems_vllm import apply_thinking_budget, runtime
@@ -46,7 +57,7 @@ class ThinkingBudgetBenchmark(base.Benchmark):
     WARMUP_STEPS = 10
     ITERATIONS = 100
 
-    def __init__(self, vllm_reference):
+    def __init__(self):
         super().__init__(
             op_name="apply_thinking_budget",
             torch_op=vllm_reference,
@@ -107,7 +118,7 @@ class ThinkingBudgetBenchmark(base.Benchmark):
                 torch.tensor([91], dtype=torch.int32, device=self.device),
             )
             if not mode.startswith("cold-"):
-                self.torch_op(*args)
+                vllm_reference(*args)
             self._original = [args[index].clone() for index in (0, 5, 8, 9, 10)]
             yield args
 
@@ -162,13 +173,4 @@ class ThinkingBudgetBenchmark(base.Benchmark):
 
 
 def test_thinking_budget_perf():
-    try:
-        from vllm.v1.worker.gpu.sample.thinking_budget import (
-            apply_thinking_budget as vllm_reference,
-        )
-    except ModuleNotFoundError as exc:
-        if not "vllm.v1.worker.gpu.sample.thinking_budget.".startswith(f"{exc.name}."):
-            raise
-        pytest.skip("installed vLLM has no native thinking-budget benchmark baseline")
-
-    ThinkingBudgetBenchmark(vllm_reference).run()
+    ThinkingBudgetBenchmark().run()
