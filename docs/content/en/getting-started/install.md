@@ -21,16 +21,12 @@ against (currently 3.10, 3.11 or 3.12).
 
 ### Build tools
 
-The package uses `setuptools`. Install the build backend and test/build
-helpers before an editable install:
+The package uses `setuptools` and has no C/CUDA extensions. Install the build
+backend before an editable install:
 
 ```bash
 python -m pip install -U "setuptools>=64,<82" wheel packaging
 ```
-
-`scikit-build-core`, `pybind11`, `cmake` and `ninja` are only needed when
-building optional native extensions or when a vendor wheel is built from
-source; `tools/setup.sh` installs them into its virtual environment.
 
 ### FlagGems dependency
 
@@ -351,12 +347,22 @@ export VLLM_PLUGINS=fl
 
 ### Missing CUDA
 
-If CUDA is not found, set `CUDA_HOME`:
+FlagGems-vllm is a pure-Python package; `pip install` does not access CUDA.
+A "CUDA not found" error is a Triton/PyTorch runtime issue, not an installation
+one. Check the runtime first:
 
 ```bash
+# Confirm PyTorch can see the GPU
+python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+
+# If the CUDA toolkit path is wrong, set it and re-import Triton
 export CUDA_HOME=/usr/local/cuda
-python -m pip install --no-build-isolation -e .
+python -c "import triton"
 ```
+
+If PyTorch or Triton is not correctly installed, refer to the
+"PyTorch, Triton and vLLM" section above, or rebuild the environment with
+`bash tools/setup.sh nvidia`.
 
 ### Triton Version Mismatch
 
