@@ -140,8 +140,10 @@ from flaggems_vllm.ops.mhc import (
 )
 from flaggems_vllm.ops.min_p import apply_min_p
 from flaggems_vllm.ops.qwen4 import (
+    NULL_BLOCK_ID,
     grouped_gemma_rmsnorm,
     hc_combine,
+    ple_conv,
     ple_short_conv_,
     ple_gate_norm,
     ple_gate_norm_,
@@ -398,6 +400,7 @@ __all__ = [
     "mul",
     "mul_",
     "mv",
+    "NULL_BLOCK_ID",
     "outer",
     "outplace_fused_experts",
     "pack_seq_triton",
@@ -410,6 +413,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "permute_copy",
     "persistent_topk",
+    "ple_conv",
     "ple_gate_norm",
     "ple_gate_norm_",
     "ple_prefill_short_conv_",
