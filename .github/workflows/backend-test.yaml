@@ -56,11 +56,6 @@ on:
         required: false
         type: number
         default: 120
-      clang_artifact_id:
-        description: 'Artifact ID for the pinned H20 Clang packages'
-        required: false
-        type: string
-        default: ''
       uv_refresh:
         description: >-
           Set to 1 on persistent runners whose uv cache survives across jobs, so
@@ -95,26 +90,8 @@ jobs:
           backend: ${{ inputs.backend }}
           gpu_check_script: ${{ inputs.gpu_check_script }}
 
-      - name: Download the pinned H20 Clang packages
-        if: inputs.backend == 'nvidia-cuda133' && inputs.runner_label == 'h20' && inputs.clang_artifact_id != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
-        with:
-          artifact-ids: ${{ inputs.clang_artifact_id }}
-          path: ${{ runner.temp }}/h20-clang-packages
-
       - name: Run selected tests
         shell: bash
         env:
           CHANGED_FILES: ${{ inputs.changed_files }}
-          BACKEND: ${{ inputs.backend }}
-          RUNNER_LABEL: ${{ inputs.runner_label }}
-          TEST_SCRIPT: ${{ inputs.test_script }}
-          PR_ID: ${{ inputs.pr_id }}
-        run: |
-          if [[ "$BACKEND" == "nvidia-cuda133" && "$RUNNER_LABEL" == "h20" ]]; then
-            clang_dir="$(mktemp -d "${RUNNER_TEMP}/flaggems-clang-XXXXXX")"
-            trap 'rm -rf -- "$clang_dir"' EXIT
-            CLANG="$(bash tools/setup-tle-clang.sh extract "${RUNNER_TEMP}/h20-clang-packages" "$clang_dir")"
-            export CLANG
-          fi
-          bash "$TEST_SCRIPT" "$BACKEND" "$PR_ID"
+        run: bash "${{ inputs.test_script }}" "${{ inputs.backend }}" "${{ inputs.pr_id }}"

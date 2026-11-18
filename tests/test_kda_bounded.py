@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM bounded KDA regressions against the unchanged vLLM FLA core."""
 
-from importlib import import_module
-
 import pytest
 import torch
 import triton
@@ -80,55 +78,15 @@ def reference_cumsum(raw, a, bias, cu=None, indices=None):
 
 
 def metadata(lengths):
-    kda = require_kda_reference()
-    delta_h = fla_reference_module("chunk_delta_h")
-    if delta_h is None:
-        pytest.skip("vLLM does not provide the FLA chunk offset reference")
+    from vllm.model_executor.layers.fla.ops.chunk_delta_h import prepare_chunk_offsets
+    from vllm.model_executor.layers.fla.ops.kda import prepare_chunk_indices
 
     cu = torch.tensor(
         [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
         dtype=torch.int32,
         device="cuda",
     )
-    return cu, kda.prepare_chunk_indices(cu, 64), delta_h.prepare_chunk_offsets(cu, 64)
-
-
-def fla_reference_module(name):
-    path = f"vllm.model_executor.layers.fla.ops.{name}"
-    try:
-        return import_module(path)
-    except ModuleNotFoundError as exc:
-        if exc.name and (path == exc.name or path.startswith(f"{exc.name}.")):
-            return None
-        raise
-
-
-def kernel_arg_names(kernel):
-    while kernel is not None and not hasattr(kernel, "arg_names"):
-        kernel = getattr(kernel, "fn", None)
-    return getattr(kernel, "arg_names", ())
-
-
-def require_kda_reference():
-    kda = fla_reference_module("kda")
-    if kda is None:
-        pytest.skip("vLLM does not provide the original KDA reference module")
-    return kda
-
-
-def has_prefill_reference(kda):
-    if not callable(getattr(kda, "_chunk_kda_fwd_with_cumulative_g", None)):
-        return False
-    delta_h = fla_reference_module("chunk_delta_h")
-    kernel = getattr(delta_h, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", None)
-    return "USE_EXP2" in kernel_arg_names(kernel)
-
-
-def prefill_reference():
-    kda = require_kda_reference()
-    if not has_prefill_reference(kda):
-        pytest.skip("vLLM lacks the original 64-token KDA reference or EXP2 core")
-    return kda
+    return cu, prepare_chunk_indices(cu, 64), prepare_chunk_offsets(cu, 64)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -149,7 +107,7 @@ def test_gate_cumsum_preserves_original_dot_order(dtype, varlen):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tokens", [1, 63, 64, 65, 129])
 def test_prefill_matches_original_64_core(dtype, tokens, key_dim=64, value_dim=32):
-    kda = prefill_reference()
+    from vllm.model_executor.layers.fla.ops import kda
 
     torch.manual_seed(454 + tokens)
     q = torch.randn((1, tokens, 2, key_dim), dtype=dtype, device="cuda")
@@ -194,7 +152,7 @@ def test_prefill_matches_original_64_core(dtype, tokens, key_dim=64, value_dim=3
 
 @pytest.mark.parametrize("beta_value", [0.0, 1.0])
 def test_prefill_varlen_keeps_activated_beta_and_vk_state(beta_value):
-    kda = prefill_reference()
+    from vllm.model_executor.layers.fla.ops import kda
 
     torch.manual_seed(534)
     dtype = torch.bfloat16
@@ -240,7 +198,7 @@ def test_prefill_varlen_keeps_activated_beta_and_vk_state(beta_value):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("inplace", [False, True])
 def test_decode_matches_vllm_vk_state_slots(dtype, inplace, dim=32):
-    kda = require_kda_reference()
+    from vllm.model_executor.layers.fla.ops import kda
 
     torch.manual_seed(136)
     q = torch.randn((1, 3, 2, dim), dtype=dtype, device="cuda")
@@ -318,7 +276,6 @@ def test_prefill_execution_error_propagates(monkeypatch):
         calls.append(1)
         raise RuntimeError("submitted KDA failed")
 
-    monkeypatch.setattr(bounded, "_prefill_core", lambda: object())
     monkeypatch.setattr(bounded, "prefill_kda64", fail)
     with pytest.raises(RuntimeError, match="submitted KDA failed"):
         bounded.chunk_kda_with_safe_gate(q, q, q, q, beta, a, None)
@@ -412,7 +369,7 @@ def test_multi_token_decode_rejects_1d_slots_before_core(monkeypatch):
 
 
 def test_model_decode_one_token_requests_preserve_1d_slots():
-    kda = require_kda_reference()
+    from vllm.model_executor.layers.fla.ops import kda
 
     q = torch.randn((1, 2, 2, 128), device="cuda", dtype=torch.bfloat16)
     k, v = torch.randn_like(q), torch.randn_like(q)
@@ -448,7 +405,7 @@ def test_model_decode_one_token_requests_preserve_1d_slots():
 
 
 def test_decode_preserves_padded_mamba_cache_slot_stride():
-    kda = require_kda_reference()
+    from vllm.model_executor.layers.fla.ops import kda
 
     torch.manual_seed(341)
     h, dim, slots, padding = 2, 128, 5, 256
@@ -497,7 +454,7 @@ def test_decode_preserves_padded_mamba_cache_slot_stride():
 
 
 def test_prefill_materializes_padded_initial_state_like_original():
-    kda = prefill_reference()
+    from vllm.model_executor.layers.fla.ops import kda
 
     torch.manual_seed(642)
     q = torch.randn((1, 66, 2, 64), device="cuda", dtype=torch.bfloat16)
@@ -567,12 +524,6 @@ def test_public_capability_hook_checks_core_before_execution(
         hook.cache_clear()
 
 
-def test_public_core_capabilities_match_validation_environment():
-    kda = fla_reference_module("kda")
-    prefill_available = has_prefill_reference(kda)
-    recurrence = getattr(kda, "fused_recurrent_gated_delta_rule_fwd_kernel", None)
-    decode_available = {"IS_KDA", "INPLACE_FINAL_STATE"}.issubset(
-        kernel_arg_names(recurrence)
-    )
-    assert bounded.chunk_kda_with_safe_gate._is_available() is prefill_available
-    assert bounded.fused_recurrent_kda._is_available() is decode_available
+def test_public_core_capabilities_are_available_in_validation_environment():
+    assert bounded.chunk_kda_with_safe_gate._is_available()
+    assert bounded.fused_recurrent_kda._is_available()
