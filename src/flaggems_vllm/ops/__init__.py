@@ -280,6 +280,7 @@ from flaggems_vllm.ops.vit_attention import (
     vision_flash_attn_varlen,
     vit_flash_attn_wrapper,
 )
+from flaggems_vllm.ops.mamba_mixer import mamba_mixer
 
 __all__ = [
     "act_quant_triton",
@@ -482,6 +483,7 @@ __all__ = [
     "weight_norm_interface",
     "weight_norm_interface_backward",
     "zero_state_rows",
+    "mamba_mixer",
 ]
 
 # Backend-only APIs have no implementation on other vendors.
