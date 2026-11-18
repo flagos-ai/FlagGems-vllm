@@ -23,6 +23,9 @@ its vendor-port torch compute calls (dtype cast / contiguous) and is
 exercised as-is.
 """
 
+import glob
+import os
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -41,6 +44,98 @@ pytestmark = pytest.mark.skipif(
 
 device = "npu"
 PAD_SLOT_ID = -1
+
+
+def _ci_env_fingerprint():
+    """Environment fingerprint for CI logs (stdout is archived by run_tests.py
+    --dump-output into accuracy_stdout.log; compare against a local baseline)."""
+    import importlib.metadata as im
+
+    import torch_npu
+    import triton
+
+    parts = [
+        f"torch={torch.__version__}",
+        f"torch_npu={torch_npu.__version__}",
+        f"triton={triton.__version__}",
+    ]
+    try:
+        parts.append(f"flagtree={im.version('flagtree')}")
+    except im.PackageNotFoundError:
+        pass
+    parts.append(f"device={torch.npu.get_device_name(0)}")
+    parts.append(f"cann_dirs={sorted(glob.glob('/usr/local/Ascend/cann*'))}")
+    try:
+        with open("/usr/local/Ascend/driver/version.info") as f:
+            parts.append(f"driver={f.read().strip().splitlines()[0]}")
+    except OSError:
+        pass
+    return " ".join(parts)
+
+
+def _kernel_ir_fingerprint(kernel_name):
+    """One-line lowering fingerprint of the newest <kernel_name> dump (requires
+    the dump enabled by the module fixture below). The dump is written once per
+    specialization, so the fingerprint printed by the first case of each new
+    specialization describes that specialization's lowering."""
+    import triton
+
+    pattern = os.path.join(triton.knobs.cache.dump_dir, "*", kernel_name + ".ttadapter")
+    dumps = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if not dumps:
+        return "no-dump"
+    with open(dumps[-1]) as f:
+        text = f.read()
+    ops = (
+        "scf.for",
+        "arith.select",
+        "memref.copy",
+        "memref.subview",
+        "tensor.extract_slice",
+        "linalg.fill",
+        "pointer_cast",
+    )
+    counts = " ".join(f"{op}={text.count(op)}" for op in ops)
+    return f"lines={len(text.splitlines())} dumps={len(dumps)} {counts}"
+
+
+def _tiling_fingerprint(batch, dim):
+    """Mirror of the wrapper tiling heuristic (causal_conv1d_update.py). batch
+    here is padded_batch_size (the kernel-side batch, i.e. x.shape[0]). The
+    B_TILE/BLOCK_N choice selects the compiled specialization; B_TILE > 1 turns
+    on the per-program sequence loop (`for bi in tl.range(0, B_TILE)`), the
+    structure unique to the batch_size=64 cases."""
+    import triton
+
+    block_n = 1024 if dim >= 1024 else 256
+    g = triton.cdiv(dim, block_n)
+    target = 2 * 48  # CORE_HINT = 48 in the wrapper
+    b_tile_raw = max(1, (batch * g + target - 1) // target)
+    if b_tile_raw <= 1:
+        b_tile = 1
+    elif b_tile_raw <= 2:
+        b_tile = 2
+    elif b_tile_raw <= 4:
+        b_tile = 4
+    else:
+        b_tile = 8
+    t_chunk = 1 if block_n == 1024 else 48
+    grid = (triton.cdiv(batch, b_tile), triton.cdiv(dim, block_n))
+    return f"B_TILE={b_tile} BLOCK_N={block_n} T_CHUNK={t_chunk} grid={grid}"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ci_dump_ir():
+    """Print the env fingerprint once and enable IR dump for this module only
+    (runtime knob, lazy-read at compile time; restored on teardown)."""
+    import triton
+
+    print(f"\n[ci-diag] {_ci_env_fingerprint()}")
+    prev = triton.knobs.compilation.dump_ir
+    triton.knobs.compilation.dump_ir = True
+    yield
+    triton.knobs.compilation.dump_ir = prev
+
 
 if QUICK_MODE:
     BATCH = [3]
@@ -167,6 +262,19 @@ def test_causal_conv1d_update_with_batch_gather(
         activation=activation,
         conv_state_indices=padded_state_indices,
         pad_slot_id=PAD_SLOT_ID,
+    )
+
+    # CI diagnosability: dump the specialization-selecting inputs (padded
+    # batch/dim drive B_TILE/BLOCK_N; state indices come from CPU randperm and
+    # must match between CI and local) and the lowering fingerprint to stdout.
+    print(
+        f"[ci-diag] batch_kernel={padded_batch_size} dim={dim} "
+        f"{_tiling_fingerprint(padded_batch_size, dim)}"
+    )
+    print(f"[ci-diag] conv_state_indices={padded_state_indices.tolist()}")
+    print(
+        "[ci-diag] ir-fingerprint: "
+        f"{_kernel_ir_fingerprint('_causal_conv1d_update_kernel_npu_tiled')}"
     )
 
     out_ref = causal_conv1d_update_ref(
