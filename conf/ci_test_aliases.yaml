@@ -26,6 +26,7 @@ mhc_pre: test_mhc_ops
 mhc_pre_broadcast: test_mhc_pre_broadcast
 # Keep the legacy family marker mapped to its shared test file.
 ihc_post: test_ihc
+ihc_pre: test_triton_ihc_pre
 
 # --- Inplace / _out variants sharing test with base ---
 beam_search_score_: test_beam_search_score

@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent causal KDA Gram matrices with cumulative log2 gates."""
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
+
+logger = logging.getLogger(__name__)
+_ASCEND = runtime.device.vendor_name == "ascend"
+# Extents only affect addressing and masks, not the reduction tile. Share the
+# compiled Ascend binary across these values; other backends keep their policy.
+_EXTENT = None if _ASCEND else tl.constexpr
 
 
 def _kda_kkt_bench(call, quantiles):
@@ -26,8 +34,8 @@ def _kda_kkt_bench(call, quantiles):
     return [samples[round(q * (len(samples) - 1))] for q in quantiles]
 
 
-@triton.jit
-def _kda_kkt_zero(A, QK, N: tl.constexpr, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["N"] if _ASCEND else [])
+def _kda_kkt_zero(A, QK, N: _EXTENT, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     tl.store(A + i, 0.0, i < N)
     tl.store(QK + i, 0.0, i < N)
@@ -38,7 +46,7 @@ def _kda_kkt_zero(A, QK, N: tl.constexpr, BLOCK: tl.constexpr):
     configs=runtime.get_tuned_config("kda_kkt_pairs"),
     key=["T", "H", "K", "BT", "NSEQ", "VARLEN", "INDEXED", "DIAGONAL"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T", "H", "K", "NSEQ"] if _ASCEND else [])
 def _kda_kkt_pairs(
     Q,
     Kptr,
@@ -49,12 +57,12 @@ def _kda_kkt_pairs(
     CU,
     CI,
     scale,
-    T: tl.constexpr,
-    H: tl.constexpr,
-    K: tl.constexpr,
+    T: _EXTENT,
+    H: _EXTENT,
+    K: _EXTENT,
     BT: tl.constexpr,
     BK: tl.constexpr,
-    NSEQ: tl.constexpr,
+    NSEQ: _EXTENT,
     VARLEN: tl.constexpr,
     INDEXED: tl.constexpr,
     DIAGONAL: tl.constexpr,
@@ -328,6 +336,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     produce zeros. Without indices, all chunks are computed on the device.
     Inputs are not modified. Backward and non-contiguous inputs are unsupported.
     """
+    logger.debug("GEMS CHUNK_KDA_SCALED_DOT_KKT_FWD")
     floats = (torch.float16, torch.bfloat16, torch.float32)
     if gk is None or beta is None:
         raise NotImplementedError("explicit cumulative gk and beta are required")
