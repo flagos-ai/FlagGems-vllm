@@ -1595,6 +1595,21 @@ ops:
   - MoE
   stages:
   - alpha: '5.5'
+- id: marlin_gemm
+  description: 'Marlin quantized GEMM supporting W4A16 chunked quantization for
+    efficient inference with quantized weights and FP16/BF16 activations.
+
+    '
+  for:
+  - marlin_gemm
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  kind:
+  - BLAS
+  stages:
+  - alpha: '5.5'
 - id: mhc_bwd
   description: 'The backward case for MHC (Manifold-Constrained Hyper-Connections).
 
