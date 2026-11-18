@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Reusable job for one backend (non-NVIDIA lanes and the H20 nvidia-tests job)
+# Reusable job for one backend (non-NVIDIA lanes and the H20 python-op job)
 # on a bare self-hosted runner. The
 # vendor environment is built by this repository's tools/setup.sh from
 # src/flaggems_vllm/backends.yaml, so nothing is fetched from the FlagGems
@@ -38,6 +38,11 @@ on:
         default: ''
       changed_files:
         description: 'CI targets JSON consumed by tools/run_ci_targets.py'
+        required: false
+        type: string
+        default: ''
+      pr_id:
+        description: 'ID of the PR (empty for pushes without one)'
         required: false
         type: string
         default: ''
@@ -75,7 +80,7 @@ jobs:
         backend-test-${{ inputs.backend }}-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
         continue-on-error: true
@@ -89,4 +94,4 @@ jobs:
         shell: bash
         env:
           CHANGED_FILES: ${{ inputs.changed_files }}
-        run: bash "${{ inputs.test_script }}" "${{ inputs.backend }}"
+        run: bash "${{ inputs.test_script }}" "${{ inputs.backend }}" "${{ inputs.pr_id }}"

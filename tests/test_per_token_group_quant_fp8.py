@@ -12,12 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 import torch
 
 import flaggems_vllm
 
 from . import accuracy_utils as utils
+
+try:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8 as _vllm_per_token_group_quant_fp8,
+    )
+
+    _HAS_VLLM_FP8_REF = True
+    _VLLM_FP8_HAS_UE8M0 = (
+        "use_ue8m0" in inspect.signature(_vllm_per_token_group_quant_fp8).parameters
+    )
+except (ImportError, TypeError):
+    _HAS_VLLM_FP8_REF = False
+    _VLLM_FP8_HAS_UE8M0 = False
 
 
 def _f32_to_fp8_e4m3fn(y):
@@ -116,9 +131,24 @@ def test_per_token_group_quant_fp8(
     x = torch.rand(num_tokens, d, dtype=dtype, device=flaggems_vllm.device)
     ref_x = utils.to_reference(x)
 
-    ref_out, ref_scale = native_per_token_group_quant_fp8(
-        ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
-    )
+    if _HAS_VLLM_FP8_REF and not column_major_scales:
+        # Use the vllm reference implementation when available
+        # (vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8)
+        # column_major_scales is FlagGems-only; fall through to the torch reference for that path.
+        if scale_ue8m0 and _VLLM_FP8_HAS_UE8M0:
+            ref_out, ref_scale = _vllm_per_token_group_quant_fp8(
+                ref_x, group_size, use_ue8m0=scale_ue8m0
+            )
+        elif not scale_ue8m0:
+            ref_out, ref_scale = _vllm_per_token_group_quant_fp8(ref_x, group_size)
+        else:
+            ref_out, ref_scale = native_per_token_group_quant_fp8(
+                ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
+            )
+    else:
+        ref_out, ref_scale = native_per_token_group_quant_fp8(
+            ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
+        )
     out, scale = flaggems_vllm.per_token_group_quant_fp8(
         x,
         group_size,

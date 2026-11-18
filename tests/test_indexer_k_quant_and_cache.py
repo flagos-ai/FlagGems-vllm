@@ -188,6 +188,11 @@ def _make_slot_mapping(num_tokens, num_blocks, block_size, device):
 @pytest.mark.parametrize(
     "dtype,num_tokens,num_blocks,block_size,head_dim,quant_block_size,scale_fmt",
     [
+        # 285B profiling shapes: indexer K quant & cache
+        # shape: [[8192, 128], [1301, 64, 132], ...]  (prefill, 8×H100 TP=8)
+        (torch.bfloat16, 8192, 1302, 16, 128, 128, "ue8m0"),
+        # 285B: decode batch size 128
+        (torch.bfloat16, 128, 20, 16, 128, 128, "ue8m0"),
         (torch.bfloat16, 19, 4, 16, 128, 128, "ue8m0"),
         (torch.float16, 23, 5, 16, 512, 128, "ue8m0"),
         (torch.float16, 29, 6, 16, 384, 128, "ue8m0"),

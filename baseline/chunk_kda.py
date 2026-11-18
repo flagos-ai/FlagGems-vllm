@@ -61,21 +61,45 @@ def _supports_lower_bound(op):
         return False
 
 
-def native():
-    """Resolve chunk_kda_with_fused_gate across vLLM releases; None if not found.
-
-    FlagGems-vllm' chunk_kda performs the gate activation and beta sigmoid inside the
-    kernel, which corresponds to the fused-gate entry the vLLM model layer calls
-    (fused gate activation + intra-chunk cumsum), not plain chunk_kda which takes
-    an already-activated g. beta sigmoid is done outside the kernel by the vLLM
-    model layer; here it is likewise precomputed in build_inputs so it stays
-    outside the timed region, leaving only the native fused-gate op inside.
-    """
+def _chunk_kda_entry():
     mod = _kda_module()
     if mod is None:
+        return None, None
+    plain = getattr(mod, "chunk_kda", None)
+    gate = getattr(mod, "fused_kda_gate", None)
+    return (
+        plain if callable(plain) else None,
+        gate if callable(gate) else None,
+    )
+
+
+def native():
+    plain, gate = _chunk_kda_entry()
+    if plain is None or gate is None:
         return None
-    op = getattr(mod, "chunk_kda_with_fused_gate", None)
-    return op if callable(op) else None
+
+    def chunk_kda(q, k, v, raw_g, beta, A_log, dt_bias, **kwargs):
+        head_k_dim = dt_bias.shape[-1]
+        g_flat = raw_g.reshape(raw_g.shape[0], raw_g.shape[1], -1)
+        gate_kwargs = {"g_bias": dt_bias}
+        lower_bound = kwargs.get("lower_bound")
+        if lower_bound is not None:
+            gate_kwargs["lower_bound"] = lower_bound
+        g_activated = gate(g_flat, A_log, head_k_dim, **gate_kwargs)
+        return plain(
+            q,
+            k,
+            v,
+            g_activated,
+            beta,
+            scale=kwargs.get("scale"),
+            initial_state=kwargs.get("initial_state"),
+            output_final_state=kwargs.get("output_final_state", False),
+            use_qk_l2norm_in_kernel=kwargs.get("use_qk_l2norm_in_kernel", False),
+            cu_seqlens=kwargs.get("cu_seqlens"),
+        )
+
+    return chunk_kda
 
 
 def grid():
@@ -109,8 +133,6 @@ def build_inputs(binding, dtype, device):
     ).to(dtype)
     v = torch.randn((1, T_total, H, D), dtype=dtype, device=device)
     raw_g = torch.randn((1, T_total, H, D), dtype=dtype, device=device)
-    # The vLLM model layer applies b_proj -> float -> sigmoid before calling
-    # the fused gate; precompute it here so only the native op is timed.
     beta = torch.randn((1, T_total, H), dtype=dtype, device=device).float().sigmoid()
     A_log = torch.rand(H, dtype=torch.float32, device=device)
     dt_bias = torch.rand(H, D, dtype=torch.float32, device=device)
@@ -126,8 +148,6 @@ def build_inputs(binding, dtype, device):
             device=device,
         )
 
-    # Match the vLLM model layer: pass raw g + A_log + dt_bias to the fused
-    # gate, which performs the gate activation and cumsum inside the kernel.
     args = (q, k, v, raw_g, beta, A_log, dt_bias)
     kwargs = {
         "scale": scale,
@@ -136,8 +156,8 @@ def build_inputs(binding, dtype, device):
         "use_qk_l2norm_in_kernel": True,
         "cu_seqlens": cu_seqlens,
     }
-    op = native()
-    if op is not None and _supports_lower_bound(op):
+    _, gate = _chunk_kda_entry()
+    if gate is not None and _supports_lower_bound(gate):
         kwargs["lower_bound"] = LOWER_BOUND
     return args, kwargs
 
@@ -174,7 +194,10 @@ def config(binding, dtype):
         "g": {
             "shape": [1, T_total, H, D],
             "dtype": dt,
-            "note": "raw gate, unactivated; activation happens inside the native kernel",
+            "note": (
+                "raw gate, unactivated; activation runs in the standalone "
+                "fused_kda_gate kernel before chunk_kda (cumsum inside)"
+            ),
         },
         "beta": {
             "shape": [1, T_total, H],

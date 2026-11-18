@@ -17,7 +17,7 @@ import importlib
 import torch
 
 OP_NAME = "moe_sum"
-DTYPES = [torch.bfloat16, torch.float16]
+DTYPES = [torch.float16, torch.float32, torch.bfloat16]
 IS_INPLACE = False
 
 # Active (topk, hidden_size) pairs from mainstream MoE models. Hunyuan
