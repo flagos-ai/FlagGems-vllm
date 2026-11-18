@@ -71,6 +71,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.ihc_pre import ihc_pre, triton_ihc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
     indexer_gemm_score,
@@ -99,7 +100,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
-from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre
+from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre_clamp_sinkhorn
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
@@ -165,6 +166,7 @@ __all__ = [
     "group_list_cumsum",
     "grouped_topk",
     "hc_combine",
+    "ihc_pre",
     "indexer_epilogue",
     "indexer_gemm_score",
     "indexer_k_quant_and_cache",
@@ -174,7 +176,7 @@ __all__ = [
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",
     "mhc_post",
-    "npu_mhc_pre",
+    "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
     "pack_seq_triton",
     "paged_scatter_triton",
@@ -200,5 +202,6 @@ __all__ = [
     "top_k_per_row_prefill",
     "top_k_top_p",
     "topk_softplus_sqrt",
+    "triton_ihc_pre",
     "unpack_seq_triton",
 ]

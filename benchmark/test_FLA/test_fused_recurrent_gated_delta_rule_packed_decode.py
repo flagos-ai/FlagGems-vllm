@@ -275,6 +275,17 @@ class PackedDecodeBenchmark(base.Benchmark):
     @staticmethod
     def reference(inputs, normalize=False):
         """Independent FP32 CPU math, including the old beta rounding boundary."""
+        threads = torch.get_num_threads()
+        if threads == 1:
+            return PackedDecodeBenchmark._reference_cpu(inputs, normalize)
+        torch.set_num_threads(1)
+        try:
+            return PackedDecodeBenchmark._reference_cpu(inputs, normalize)
+        finally:
+            torch.set_num_threads(threads)
+
+    @staticmethod
+    def _reference_cpu(inputs, normalize=False):
         mixed = inputs["mixed_qkv"].detach().cpu().float()
         state = inputs["initial_state"].detach().cpu().clone()
         B = mixed.shape[0]

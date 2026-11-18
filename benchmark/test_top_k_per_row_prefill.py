@@ -130,6 +130,11 @@ class TopKPerRowPrefillBenchmark(base.Benchmark):
             (12961, 4100, 512, 4360, 1),
             (16380, 5115, 512, 5376, 1),
             (4100, 1025, 512, 1288, 1),
+            # 285B profiling shapes (prefill 8×H100 TP=8):
+            #   shape1: [[8192, 8192], [8192], [8192], [8192, 2048]]  topk=2048
+            #   shape2: [[8192, 16384], ...]  topk=2048
+            (8192, 8192, 2048, 8192, 1),
+            (8192, 16384, 2048, 16384, 1),
         ]
 
     def get_input_iter(self, dtype):
