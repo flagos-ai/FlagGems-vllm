@@ -13,28 +13,18 @@ from flaggems_vllm import runtime
 @triton.jit
 def _flash_write(
     C,
-    T,
-    OWN,
-    GROUP,
-    ACTIVE,
+    Slots,
     Q,
     S,
     PAGE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
-    TS0: tl.constexpr,
-    TS1: tl.constexpr,
-    NOWNER: tl.constexpr,
-    NCOL: tl.constexpr,
+    NSLOT: tl.constexpr,
 ):
     row = tl.program_id(0)
-    active = tl.load(ACTIVE + row)
-    if active:
-        owner = tl.load(OWN + row).to(tl.int64)
-        owner = tl.where(owner < 0, owner + NOWNER, owner)
-        group = tl.load(GROUP + row).to(tl.int64)
-        column = tl.minimum(tl.maximum(group // PAGE, 0), NCOL - 1)
-        page = tl.load(T + owner * TS0 + column * TS1).to(tl.int64)
-        slot = group % PAGE
+    dst = tl.load(Slots + row).to(tl.int64)
+    if (dst >= 0) & (dst < NSLOT):
+        page = dst // PAGE
+        slot = dst % PAGE
         d = tl.arange(0, 128)
         byte = tl.load(Q + row * 128 + d)
         tl.store(C + page * PAGE_STRIDE + slot * 128 + d, byte)
@@ -46,13 +36,18 @@ def _flash_write(
         )
 
 
-def hy4_flash_write_pool(cache, table, owners, groups, active, quant, scales):
-    """Update active rows in place. Live owner/group pairs must map to valid, distinct slots."""
+def hy4_flash_write_pool(cache, slots, quant, scales):
+    """Update distinct slots in place; negative or out-of-bounds slots do not write.
+
+    Slots encode page * page_size + row. Each byte page stores an E4M3FN
+    plane followed by its FP32 scale plane.
+    """
     if runtime.device.vendor_name != "nvidia" or cache.device.type != "cuda":
         raise NotImplementedError("Flash pool writes require NVIDIA CUDA")
     if (
         cache.dtype != torch.uint8
         or cache.ndim != 3
+        or cache.shape[1] == 0
         or cache.shape[-1] != 132
         or cache.stride(2) != 1
         or cache.stride(1) != 132
@@ -61,7 +56,7 @@ def hy4_flash_write_pool(cache, table, owners, groups, active, quant, scales):
         raise ValueError(
             f"Invalid Flash byte-page layout: dtype={cache.dtype}, shape={tuple(cache.shape)}, strides={cache.stride()}"
         )
-    n = groups.numel()
+    n = slots.numel()
     if (
         quant.shape != (n, 128)
         or quant.dtype != torch.float8_e4m3fn
@@ -72,33 +67,21 @@ def hy4_flash_write_pool(cache, table, owners, groups, active, quant, scales):
     ):
         raise ValueError("Invalid FP8 quantized pool data")
     if (
-        table.ndim != 2
-        or (n and (not table.shape[0] or not table.shape[1] or not cache.shape[1]))
-        or any(
-            x.dtype not in (torch.int32, torch.int64) for x in (table, owners, groups)
-        )
-        or active.dtype != torch.bool
-        or any(
-            x.shape != (n,) or not x.is_contiguous() for x in (owners, groups, active)
-        )
+        slots.shape != (n,)
+        or slots.dtype not in (torch.int32, torch.int64)
+        or not slots.is_contiguous()
     ):
         raise ValueError("Invalid pool write metadata")
-    if any(
-        x.device != cache.device for x in (table, owners, groups, active, quant, scales)
-    ):
+    if any(x.device != cache.device for x in (slots, quant, scales)):
         raise ValueError("Pool write tensors must share a device")
     if n:
         _flash_write[(n,)](
             cache,
-            table,
-            owners,
-            groups,
-            active,
+            slots,
             quant.view(torch.uint8),
             scales,
             cache.shape[1],
             cache.stride(0),
-            *table.stride(),
-            *table.shape,
+            cache.shape[0] * cache.shape[1],
             num_warps=4,
         )

@@ -1344,8 +1344,30 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
-- id: hy4_flash_expand_groups
-  description: Expand history groups and the live current group into packed token IDs.
+- id: hy4_flash_engram_gate
+  description: Compute the Engram key-query gate on normalized rows.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_engram_lookup_norm
+  description: Dequantize and normalize Engram lookup rows with invalid-hash masking.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_engram_residual
+  description: Normalize the Engram value signal and accumulate the gated residual.
   for:
   - Hy4Flash
   labels:
@@ -1377,8 +1399,8 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '0.3'
-- id: hy4_flash_prepare_groups
-  description: Gather live compressed groups from previous carry and incoming keys.
+- id: hy4_flash_gather_groups
+  description: Gather group members from prepared source rows in key and tail buffers.
   for:
   - Hy4Flash
   labels:
@@ -1422,7 +1444,7 @@ ops:
   stages:
   - alpha: '0.3'
 - id: hy4_flash_write_tails
-  description: Retain new keys and rotary positions in an IndexPool tail ring.
+  description: Write key and rotary-position rows into prepared tail cache slots.
   for:
   - Hy4Flash
   labels:

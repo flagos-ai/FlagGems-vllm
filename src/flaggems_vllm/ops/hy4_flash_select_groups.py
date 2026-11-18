@@ -136,7 +136,7 @@ def hy4_flash_select_groups(logits, upper, budget):
             num_warps=4,
         )
     else:
-        from ._hy4_flash_radix import select_wide
+        from flaggems_vllm.ops._hy4_flash_radix import select_wide
 
         select_wide(logits, upper, out)
     return out

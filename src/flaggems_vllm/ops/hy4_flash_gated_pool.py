@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .hy4_flash_fwht_quant_fp8 import _check_tensor
+from flaggems_vllm.ops.hy4_flash_fwht_quant_fp8 import _check_tensor
 
 
 @triton.jit

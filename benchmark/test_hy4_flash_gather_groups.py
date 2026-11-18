@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_hy4_flash_prepare_groups import make_inputs, reference
+from tests.test_hy4_flash_gather_groups import make_inputs, reference
 
 from . import base
 
@@ -21,14 +21,14 @@ class IndexPoolBenchmark(base.Benchmark):
             yield make_inputs(shape)
 
 
-@pytest.mark.hy4_flash_prepare_groups
+@pytest.mark.hy4_flash_gather_groups
 @pytest.mark.skipif(
     not torch.cuda.is_available() or flaggems_vllm.vendor_name != "nvidia",
     reason="Hy4 Flash IndexPool requires NVIDIA CUDA",
 )
-def test_hy4_flash_prepare_groups_benchmark():
+def test_hy4_flash_gather_groups_benchmark():
     benchmark = IndexPoolBenchmark(
-        op_name="hy4_flash_prepare_groups", torch_op=reference, dtypes=[torch.bfloat16]
+        op_name="hy4_flash_gather_groups", torch_op=reference, dtypes=[torch.bfloat16]
     )
-    benchmark.set_gems(flaggems_vllm.hy4_flash_prepare_groups)
+    benchmark.set_gems(flaggems_vllm.hy4_flash_gather_groups)
     benchmark.run()

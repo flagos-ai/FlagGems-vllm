@@ -1876,3 +1876,14 @@ cast_sigmoid:
   - META: {BLOCK_SIZE: 8192}
     num_warps: 8
     num_stages: 1
+
+hy4_flash_engram_row:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+  - META: {}
+    num_warps: 16
+    num_stages: 1

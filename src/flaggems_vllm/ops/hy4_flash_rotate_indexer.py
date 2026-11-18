@@ -8,8 +8,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
-
-from .hy4_flash_fwht_quant_fp8 import _check_tensor
+from flaggems_vllm.ops.hy4_flash_fwht_quant_fp8 import _check_tensor
 
 if runtime.device.vendor_name == "nvidia":
     from triton.language.extra.cuda import libdevice

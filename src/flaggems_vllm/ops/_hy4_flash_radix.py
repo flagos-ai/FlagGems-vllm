@@ -10,14 +10,13 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.utils import libentry
-
-from .cooperative_topk import (
+from flaggems_vllm.ops.cooperative_topk import (
     _key_greater,
     _masked_histogram,
     _ordered_key,
     _radix_digit,
 )
+from flaggems_vllm.utils import libentry
 
 
 @triton.jit
