@@ -25,16 +25,7 @@ from baseline.hc_expand import (
 )
 from vllm.utils.torch_utils import set_random_seed
 
-TORCH_REFERENCE = torch_reference()
-
-pytestmark = [
-    pytest.mark.gpu,
-    pytest.mark.hc_expand,
-    pytest.mark.skipif(
-        TORCH_REFERENCE is None,
-        reason="vLLM PyTorch hc_expand unavailable",
-    ),
-]
+TORCH_REFERENCE = torch_reference
 
 
 def _assert_bits_equal(actual, expected):

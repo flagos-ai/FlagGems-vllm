@@ -26,9 +26,9 @@ from baseline.hc_expand import (
 from . import base
 
 if flaggems_vllm.vendor_name == "ascend":
-    PERFORMANCE_BASELINE = torch_reference()
+    PERFORMANCE_BASELINE = torch_reference
 else:
-    PERFORMANCE_BASELINE = native()
+    PERFORMANCE_BASELINE = native
 
 pytestmark = [
     pytest.mark.hc_expand,

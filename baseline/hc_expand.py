@@ -14,13 +14,17 @@
 
 """Shared baseline contract for the mHC ``hc_expand`` operator.
 
-Functional tests use vLLM's PyTorch ``hc_expand`` implementation. vLLM's NVIDIA
-Triton implementation is the performance baseline used by the benchmark suite.
+Functional tests use a local PyTorch reference matching vLLM's implementation.
+vLLM's NVIDIA Triton implementation is the performance baseline used by the
+benchmark suite.
 """
 
-import importlib
-
 import torch
+
+try:
+    from vllm.models.deepseek_v41.nvidia.ops.mhc import hc_expand as native
+except (ImportError, OSError, RuntimeError):
+    native = None
 
 OP_NAME = "hc_expand"
 DTYPES = [torch.bfloat16, torch.float32]
@@ -64,28 +68,9 @@ FUNCTIONAL_SHAPES = [
     (8193, 5120, 7),
 ]
 
-NATIVE_UNAVAILABLE_REASON = None
-
-
-def _resolve(module_name, attr):
-    global NATIVE_UNAVAILABLE_REASON
-    try:
-        module = importlib.import_module(module_name)
-        op = getattr(module, attr)
-    except (ImportError, AttributeError, RuntimeError, OSError) as exc:
-        NATIVE_UNAVAILABLE_REASON = f"{module_name}.{attr}: {exc}"
-        return None
-    return op if callable(op) else None
-
-
-def native():
-    """Return vLLM's NVIDIA Triton implementation used as the perf baseline."""
-    return _resolve("vllm.models.deepseek_v41.nvidia.ops.mhc", "hc_expand")
-
-
-def torch_reference():
-    """Return vLLM's PyTorch implementation used as the correctness oracle."""
-    return _resolve("vllm.model_executor.layers.mhc", "hc_expand")
+def torch_reference(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    """PyTorch reference copied from vllm/model_executor/layers/mhc.py."""
+    return x.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
 
 
 def grid():
