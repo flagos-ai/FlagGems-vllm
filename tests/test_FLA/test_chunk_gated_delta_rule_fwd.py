@@ -468,3 +468,151 @@ def test_chunk_gated_delta_rule_fwd_non_contiguous_inputs_ascend():
     torch.testing.assert_close(
         result[3].float(), expected_final_state, rtol=1.5, atol=1.0
     )
+
+
+def _fp32_beta_inputs(dtype, case):
+    generator = torch.Generator().manual_seed(20261118)
+    # Long packed input exercises the staged path; short packed MIX kernels
+    # have separate compiler resource requirements on Ascend A2.
+    tokens = 1 if case == "single" else (769 if case == "packed" else 73)
+    q = (torch.randn(1, tokens, 2, 128, generator=generator) * 0.2).to(dtype)
+    k = (torch.randn(1, tokens, 2, 128, generator=generator) * 0.05).to(dtype)
+    v = (torch.randn(1, tokens, 6, 128, generator=generator) * 0.3).to(dtype)
+    g = -torch.rand(1, tokens, 6, generator=generator) * 0.08
+    beta = torch.randn(1, tokens, 6, generator=generator).sigmoid()
+    cu = torch.tensor([0, 3, tokens], dtype=torch.long) if case == "packed" else None
+    state = None
+    if case != "single":
+        state = (
+            torch.randn(2 if cu is not None else 1, 6, 128, 128, generator=generator)
+            * 0.02
+        )
+        state[..., 0, 1] += 0.4
+    return q, k, v, g, beta, state, cu
+
+
+def _fp32_beta_to_device(cpu):
+    return [x.to(flaggems_vllm.device) if x is not None else None for x in cpu]
+
+
+def _fp32_beta_call(tensors, *, output_final_state=True):
+    q, k, v, g, beta, initial, cu = tensors
+    return flaggems_vllm.chunk_gated_delta_rule_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=128**-0.5,
+        initial_state=initial,
+        output_final_state=output_final_state,
+        cu_seqlens=cu,
+    )
+
+
+@pytest.mark.chunk_gated_delta_rule_fwd
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend FP32 beta contract"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("case", ["single", "dense", "packed"])
+def test_chunk_gated_delta_rule_fwd_fp32_beta(dtype, case):
+    cpu = _fp32_beta_inputs(dtype, case)
+    tensors = _fp32_beta_to_device(cpu)
+    assert tensors[4].dtype == torch.float32
+    assert torch.any(cpu[4] != cpu[4].to(dtype).float())
+    expected, state = naive_chunk_gated_delta_rule_fwd(*cpu[:5], 128**-0.5, *cpu[5:])
+    final = case != "single"
+    result = _fp32_beta_call(tensors, output_final_state=final)
+    assert len(result) == 7 and result[2] is None
+    torch.testing.assert_close(
+        result[1].cpu().float(), expected, atol=2e-3, rtol=2.5e-2
+    )
+    if final:
+        assert result[3].dtype == torch.float32
+        torch.testing.assert_close(result[3].cpu(), state, atol=2e-3, rtol=2.5e-2)
+        torch.testing.assert_close(tensors[5].cpu(), cpu[5], atol=0, rtol=0)
+    else:
+        assert result[3] is None
+    torch.testing.assert_close(tensors[4].cpu(), cpu[4], atol=0, rtol=0)
+
+
+@pytest.mark.chunk_gated_delta_rule_fwd
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend FP32 beta graph contract"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_chunk_gated_delta_rule_fwd_fp32_beta_graph(dtype):
+    cpu = _fp32_beta_inputs(dtype, "packed")
+    tensors = _fp32_beta_to_device(cpu)
+    _fp32_beta_call(tensors)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        result = _fp32_beta_call(tensors)
+    for version, boundary in ((1, 3), (2, 64)):
+        changed = [x.clone() if x is not None else None for x in cpu]
+        changed[0] *= 0.7 + version * 0.1
+        changed[2] *= -0.8
+        changed[4] = 1 - changed[4] * (0.4 + version * 0.1)
+        changed[5] += version * 0.01
+        changed[6][1] = boundary
+        expected, state = naive_chunk_gated_delta_rule_fwd(
+            *changed[:5], 128**-0.5, *changed[5:]
+        )
+        for actual, value in zip(tensors, changed):
+            if actual is not None:
+                actual.copy_(value)
+        result[1].fill_(float("nan"))
+        result[3].fill_(float("nan"))
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(
+            result[1].cpu().float(), expected, atol=2e-3, rtol=2.5e-2
+        )
+        torch.testing.assert_close(result[3].cpu(), state, atol=2e-3, rtol=2.5e-2)
+        torch.testing.assert_close(tensors[5].cpu(), changed[5], atol=0, rtol=0)
+        torch.testing.assert_close(tensors[4].cpu(), changed[4], atol=0, rtol=0)
+
+
+@pytest.mark.chunk_gated_delta_rule_fwd
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend beta validation"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "fp64",
+        "integer",
+        "bool",
+        "other_low_precision",
+        "not_tensor",
+        "rank",
+        "shape",
+        "device",
+    ],
+)
+def test_chunk_gated_delta_rule_fwd_beta_contract_rejected(dtype, invalid):
+    cpu = _fp32_beta_inputs(dtype, "dense")
+    tensors = _fp32_beta_to_device(cpu)
+    beta = tensors[4]
+    if invalid == "fp64":
+        beta = torch.empty_like(beta, dtype=torch.float64)
+    elif invalid == "integer":
+        beta = beta.to(torch.int32)
+    elif invalid == "bool":
+        beta = beta.bool()
+    elif invalid == "other_low_precision":
+        beta = beta.to(torch.bfloat16 if dtype == torch.float16 else torch.float16)
+    elif invalid == "not_tensor":
+        beta = 0.5
+    elif invalid == "rank":
+        beta = beta.unsqueeze(-1)
+    elif invalid == "shape":
+        beta = beta[..., :-1]
+    else:
+        beta = cpu[4]
+    tensors[4] = beta
+    with pytest.raises((TypeError, ValueError), match="beta"):
+        _fp32_beta_call(tensors)
+    torch.testing.assert_close(tensors[5].cpu(), cpu[5], atol=0, rtol=0)
