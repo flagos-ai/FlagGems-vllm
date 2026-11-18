@@ -20,6 +20,7 @@ gates are documented on `top_k_per_row_prefill` at the bottom of this file.
 """
 
 import functools
+import logging
 import threading
 from collections import OrderedDict
 from importlib import import_module
@@ -29,6 +30,7 @@ import triton
 import triton.language as tl
 
 _generic = import_module("flaggems_vllm.ops.top_k_per_row_prefill")
+logger = logging.getLogger(__name__)
 
 # Dense iff vocab_size <= DENSE_VOCAB_PER_TOPK * top_k, i.e. density >= 10%. A
 # prefix sum over the take mask beats one atomic per selected element above a
@@ -54,10 +56,9 @@ DENSE_VOCAB_PER_TOPK = 10
 #   SKIP                a program returns at once unless its row is flagged:
 #                       the one-read route's retry.
 #
-# The generic route (DENSE False) calls the generic operator's own
-# _process_bins, so only the scan differs from upstream there.
-
-_generic_process_bins = _generic._process_bins
+# Both routes use the local bin pass below. The generic route retains atomic
+# slot allocation; its scratch-counter protocol differs from the generic op's
+# register-carried counters and must not call that op's private _process_bins.
 
 
 @triton.jit
@@ -110,11 +111,12 @@ def _distribute_to_bins(
 
 
 @triton.jit
-def _dense_bins(
+def _bins(
     logits,
     in_range,
     ones,
     offs,
+    found_ptrs,
     final_cnt_ptrs,
     logit_pattern,
     threshold_bin_idx,
@@ -126,6 +128,7 @@ def _dense_bins(
     slot_base,
     STEP: tl.constexpr,
     TOPK: tl.constexpr,
+    DENSE: tl.constexpr,
     SHORT: tl.constexpr,
 ):
     NUM_FINAL_ITEMS: tl.constexpr = 2048
@@ -134,11 +137,20 @@ def _dense_bins(
         logits, in_range, logit_pattern, STEP=STEP, SHORT=SHORT
     )
     take_lt = is_partial_match & (bin_idx < threshold_bin_idx) & write_directly
-    take_int = take_lt.to(tl.int32)
-    flat_take = tl.reshape(take_int, (take_int.numel,))
-    offsets = tl.cumsum(flat_take, axis=0) - flat_take
-    out_pos_lt = slot_base + tl.reshape(offsets, take_int.shape)
-    slot_base += tl.sum(flat_take, axis=0)
+    if DENSE:
+        take_int = take_lt.to(tl.int32)
+        flat_take = tl.reshape(take_int, (take_int.numel,))
+        offsets = tl.cumsum(flat_take, axis=0) - flat_take
+        out_pos_lt = slot_base + tl.reshape(offsets, take_int.shape)
+        slot_base += tl.sum(flat_take, axis=0)
+    else:
+        out_pos_lt = tl.atomic_add(
+            found_ptrs,
+            ones,
+            mask=take_lt,
+            sem="relaxed",
+            scope="cta",
+        )
     tl.store(s_out_indices_ptr + out_pos_lt, offs.to(tl.int32), mask=take_lt)
 
     if STEP < 3:
@@ -169,72 +181,6 @@ def _dense_bins(
             s_out_indices_ptr + out_pos_eq,
             offs.to(tl.int32),
             mask=take_eq & (out_pos_eq < TOPK),
-        )
-    return slot_base
-
-
-@triton.jit
-def _bins(
-    logits,
-    in_range,
-    ones,
-    offs,
-    found_ptrs,
-    final_cnt_ptrs,
-    logit_pattern,
-    threshold_bin_idx,
-    write_directly,
-    use_final,
-    s_histogram_ptr,
-    s_final_logits_ptr,
-    s_out_indices_ptr,
-    slot_base,
-    STEP: tl.constexpr,
-    TOPK: tl.constexpr,
-    DENSE: tl.constexpr,
-    SHORT: tl.constexpr,
-):
-    if DENSE:
-        slot_base = _dense_bins(
-            logits,
-            in_range,
-            ones,
-            offs,
-            final_cnt_ptrs,
-            logit_pattern,
-            threshold_bin_idx,
-            write_directly,
-            use_final,
-            s_histogram_ptr,
-            s_final_logits_ptr,
-            s_out_indices_ptr,
-            slot_base,
-            STEP=STEP,
-            TOPK=TOPK,
-            SHORT=SHORT,
-        )
-    else:
-        _generic_process_bins(
-            logits,
-            in_range,
-            ones,
-            offs,
-            found_ptrs,
-            final_cnt_ptrs,
-            logit_pattern,
-            threshold_bin_idx,
-            write_directly,
-            use_final,
-            0,
-            None,
-            s_histogram_ptr,
-            s_final_logits_ptr,
-            s_out_indices_ptr,
-            None,
-            STEP=STEP,
-            TOPK=TOPK,
-            MULTIPLE_BLOCKS_PER_ROW=False,
-            MERGE_BLOCKS=False,
         )
     return slot_base
 
@@ -1638,8 +1584,8 @@ def top_k_per_row_prefill(
       dense     vocab <= DENSE_VOCAB_PER_TOPK * top_k. The radix kernel with a
                 prefix-sum slot allocator and VEC=2; 512 STEP-0 bins for
                 top_k 512 on rows up to 1536.
-      generic   everything else: the radix kernel with the generic operator's
-                own bin pass.
+      generic   everything else: the radix kernel with atomic slot allocation
+                in the local bin pass.
 
     The sampled and one-read routes need stride1 == 1, float32 logits, int32
     row bounds, no TLE and buffers within _MAX_CAND_ELEMS; a call that misses
@@ -1648,6 +1594,7 @@ def top_k_per_row_prefill(
 
     With a Triton that has TLE, every call goes to the generic operator.
     """
+    logger.debug("GEMS_HYGON TOP_K_PER_ROW_PREFILL")
     if getattr(_generic, "HAS_TLE", False):
         return _generic.top_k_per_row_prefill(
             logits, row_starts, row_ends, indices, num_rows, stride0, stride1, top_k
