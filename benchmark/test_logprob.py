@@ -15,20 +15,25 @@
 """Benchmark the complete compute_topk_scores call."""
 
 import importlib
-import statistics
+import importlib.util
+from contextlib import redirect_stdout
 from dataclasses import dataclass
+from io import StringIO
 from types import SimpleNamespace
 
 import pytest
 import torch
-import triton.testing
 
 import flaggems_vllm
 from flaggems_vllm import runtime
 
+from . import base, conftest, consts
+
 try:
     from vllm.v1.worker.gpu.sample import logprob as baseline_logprob
 except ImportError:
+    if importlib.util.find_spec("vllm") is not None:
+        raise
     baseline_logprob = None
 
 
@@ -67,9 +72,6 @@ CASES = (
     Case("full-vocab-logits", 1, 32000, 32000, logits_mode=True),
     Case("full-vocab-logits-b64", 64, 32000, 32000, logits_mode=True),
 )
-WARMUP_MS = 50
-REPETITION_MS = 300
-REPEATS = 5
 RESULTS = []
 
 
@@ -106,39 +108,56 @@ def _make_inputs(candidate, case: Case, device: torch.device, dtype: torch.dtype
     return logits, sampled, state, mapping
 
 
-class LogprobBenchmark:
-    def __init__(self, calls):
-        self.calls = calls
+class LogprobBenchmark(base.Benchmark):
+    DEFAULT_SHAPE_DESC = "B, V, K, custom_count, logits_mode"
 
-    def run(self):
-        samples = {name: [] for name in self.calls}
-        names = list(self.calls)
-        for repeat in range(REPEATS):
-            order = names if repeat % 2 == 0 else list(reversed(names))
-            for name in order:
-                if flaggems_vllm.vendor_name == "ascend":
-                    elapsed_ms = triton.backends.ascend.testing.do_bench_npu(
-                        self.calls[name]
-                    )
-                else:
-                    do_bench = (
-                        triton.musa_testing.do_bench
-                        if flaggems_vllm.device == "musa"
-                        else triton.testing.do_bench
-                    )
-                    elapsed_ms = do_bench(
-                        self.calls[name],
-                        warmup=WARMUP_MS,
-                        rep=REPETITION_MS,
-                        return_mode="median",
-                    )
-                samples[name].append(elapsed_ms)
-        return {name: statistics.median(values) for name, values in samples.items()}
+    def __init__(self, case, candidate, torch_op, device):
+        self.case = case
+        self.candidate = candidate
+        self._latencies = {}
+        super().__init__(
+            op_name="compute_topk_scores",
+            torch_op=torch_op,
+            gems_op=candidate.compute_topk_scores,
+            dtypes=[case.dtype],
+        )
+        self.device = device
+
+    def set_shapes(self, shape_file_path=None):
+        case = self.case
+        self.shapes = [
+            (
+                case.batch_size,
+                case.vocab_size,
+                case.k,
+                case.custom_count,
+                case.logits_mode,
+            )
+        ]
+        self.shape_desc = self.DEFAULT_SHAPE_DESC
+
+    def get_input_iter(self, dtype):
+        case = self.case
+        logits, sampled, state, mapping = _make_inputs(
+            self.candidate, case, self.device, dtype
+        )
+        yield logits, case.k, sampled, {
+            "logprob_token_ids_state": state,
+            "expanded_idx_mapping": mapping,
+            "max_per_req_token_ids": case.custom_count,
+            "logits_mode": case.logits_mode,
+        }
+
+    def get_latency(self, op, *args, **kwargs):
+        latency = super().get_latency(op, *args, **kwargs)
+        self._latencies[op] = latency
+        return latency
 
 
 def _print_summary():
     if not RESULTS:
         return
+    has_baseline = any("vllm" in timings for _, _, timings in RESULTS)
     headers = (
         "Case",
         "B",
@@ -149,7 +168,7 @@ def _print_summary():
         "Dtype",
         "FlagGems (us)",
     )
-    if baseline_logprob is not None:
+    if has_baseline:
         headers += ("vLLM (us)", "Speedup")
     rows = [headers]
     for case, dtype, timings in RESULTS:
@@ -164,9 +183,11 @@ def _print_summary():
             str(dtype).split(".", 1)[-1],
             f"{candidate_us:.2f}",
         )
-        if "vllm" in timings:
+        if has_baseline and "vllm" in timings:
             baseline_us = timings["vllm"] * 1000
             row += (f"{baseline_us:.2f}", f"{baseline_us / candidate_us:.3f}x")
+        elif has_baseline:
+            row += ("N/A", "N/A")
         rows.append(row)
 
     widths = [max(len(row[i]) for row in rows) for i in range(len(headers))]
@@ -179,17 +200,13 @@ def _print_summary():
             + " |"
         )
 
-    print("\ncompute_topk_scores performance (do_bench GPU time)")
+    print("\ncompute_topk_scores performance")
     print(f"Device: {flaggems_vllm.device}")
-    timer = (
-        "Ascend do_bench_npu defaults"
-        if flaggems_vllm.vendor_name == "ascend"
-        else f"Warmup: {WARMUP_MS} ms; rep: {REPETITION_MS} ms"
-    )
-    print(
-        f"{timer}; repeats: {REPEATS}"
-        + ("; speedup = vLLM / FlagGems" if baseline_logprob is not None else "")
-    )
+    config = conftest.Config
+    timer = f"Mode: {config.mode.value}"
+    if config.mode == consts.BenchMode.KERNEL:
+        timer += f"; warmup: {config.warm_up} ms; rep: {config.repetition} ms"
+    print(timer + ("; speedup = vLLM / FlagGems" if has_baseline else ""))
     print(separator)
     print(format_row(rows[0]))
     print(separator)
@@ -210,25 +227,17 @@ def test_compute_topk_scores_perf(candidate_logprob, device, case):
     dtype = case.dtype
     if dtype == torch.bfloat16 and not runtime.device.support_bf16:
         pytest.skip("bfloat16 is unavailable on this backend")
-    logits, sampled, state, mapping = _make_inputs(
-        candidate_logprob, case, device, dtype
+    benchmark = LogprobBenchmark(
+        case,
+        candidate_logprob,
+        baseline_logprob.compute_topk_scores if baseline_logprob is not None else None,
+        device,
     )
-    kwargs = dict(
-        logprob_token_ids_state=state,
-        expanded_idx_mapping=mapping,
-        max_per_req_token_ids=case.custom_count,
-        logits_mode=case.logits_mode,
-    )
-    calls = {
-        "candidate": lambda: candidate_logprob.compute_topk_scores(
-            logits, case.k, sampled, **kwargs
-        ),
-    }
-    if baseline_logprob is not None:
-        calls["vllm"] = lambda: baseline_logprob.compute_topk_scores(
-            logits, case.k, sampled, **kwargs
-        )
-    for call in calls.values():
-        call()
-    runtime.torch_device_fn.synchronize()
-    RESULTS.append((case, dtype, LogprobBenchmark(calls).run()))
+    with redirect_stdout(StringIO()):
+        benchmark.run()
+    if not benchmark._latencies:
+        return
+    timings = {"candidate": benchmark._latencies[benchmark.gems_op]}
+    if benchmark.torch_op in benchmark._latencies:
+        timings["vllm"] = benchmark._latencies[benchmark.torch_op]
+    RESULTS.append((case, dtype, timings))
