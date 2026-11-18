@@ -48,7 +48,7 @@ def _flash_write(
 
 def hy4_flash_write_pool(cache, table, owners, groups, active, quant, scales):
     """Update active rows in place. Live owner/group pairs must map to valid, distinct slots."""
-    if runtime.device.vendor_name != "nvidia" or cache.device.type != "cuda":
+    if runtime.device.vendor_name not in ("nvidia", "metax") or cache.device.type != "cuda":
         raise NotImplementedError("Flash pool writes require NVIDIA CUDA")
     if (
         cache.dtype != torch.uint8

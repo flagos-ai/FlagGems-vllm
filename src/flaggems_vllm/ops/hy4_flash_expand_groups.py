@@ -52,7 +52,7 @@ def hy4_flash_expand_groups(group_ids, positions, ratio, active=None):
         or ratio not in (2, 4, 8, 16)
     ):
         raise ValueError("Invalid Flash group expansion inputs")
-    if runtime.device.vendor_name != "nvidia" or group_ids.device.type != "cuda":
+    if runtime.device.vendor_name not in ("nvidia", "metax") or group_ids.device.type != "cuda":
         raise NotImplementedError("Flash group expansion requires NVIDIA CUDA")
     n, budget = group_ids.shape
     if (

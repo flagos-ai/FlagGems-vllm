@@ -11,7 +11,7 @@ from flaggems_vllm import runtime
 
 from .hy4_flash_fwht_quant_fp8 import _check_tensor
 
-if runtime.device.vendor_name == "nvidia":
+if runtime.device.vendor_name in ("nvidia", "metax"):
     from triton.language.extra.cuda import libdevice
 
 

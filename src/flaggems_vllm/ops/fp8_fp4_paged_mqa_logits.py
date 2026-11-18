@@ -93,6 +93,7 @@ def _mqa_logits_kernel(
     BLOCK_D: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     IS_MXFP4: tl.constexpr,
+    FP16_DOT: tl.constexpr = False,
     PAGED_KV: tl.constexpr = False,
     NEXT_N: tl.constexpr = 1,
     stride_kv_page: tl.constexpr = 0,
@@ -156,6 +157,9 @@ def _mqa_logits_kernel(
         q_offsets = h_ids[:, None] * head_dim + d_ids[None, :]
         q_u8 = tl.load(q_row_base + q_offsets)
         q_fp8 = q_u8.to(tl.float8e4nv, bitcast=True)
+        if FP16_DOT:
+            # MetaX C550 cannot lower FP8 tensor-core dots; dequantize first.
+            q_f16 = q_fp8.to(tl.float16)
 
     # Pre-load weights: [num_heads] float32
     w_all = tl.load(w_row_base + tl.arange(0, num_heads))
@@ -189,7 +193,7 @@ def _mqa_logits_kernel(
             kv_u8 = tl.load(KV_data_ptr + kv_offsets)
 
             # Tensor-core MMA: Q[H, D] @ KV[block_size, D]^T -> [H, block_size]
-            if IS_MXFP4:
+            if IS_MXFP4 or FP16_DOT:
                 kv_fp16 = kv_u8.to(tl.float8e4nv, bitcast=True).to(tl.float16)
                 dots = tl.dot(q_f16, tl.trans(kv_fp16))
             else:
@@ -473,6 +477,16 @@ def _launch_tle_kernel(
     return logits
 
 
+def _fp16_dot() -> bool:
+    """MetaX has no FP8 dot lowering; dequantize to FP16 for the MMA."""
+    try:
+        from flaggems_vllm import runtime
+
+        return runtime.device.vendor_name != "nvidia"
+    except Exception:
+        return os.environ.get("GEMS_VENDOR", "").strip().lower() == "metax"
+
+
 def fp8_fp4_paged_mqa_logits(
     q,
     kv_cache,
@@ -609,6 +623,7 @@ def fp8_fp4_paged_mqa_logits(
             BLOCK_D=BLOCK_D,
             NUM_BLOCKS=NUM_BLOCKS,
             IS_MXFP4=is_fp4,
+            FP16_DOT=_fp16_dot(),
         )
 
     return logits

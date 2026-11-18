@@ -28,7 +28,7 @@ def _flash_fwht(X, Q, S):
 
 
 def _check_tensor(x, name):
-    if runtime.device.vendor_name != "nvidia" or x.device.type != "cuda":
+    if runtime.device.vendor_name not in ("nvidia", "metax") or x.device.type != "cuda":
         raise NotImplementedError("Hy4 Flash IndexPool is validated on NVIDIA CUDA")
     if x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         raise TypeError(f"{name} must have FP32, FP16 or BF16 dtype")

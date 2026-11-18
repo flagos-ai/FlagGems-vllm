@@ -1205,3 +1205,22 @@ def flash_mla_sparse_fwd(
         topk_length is not None,
     )
     return output, max_logits, lse
+
+# MetaX C550: the default BK=64/BH=64 configs need 184 KB shared memory, above
+# the 64 KB hardware limit.  Keep one C550-sized config (BK=16, BH=32).
+def _shrink_sparse_configs_for_metax() -> None:
+    import os
+
+    try:
+        from flaggems_vllm import runtime
+
+        vendor = runtime.device.vendor_name
+    except Exception:
+        vendor = os.environ.get("GEMS_VENDOR", "").strip().lower()
+    if vendor != "nvidia":
+        triton_flash_mla_sparse_fwd.configs = [
+            triton.Config({"BK": 16, "BH": 32}, num_warps=4, num_stages=1)
+        ]
+
+
+_shrink_sparse_configs_for_metax()

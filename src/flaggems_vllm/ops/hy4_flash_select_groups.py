@@ -85,7 +85,7 @@ def _flash_select_single_cta(
 
 def hy4_flash_select_groups(logits, upper, budget):
     """Exact score selection, ascending IDs, -1 padding; inputs remain read-only."""
-    if runtime.device.vendor_name != "nvidia" or logits.device.type != "cuda":
+    if runtime.device.vendor_name not in ("nvidia", "metax") or logits.device.type != "cuda":
         raise NotImplementedError("Flash selector requires NVIDIA CUDA")
     if (
         logits.ndim != 2
