@@ -350,9 +350,12 @@ def _run_accuracy_worker() -> None:
     not (_is_hopper() and has_triton_tle(3, 6, 0)),
     reason="requires Hopper with FlagTree TLE",
 )
-def test_megamoe_fp8_accuracy():
+def test_megamoe_fp8_accuracy(monkeypatch):
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two visible Hopper GPUs")
+
+    # This one-node test uses direct GPU peer pointers from NVSHMEM.
+    monkeypatch.setenv("NVSHMEM_REMOTE_TRANSPORT", "none")
 
     _run_torchrun(
         [str(Path(__file__).resolve()), "--accuracy-worker"],

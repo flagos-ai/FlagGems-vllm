@@ -237,28 +237,33 @@ def test_arbitrary_fp32_bit_patterns(width, k):
 
 @gpu
 @pytest.mark.parametrize(
-    "width,candidate_count",
+    "width,candidate_count,k",
     [
-        (4097, 63),
-        (4097, 64),
-        (4097, 65),
-        (65539, 255),
-        (65539, 256),
-        (65539, 257),
-        (262147, 255),
-        (262147, 256),
-        (262147, 257),
+        (4097, 63, 512),
+        (4097, 64, 512),
+        (4097, 65, 512),
+        (16384, 255, 1024),
+        (16384, 256, 1024),
+        (16384, 257, 1024),
+        (65539, 255, 512),
+        (65539, 256, 512),
+        (65539, 257, 512),
+        (262147, 255, 512),
+        (262147, 256, 512),
+        (262147, 257, 512),
     ],
 )
-def test_threshold_bucket_capacity_boundaries(width, candidate_count):
+def test_threshold_bucket_capacity_boundaries(width, candidate_count, k):
     # Distinct nearby FP32 values share a coarse bucket. The best candidates
     # must survive both sides of the compact-buffer capacity boundaries.
-    rows, k, above_count = 4, 512, 480
+    rows, above_count = 4, k - 32
     stride = (width + 3) // 4 * 4
     storage = torch.full((rows, stride), float("nan"))
     storage[:, :width] = -2.0
     generator = torch.Generator().manual_seed(53)
-    candidates = 1 + torch.arange(candidate_count) * torch.finfo(torch.float32).eps
+    candidates = (
+        1.03125 + torch.arange(candidate_count) * torch.finfo(torch.float32).eps
+    )
     for row in range(rows):
         positions = torch.randperm(width, generator=generator)
         storage[row, positions[:above_count]] = 2.0
@@ -285,6 +290,46 @@ def test_top_values_concentrated_in_one_segment(width, k):
     lengths, output, workspace = _buffers(logits, [width, width], k)
     flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
     _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
+@pytest.mark.parametrize("width", [524288, 1048576])
+@pytest.mark.parametrize("candidate_count", [64, 257])
+def test_single_row_partitioned_threshold_candidates(width, candidate_count):
+    # Single long rows can use more partitions than a batch of long rows.
+    # Place the threshold candidates at partition ends, including the row tail,
+    # and exercise both compact selection and exact capacity-overflow recovery.
+    k, above_count = 512, 480
+    storage = torch.full((1, width + 4), float("nan"))
+    storage[:, :width] = -2.0
+    storage[0, :above_count] = 2.0
+    candidate = torch.arange(candidate_count)
+    positions = (candidate.remainder(128) + 1) * (width // 128) - 1 - candidate // 128
+    storage[0, positions] = 1 + candidate * torch.finfo(torch.float32).eps
+    logits = storage.to(device)[:, :width]
+    lengths, output, workspace = _buffers(logits, [width], k)
+    flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
+@pytest.mark.parametrize("workspace_shape", [(4, 16384), (2, 2, 16384), (65537,)])
+def test_multidimensional_workspace_reuse(workspace_shape):
+    rows, width, k = 4, 16384, 1024
+    logits = torch.randn(rows, width, device=device)
+    lengths, output, _ = _buffers(logits, [0, k, k + 1, width], k)
+    workspace_numel = 1
+    for size in workspace_shape:
+        workspace_numel *= size
+    storage = torch.full((workspace_numel + 64,), 251, dtype=torch.uint8, device=device)
+    workspace = storage[32:-32].view(workspace_shape)
+    for poison in (17, 29):
+        workspace.fill_(poison)
+        output.fill_(-17)
+        flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+        _check(logits, lengths, output, k, reference_on_cpu=True)
+        assert torch.all(storage[:32] == 251)
+        assert torch.all(storage[-32:] == 251)
 
 
 @gpu
@@ -320,6 +365,8 @@ def test_maximum_packed_histogram_count():
         "k",
         "rows",
         "logits_rank",
+        "logits_scalar",
+        "logits_vector",
         "logits_layout",
         "column_stride",
         "row_stride",
@@ -335,6 +382,7 @@ def test_maximum_packed_histogram_count():
         "workspace_stride",
         "workspace_alignment",
         "float_k",
+        "string_k",
         "alias",
     ],
 )
@@ -350,6 +398,10 @@ def test_invalid_inputs_rejected_before_output_mutation(broken):
         output = output[:, :k].contiguous()
     elif broken == "logits_rank":
         logits = logits.unsqueeze(0)
+    elif broken == "logits_scalar":
+        logits = logits[0, 0]
+    elif broken == "logits_vector":
+        logits = logits[0]
     elif broken == "logits_layout":
         if device == "npu":
             # Sparse NPU allocation is not required to test this metadata guard.
@@ -390,6 +442,8 @@ def test_invalid_inputs_rejected_before_output_mutation(broken):
         )[1:]
     elif broken == "float_k":
         k = float(k)
+    elif broken == "string_k":
+        k = str(k)
     elif broken == "alias":
         output = logits.view(torch.int32).reshape(-1)[: rows * k].view(rows, k)
     before = output.clone()
@@ -556,6 +610,12 @@ def test_export_and_vendor_dispatch():
     assert "cooperative_topk" in flaggems_vllm.ops.__all__
     assert callable(flaggems_vllm.ops.cooperative_topk)
     assert callable(flaggems_vllm.cooperative_topk)
+    if flaggems_vllm.vendor_name == "thead":
+        from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import (
+            cooperative_topk as thead_cooperative_topk,
+        )
+
+        assert flaggems_vllm.cooperative_topk is thead_cooperative_topk
     if flaggems_vllm.vendor_name == "ascend":
         from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import (
             cooperative_topk as ascend_cooperative_topk,

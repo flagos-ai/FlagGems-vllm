@@ -42,6 +42,27 @@ PYTHONPATH=src pytest -q benchmark/test_fused_inv_rope_fp8_quant.py \
 
 - `--level core` (默认): 运行 `benchmark/core_shapes.yaml` 中定义的核心负载形状
 - `--level comprehensive`: 扩展形状覆盖，包含更大规模的长短序列
+- `--shape_file FILE`: 指定自定义形状 YAML 文件覆盖默认形状
+
+### 模型 Profiling 模式
+
+`--model-profile FILE` 加载模型 profiling 形状 YAML（如
+`benchmark/model_shapes/285B.yaml`），同时完成两件事：
+
+1. 把 `--shape_file` 覆盖为该 YAML，因此只会跑其中定义的形状，
+   无需修改各算子测试文件。
+2. 把每个算子的 `profiling:` 元数据作为 **Time Share** 列附加到结果表
+   （`pf 1.44%/3240x | dc 0.86%/7200x`），可直接对照真实生产 trace 中
+   该算子的权重评估 FlagGems kernel 延迟。
+
+```bash
+PYTHONPATH=src pytest -q benchmark/test_fused_add_rms_norm.py \
+    --model-profile benchmark/model_shapes/285B.yaml \
+    --level core --iter 10 --warmup 5
+```
+
+仅当 profiling 数据加载时该列才会出现；不传 `--model-profile` 时输出
+保持不变。
 
 ### 迭代与预热控制
 
@@ -100,6 +121,31 @@ grouped_topk:
   - [8, 16, 4, 2, 2]   # [batch, num_experts, n_group, topk_group, topk]
   - [32, 32, 8, 4, 4]
 ```
+
+## 模型 Profiling 形状 (`benchmark/model_shapes/`)
+
+除手工维护的 `core_shapes.yaml` 外，基准测试套件也可以由真实模型
+profiling trace 采集的形状驱动。这些形状文件位于
+`benchmark/model_shapes/`（如 `285B.yaml`，即一个 285B 参数模型在
+8×H100、TP=8 下运行时调用的算子）。
+
+每条目除 `core_shapes.yaml` 已有的 `shapes` 和 `shape_desc` 两个块外，
+还带一个 `profiling:` 子块，记录该算子的 GPU 时间占比与调用次数：
+
+```yaml
+flash_mla_sparse_fwd:
+  profiling:
+    prefill: {pct: 38.55, calls: 12960}
+    decode:  {pct:  8.55, calls: 28800}
+  shapes:
+    - [8192, 64, 576, 83264, 1, 2048, 512]   # prefill
+    - [ 128, 64, 576, 83264, 1, 2048, 512]   # decode
+  shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
+```
+
+用 `--model-profile`（见上方选项说明）加载此类文件；profiling 元数据会
+以 **Time Share** 列形式呈现，便于把 FlagGems kernel 延迟与该算子在
+真实负载中的权重直接对比。新模型的采集流程见形状文件头部的注释说明。
 
 ## 加速比计算标准
 

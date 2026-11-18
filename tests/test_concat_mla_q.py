@@ -14,6 +14,14 @@ if cfg.QUICK_MODE:
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+try:
+    import vllm._custom_ops  # noqa: F401
+
+    _HAS_VLLM_CONCAT_MLA_Q = hasattr(torch.ops._C_cache_ops, "concat_mla_q")
+except (ImportError, RuntimeError):
+    _HAS_VLLM_CONCAT_MLA_Q = False
+
+
 @gpu
 @pytest.mark.concat_mla_q
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -36,7 +44,20 @@ def test_concat_mla_q_matches_reference(dtype, shape, broadcast, strided):
     before_n, before_r = qn.clone(), qr.clone()
     address = out.data_ptr()
     assert flaggems_vllm.concat_mla_q(qn, qr, out) is None
-    expected = torch.cat([qn, qr.expand(tokens, heads, rope)], dim=-1)
+    # The native vLLM kernel specializes on 512 latent and 64 rotary channels
+    # in half precision with unit last-dimension strides.
+    if (
+        _HAS_VLLM_CONCAT_MLA_Q
+        and (nope, rope) == (512, 64)
+        and dtype in (torch.float16, torch.bfloat16)
+        and not strided
+    ):
+        expected = torch.empty(tokens, heads, nope + rope, dtype=dtype, device="cuda")
+        torch.ops._C_cache_ops.concat_mla_q(
+            qn, qr.expand(tokens, heads, rope), expected
+        )
+    else:
+        expected = torch.cat([qn, qr.expand(tokens, heads, rope)], dim=-1)
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
     assert out.data_ptr() == address
     torch.testing.assert_close(qn, before_n, rtol=0, atol=0)

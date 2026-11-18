@@ -499,6 +499,11 @@ class Benchmark:
                     pytest.fail(str(e))
 
                 metric = BenchmarkMetrics()
+                # Attach profiling time-share metadata when --model-profile
+                # was supplied.  The same metadata applies to every shape
+                # inside this op because it comes from op-level profiling.
+                if Config.model_profile and self.op_name in Config.model_profile:
+                    metric.time_share = Config.model_profile[self.op_name]
                 try:
                     args, kwargs = self.unpack_to_args_kwargs(input)
                     metric.shape_detail = self.record_shapes(*args, **kwargs)
