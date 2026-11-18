@@ -813,3 +813,31 @@ cast_sigmoid:
     - [1048576]       # large flat (1M)
     - [4096, 4096]    # large 2D (16M)
   shape_desc: "small: [1], [1,256]; medium: [128,256], [4096,256]; large: [1048576], [4096,4096]"
+
+flash_mla_with_kvcache_sparse_w8a8_fp8:
+  shapes:
+  - - 16
+    - 1
+    - 64
+    - 128
+    - 1032
+    - 0
+  - - 16
+    - 1
+    - 64
+    - 640
+    - 17416
+    - 0
+  - - 16
+    - 1
+    - 64
+    - 8320
+    - 1544
+    - 0
+  - - 1028
+    - 1
+    - 64
+    - 8320
+    - 1544
+    - 0
+  shape_desc: batch, queries, heads, topk, cache_pages, rope_dimension

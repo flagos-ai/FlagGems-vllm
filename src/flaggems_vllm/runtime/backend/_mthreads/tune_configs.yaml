@@ -775,6 +775,37 @@ hc_combine:
     num_warps: 4
     num_stages: 1
 
+mthreads_sparse_fp8_mla:
+- META:
+    BH: 32
+    BN: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 32
+    BN: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BH: 64
+    BN: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BH: 64
+    BN: 128
+  num_warps: 16
+  num_stages: 1
+mthreads_sparse_fp8_combine:
+- META:
+    BV: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BV: 256
+  num_warps: 4
+  num_stages: 1
+
 fused_kimi_k3_mla_kv_concat:
   - META: {BLOCK: 8, ROW_LAYOUT: false}
     num_warps: 4
