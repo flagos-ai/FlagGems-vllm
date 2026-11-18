@@ -126,11 +126,11 @@ def triton_flash_mla_sparse_fwd(
         t_ptr += t_base
         kv_ids = tl.load(t_ptr, t_msk, other=-1)
         mask_ids = (kv_ids < SKV) & (kv_ids >= 0)
-        # filter invalid index that may cause overflow in mul
-        kv_ids = tl.where(mask_ids, kv_ids, 0)
+        # A valid row can have an element offset beyond INT32_MAX.
+        kv_offsets = tl.where(mask_ids, kv_ids, 0).to(tl.int64) * stride_kvn
 
         # step2: gather kv with indices
-        kv_ptr = kv_base + offs_d[:, None] + kv_ids[None, :] * stride_kvn
+        kv_ptr = kv_base + offs_d[:, None] + kv_offsets[None, :]
         kv_blk0 = tl.load(kv_ptr, cache_modifier=".cg")  # [BDP, BK]
         kv_blk1 = tl.load(kv_ptr + BDP, cache_modifier=".cg")  # [BDP, BK]
         # step3: (q @ kv) * sm_scale
@@ -139,7 +139,7 @@ def triton_flash_mla_sparse_fwd(
         )  # [BH, BDP]@[BDP, BK] -> [BH, BK]
         qk = tl.dot(q_blk1, kv_blk1, qk, out_dtype=tl.float32)
         if DQK == 576:
-            tkv_ptr = tkv_base + offs_td[:, None] + kv_ids[None, :] * stride_kvn
+            tkv_ptr = tkv_base + offs_td[:, None] + kv_offsets[None, :]
             tkv_blk = tl.load(tkv_ptr, cache_modifier=".cg")  # [TDP, BK]
             qk = tl.dot(tq_blk, tkv_blk, qk, out_dtype=tl.float32)
         qk *= sm_scale
