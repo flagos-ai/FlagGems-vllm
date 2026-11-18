@@ -91,7 +91,9 @@ def _input_fn(shape, dtype, device):
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(dtype)
+    # Keep topk_weights float32: this is the production router contract and
+    # the mctlass stage2 weighted path reads float32 weights.
+    topk_ids = topk_ids.to(torch.int32)
     yield hidden_states, w1, w2, topk_weights, topk_ids
 
 
@@ -190,6 +192,12 @@ def thead_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
 
 def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
     """Run vLLM-MetaX's production unquantized MoE method."""
+    assert topk_weights.dtype == torch.float32, (
+        "MetaX mctlass baseline expects float32 topk_weights"
+    )
+    assert topk_ids.dtype == torch.int32, (
+        "MetaX mctlass baseline expects int32 topk_ids"
+    )
     import vllm_metax
     from vllm.config import set_current_vllm_config
     from vllm.forward_context import set_forward_context
