@@ -310,7 +310,7 @@ def _get_int8_config(batch, m, n, k, scale_n=128, scale_m=1, scale_k_contiguous=
         unroll = 4 if m <= 96 else (2 if m <= 512 else 1)
         kpack = 2
         if 16 < m <= 72 and scale_k_contiguous:
-            bm, bn, warps, group = 16, 32, 2, 4
+            bm, bn, warps, group = 16, 32, 2, (1 if 32 <= m <= 64 else 4)
             num_stages, pack_scales = 2, True
             if 32 < m <= 48 and scale_k_contiguous:
                 bn, group, kpack = 16, 1, 1
@@ -694,35 +694,37 @@ def _integer_factor_body(
     IST: tl.constexpr,
 ):
     rk = tl.arange(0, 128)
-    acc = tl.zeros((BM, BN), tl.int32)
+    # Keep activation rows on the dot's column axis to reduce register
+    # pressure in the broadcast shift-add and improve the MMAC feed layout.
+    acc = tl.zeros((BN, BM), tl.int32)
     for outer in range(8):
         xp = tl.load(P + rm * 8 + outer, rm < M, other=0).to(tl.uint32)
         wp = tl.load(P + (M + PN) * 8 + outer).to(tl.uint32)
         words = xp + wp
         for sub in tl.range(4, loop_unroll_factor=INNER, num_stages=IST):
             kk = (outer * 4 + sub) * 128 + rk
+            a = tl.load(W + rn[:, None] * 4096 + kk[None, :])
             if ALIGNED:
-                a = tl.load(A + rm[:, None] * 4096 + kk[None, :])
+                w = tl.load(A + rm[None, :] * 4096 + kk[:, None])
             else:
-                a = tl.load(
-                    A + rm[:, None] * 4096 + kk[None, :], rm[:, None] < M, other=0
+                w = tl.load(
+                    A + rm[None, :] * 4096 + kk[:, None], rm[None, :] < M, other=0
                 )
-            w = tl.load(W + rn[None, :] * 4096 + kk[:, None])
             part = tl.dot(a, w, out_dtype=tl.int32)
             acc = tl.inline_asm_elementwise(
                 "v_lshl_add_u32 $0, $1, $2, $3",
                 "=v,v,v,v",
-                [part, words[:, None], acc],
+                [part, words[None, :], acc],
                 dtype=tl.int32,
                 is_pure=True,
                 pack=1,
             )
             words = words >> 8
-    value = acc.to(tl.float32) * tl.exp2(emin.to(tl.float32) - 127.0)[:, None]
+    value = acc.to(tl.float32) * tl.exp2(emin.to(tl.float32) - 127.0)[None, :]
     if ALIGNED:
-        tl.store(O + rm[:, None] * 1024 + rn[None, :], value)
+        tl.store(O + rm[None, :] * 1024 + rn[:, None], value)
     else:
-        tl.store(O + rm[:, None] * 1024 + rn[None, :], value, rm[:, None] < M)
+        tl.store(O + rm[None, :] * 1024 + rn[:, None], value, rm[None, :] < M)
 
 
 @triton.jit
@@ -745,7 +747,7 @@ def integer_factor_bmm_kernel(
     INNER: tl.constexpr,
     IST: tl.constexpr,
 ):
-    tl.static_assert(BM == 128 and BN == 128 and (GM == 1 or GM == 4))
+    tl.static_assert(BM == 128 and BN == 128 and (GM == 4 or GM == 8))
     pid = tl.program_id(0)
     nm = tl.cdiv(M, BM)
     nn = 1024 // BN
@@ -798,6 +800,139 @@ def integer_factor_bmm_kernel(
 
 
 @triton.jit
+def _single_head_integer_body(
+    A,
+    W,
+    Out,
+    rm,
+    rn,
+    base,
+    word0,
+    word1,
+    M: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    STAGES: tl.constexpr,
+):
+    acc = tl.zeros((BM, BN), tl.int32)
+    rk = tl.arange(0, 128)
+    for outer in range(2):
+        words = tl.where(outer == 0, word0, word1)
+        for sub in tl.range(16, num_stages=STAGES):
+            kk = (outer * 16 + sub) * 128 + rk
+            shift = words & 3
+            left = tl.load(
+                A + rm[:, None] * 4096 + kk[None, :], rm[:, None] < M, other=0
+            )
+            right = tl.load(W + rn[None, :] * 4096 + kk[:, None])
+            part = tl.dot(left, right, out_dtype=tl.int32)
+            acc = tl.inline_asm_elementwise(
+                "v_lshl_add_u32 $0, $1, $2, $3",
+                "=v,v,v,v",
+                [part, shift[:, None], acc],
+                dtype=tl.int32,
+                is_pure=True,
+                pack=1,
+            )
+            words = words >> 2
+    scale = ((base - 127) << 23).to(tl.float32, bitcast=True)
+    value = acc.to(tl.float32) * scale[:, None]
+    tl.store(Out + rm[:, None] * 1024 + rn[None, :], value, rm[:, None] < M)
+
+
+@triton.jit
+def int8_single_head_integer_kernel(
+    A,
+    W,
+    XS,
+    WS,
+    Out,
+    M: tl.constexpr,
+    XSM: tl.constexpr,
+    XSK: tl.constexpr,
+    WSN: tl.constexpr,
+    WSK: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    GM: tl.constexpr,
+    STAGES: tl.constexpr,
+):
+    tl.static_assert(BN <= 128 and 128 % BN == 0)
+    pid = tl.program_id(0)
+    nm = tl.cdiv(M, BM)
+    nn = 1024 // BN
+    group_id = pid // (GM * nn)
+    first_m = group_id * GM
+    size_m = tl.minimum(nm - first_m, GM)
+    local = pid % (GM * nn)
+    pm = first_m + local % size_m
+    pn = local // size_m
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    kg = tl.arange(0, 32)
+    x = tl.load(XS + rm[:, None] * XSM + kg[None, :] * XSK, rm[:, None] < M, other=1.0)
+    w = tl.load(WS + (pn * BN // 128) * WSN + kg * WSK)
+    xb = x.to(tl.int32, bitcast=True)
+    wb = w.to(tl.int32, bitcast=True)
+    xe = (xb >> 23) & 255
+    we = (wb >> 23) & 255
+    xmin = tl.min(xe, 1)
+    xmax = tl.max(xe, 1)
+    wmin = tl.min(we, 0)
+    wmax = tl.max(we, 0)
+    xok = tl.min(((xb & -2139095041) == 0) & (xe > 0) & (xe < 255), 1) == 1
+    wok = tl.min(((wb & -2139095041) == 0) & (we > 0) & (we < 255), 0) == 1
+    base = xmin + wmin
+    # A shift span of at most three bounds the worst-case INT8 sum by 2**29.
+    # Keep products normal and the final scaled sum within FP32 range.
+    valid = (
+        xok
+        & wok
+        & (xmax - xmin + wmax - wmin <= 3)
+        & (base >= 190)
+        & (xmax + wmax <= 286)
+    )
+    if tl.min(valid | (rm >= M), 0) == 1:
+        # Two bits per K group keep all 32 shifts in two registers per row.
+        shifts = (xe + we[None, :] - base[:, None]).to(tl.uint32)
+        packed = tl.sum(
+            tl.reshape(shifts, (BM, 2, 16)) << (tl.arange(0, 16)[None, None, :] * 2), 2
+        )
+        word0, word1 = tl.split(packed)
+        _single_head_integer_body(
+            A, W, Out, rm, rn, base, word0, word1, M, BM, BN, STAGES
+        )
+    else:
+        _int8_block_bmm_kernel(
+            A,
+            W,
+            XS,
+            WS,
+            Out,
+            M,
+            1024,
+            4096,
+            (0, 4096, 1),
+            (0, 1, 4096),
+            (0, XSM, XSK),
+            (0, WSK, WSN),
+            (0, 1024, 1),
+            1,
+            128,
+            128,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            GROUP_M=GM,
+            ALIGNED=M % BM == 0,
+            TILE_K=128,
+            UNROLL=1,
+            ACC_FP32=True,
+            PACK_SCALES=True,
+            SCALE_GROUPS=2,
+        )
+
+
+@triton.jit
 def int8_single_head_paired_k_kernel(
     A,
     W,
@@ -825,27 +960,22 @@ def int8_single_head_paired_k_kernel(
     wp = W + col[None, :] * k + inner_k[:, None]
     asp = XS + row * XS_M
     wsp = WS + (pn * BLOCK_N // scale_block) * k_groups
-    even = tl.zeros((block_m, BLOCK_N), tl.float32)
-    odd = tl.zeros((block_m, BLOCK_N), tl.float32)
-    # Separate accumulators let the adjacent dot and scale operations overlap.
+    acc = tl.zeros((block_m, BLOCK_N), tl.float32)
     for pair in range(k_groups // 2):
         group = pair * 2
-        offset = group * scale_block
-        a0 = tl.load(ap + offset, valid[:, None], 0)
-        w0 = tl.load(wp + offset)
-        a1 = tl.load(ap + offset + scale_block, valid[:, None], 0)
-        w1 = tl.load(wp + offset + scale_block)
-        s0 = tl.load(asp + group * XS_K, valid, 0).to(tl.float32) * tl.load(
-            wsp + group
-        ).to(tl.float32)
-        s1 = tl.load(asp + (group + 1) * XS_K, valid, 0).to(tl.float32) * tl.load(
-            wsp + group + 1
-        ).to(tl.float32)
-        d0 = tl.dot(a0, w0, out_dtype=tl.int32)
-        d1 = tl.dot(a1, w1, out_dtype=tl.int32)
-        even = tl.fma(d0.to(tl.float32), s0[:, None], even)
-        odd = tl.fma(d1.to(tl.float32), s1[:, None], odd)
-    tl.store(Out + row[:, None] * n + col[None, :], even + odd, valid[:, None])
+        groups = group + tl.arange(0, 2)
+        scales = tl.load(asp[:, None] + groups[None, :] * XS_K, valid[:, None], 0).to(
+            tl.float32
+        ) * tl.load(wsp + groups)[None, :].to(tl.float32)
+        scale0, scale1 = tl.split(scales)
+        for sub in tl.static_range(2):
+            offset = (group + sub) * scale_block
+            a = tl.load(ap + offset, valid[:, None], 0)
+            w = tl.load(wp + offset)
+            scale = scale0 if sub == 0 else scale1
+            dot = tl.dot(a, w, out_dtype=tl.int32)
+            acc = tl.fma(dot.to(tl.float32), scale[:, None], acc)
+    tl.store(Out + row[:, None] * n + col[None, :], acc, valid[:, None])
 
 
 @triton.jit
@@ -1108,7 +1238,37 @@ def _int8_block_bmm(
             return out
         a_scale_stride = A_scale.stride()
         if (
-            64 < m <= 176
+            224 < m <= 512
+            and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
+            and A.stride()[1:] == (4096, 1)
+            and B.stride()[1:] == (1, 4096)
+            and a_scale_stride[1:] == (32, 1)
+            and B_scale.stride()[1:] == (1, 32)
+            and out.stride()[1:] == (1024, 1)
+            and A_scale.dtype == B_scale.dtype == torch.float32
+        ):
+            int8_single_head_integer_kernel[(triton.cdiv(m, 64) * 16,)](
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out,
+                m,
+                32,
+                1,
+                32,
+                1,
+                BM=64,
+                BN=64,
+                GM=4,
+                STAGES=2,
+                num_warps=4,
+                num_stages=2,
+                kpack=1,
+            )
+            return out
+        if (
+            64 < m <= 224
             and (m > 72 or a_scale_stride[2] != 1)
             and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
             and A.stride()[1:] == (4096, 1)
@@ -1134,7 +1294,7 @@ def _int8_block_bmm(
             )
             return out
         if (
-            m >= 8192
+            m >= 4096
             and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
             and A.stride()[1:] == (4096, 1)
             and B.stride()[1:] == (1, 4096)
@@ -1171,12 +1331,12 @@ def _int8_block_bmm(
                 *scale_strides,
                 BM=128,
                 BN=128,
-                GM=1 if m % 128 == 0 else 4,
+                GM=4 if m % 128 == 0 else 8,
                 INNER=1,
                 IST=2,
-                num_warps=4,
+                num_warps=8,
                 num_stages=1,
-                kpack=2,
+                kpack=1,
             )
             return out
         cfg = _get_int8_config(batch, m, n, k, sn, sm, a_scale_stride[2] == 1)
