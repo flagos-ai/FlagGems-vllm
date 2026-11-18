@@ -233,6 +233,7 @@ def mega_mhc(
             and block_p <= 32
             and k * block_p >= 4096 * multiprocessors
             and hidden % 8 == 0
+            and 2 * tokens * k <= 2**32
             and sinkhorn_repeat < 2**32
             and all(t.data_ptr() % 16 == 0 for t in (x, residual, fn, norm))
             and has_triton_tle_attrs(("gpu.alloc", "gpu.local_ptr"))

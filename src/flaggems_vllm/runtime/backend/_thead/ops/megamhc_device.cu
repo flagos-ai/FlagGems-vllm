@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
+#include <type_traits>
 #include <hggc_runtime.h>
 
 extern "C" __device__ int megamhc_wait(uint64_t address, uint64_t expected) {
@@ -164,6 +165,8 @@ DEFINE_MHC_POST(4)
 
 // Multi-row SIMD projection reuses the FP32 weights without MMA mode.
 namespace megamhc_simt {
+// Eight packed vectors cap the normalization cache at 32 registers per lane.
+constexpr unsigned kCachedVectors = 8;
 // Vector transactions move eight BF16 values (16 bytes). Each token reserves
 // one warp-sized projection row: the supported 1/2/4-stream mixes fit below
 // lane 32, leaving a lane for the row norm used by compensated retries.
@@ -228,6 +231,9 @@ __device__ __forceinline__ int
 project(uint64_t xp, uint64_t rp, uint64_t postp, uint64_t combp, uint64_t fnp,
         uint64_t outp, uint64_t token, uint64_t cs0, uint64_t cs1, uint64_t cs2,
         unsigned hidden, unsigned shared, float eps) {
+  // The host bounds dense byte offsets before selecting the SIMD path.
+  using Index = typename std::conditional<(Warps >= R * (R + 2)), unsigned,
+                                          uint64_t>::type;
   constexpr unsigned P = R * (R + 2);
   constexpr unsigned Heads = (P + Warps - 1) / Warps;
   const unsigned lane = threadIdx.x & 31;
@@ -236,19 +242,19 @@ project(uint64_t xp, uint64_t rp, uint64_t postp, uint64_t combp, uint64_t fnp,
   const unsigned row = warp / RowWarps;
   const unsigned inrow = warp % RowWarps;
 
-  const uint64_t row_hidden = (token + row) * hidden;
-  const uint64_t row_residual = (token + row) * R * hidden;
+  const Index row_hidden = (Index(token) + row) * hidden;
+  const Index row_residual = (Index(token) + row) * R * hidden;
   float sq[8] = {};
   {
     float post[R], comb[R][R];
 #pragma unroll
     for (unsigned dst = 0; dst < R; ++dst) {
-      post[dst] =
-          reinterpret_cast<const float *>(postp)[(token + row) * R + dst];
+      post[dst] = reinterpret_cast<const float *>(
+          postp)[(Index(token) + row) * R + dst];
 #pragma unroll
       for (unsigned src = 0; src < R; ++src) {
         comb[dst][src] = reinterpret_cast<const float *>(
-            combp)[(token + row) * cs0 + src * cs1 + dst * cs2];
+            combp)[(Index(token) + row) * cs0 + src * cs1 + dst * cs2];
       }
     }
     for (unsigned start = (inrow * 32 + lane) * 8; start < hidden;
@@ -312,11 +318,16 @@ project(uint64_t xp, uint64_t rp, uint64_t postp, uint64_t combp, uint64_t fnp,
   }
 
   float acc[Rows][Heads][8] = {};
+  // A single head per warp can overlap two iterations without growing the
+  // multi-head accumulator's register footprint.
+  constexpr unsigned Unroll = Heads == 1 ? 2 : 1;
+#pragma unroll Unroll
   for (unsigned start = lane * 8; start < R * hidden; start += 32 * 8) {
     PackedBf16 av[Rows];
 #pragma unroll
     for (unsigned row = 0; row < Rows; ++row)
-      av[row] = load_bf16(outp + 2 * ((token + row) * R * hidden + start));
+      av[row] =
+          load_bf16(outp + 2 * ((Index(token) + row) * R * hidden + start));
 #pragma unroll
     for (unsigned j = 0; j < Heads; ++j) {
       const unsigned head = warp + j * Warps;
@@ -441,6 +452,101 @@ __device__ __forceinline__ int retry_projection(uint64_t residual, uint64_t fnp,
   return 0;
 }
 
+template <unsigned Warps, unsigned R, unsigned Rows, bool Cached>
+__device__ __forceinline__ int
+finish(uint64_t residual, uint64_t yp, uint64_t norm_p, uint64_t token,
+       unsigned hidden, unsigned shared, float norm_eps, bool norm) {
+  constexpr unsigned RowWarps = Warps / Rows;
+  const unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+  const unsigned row = warp / RowWarps, inrow = warp % RowWarps;
+
+  float pre[R];
+#pragma unroll
+  for (unsigned src = 0; src < R; ++src)
+    pre[src] = shared_load(shared, 2 * Rows * 32 + row * R + src);
+  float sq[8] = {};
+  constexpr unsigned VectorStride = RowWarps * 32 * 8;
+  constexpr unsigned Unroll = Cached ? kCachedVectors : 1;
+  const unsigned chunks =
+      Cached ? kCachedVectors : (hidden + VectorStride - 1) / VectorStride;
+  PackedBf16 tiles[Cached ? kCachedVectors : 1];
+#pragma unroll Unroll
+  for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+    const unsigned start = (inrow * 32 + lane) * 8 + chunk * VectorStride;
+    if (start < hidden) {
+      PackedBf16 sources[R], rounded;
+#pragma unroll
+      for (unsigned src = 0; src < R; ++src)
+        sources[src] = load_bf16(
+            residual + 2 * ((token + row) * R * hidden + src * hidden + start));
+#pragma unroll
+      for (unsigned word = 0; word < 4; ++word) {
+        float lo = 0.f, hi = 0.f;
+#pragma unroll
+        for (unsigned src = 0; src < R; ++src) {
+          lo = __fmaf_rn(pre[src], bf16_at(sources[src], word * 2), lo);
+          hi = __fmaf_rn(pre[src], bf16_at(sources[src], word * 2 + 1), hi);
+        }
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;"
+            : "=r"(rounded.values[word])
+            : "f"(hi), "f"(lo));
+        lo = bf16_at(rounded, word * 2);
+        hi = bf16_at(rounded, word * 2 + 1);
+        sq[2 * word] += lo * lo;
+        sq[2 * word + 1] += hi * hi;
+      }
+      // Cache BF16 bits, preserving the collapse rounding before RMSNorm.
+      if constexpr (Cached)
+        tiles[chunk] = rounded;
+      else
+        store_bf16(yp + 2 * ((token + row) * hidden + start), rounded);
+    }
+  }
+#pragma unroll
+  for (unsigned width = 4; width > 0; width /= 2) {
+#pragma unroll
+    for (unsigned j = 0; j < width; ++j)
+      sq[j] += sq[j + width];
+  }
+  float sum = warp_sum(sq[0]);
+  const unsigned scratch = 2 * Rows * 32 + Rows * R;
+  if (lane == 0)
+    shared_store(shared, scratch + warp, sum);
+  __syncthreads();
+  float total = lane < RowWarps
+                    ? shared_load(shared, scratch + row * RowWarps + lane)
+                    : 0.f;
+  total = warp_sum(total);
+  float rsqrt = rsqrtf(total / hidden + norm_eps);
+  if (norm) {
+#pragma unroll Unroll
+    for (unsigned chunk = 0; chunk < chunks; ++chunk) {
+      const unsigned start = (inrow * 32 + lane) * 8 + chunk * VectorStride;
+      if (start < hidden) {
+        PackedBf16 y;
+        if constexpr (Cached)
+          y = tiles[chunk];
+        else
+          y = load_bf16(yp + 2 * ((token + row) * hidden + start));
+        PackedBf16 w = load_bf16(norm_p + 2 * start), out;
+#pragma unroll
+        for (unsigned word = 0; word < 4; ++word) {
+          float lo = bf16_at(y, 2 * word) * rsqrt * bf16_at(w, 2 * word);
+          float hi =
+              bf16_at(y, 2 * word + 1) * rsqrt * bf16_at(w, 2 * word + 1);
+          asm("cvt.rn.bf16x2.f32 %0, %1, %2;"
+              : "=r"(out.values[word])
+              : "f"(hi), "f"(lo));
+        }
+        store_bf16(yp + 2 * ((token + row) * hidden + start), out);
+      }
+    }
+  }
+  __syncthreads();
+
+  return 0;
+}
+
 template <unsigned Warps, unsigned R, unsigned Rows>
 __device__ __forceinline__ int
 epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
@@ -532,74 +638,15 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
       reinterpret_cast<float *>(nc)[(token + row) * R * R + lane] = c;
   }
   __syncthreads();
-  constexpr unsigned RowWarps = Warps / Rows;
-  const unsigned row = warp / RowWarps, inrow = warp % RowWarps;
-
-  float pre[R];
-#pragma unroll
-  for (unsigned src = 0; src < R; ++src)
-    pre[src] = shared_load(shared, 2 * Rows * 32 + row * R + src);
-  float sq[8] = {};
-  for (unsigned start = (inrow * 32 + lane) * 8; start < hidden;
-       start += RowWarps * 32 * 8) {
-    PackedBf16 sources[R], rounded;
-#pragma unroll
-    for (unsigned src = 0; src < R; ++src)
-      sources[src] = load_bf16(
-          residual + 2 * ((token + row) * R * hidden + src * hidden + start));
-#pragma unroll
-    for (unsigned word = 0; word < 4; ++word) {
-      float lo = 0.f, hi = 0.f;
-#pragma unroll
-      for (unsigned src = 0; src < R; ++src) {
-        lo = __fmaf_rn(pre[src], bf16_at(sources[src], word * 2), lo);
-        hi = __fmaf_rn(pre[src], bf16_at(sources[src], word * 2 + 1), hi);
-      }
-      asm("cvt.rn.bf16x2.f32 %0, %1, %2;"
-          : "=r"(rounded.values[word])
-          : "f"(hi), "f"(lo));
-      lo = bf16_at(rounded, word * 2);
-      hi = bf16_at(rounded, word * 2 + 1);
-      sq[2 * word] += lo * lo;
-      sq[2 * word + 1] += hi * hi;
-    }
-    store_bf16(yp + 2 * ((token + row) * hidden + start), rounded);
+  // Reuse registers released by a multi-head projection. Narrow projections
+  // keep the streaming finish to avoid raising their register requirement.
+  if constexpr (Warps < R * (R + 2)) {
+    if (norm && hidden <= kCachedVectors * (Warps / Rows) * 32 * 8)
+      return finish<Warps, R, Rows, true>(residual, yp, norm_p, token, hidden,
+                                          shared, norm_eps, norm);
   }
-#pragma unroll
-  for (unsigned width = 4; width > 0; width /= 2) {
-#pragma unroll
-    for (unsigned j = 0; j < width; ++j)
-      sq[j] += sq[j + width];
-  }
-  float sum = warp_sum(sq[0]);
-  const unsigned scratch = 2 * Rows * 32 + Rows * R;
-  if (lane == 0)
-    shared_store(shared, scratch + warp, sum);
-  __syncthreads();
-  float total = lane < RowWarps
-                    ? shared_load(shared, scratch + row * RowWarps + lane)
-                    : 0.f;
-  total = warp_sum(total);
-  float rsqrt = rsqrtf(total / hidden + norm_eps);
-  if (norm) {
-    for (unsigned start = (inrow * 32 + lane) * 8; start < hidden;
-         start += RowWarps * 32 * 8) {
-      PackedBf16 y = load_bf16(yp + 2 * ((token + row) * hidden + start));
-      PackedBf16 w = load_bf16(norm_p + 2 * start), out;
-#pragma unroll
-      for (unsigned word = 0; word < 4; ++word) {
-        float lo = bf16_at(y, 2 * word) * rsqrt * bf16_at(w, 2 * word);
-        float hi = bf16_at(y, 2 * word + 1) * rsqrt * bf16_at(w, 2 * word + 1);
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;"
-            : "=r"(out.values[word])
-            : "f"(hi), "f"(lo));
-      }
-      store_bf16(yp + 2 * ((token + row) * hidden + start), out);
-    }
-  }
-  __syncthreads();
-
-  return 0;
+  return finish<Warps, R, Rows, false>(residual, yp, norm_p, token, hidden,
+                                       shared, norm_eps, norm);
 }
 
 } // namespace megamhc_simt
