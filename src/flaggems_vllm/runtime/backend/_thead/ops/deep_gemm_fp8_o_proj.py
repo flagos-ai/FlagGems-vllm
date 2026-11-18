@@ -775,11 +775,10 @@ def _tile(m: int):
         return 16, 128, 4, 2, 1, True
     if m <= 64:
         return 64, 128, 4, 2, 1, False
-    if m <= 128:
-        # A 128-row tile reads each weight tile once (the 64-row tile reads it
-        # twice); measured 100.3/179.7 us vs 106.9/203.1 us for g=8/g=16.
-        return 128, 128, 8, 2, 8, False
     if m <= 1024:
+        # m=128 measured 73.4 us (117 TFLOPS) with this tile against 99.5 us
+        # (86 TFLOPS) for the 128-row tile: 128 CTAs keep the load side busy
+        # while the 64-row tile only touches two waves of SMs.
         return 64, 128, 4, 3, 32, False
     return 64, 128, 4, 3, 8, False
 
