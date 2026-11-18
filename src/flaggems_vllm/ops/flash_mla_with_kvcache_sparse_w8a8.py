@@ -6,7 +6,7 @@ from typing import Callable, Optional
 import torch
 
 
-def flash_mla_with_kvcache_sparse_w8a8_int8(
+def flash_mla_with_kvcache_sparse_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,
@@ -29,7 +29,7 @@ def flash_mla_with_kvcache_sparse_w8a8_int8(
     raise NotImplementedError("No registered sparse W8A8 INT8 KVCache MLA backend")
 
 
-def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
+def prepare_flash_mla_with_kvcache_sparse_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,

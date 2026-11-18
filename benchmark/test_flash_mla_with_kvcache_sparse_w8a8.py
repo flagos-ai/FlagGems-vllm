@@ -5,7 +5,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_flash_mla_with_kvcache_sparse_w8a8_int8 import (
+from tests.test_flash_mla_with_kvcache_sparse_w8a8 import (
     SUPPORTED,
     assert_accuracy,
     make_inputs,
@@ -42,7 +42,7 @@ class SparseMLAInt8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
 
     def __init__(self):
         super().__init__(
-            "flash_mla_with_kvcache_sparse_w8a8_int8", run_native, [torch.bfloat16]
+            "flash_mla_with_kvcache_sparse_w8a8", run_native, [torch.bfloat16]
         )
         self.set_gems(run_gems)
 
@@ -62,8 +62,8 @@ class SparseMLAInt8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
                 lengths, queries * heads, 1, heads, False, topk
             )
             valid = torch.zeros((batch, queries, 1), dtype=torch.bool, device=device)
-            handle, actual = (
-                flaggems_vllm.prepare_flash_mla_with_kvcache_sparse_w8a8_int8(*inputs)
+            handle, actual = flaggems_vllm.prepare_flash_mla_with_kvcache_sparse_w8a8(
+                *inputs
             )
             args = (
                 inputs,
@@ -99,7 +99,7 @@ class SparseMLAInt8Benchmark(ParallelBenchmarkMixin, base.Benchmark):
         )
 
 
-@pytest.mark.flash_mla_with_kvcache_sparse_w8a8_int8
+@pytest.mark.flash_mla_with_kvcache_sparse_w8a8
 @pytest.mark.skipif(not SUPPORTED, reason="No registered sparse INT8 KVCache MLA")
-def test_flash_mla_with_kvcache_sparse_w8a8_int8():
+def test_flash_mla_with_kvcache_sparse_w8a8():
     SparseMLAInt8Benchmark().run()

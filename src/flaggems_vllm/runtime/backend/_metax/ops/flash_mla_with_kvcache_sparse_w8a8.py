@@ -320,7 +320,7 @@ class SparseMLAInt8PreparedHandle:
         return self.output, self.lse
 
 
-def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
+def prepare_flash_mla_with_kvcache_sparse_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,
@@ -452,7 +452,7 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
     return handle, handle()
 
 
-def flash_mla_with_kvcache_sparse_w8a8_int8(
+def flash_mla_with_kvcache_sparse_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,
@@ -466,7 +466,7 @@ def flash_mla_with_kvcache_sparse_w8a8_int8(
     attn_sink: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, output = prepare_flash_mla_with_kvcache_sparse_w8a8_int8(
+    _, output = prepare_flash_mla_with_kvcache_sparse_w8a8(
         q_nope,
         q_rope,
         k_nope,
