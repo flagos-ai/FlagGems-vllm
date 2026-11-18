@@ -31,7 +31,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 NULL_BLOCK_ID = 0
 
 try:
@@ -429,5 +428,6 @@ def ple_conv(
             NULL_STATE_ID=NULL_BLOCK_ID,
             num_warps=num_warps,
         )
+
 
 __all__ = ["NULL_BLOCK_ID", "ple_conv"]
