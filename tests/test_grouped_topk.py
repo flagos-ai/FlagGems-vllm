@@ -379,17 +379,16 @@ def test_grouped_topk_deepseek_v3_2(
     ref_topk_weights = utils.to_reference(ref_topk_weights)
     ref_topk_ids = utils.to_reference(ref_topk_ids)
 
-    with flaggems_vllm.use_gems():
-        res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
-            scores.clone(),
-            n_group,
-            topk_group,
-            topk,
-            renormalize,
-            routed_scaling_factor,
-            bias,
-            scoring_func,
-        )
+    res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
+        scores.clone(),
+        n_group,
+        topk_group,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        bias,
+        scoring_func,
+    )
 
     utils.gems_assert_equal(res_topk_ids, ref_topk_ids)
 
@@ -437,17 +436,16 @@ def test_grouped_topk_glm_5_2(
     ref_topk_weights = utils.to_reference(ref_topk_weights)
     ref_topk_ids = utils.to_reference(ref_topk_ids)
 
-    with flaggems_vllm.use_gems():
-        res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
-            scores.clone(),
-            n_group,
-            topk_group,
-            topk,
-            renormalize,
-            routed_scaling_factor,
-            bias,
-            scoring_func,
-        )
+    res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
+        scores.clone(),
+        n_group,
+        topk_group,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        bias,
+        scoring_func,
+    )
 
     utils.gems_assert_equal(res_topk_ids, ref_topk_ids)
 
@@ -500,17 +498,16 @@ def test_grouped_topk(
     ref_topk_weights = utils.to_reference(ref_topk_weights)
     ref_topk_ids = utils.to_reference(ref_topk_ids)
 
-    with flaggems_vllm.use_gems():
-        res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
-            scores.clone(),
-            n_group,
-            topk_group,
-            topk,
-            renormalize,
-            routed_scaling_factor,
-            bias,
-            scoring_func,
-        )
+    res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
+        scores.clone(),
+        n_group,
+        topk_group,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        bias,
+        scoring_func,
+    )
 
     utils.gems_assert_equal(res_topk_ids, ref_topk_ids)
 
@@ -560,17 +557,16 @@ def test_grouped_topk_large_scale(
     ref_topk_weights = utils.to_reference(ref_topk_weights)
     ref_topk_ids = utils.to_reference(ref_topk_ids)
 
-    with flaggems_vllm.use_gems():
-        res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
-            scores.clone(),
-            n_group,
-            topk_group,
-            topk,
-            renormalize,
-            routed_scaling_factor,
-            bias,
-            scoring_func,
-        )
+    res_topk_weights, res_topk_ids = flaggems_vllm.grouped_topk(
+        scores.clone(),
+        n_group,
+        topk_group,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        bias,
+        scoring_func,
+    )
 
     utils.gems_assert_equal(res_topk_ids, ref_topk_ids)
 
@@ -598,17 +594,16 @@ def test_grouped_topk_scaling_factor(routed_scaling_factor, renormalize):
     ref_weights = utils.to_reference(ref_weights)
     ref_ids = utils.to_reference(ref_ids)
 
-    with flaggems_vllm.use_gems():
-        res_weights, res_ids = flaggems_vllm.grouped_topk(
-            scores.clone(),
-            4,
-            2,
-            2,
-            renormalize,
-            routed_scaling_factor,
-            bias,
-            0,
-        )
+    res_weights, res_ids = flaggems_vllm.grouped_topk(
+        scores.clone(),
+        4,
+        2,
+        2,
+        renormalize,
+        routed_scaling_factor,
+        bias,
+        0,
+    )
 
     utils.gems_assert_equal(res_ids, ref_ids)
 
@@ -636,10 +631,9 @@ def test_grouped_topk_single_token(renormalize, scoring_func):
     ref_weights = utils.to_reference(ref_weights)
     ref_ids = utils.to_reference(ref_ids)
 
-    with flaggems_vllm.use_gems():
-        res_weights, res_ids = flaggems_vllm.grouped_topk(
-            scores.clone(), 4, 2, 2, renormalize, 1.0, bias, scoring_func
-        )
+    res_weights, res_ids = flaggems_vllm.grouped_topk(
+        scores.clone(), 4, 2, 2, renormalize, 1.0, bias, scoring_func
+    )
 
     utils.gems_assert_equal(res_ids, ref_ids)
 
@@ -665,13 +659,150 @@ def test_grouped_topk_sigmoid(renormalize):
     ref_weights = utils.to_reference(ref_weights)
     ref_ids = utils.to_reference(ref_ids)
 
-    with flaggems_vllm.use_gems():
-        res_weights, res_ids = flaggems_vllm.grouped_topk(
-            scores.clone(), 4, 2, 2, renormalize, 1.0, bias, 1
-        )
+    res_weights, res_ids = flaggems_vllm.grouped_topk(
+        scores.clone(), 4, 2, 2, renormalize, 1.0, bias, 1
+    )
 
     utils.gems_assert_equal(res_ids, ref_ids)
 
     atol, rtol = get_tolerance(dtype, 1, renormalize)
     res_weights = utils.to_reference(res_weights)
     torch.testing.assert_close(res_weights, ref_weights, atol=atol, rtol=rtol)
+
+
+def _torch_padding_routing_reference(
+    scores, groups, keep, topk, renormalize, scale, bias, scoring_func
+):
+    """Independent eager oracle, matching each existing route's score precision."""
+    experts = scores.size(1)
+    per_group = experts // groups
+    fast = (groups == keep == 1 and experts <= 256 and topk <= 8) or (
+        groups > 1
+        and experts <= 256
+        and per_group <= 32
+        and per_group * keep <= 128
+        and topk <= 8
+        and keep <= 4
+    )
+    if fast:
+        u = scores.float()
+        unbiased = u.sigmoid() if scoring_func == 1 else u
+        ranked = unbiased + bias.float()
+    else:
+        # Legacy generic path rounds each pointwise step to the input dtype,
+        # including the final addition of the routing bias.
+        unbiased = 0.5 * torch.tanh(0.5 * scores) + 0.5 if scoring_func == 1 else scores
+        ranked = unbiased + bias.to(scores.dtype)
+    group_score = ranked.float().view(-1, groups, per_group).topk(2, dim=-1)[0].sum(-1)
+    if not fast:
+        group_score = group_score.to(scores.dtype).float()
+    group_ids = group_score.argsort(descending=True, stable=True)[:, :keep]
+    enabled = torch.zeros_like(group_score, dtype=torch.bool)
+    enabled.scatter_(1, group_ids, True)
+    selected = enabled.unsqueeze(-1).expand(-1, -1, per_group).reshape_as(ranked)
+    ranked = ranked.float().masked_fill(~selected, float("-inf"))
+    ids = ranked.argsort(descending=True, stable=True)[:, :topk]
+    weights = unbiased.float().gather(1, ids)
+    if renormalize:
+        weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+    return weights * scale, ids.to(torch.int32)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(
+    vendor_name != "nvidia", reason="padding is a CUDA routing contract"
+)
+@pytest.mark.parametrize(
+    "experts,groups,keep,topk",
+    [(512, 1, 1, 16), (256, 1, 1, 8), (256, 8, 4, 8), (384, 3, 2, 4)],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mode", ["mixed", "all", "none"])
+def test_grouped_topk_padding(experts, groups, keep, topk, dtype, mode):
+    rows = 9
+    # A deterministic, margin-heavy fixture avoids numerical ties in the valid rows.
+    score = torch.linspace(-2.0, 2.0, experts, device=device)
+    scores = torch.stack([score.roll(i * 17) for i in range(rows)]).to(dtype)
+    bias = torch.linspace(-0.30, 0.30, experts, device=device, dtype=dtype)
+    args = (scores, groups, keep, topk, True, 3.998, bias, 1)
+    valid_reference = _torch_padding_routing_reference(*args)
+    if mode == "mixed":
+        mask = torch.arange(rows, device=device) % 3 == 1
+    else:
+        mask = torch.full((rows,), mode == "all", device=device, dtype=torch.bool)
+    w, ids = flaggems_vllm.grouped_topk(*args, is_padding=mask)
+    assert (w.shape, ids.shape) == ((rows, topk), (rows, topk))
+    assert (w.dtype, ids.dtype) == (torch.float32, torch.int32)
+    assert w.device == ids.device == scores.device
+    torch.testing.assert_close(
+        w[~mask], valid_reference[0][~mask], atol=2e-6, rtol=2e-6
+    )
+    torch.testing.assert_close(ids[~mask], valid_reference[1][~mask], atol=0, rtol=0)
+    assert torch.all(w[mask] == 0)
+    assert torch.all(ids[mask] == -1)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(
+    vendor_name != "nvidia", reason="padding is a CUDA routing contract"
+)
+def test_grouped_topk_padding_graph_is_dynamic():
+    rows, experts, topk = 33, 512, 16
+    scores = torch.randn(rows, experts, device=device, dtype=torch.float32)
+    bias = torch.rand(experts, device=device, dtype=scores.dtype)
+    mask = torch.zeros(rows, device=device, dtype=torch.bool)
+    args = (scores, 1, 1, topk, True, 3.998, bias, 1)
+    baseline = _torch_padding_routing_reference(*args)
+    for _ in range(2):
+        flaggems_vllm.grouped_topk(*args, is_padding=mask)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w, ids = flaggems_vllm.grouped_topk(*args, is_padding=mask)
+    for a in (1, 2):
+        mask.copy_(torch.arange(rows, device=device) % 3 == a)
+        graph.replay()
+        torch.testing.assert_close(w[~mask], baseline[0][~mask], atol=2e-6, rtol=2e-6)
+        torch.testing.assert_close(ids[~mask], baseline[1][~mask], atol=0, rtol=0)
+        assert torch.all(w[mask] == 0)
+        assert torch.all(ids[mask] == -1)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(
+    vendor_name != "nvidia", reason="padding is a CUDA routing contract"
+)
+def test_grouped_topk_padding_metadata_and_empty():
+    scores = torch.empty((0, 16), device=device)
+    bias = torch.zeros(16, device=device)
+    mask = torch.empty(0, device=device, dtype=torch.bool)
+    w, ids = flaggems_vllm.grouped_topk(scores, 1, 1, 4, False, 1.0, bias, 0, mask)
+    assert w.shape == ids.shape == (0, 4)
+    scores = torch.empty((3, 16), device=device)
+    for bad in (
+        torch.empty(2, device=device, dtype=torch.bool),
+        torch.empty(3, device=device),
+        torch.empty(6, device=device, dtype=torch.bool)[::2],
+        torch.empty(3, device="cpu", dtype=torch.bool),
+    ):
+        with pytest.raises(ValueError, match="is_padding"):
+            flaggems_vllm.grouped_topk(scores, 1, 1, 4, False, 1.0, bias, 0, bad)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(
+    vendor_name != "nvidia", reason="padding is a CUDA routing contract"
+)
+def test_grouped_topk_padding_with_strided_scores():
+    rows, experts = 7, 256
+    backing = torch.randn(rows, experts + 8, device=device)
+    scores = backing[:, :experts]
+    bias = torch.randn(experts, device=device)
+    mask = (torch.arange(rows, device=device) % 2) == 0
+    args = (8, 4, 8, False, 1.5, bias, 0)
+    ref = _torch_padding_routing_reference(scores, *args)
+    w, ids = flaggems_vllm.grouped_topk(scores, *args, mask)
+    torch.testing.assert_close(w[~mask], ref[0][~mask], rtol=0, atol=0)
+    torch.testing.assert_close(ids[~mask], ref[1][~mask], rtol=0, atol=0)
+    assert torch.all(w[mask] == 0)
+    assert torch.all(ids[mask] == -1)

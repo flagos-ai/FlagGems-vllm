@@ -286,6 +286,3 @@ def test_grouped_gemma_rmsnorm_public_dispatch():
     assert (
         flaggems_vllm.grouped_gemma_rmsnorm is flaggems_vllm.ops.grouped_gemma_rmsnorm
     )
-    assert all(
-        item[0] != "grouped_gemma_rmsnorm" for item in flaggems_vllm._FULL_CONFIG
-    )

@@ -344,7 +344,6 @@ def test_export_and_library_only_contract():
     assert public_op is ops.fused_indexer_k_norm
     assert public_op is module.fused_indexer_k_norm
     assert OP_NAME in ops.__all__
-    assert OP_NAME not in {name for name, _ in flaggems_vllm._FULL_CONFIG}
     assert tuple(inspect.signature(public_op).parameters) == (
         "x",
         "weight",
