@@ -2357,6 +2357,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.4'
+- id: triton_ihc_pre
+  description: iHC RMS-normalized FP32 gates and pre-gated channel reduction.
+  for:
+  - triton_ihc_pre
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.4'
 - id: triton_lighting_indexer_k_tiled_interface
   description: Part of FP8 MQA framework. It is currently not exposed as an operator
     for use.

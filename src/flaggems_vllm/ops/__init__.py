@@ -128,7 +128,7 @@ from flaggems_vllm.ops.ihc import (
     ihc_post_ref,
     triton_ihc_post,
     ihc_pre,
-    ihc_pre_ref,
+    triton_ihc_pre,
 )
 from flaggems_vllm.ops.mhc import (
     MixLayout,
@@ -375,7 +375,6 @@ __all__ = [
     "ihc_post",
     "ihc_post_ref",
     "ihc_pre",
-    "ihc_pre_ref",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "instance_norm",
@@ -468,6 +467,7 @@ __all__ = [
     "topk_softmax",
     "topk_softplus_sqrt",
     "triton_ihc_post",
+    "triton_ihc_pre",
     "triton_reshape_and_cache_flash",
     "triton_scaled_mm",
     "triton_unified_attention",
