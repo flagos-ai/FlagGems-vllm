@@ -587,3 +587,69 @@ mhc_shifted_project_thead_aiu:
     bn: [32]
     w: [4, 8]
     ps: [3]
+
+# Small-shape full-K project + coefficient epilogue (one launch, no split).
+# The measured winner for every H <= 1280 shape is BLOCK_M=16/BLOCK_K=128 at
+# num_stages=3; the small sweep keeps response to shape changes without the
+# cost of the full project space.
+mhc_shifted_project_coeff_thead:
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 16, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+
+# Small-shape split-K project + last-CTA coefficient epilogue.  num_warps is
+# fixed at 4 because the release/acquire fence width is NTHREADS=128, and
+# BLOCK_N is fixed at 32 to match the packed weight stride used as the
+# partials/scratch row stride.
+mhc_shifted_project_coeff_splitk_thead:
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 16, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 128, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2

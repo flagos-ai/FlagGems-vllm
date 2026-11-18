@@ -614,6 +614,7 @@ def test_production_path_has_no_torch_compute():
         "torch.Tensor",
         "torch.bfloat16",
         "torch.float32",
+        "torch.int32",
         "torch.cuda",
     }
     for path in paths:
