@@ -5,6 +5,8 @@ import json
 import math
 import os
 import statistics
+import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -90,7 +92,88 @@ def _native(*args, **kwargs):
     return _resolve_native()(*args, **kwargs)
 
 
+_NATIVE_CONFIGS = {
+    "kda_gate_cumsum_fwd_kernel": "ckfg_native_gate",
+    "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter": "ckfg_native_inter",
+    "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra": "ckfg_native_intra",
+    "merge_16x16_to_64x64_inverse_kernel": "ckfg_native_inverse",
+    "recompute_w_u_fwd_kernel": "ckfg_native_recompute",
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": "ckfg_native_state",
+    "chunk_gla_fwd_kernel_o": "ckfg_native_output",
+}
+
+
+def _set_native_configs(patch, tuner, configs):
+    patch.setattr(tuner, "configs", configs)
+    # Keep winners learned by this bounded search local to the benchmark.
+    # Restoring only configs would leave its cache active in later tests.
+    for name in ("cache", "configs_timings", "seen_tuned_metas"):
+        if hasattr(tuner, name):
+            patch.setattr(tuner, name, {})
+    for name in ("best_config", "bench_time"):
+        patch.setattr(tuner, name, getattr(tuner, name, None), raising=False)
+
+
+@contextmanager
+def _native_tuning_scope(native, shape=None, dtype=None):
+    """Bound this native call's search; restore the provider after measurement."""
+    vendor = flaggems_vllm.vendor_name
+    if vendor != "thead":
+        yield
+        return
+    from triton.runtime.autotuner import Autotuner
+
+    prefix = native.__module__.rsplit(".", 1)[0]
+    seen = set()
+    with pytest.MonkeyPatch.context() as patch:
+        for name in ("kda", "solve_tril", "chunk_delta_h", "l2norm"):
+            module = sys.modules.get(f"{prefix}.{name}")
+            if module is None:
+                continue
+            for value in vars(module).values():
+                chain = set()
+                while not isinstance(value, Autotuner) and hasattr(value, "fn"):
+                    if id(value) in chain:
+                        break
+                    chain.add(id(value))
+                    value = value.fn
+                if not isinstance(value, Autotuner) or id(value) in seen:
+                    continue
+                seen.add(id(value))
+                kernel = value.fn
+                while not hasattr(kernel, "__name__") and hasattr(kernel, "fn"):
+                    kernel = kernel.fn
+                kernel_name = getattr(kernel, "__name__", None)
+                profile = _NATIVE_CONFIGS.get(kernel_name)
+                if profile is not None:
+                    # Keep every winner observed in the complete core search.
+                    # Match existing provider configurations rather than insert
+                    # new ones; an unknown provider falls back to its full list.
+                    allowed = {
+                        (repr(sorted(c.kwargs.items())), c.num_warps, c.num_stages)
+                        for c in flaggems_vllm.runtime.get_tuned_config(profile)
+                    }
+                    selected = [
+                        c
+                        for c in value.configs
+                        if (repr(sorted(c.kwargs.items())), c.num_warps, c.num_stages)
+                        in allowed
+                    ]
+                    if selected:
+                        _set_native_configs(patch, value, selected)
+                        continue
+        yield
+
+
 def _measure(shape, dtype, gems, args, kwargs, measure_native):
+    native_skip_reason = "native timing disabled by --metrics"
+    if measure_native and flaggems_vllm.vendor_name == "ascend":
+        # Skip before resolving vLLM; retain every Gems case and its CPU oracle.
+        measure_native = False
+        native_skip_reason = (
+            "Ascend native disabled: known cold-autotune timeouts and "
+            "independent accuracy failures"
+        )
     saved = args[2].clone()
     expected = reference(args, kwargs)
     result = gems(*args, **kwargs)
@@ -119,13 +202,14 @@ def _measure(shape, dtype, gems, args, kwargs, measure_native):
             native = _resolve_native()
             if native is gems:
                 raise ValueError("native resolves to the Gems candidate")
-            args[2].copy_(saved)
-            native_result = native(*args, **kwargs)
-            check(native_result[0], expected[0], dtype)
-            check(native_result[1], expected[1], dtype)
-            for actual, candidate in zip(native_result, gems_expected, strict=True):
-                check(actual, candidate, dtype)
-            native_samples = _latency(native, args, kwargs, saved)
+            with _native_tuning_scope(native, shape, dtype):
+                args[2].copy_(saved)
+                native_result = native(*args, **kwargs)
+                check(native_result[0], expected[0], dtype)
+                check(native_result[1], expected[1], dtype)
+                for actual, candidate in zip(native_result, gems_expected, strict=True):
+                    check(actual, candidate, dtype)
+                native_samples = _latency(native, args, kwargs, saved)
             native_ms = statistics.median(native_samples)
             if not math.isfinite(native_ms) or native_ms <= 0:
                 raise ValueError(f"invalid native latency: {native_ms}")
@@ -143,7 +227,7 @@ def _measure(shape, dtype, gems, args, kwargs, measure_native):
         finally:
             args[2].copy_(saved)
     else:
-        row["native_unavailable"] = "native timing disabled by --metrics"
+        row["native_unavailable"] = native_skip_reason
     path = os.environ.get("FG_KDA_PERF_RAW")
     if path:
         with open(path, "a") as out:
