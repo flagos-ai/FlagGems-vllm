@@ -18,10 +18,12 @@ fused_recurrent_gated_delta_rule_fwd: test_FLA/test_fused_recurrent_gated_delta_
 
 # --- MHC operators (tested in test_mhc_ops.py) ---
 hc_head_fused_kernel: test_mhc_ops
+hc_split_sinkhorn: test_mhc_ops
 hc_split_sinkhorn_forward: test_mhc_ops
 mhc_bwd: test_mhc_ops
 mhc_post: test_mhc_ops
 mhc_pre: test_mhc_ops
+mhc_pre_broadcast: test_mhc_pre_broadcast
 # Keep the legacy family marker mapped to its shared test file.
 ihc_post: test_ihc
 
@@ -34,7 +36,11 @@ silu_and_mul_with_clamp_out: test_silu_and_mul_with_clamp
 weight_norm_interface_backward: test_weight_norm_interface
 
 # --- Alternative naming ---
+gather_sampler_output: test_batch_shard
+draft_watermarking_mask: test_watermark
 act_quant_triton: test_quant
+apply_min_p: test_min_p
+apply_thinking_budget: test_thinking_budget
 flash_attn_varlen_opt_func: test_flash_attn_varlen_func
 megamoe_int8: test_megamoe
 moe_align_block_size_triton: test_moe_align_block_size
@@ -45,3 +51,4 @@ triton_reshape_and_cache_flash: test_triton_reshape_and_cache_flash
 flash_attn_varlen_func_w8a8: test_flash_attn_varlen_func_w8a8_fp8
 fused_marlin_moe_w4a16: test_fused_marlin_moe
 fused_marlin_moe_w8a16: test_fused_marlin_moe
+pad_trailing_draft_slots: test_speculator
