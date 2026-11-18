@@ -323,6 +323,35 @@ kda_kkt_pairs:
     num_warps: 4
     num_stages: 1
 
+# Winners from the full native core search; the provider kernels are unchanged.
+kda_kkt_native_inter:
+  - META: {BK: 32}
+    num_warps: 8
+    num_stages: 3
+  - META: {BK: 64}
+    num_warps: 8
+    num_stages: 4
+  - META: {BK: 32}
+    num_warps: 1
+    num_stages: 4
+  - META: {BK: 32}
+    num_warps: 1
+    num_stages: 3
+
+kda_kkt_native_intra:
+  - META: {}
+    num_warps: 1
+    num_stages: 3
+  - META: {}
+    num_warps: 2
+    num_stages: 3
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+  - META: {}
+    num_warps: 8
+    num_stages: 3
+
 gate_sigmoid_mul:
   - META:
       BLOCK_SIZE: 1024
