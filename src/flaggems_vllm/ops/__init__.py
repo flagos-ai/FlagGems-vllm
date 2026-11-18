@@ -268,6 +268,7 @@ from flaggems_vllm.ops.kpool import (
     kpool_decode_update_and_maybe_write_cache_batched,
     kpool_seed_tail_cache,
 )
+from flaggems_vllm.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.ops.mhc_with_norm import (
     mhc_fused_post_pre_with_norm,
     mhc_pre_with_norm,
@@ -280,7 +281,6 @@ from flaggems_vllm.ops.vit_attention import (
     vision_flash_attn_varlen,
     vit_flash_attn_wrapper,
 )
-from flaggems_vllm.ops.mamba_mixer import mamba_mixer
 
 __all__ = [
     "act_quant_triton",

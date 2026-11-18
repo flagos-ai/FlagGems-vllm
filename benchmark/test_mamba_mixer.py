@@ -11,39 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Single-file FlagGems-vLLM MambaMixer benchmark.
-
-Like other operators in benchmark/, one pytest test loops through predefined
-shapes and base.Benchmark.run() renders the project's standard result table.
-
-Shape = (batch, seq_len, hidden_size, intermediate_size).
-For this Mamba-1 implementation, seq_len == 1 means single-token decode;
-seq_len > 1 means pure prefill. These paths share ONE performance table.
-
-A real vLLM 0.24.0 MambaMixer.forward_impl is used as the reference, with
-TP=1 F.linear adapters for the projection modules. Native vLLM conv/SSM
-kernels are retained. The candidate is FlagGems-vllm's Triton MambaMixer.
-The test measures the entire mixer, NOT an end-to-end model runner.
-
-Stateful kernels update caches in place: each measurement restores both Conv
-and SSM states BEFORE the timed interval. This requires a custom get_latency
-method; default base.Benchmark.get_latency would benchmark mutated states.
-
-The benchmark covers torch.float16, torch.bfloat16, torch.float32. The
-FlagGems MambaMixer must also support FP32. Use the accompanying FP32 operator
-patch; registering a dtype in the benchmark alone is not sufficient.
-
-Run from repo root:
-    pytest -s benchmark/test_mamba_mixer_perf.py \
-        --level core --warmup 100 --iter 500 --mode kernel
-    # Optional: isolate FP32 after enabling the FP32 FlagGems MambaMixer:
-    pytest -s benchmark/test_mamba_mixer_perf.py \
-        --level core --dtypes float32 --warmup 100 --iter 500 --mode kernel
-
-Optional: MAMBA_BENCH_GPU=0, MAMBA_BENCH_STATE_SIZE=16,
-          MAMBA_BENCH_DT_RANK=48, MAMBA_BENCH_KERNEL_SIZE=4,
-          MAMBA_BENCH_RMS_NORM=0, MAMBA_BENCH_BIAS=0
-"""
 
 from __future__ import annotations
 
@@ -63,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import base, consts
+
 
 @dataclass
 class CachePair:
@@ -113,9 +81,7 @@ class _LinearTuple(nn.Module):
 
 
 class _ConvWeights(nn.Module):
-    def __init__(
-        self, weight: torch.Tensor, bias: torch.Tensor | None
-    ) -> None:
+    def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None) -> None:
         super().__init__()
         self.weight = nn.Parameter(weight.detach().clone())
         if bias is None:
@@ -177,9 +143,7 @@ def build_vllm_mamba_layer(
     mamba_ssm_module = importlib.import_module(
         "vllm.model_executor.layers.mamba.ops.mamba_ssm"
     )
-    norm_module = importlib.import_module(
-        "vllm.model_executor.layers.layernorm"
-    )
+    norm_module = importlib.import_module("vllm.model_executor.layers.layernorm")
     MambaMixer = mixer_module.MambaMixer
     RMSNorm = norm_module.RMSNorm
 
@@ -188,61 +152,88 @@ def build_vllm_mamba_layer(
 
     in_proj_weight = _randn(
         (2 * intermediate_size, hidden_size),
-        device=device, dtype=dtype, scale=1.0 / math.sqrt(hidden_size),
+        device=device,
+        dtype=dtype,
+        scale=1.0 / math.sqrt(hidden_size),
         generator=generator,
     )
     in_proj_bias = (
         _randn(
-            (2 * intermediate_size,), device=device, dtype=dtype,
-            scale=0.02, generator=generator,
+            (2 * intermediate_size,),
+            device=device,
+            dtype=dtype,
+            scale=0.02,
+            generator=generator,
         )
-        if use_bias else None
+        if use_bias
+        else None
     )
     conv1d_weight = _randn(
         (intermediate_size, 1, kernel_size),
-        device=device, dtype=dtype, scale=0.15, generator=generator,
+        device=device,
+        dtype=dtype,
+        scale=0.15,
+        generator=generator,
     )
     conv1d_bias = (
         _randn(
-            (intermediate_size,), device=device, dtype=dtype,
-            scale=0.02, generator=generator,
+            (intermediate_size,),
+            device=device,
+            dtype=dtype,
+            scale=0.02,
+            generator=generator,
         )
-        if use_conv_bias else None
+        if use_conv_bias
+        else None
     )
     x_proj_weight = _randn(
         (time_step_rank + 2 * state_size, intermediate_size),
-        device=device, dtype=dtype,
-        scale=1.0 / math.sqrt(intermediate_size), generator=generator,
+        device=device,
+        dtype=dtype,
+        scale=1.0 / math.sqrt(intermediate_size),
+        generator=generator,
     )
     dt_proj_weight = _randn(
         (intermediate_size, time_step_rank),
-        device=device, dtype=dtype,
-        scale=1.0 / math.sqrt(time_step_rank), generator=generator,
+        device=device,
+        dtype=dtype,
+        scale=1.0 / math.sqrt(time_step_rank),
+        generator=generator,
     )
     dt_proj_bias = _randn(
-        (intermediate_size,), device=device, dtype=dtype,
-        scale=0.05, generator=generator,
+        (intermediate_size,),
+        device=device,
+        dtype=dtype,
+        scale=0.05,
+        generator=generator,
     )
     A = -torch.exp(
         _randn(
-            (intermediate_size, state_size), device=device,
-            dtype=torch.float32, scale=0.1, generator=generator,
+            (intermediate_size, state_size),
+            device=device,
+            dtype=torch.float32,
+            scale=0.1,
+            generator=generator,
         )
     )
-    D = torch.ones(
-        (intermediate_size,), device=device, dtype=torch.float32
-    )
+    D = torch.ones((intermediate_size,), device=device, dtype=torch.float32)
     out_proj_weight = _randn(
         (hidden_size, intermediate_size),
-        device=device, dtype=dtype,
-        scale=1.0 / math.sqrt(intermediate_size), generator=generator,
+        device=device,
+        dtype=dtype,
+        scale=1.0 / math.sqrt(intermediate_size),
+        generator=generator,
     )
     out_proj_bias = (
         _randn(
-            (hidden_size,), device=device, dtype=dtype,
-            scale=0.02, generator=generator,
+            (hidden_size,),
+            device=device,
+            dtype=dtype,
+            scale=0.02,
+            generator=generator,
         )
-        if use_bias else None
+        if use_bias
+        else None
     )
 
     # Construct the vLLM layer object without invoking its distributed/model
@@ -271,9 +262,7 @@ def build_vllm_mamba_layer(
     layer.in_proj = _LinearTuple(in_proj_weight, in_proj_bias)
     layer.conv1d = _ConvWeights(conv1d_weight, conv1d_bias)
     layer.x_proj = _LinearTuple(x_proj_weight, None)
-    layer.dt_proj = _LinearTuple(
-        dt_proj_weight, dt_proj_bias, skip_bias_add=True
-    )
+    layer.dt_proj = _LinearTuple(dt_proj_weight, dt_proj_bias, skip_bias_add=True)
     layer.out_proj = _LinearTuple(out_proj_weight, out_proj_bias)
     layer.A = nn.Parameter(A)
     layer.D = nn.Parameter(D)
@@ -282,12 +271,12 @@ def build_vllm_mamba_layer(
         layer.dt_layernorm = RMSNorm(
             time_step_rank, eps=rms_norm_eps, has_weight=True
         ).to(device=device, dtype=dtype)
-        layer.b_layernorm = RMSNorm(
-            state_size, eps=rms_norm_eps, has_weight=True
-        ).to(device=device, dtype=dtype)
-        layer.c_layernorm = RMSNorm(
-            state_size, eps=rms_norm_eps, has_weight=True
-        ).to(device=device, dtype=dtype)
+        layer.b_layernorm = RMSNorm(state_size, eps=rms_norm_eps, has_weight=True).to(
+            device=device, dtype=dtype
+        )
+        layer.c_layernorm = RMSNorm(state_size, eps=rms_norm_eps, has_weight=True).to(
+            device=device, dtype=dtype
+        )
         with torch.no_grad():
             layer.dt_layernorm.weight.fill_(1.0)
             layer.b_layernorm.weight.fill_(1.0)
@@ -309,15 +298,9 @@ def build_vllm_mamba_layer(
         "D": layer.D,
         "out_proj_weight": layer.out_proj.weight,
         "out_proj_bias": layer.out_proj.bias,
-        "dt_norm_weight": (
-            layer.dt_layernorm.weight if use_rms_norm else None
-        ),
-        "b_norm_weight": (
-            layer.b_layernorm.weight if use_rms_norm else None
-        ),
-        "c_norm_weight": (
-            layer.c_layernorm.weight if use_rms_norm else None
-        ),
+        "dt_norm_weight": (layer.dt_layernorm.weight if use_rms_norm else None),
+        "b_norm_weight": (layer.b_layernorm.weight if use_rms_norm else None),
+        "c_norm_weight": (layer.c_layernorm.weight if use_rms_norm else None),
     }
 
     return BenchmarkLayer(
@@ -353,13 +336,18 @@ def make_cache_pair(
         conv_shape = (slots, kernel_size - 1, intermediate_size)
 
     initial_conv = _randn(
-        conv_shape, device=device, dtype=activation_dtype,
-        scale=0.03, generator=generator,
+        conv_shape,
+        device=device,
+        dtype=activation_dtype,
+        scale=0.03,
+        generator=generator,
     )
     initial_ssm = _randn(
         (slots, intermediate_size, state_size),
-        device=device, dtype=torch.float32,
-        scale=0.02, generator=generator,
+        device=device,
+        dtype=torch.float32,
+        scale=0.02,
+        generator=generator,
     )
     return CachePair(
         conv_storage=initial_conv.clone(),
@@ -380,25 +368,15 @@ def make_vllm_metadata(
     context_len: int = 512,
 ):
     """Construct vLLM 0.24.0 Mamba1AttentionMetadata for pure prefill/decode."""
-    from vllm.v1.attention.backends.mamba1_attn import (
-        Mamba1AttentionMetadata,
-    )
-    from vllm.v1.attention.backends.utils import (
-        compute_causal_conv1d_metadata,
-    )
+    from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionMetadata
+    from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
 
     if mode == "prefill":
-        query_start_loc_cpu = (
-            torch.arange(batch_size + 1, dtype=torch.int32) * seq_len
-        )
+        query_start_loc_cpu = torch.arange(batch_size + 1, dtype=torch.int32) * seq_len
         query_start_loc = query_start_loc_cpu.to(device=device)
-        has_initial_states = torch.zeros(
-            (batch_size,), dtype=torch.bool, device=device
-        )
-        nums_dict, batch_ptr, token_chunk_offset_ptr = (
-            compute_causal_conv1d_metadata(
-                query_start_loc_cpu, device=device
-            )
+        has_initial_states = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+        nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+            query_start_loc_cpu, device=device
         )
         return Mamba1AttentionMetadata(
             num_prefills=batch_size,
@@ -523,7 +501,9 @@ def run_flaggems_forward(
         w["out_proj_weight"],
         in_proj_bias=w["in_proj_bias"],
         conv1d_bias=w["conv1d_bias"],
-        dt_proj_bias=(w["dt_proj_bias"].float() if w["dt_proj_bias"] is not None else None),
+        dt_proj_bias=(
+            w["dt_proj_bias"].float() if w["dt_proj_bias"] is not None else None
+        ),
         out_proj_bias=w["out_proj_bias"],
         conv_state=cache.conv_state,
         ssm_state=cache.ssm_state,
@@ -562,9 +542,7 @@ def assert_correctness(
     else:
         raise ValueError(f"Unsupported benchmark dtype: {dtype}")
 
-    torch.testing.assert_close(
-        flaggems_output, vllm_output, atol=atol, rtol=rtol
-    )
+    torch.testing.assert_close(flaggems_output, vllm_output, atol=atol, rtol=rtol)
     torch.testing.assert_close(
         flaggems_cache.conv_state,
         vllm_cache.conv_state,
@@ -583,16 +561,16 @@ def assert_correctness(
             (flaggems_output.float() - vllm_output.float()).abs().max().item()
         ),
         "conv_state_max_abs_diff": float(
-            (
-                flaggems_cache.conv_state.float()
-                - vllm_cache.conv_state.float()
-            ).abs().max().item()
+            (flaggems_cache.conv_state.float() - vllm_cache.conv_state.float())
+            .abs()
+            .max()
+            .item()
         ),
         "ssm_state_max_abs_diff": float(
-            (
-                flaggems_cache.ssm_state.float()
-                - vllm_cache.ssm_state.float()
-            ).abs().max().item()
+            (flaggems_cache.ssm_state.float() - vllm_cache.ssm_state.float())
+            .abs()
+            .max()
+            .item()
         ),
     }
 
@@ -638,9 +616,7 @@ class _Workload:
 
 
 def _baseline_forward(workload: _Workload) -> None:
-    workload.layer.layer.forward_impl(
-        workload.hidden_states, workload.baseline_output
-    )
+    workload.layer.layer.forward_impl(workload.hidden_states, workload.baseline_output)
 
 
 def _gems_forward(workload: _Workload) -> None:
@@ -664,9 +640,7 @@ def _validate_once(workload: _Workload) -> None:
     workload.baseline_cache.reset()
     workload.gems_cache.reset()
     with torch.inference_mode():
-        with vllm_forward_context_for_benchmark(
-            workload.layer, workload.metadata
-        ):
+        with vllm_forward_context_for_benchmark(workload.layer, workload.metadata):
             _baseline_forward(workload)
             _gems_forward(workload)
     torch.cuda.synchronize(workload.device)
@@ -688,10 +662,9 @@ def _validate_once(workload: _Workload) -> None:
 def _make_workload(
     shape: tuple[int, int, int, int], dtype: torch.dtype, device: torch.device
 ) -> _Workload:
-    from vllm.model_executor.layers.mamba.mamba_utils import (
-        is_conv_state_dim_first,
-    )
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
     from flaggems_vllm.ops.mamba_mixer import mamba_mixer
 
     batch, seq_len, hidden_size, intermediate_size = shape
@@ -716,12 +689,8 @@ def _make_workload(
         use_rms_norm=use_rms_norm,
         use_bias=use_bias,
     )
-    hidden_states = (
-        torch.randn(n_tokens, hidden_size, device=device, dtype=dtype) * 0.2
-    )
-    cache_indices = torch.arange(
-        1, batch + 1, device=device, dtype=torch.int32
-    )
+    hidden_states = torch.randn(n_tokens, hidden_size, device=device, dtype=dtype) * 0.2
+    cache_indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
     metadata = make_vllm_metadata(
         mode=mode,
         batch_size=batch,
@@ -741,6 +710,7 @@ def _make_workload(
     )
     # Two independent caches, initialized using the same seed.
     seed = 10000 + batch * 100 + seq_len
+
     def new_cache():
         return make_cache_pair(
             batch_size=batch,
@@ -868,9 +838,7 @@ class MambaMixerBenchmark(base.Benchmark):
             else workload.gems_cache.reset
         )
         with torch.inference_mode():
-            with vllm_forward_context_for_benchmark(
-                workload.layer, workload.metadata
-            ):
+            with vllm_forward_context_for_benchmark(workload.layer, workload.metadata):
                 return _time_stateful_forward(
                     fn=lambda: op(workload),
                     reset=reset,
@@ -892,4 +860,3 @@ def test_mamba_mixer_perf():
     torch.backends.cuda.matmul.allow_tf32 = False
     bench = MambaMixerBenchmark()
     bench.run()
-

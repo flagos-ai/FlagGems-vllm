@@ -25,12 +25,19 @@ import triton.language as tl
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 
-
 _LINEAR_CONFIGS = [
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=3),
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 32}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=3
+    ),
 ]
 # Stateful kernels below deliberately use fixed BLOCK_I values instead of
 # runtime autotuning. Autotuning replays a kernel on its arguments and would
@@ -84,8 +91,7 @@ def _mamba_linear_kernel(
         if X.dtype.element_ty == tl.float32:
             # H20 (SM90): tf32x3 preserves FP32 GEMM accuracy much better
             # than the default tf32 mode. Do not round activations to BF16.
-            acc += tl.dot(x, w, out_dtype=tl.float32,
-                          input_precision="tf32x3")
+            acc += tl.dot(x, w, out_dtype=tl.float32, input_precision="tf32x3")
         else:
             acc += tl.dot(x, w, out_dtype=tl.float32)
 
@@ -348,10 +354,16 @@ def _mamba_selective_scan_varlen_kernel(
     d = tl.load(D + channel, mask=channel_mask, other=0.0).to(tl.float32)
 
     for token in range(seq_start, seq_end):
-        u = tl.load(CONV_OUT + token * intermediate_size + channel, mask=channel_mask, other=0.0).to(tl.float32)
-        dt = tl.load(DT + token * intermediate_size + channel, mask=channel_mask, other=0.0).to(tl.float32)
+        u = tl.load(
+            CONV_OUT + token * intermediate_size + channel, mask=channel_mask, other=0.0
+        ).to(tl.float32)
+        dt = tl.load(
+            DT + token * intermediate_size + channel, mask=channel_mask, other=0.0
+        ).to(tl.float32)
         if HAS_DT_BIAS:
-            dt += tl.load(DT_BIAS + channel, mask=channel_mask, other=0.0).to(tl.float32)
+            dt += tl.load(DT_BIAS + channel, mask=channel_mask, other=0.0).to(
+                tl.float32
+            )
         # Stable softplus used by Mamba's delta discretization.
         dt = tl.where(dt <= 20.0, tl.log(1.0 + tl.exp(dt)), dt)
 
@@ -403,7 +415,10 @@ def _check_contiguous(name: str, tensor: torch.Tensor | None) -> None:
 def _linear(x, weight, bias, out):
     m, k = x.shape
     n = weight.shape[0]
-    grid = lambda meta: (triton.cdiv(m, meta["BLOCK_M"]), triton.cdiv(n, meta["BLOCK_N"]))
+    grid = lambda meta: (
+        triton.cdiv(m, meta["BLOCK_M"]),
+        triton.cdiv(n, meta["BLOCK_N"]),
+    )
     _mamba_linear_kernel[grid](
         x,
         weight,
@@ -509,7 +524,9 @@ def mamba_mixer(
     if num_actual_tokens is None:
         total_tokens = padded_tokens
     else:
-        if isinstance(num_actual_tokens, bool) or not isinstance(num_actual_tokens, int):
+        if isinstance(num_actual_tokens, bool) or not isinstance(
+            num_actual_tokens, int
+        ):
             raise TypeError("num_actual_tokens must be an int or None")
         if not 0 <= num_actual_tokens <= padded_tokens:
             raise ValueError(
@@ -520,7 +537,9 @@ def mamba_mixer(
 
     if output is not None:
         if output.ndim != 2 or output.shape[1] != hidden_size:
-            raise ValueError("output must have shape [>=num_actual_tokens, hidden_size]")
+            raise ValueError(
+                "output must have shape [>=num_actual_tokens, hidden_size]"
+            )
         if output.shape[0] < total_tokens:
             raise ValueError("output has fewer rows than num_actual_tokens")
         if output.dtype != hidden_states.dtype:
@@ -531,13 +550,21 @@ def mamba_mixer(
     if total_tokens == 0:
         if output is not None:
             return output
-        return torch.empty((0, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
+        return torch.empty(
+            (0, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype
+        )
 
     # Do not let padded rows enter any projection or final output GEMM.
     hidden_states = hidden_states[:total_tokens]
 
-    if in_proj_weight.ndim != 2 or in_proj_weight.shape[1] != hidden_size or in_proj_weight.shape[0] % 2:
-        raise ValueError("in_proj_weight must have shape [2 * intermediate_size, hidden_size]")
+    if (
+        in_proj_weight.ndim != 2
+        or in_proj_weight.shape[1] != hidden_size
+        or in_proj_weight.shape[0] % 2
+    ):
+        raise ValueError(
+            "in_proj_weight must have shape [2 * intermediate_size, hidden_size]"
+        )
     intermediate_size = in_proj_weight.shape[0] // 2
 
     if conv1d_weight.ndim == 3:
@@ -568,11 +595,15 @@ def mamba_mixer(
         raise ValueError("x_proj_weight output dimension must equal R + 2*S")
     state_size = (x_proj_weight.shape[0] - time_step_rank) // 2
     if state_size < 1 or state_size > 64:
-        raise NotImplementedError("state_size must be in [1, 64] for this first Triton path")
+        raise NotImplementedError(
+            "state_size must be in [1, 64] for this first Triton path"
+        )
     if A.shape != (intermediate_size, state_size) or D.shape != (intermediate_size,):
         raise ValueError("A or D shape does not match intermediate_size/state_size")
     if out_proj_weight.shape != (hidden_size, intermediate_size):
-        raise ValueError("out_proj_weight must have shape [hidden_size, intermediate_size]")
+        raise ValueError(
+            "out_proj_weight must have shape [hidden_size, intermediate_size]"
+        )
     optional_shapes = (
         ("in_proj_bias", in_proj_bias, (2 * intermediate_size,)),
         ("conv1d_bias", conv1d_bias, (intermediate_size,)),
@@ -602,17 +633,32 @@ def mamba_mixer(
 
     has_cache = conv_state is not None or ssm_state is not None
     if (conv_state is None) != (ssm_state is None):
-        raise ValueError("conv_state and ssm_state must either both be provided or both be omitted")
+        raise ValueError(
+            "conv_state and ssm_state must either both be provided or both be omitted"
+        )
     if has_cache:
-        if conv_state.ndim != 3 or conv_state.shape[1:] != (intermediate_size, kernel_size - 1):
+        if conv_state.ndim != 3 or conv_state.shape[1:] != (
+            intermediate_size,
+            kernel_size - 1,
+        ):
             raise ValueError("conv_state must have shape [cache_slots, I, K-1]")
-        if ssm_state.ndim != 3 or ssm_state.shape[1:] != (intermediate_size, state_size):
+        if ssm_state.ndim != 3 or ssm_state.shape[1:] != (
+            intermediate_size,
+            state_size,
+        ):
             raise ValueError("ssm_state must have shape [cache_slots, I, S]")
         if conv_state.shape[0] != ssm_state.shape[0]:
-            raise ValueError("conv_state and ssm_state must have the same number of cache slots")
+            raise ValueError(
+                "conv_state and ssm_state must have the same number of cache slots"
+            )
         allowed_state_dtypes = (torch.float16, torch.bfloat16, torch.float32)
-        if conv_state.dtype not in allowed_state_dtypes or ssm_state.dtype not in allowed_state_dtypes:
-            raise NotImplementedError("conv_state and ssm_state must be FP16, BF16, or FP32")
+        if (
+            conv_state.dtype not in allowed_state_dtypes
+            or ssm_state.dtype not in allowed_state_dtypes
+        ):
+            raise NotImplementedError(
+                "conv_state and ssm_state must be FP16, BF16, or FP32"
+            )
         # vLLM's causal-conv path casts its input to the Conv cache dtype.
         # This implementation supports same-dtype caches and FP32 caches;
         # cross-casting FP16 <-> BF16 is deliberately rejected.
@@ -625,7 +671,9 @@ def mamba_mixer(
                 "cache_indices must be provided when using vLLM's NULL_BLOCK_ID=0"
             )
     elif cache_indices is not None or has_initial_state is not None:
-        raise ValueError("cache_indices/has_initial_state require conv_state and ssm_state")
+        raise ValueError(
+            "cache_indices/has_initial_state require conv_state and ssm_state"
+        )
 
     if cache_indices is not None and cache_indices.shape != (num_sequences,):
         raise ValueError("cache_indices must have shape [num_sequences]")
@@ -685,25 +733,62 @@ def mamba_mixer(
         if tensor is not None and tensor.device != hidden_states.device:
             raise ValueError(f"{name} and hidden_states must be on the same device")
 
-    if in_proj_weight.dtype != hidden_states.dtype or conv1d_weight.dtype != hidden_states.dtype:
-        raise ValueError("in_proj_weight and conv1d_weight must match hidden_states dtype")
-    if x_proj_weight.dtype != hidden_states.dtype or dt_proj_weight.dtype != hidden_states.dtype:
-        raise ValueError("x_proj_weight and dt_proj_weight must match hidden_states dtype")
+    if (
+        in_proj_weight.dtype != hidden_states.dtype
+        or conv1d_weight.dtype != hidden_states.dtype
+    ):
+        raise ValueError(
+            "in_proj_weight and conv1d_weight must match hidden_states dtype"
+        )
+    if (
+        x_proj_weight.dtype != hidden_states.dtype
+        or dt_proj_weight.dtype != hidden_states.dtype
+    ):
+        raise ValueError(
+            "x_proj_weight and dt_proj_weight must match hidden_states dtype"
+        )
     if out_proj_weight.dtype != hidden_states.dtype:
         raise ValueError("out_proj_weight must match hidden_states dtype")
-    if use_rms_norm and any(w is not None and w.numel() != width for w, width in (
-        (dt_norm_weight, time_step_rank), (b_norm_weight, state_size), (c_norm_weight, state_size)
-    )):
+    if use_rms_norm and any(
+        w is not None and w.numel() != width
+        for w, width in (
+            (dt_norm_weight, time_step_rank),
+            (b_norm_weight, state_size),
+            (c_norm_weight, state_size),
+        )
+    ):
         raise ValueError("RMSNorm weight has an incorrect width")
-    if not use_rms_norm and any(w is not None for w in (dt_norm_weight, b_norm_weight, c_norm_weight)):
+    if not use_rms_norm and any(
+        w is not None for w in (dt_norm_weight, b_norm_weight, c_norm_weight)
+    ):
         raise ValueError("norm weights were supplied but use_rms_norm=False")
 
-    projected = torch.empty((total_tokens, 2 * intermediate_size), device=hidden_states.device, dtype=hidden_states.dtype)
-    conv_out = torch.empty((total_tokens, intermediate_size), device=hidden_states.device, dtype=hidden_states.dtype)
+    projected = torch.empty(
+        (total_tokens, 2 * intermediate_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    conv_out = torch.empty(
+        (total_tokens, intermediate_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
     params_width = time_step_rank + 2 * state_size
-    ssm_params = torch.empty((total_tokens, params_width), device=hidden_states.device, dtype=hidden_states.dtype)
-    dt = torch.empty((total_tokens, intermediate_size), device=hidden_states.device, dtype=hidden_states.dtype)
-    scan_out = torch.empty((total_tokens, intermediate_size), device=hidden_states.device, dtype=hidden_states.dtype)
+    ssm_params = torch.empty(
+        (total_tokens, params_width),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    dt = torch.empty(
+        (total_tokens, intermediate_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    scan_out = torch.empty(
+        (total_tokens, intermediate_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
     if output is None:
         output = torch.empty(
             (total_tokens, hidden_size),
@@ -762,20 +847,38 @@ def mamba_mixer(
 
         if use_rms_norm:
             _mamba_rms_norm_kernel[(total_tokens,)](
-                ssm_params, dt_norm_weight, total_tokens, time_step_rank, 0,
-                ssm_params.stride(0), ssm_params.stride(1), rms_norm_eps,
+                ssm_params,
+                dt_norm_weight,
+                total_tokens,
+                time_step_rank,
+                0,
+                ssm_params.stride(0),
+                ssm_params.stride(1),
+                rms_norm_eps,
                 HAS_WEIGHT=dt_norm_weight is not None,
                 BLOCK=triton.next_power_of_2(time_step_rank),
             )
             _mamba_rms_norm_kernel[(total_tokens,)](
-                ssm_params, b_norm_weight, total_tokens, state_size, time_step_rank,
-                ssm_params.stride(0), ssm_params.stride(1), rms_norm_eps,
+                ssm_params,
+                b_norm_weight,
+                total_tokens,
+                state_size,
+                time_step_rank,
+                ssm_params.stride(0),
+                ssm_params.stride(1),
+                rms_norm_eps,
                 HAS_WEIGHT=b_norm_weight is not None,
                 BLOCK=block_s,
             )
             _mamba_rms_norm_kernel[(total_tokens,)](
-                ssm_params, c_norm_weight, total_tokens, state_size, time_step_rank + state_size,
-                ssm_params.stride(0), ssm_params.stride(1), rms_norm_eps,
+                ssm_params,
+                c_norm_weight,
+                total_tokens,
+                state_size,
+                time_step_rank + state_size,
+                ssm_params.stride(0),
+                ssm_params.stride(1),
+                rms_norm_eps,
                 HAS_WEIGHT=c_norm_weight is not None,
                 BLOCK=block_s,
             )
@@ -829,4 +932,3 @@ def mamba_mixer(
 
 
 __all__ = ["mamba_mixer"]
-

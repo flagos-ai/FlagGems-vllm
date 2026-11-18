@@ -1,29 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
-"""
-Correctness tests for FlagGems-vLLM's Mamba-1 mixer.
-
-The reference follows the pure-prefill and pure-decode branches of
-vLLM's MambaMixer.forward_impl:
-  * torch.nn.functional.linear for the four projection layers;
-  * vLLM causal_conv1d_fn / causal_conv1d_update;
-  * vLLM selective_scan_fn / selective_state_update.
-
-This avoids requiring a full model runner or scheduler metadata builder while
-still comparing the complete Mamba-1 mixer computation against vLLM's native
-low-level kernels.
-
-Dtype coverage: FP16, BF16, FP32 (for the accompanying FP32-enabled
-FlagGems-vllm MambaMixer operator). Each dtype is tested with and without
-Mamba-1 RMSNorm, in both Prefill and Decode.
-
-Run on an NVIDIA CUDA device from the FlagGems-vllm repository root:
-    pytest -v -s tests/test_mamba_mixer.py
-    pytest -v -s tests/test_mamba_mixer.py -k fp32
-
-FP32 baseline F.linear uses IEEE FP32 (TF32 disabled); the candidate uses
-Triton input_precision="tf32x3" for FP32 GEMMs. This is not an end-to-end
-model runner test.
-"""
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
@@ -32,7 +19,6 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
-
 
 pytest.importorskip("vllm")
 
@@ -162,28 +148,21 @@ def _make_weights(
             dtype=dtype,
             scale=1.0 / math.sqrt(intermediate_size),
         ),
-        "out_proj_bias": _randn(
-            (hidden_size,), device=device, dtype=dtype, scale=0.02
-        ),
+        "out_proj_bias": _randn((hidden_size,), device=device, dtype=dtype, scale=0.02),
         "dt_norm_weight": None,
         "b_norm_weight": None,
         "c_norm_weight": None,
     }
 
     if use_rms_norm:
-        weights["dt_norm_weight"] = (
-            1.0
-            + _randn(
-                (time_step_rank,), device=device, dtype=dtype, scale=0.02
-            )
+        weights["dt_norm_weight"] = 1.0 + _randn(
+            (time_step_rank,), device=device, dtype=dtype, scale=0.02
         )
-        weights["b_norm_weight"] = (
-            1.0
-            + _randn((state_size,), device=device, dtype=dtype, scale=0.02)
+        weights["b_norm_weight"] = 1.0 + _randn(
+            (state_size,), device=device, dtype=dtype, scale=0.02
         )
-        weights["c_norm_weight"] = (
-            1.0
-            + _randn((state_size,), device=device, dtype=dtype, scale=0.02)
+        weights["c_norm_weight"] = 1.0 + _randn(
+            (state_size,), device=device, dtype=dtype, scale=0.02
         )
 
     return weights
@@ -253,9 +232,7 @@ def _rms_norm_reference(
 ) -> torch.Tensor:
     """FP32 accumulation, matching the vLLM RMSNorm contract."""
     x_fp32 = x.float()
-    y = x_fp32 * torch.rsqrt(
-        torch.mean(x_fp32 * x_fp32, dim=-1, keepdim=True) + eps
-    )
+    y = x_fp32 * torch.rsqrt(torch.mean(x_fp32 * x_fp32, dim=-1, keepdim=True) + eps)
     if weight is not None:
         y = y * weight.float()
     return y.to(x.dtype)
@@ -279,15 +256,9 @@ def _ssm_transform_reference(
     )
 
     if use_rms_norm:
-        dt = _rms_norm_reference(
-            dt, weights["dt_norm_weight"], rms_norm_eps
-        )
-        b = _rms_norm_reference(
-            b, weights["b_norm_weight"], rms_norm_eps
-        )
-        c = _rms_norm_reference(
-            c, weights["c_norm_weight"], rms_norm_eps
-        )
+        dt = _rms_norm_reference(dt, weights["dt_norm_weight"], rms_norm_eps)
+        b = _rms_norm_reference(b, weights["b_norm_weight"], rms_norm_eps)
+        c = _rms_norm_reference(c, weights["c_norm_weight"], rms_norm_eps)
 
     dt = F.linear(dt, weights["dt_proj_weight"], bias=None)
     return dt, b, c
@@ -471,9 +442,7 @@ def _assert_close(
     [torch.float16, torch.bfloat16, torch.float32],
     ids=["fp16", "bf16", "fp32"],
 )
-@pytest.mark.parametrize(
-    "use_rms_norm", [False, True], ids=["no-rmsnorm", "rmsnorm"]
-)
+@pytest.mark.parametrize("use_rms_norm", [False, True], ids=["no-rmsnorm", "rmsnorm"])
 def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
     """Packed variable-length Prefill, including short sequences and cache reuse."""
     device = torch.device("cuda", torch.cuda.current_device())
@@ -526,13 +495,9 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
         device=device,
     )
     # Cache slot zero is vLLM's NULL_BLOCK_ID.
-    cache_indices = torch.tensor(
-        [1, 2], dtype=torch.int32, device=device
-    )
+    cache_indices = torch.tensor([1, 2], dtype=torch.int32, device=device)
     # Exercise both a fresh request and a request continuing from cache.
-    has_initial_state = torch.tensor(
-        [False, True], dtype=torch.bool, device=device
-    )
+    has_initial_state = torch.tensor([False, True], dtype=torch.bool, device=device)
 
     with torch.inference_mode():
         expected = _vllm_prefill_reference(
@@ -617,9 +582,7 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
     [torch.float16, torch.bfloat16, torch.float32],
     ids=["fp16", "bf16", "fp32"],
 )
-@pytest.mark.parametrize(
-    "use_rms_norm", [False, True], ids=["no-rmsnorm", "rmsnorm"]
-)
+@pytest.mark.parametrize("use_rms_norm", [False, True], ids=["no-rmsnorm", "rmsnorm"])
 def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
     """One-token-per-sequence Decode with non-contiguous vLLM Conv State."""
     device = torch.device("cuda", torch.cuda.current_device())
@@ -663,9 +626,7 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
         dtype=dtype,
         scale=0.2,
     )
-    cache_indices = torch.arange(
-        1, batch_size + 1, dtype=torch.int32, device=device
-    )
+    cache_indices = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
 
     with torch.inference_mode():
         expected = _vllm_decode_reference(
@@ -721,4 +682,3 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
         dtype,
         name="Decode SSM State",
     )
-
