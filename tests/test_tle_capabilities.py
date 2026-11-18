@@ -3,28 +3,41 @@
 
 import sys
 from importlib import import_module, util
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
+from flaggems_vllm.utils.libentry import LibEntry
 from flaggems_vllm.utils.tle_capabilities import (
     supports_sparse_mla_tle,
     supports_topk_tle,
 )
 
 
-def _language():
-    def api(*args, **kwargs):
-        raise AssertionError("capability check executed an optional API")
+@triton.jit
+def _unexpected_tle_call():
+    tl.static_assert(False, "capability check executed an optional API")
 
-    return SimpleNamespace(
-        cumsum=api,
-        pipe=api,
-        gpu=SimpleNamespace(
-            alloc=api, local_ptr=api, copy=api, warp_specialize=api, smem=object()
-        ),
-    )
+
+def _language():
+    # Match the runtime module structure so the tuner can hash these JIT stubs.
+    language = ModuleType("triton.experimental.tle.language")
+    language.cumsum = _unexpected_tle_call
+    language.pipe = _unexpected_tle_call
+    language.gpu = ModuleType(f"{language.__name__}.gpu")
+    for name in ("alloc", "local_ptr", "copy", "warp_specialize"):
+        setattr(language.gpu, name, _unexpected_tle_call)
+    language.gpu.smem = object()
+    return language
+
+
+def _cache_key(kernel):
+    if isinstance(kernel, LibEntry):
+        kernel = kernel.jit_function
+    return kernel.cache_key
 
 
 @pytest.mark.parametrize(
@@ -120,7 +133,7 @@ def test_incomplete_tle_does_not_break_non_tle_cache_key(
     module = load(language)
     assert module.HAS_TLE is False
     # Exercise Triton's real dependency walk, including disabled constexpr branches.
-    assert getattr(module, f"non_tle_top_k_per_row_{phase}").cache_key
+    assert _cache_key(getattr(module, f"non_tle_top_k_per_row_{phase}"))
     assert module.tle is None
     assert vars(target) == before
 
@@ -153,7 +166,7 @@ def test_attn_res_missing_tle_load_uses_non_tle_cache_key(monkeypatch):
 
     assert module._HAS_TLE_LOAD is False
     assert module.tle is None
-    assert module._attn_res_post_kernel.cache_key
+    assert _cache_key(module._attn_res_post_kernel)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
