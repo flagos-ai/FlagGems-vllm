@@ -14,6 +14,14 @@
 
 # isort: off
 from flaggems_vllm.ops.batch_shard import gather_sampler_output
+from flaggems_vllm.ops.hy4_flash_expand_groups import hy4_flash_expand_groups
+from flaggems_vllm.ops.hy4_flash_fwht_quant_fp8 import hy4_flash_fwht_quant_fp8
+from flaggems_vllm.ops.hy4_flash_gated_pool import hy4_flash_gated_pool
+from flaggems_vllm.ops.hy4_flash_prepare_groups import hy4_flash_prepare_groups
+from flaggems_vllm.ops.hy4_flash_rotate_indexer import hy4_flash_rotate_indexer
+from flaggems_vllm.ops.hy4_flash_select_groups import hy4_flash_select_groups
+from flaggems_vllm.ops.hy4_flash_write_pool import hy4_flash_write_pool
+from flaggems_vllm.ops.hy4_flash_write_tails import hy4_flash_write_tails
 from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
@@ -370,6 +378,14 @@ __all__ = [
     "hc_combine",
     "hc_head_fused_kernel",
     "hc_split_sinkhorn",
+    "hy4_flash_expand_groups",
+    "hy4_flash_fwht_quant_fp8",
+    "hy4_flash_gated_pool",
+    "hy4_flash_prepare_groups",
+    "hy4_flash_rotate_indexer",
+    "hy4_flash_select_groups",
+    "hy4_flash_write_pool",
+    "hy4_flash_write_tails",
     "ihc_post",
     "ihc_post_ref",
     "ihc_pre",

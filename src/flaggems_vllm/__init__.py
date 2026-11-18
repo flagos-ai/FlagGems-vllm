@@ -51,6 +51,14 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 __all__ = [
     "disable_symm_mem",
     "enable_symm_mem",
+    "hy4_flash_expand_groups",
+    "hy4_flash_fwht_quant_fp8",
+    "hy4_flash_gated_pool",
+    "hy4_flash_prepare_groups",
+    "hy4_flash_rotate_indexer",
+    "hy4_flash_select_groups",
+    "hy4_flash_write_pool",
+    "hy4_flash_write_tails",
     "SUPPORTED_FP8_DTYPE",
     "use_symm_mem",
 ]
