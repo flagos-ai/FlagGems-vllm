@@ -475,3 +475,76 @@ def test_repeated_inputs_stable_selection(rows, vocab, k, score_kind, strided):
         else:
             torch.testing.assert_close(out, first, rtol=0, atol=0)
     torch.testing.assert_close(logits, inputs_before, rtol=0, atol=0)
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.parametrize(
+    "vocab", [2048, 8192] if cfg.QUICK_MODE else [2048, 8192, 17600, 65536]
+)
+@pytest.mark.parametrize(
+    "pattern", ["finite", "nan", "nan_payloads", "all_nan", "infinities", "signed_zero"]
+)
+@pytest.mark.parametrize("stride", [1, 2])
+def test_special_value_boundaries(vocab, pattern, stride):
+    from .test_top_k_per_row_decode import _assert_selected_values, _special_logits
+
+    k = 512
+    logits = _special_logits(vocab, pattern, stride)
+    starts = torch.tensor([0, 1, 3, 7, 0, 16, 1, 0], device=device, dtype=torch.int32)
+    lengths = torch.tensor(
+        [0, 1, 511, 512, 513, vocab // 2, vocab - 1, vocab],
+        device=device,
+        dtype=torch.int32,
+    )
+    ends = starts + lengths
+    out = torch.full((8, k), -777, device=device, dtype=torch.int32)
+    flaggems_vllm.top_k_per_row_prefill(
+        logits, starts, ends, out, 8, logits.stride(0), logits.stride(1), k
+    )
+    _assert_selected_values(logits, starts, ends, out, k)
+
+
+@pytest.mark.top_k_per_row_prefill
+@pytest.mark.skipif(device != "cuda", reason="CUDA-compatible graph API required")
+@pytest.mark.parametrize("stride", [1, 2])
+def test_special_values_graph_replay(stride):
+    from .test_top_k_per_row_decode import _assert_selected_values, _special_logits
+
+    k, vocab = 512, 8192
+    logits = _special_logits(vocab, "nan", stride)
+    starts = torch.zeros(8, device=device, dtype=torch.int32)
+    ends = torch.full((8,), vocab, device=device, dtype=torch.int32)
+    out = torch.full((8, k), -777, device=device, dtype=torch.int32)
+
+    def run():
+        flaggems_vllm.top_k_per_row_prefill(
+            logits, starts, ends, out, 8, logits.stride(0), logits.stride(1), k
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for pattern in [
+        "finite",
+        "nan",
+        "nan_payloads",
+        "all_nan",
+        "infinities",
+        "signed_zero",
+    ]:
+        logits.copy_(_special_logits(vocab, pattern))
+        starts.copy_(
+            torch.tensor([0, 1, 3, 7, 0, 16, 1, 0], device=device, dtype=torch.int32)
+        )
+        ends.copy_(
+            starts
+            + torch.tensor(
+                [0, 1, 511, 512, 513, vocab // 2, vocab - 1, vocab],
+                device=device,
+                dtype=torch.int32,
+            )
+        )
+        out.fill_(-777)
+        graph.replay()
+        _assert_selected_values(logits, starts, ends, out, k)

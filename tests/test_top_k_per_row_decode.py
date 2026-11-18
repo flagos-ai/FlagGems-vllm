@@ -26,6 +26,7 @@ import flaggems_vllm
 from flaggems_vllm.ops.top_k_per_row_decode import top_k_per_row_decode as _generic_impl
 
 from . import conftest as cfg
+from .accuracy_utils import gems_assert_equal, to_reference
 
 device = flaggems_vllm.device
 
@@ -385,3 +386,114 @@ def test_repeated_inputs_stable_selection(rows, vocab, k, score_kind, strided):
         else:
             torch.testing.assert_close(out, first, rtol=0, atol=0)
     torch.testing.assert_close(logits, inputs_before, rtol=0, atol=0)
+
+
+# Exercise both the small final-rank bucket and full radix refinement. The
+# output starts poisoned so missing writes cannot be hidden by zero allocation.
+_SPECIAL_CASES = [
+    "finite",
+    "nan",
+    "nan_payloads",
+    "all_nan",
+    "infinities",
+    "signed_zero",
+]
+
+
+def _special_logits(vocab, pattern, stride=1):
+    torch.manual_seed(2026)
+    storage = torch.randn(8, vocab * stride, device=device, dtype=torch.float32)
+    logits = storage[:, ::stride]
+    if pattern == "nan":
+        logits[:, ::9] = float("nan")
+        logits[:, 1::9] = float("inf")
+        logits[:, 2::9] = -float("inf")
+    elif pattern == "nan_payloads":
+        # Positive/negative, signaling/quiet and distinct payloads must all
+        # have the same NaN-first ordering as torch.topk.
+        bits = torch.tensor(
+            [0x7F800001, 0x7FC00001, -0x7FFFFF, -0x3FFFFF],
+            dtype=torch.int32,
+            device=device,
+        ).view(torch.float32)
+        for i in range(4):
+            logits[:, i::9] = bits[i]
+    elif pattern == "all_nan":
+        logits.fill_(float("nan"))
+    elif pattern == "infinities":
+        logits[:, ::3] = float("inf")
+        logits[:, 1::3] = -float("inf")
+    elif pattern == "signed_zero":
+        logits.fill_(-0.0)
+        logits[:, 1::2] = 0.0
+    return logits
+
+
+def _assert_selected_values(logits, starts, ends, out, k):
+    # Check cardinality and uniqueness BEFORE gather: invalid indices or
+    # unwritten output slots are correctness failures, not acceptable ties.
+    reference = to_reference(logits)
+    for row, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
+        count = min(k, end - start)
+        ids = out[row].long()
+        valid = ids[ids >= 0]
+        assert valid.numel() == count
+        assert bool((valid < end - start).all())
+        assert valid.unique().numel() == count
+        assert bool((ids[ids < 0] == -1).all())
+        actual = logits[row, start + valid].sort().values
+        expected = reference[row, start:end].topk(count).values.sort().values
+        gems_assert_equal(actual, expected, equal_nan=True)
+
+
+@pytest.mark.top_k_per_row_decode
+@pytest.mark.parametrize(
+    "vocab", [2048, 8192] if cfg.QUICK_MODE else [2048, 8192, 17600, 65536]
+)
+@pytest.mark.parametrize("pattern", _SPECIAL_CASES)
+@pytest.mark.parametrize("stride", [1, 2])
+def test_special_value_boundaries(vocab, pattern, stride):
+    k = 512
+    logits = _special_logits(vocab, pattern, stride)
+    lengths = torch.tensor(
+        [0, 1, 511, 512, 513, vocab // 2, vocab - 1, vocab],
+        device=device,
+        dtype=torch.int32,
+    )
+    out = torch.full((8, k), -777, device=device, dtype=torch.int32)
+    flaggems_vllm.top_k_per_row_decode(
+        logits, 1, lengths, out, 8, logits.stride(0), logits.stride(1), k
+    )
+    _assert_selected_values(logits, torch.zeros_like(lengths), lengths, out, k)
+
+
+@pytest.mark.top_k_per_row_decode
+@pytest.mark.skipif(device != "cuda", reason="CUDA-compatible graph API required")
+@pytest.mark.parametrize("stride", [1, 2])
+def test_special_values_graph_replay(stride):
+    k, vocab = 512, 8192
+    logits = _special_logits(vocab, "nan", stride)
+    lengths = torch.full((8,), vocab, device=device, dtype=torch.int32)
+    out = torch.full((8, k), -777, device=device, dtype=torch.int32)
+
+    def run():
+        flaggems_vllm.top_k_per_row_decode(
+            logits, 1, lengths, out, 8, logits.stride(0), logits.stride(1), k
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for pattern in _SPECIAL_CASES:
+        logits.copy_(_special_logits(vocab, pattern))
+        lengths.copy_(
+            torch.tensor(
+                [0, 1, 511, 512, 513, vocab // 2, vocab - 1, vocab],
+                device=device,
+                dtype=torch.int32,
+            )
+        )
+        out.fill_(-777)
+        graph.replay()
+        _assert_selected_values(logits, torch.zeros_like(lengths), lengths, out, k)

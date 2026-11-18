@@ -131,24 +131,20 @@ def _use_radix_final_for_prefill(vocab_size):
 
 @triton.jit
 def _convert_to_uint32(x):
+    # Smaller keys rank first: all NaNs precede +inf, and signed zeros tie.
     bits = x.to(tl.uint32, bitcast=True)
+    bits = tl.where(x == 0, 0, bits).to(tl.uint32)
     sign_mask = tl.full(bits.shape, 0x80000000, tl.uint32)
     sign_set = (bits & sign_mask) != 0
     inv = (~bits) & tl.full(bits.shape, 0x7FFFFFFF, tl.uint32)
-    return tl.where(sign_set, bits, inv)
+    return tl.where(x != x, 0, tl.where(sign_set, bits, inv)).to(tl.uint32)
 
 
 @triton.jit
 def _extract_bin_idx(x, in_range, pattern, STEP: tl.constexpr):
     is_partial_match = in_range
     if STEP == 0:
-        h = x.to(tl.float16)
-        bits = h.to(tl.uint16, bitcast=True)
-        sign_mask = tl.full(bits.shape, 0x8000, tl.uint16)
-        sign_set = (bits & sign_mask) != 0
-        inv = (~bits) & tl.full(bits.shape, 0x7FFF, tl.uint16)
-        mapped = tl.where(sign_set, bits, inv)
-        bin_idx = (mapped >> 5).to(tl.uint32)
+        bin_idx = _convert_to_trt_uint16_hi11(x).to(tl.uint32)
     else:
         bits = _convert_to_uint32(x)
         if STEP == 1:
@@ -166,11 +162,13 @@ def _extract_bin_idx(x, in_range, pattern, STEP: tl.constexpr):
 def _convert_to_trt_uint16_hi11(x):
     h = x.to(tl.float16)
     bits = h.to(tl.uint16, bitcast=True)
+    bits = tl.where(x == 0, 0, bits).to(tl.uint16)
     sign_mask = tl.full(bits.shape, 0x8000, tl.uint16)
     sign_set = (bits & sign_mask) != 0
     inv = (~bits) & tl.full(bits.shape, 0x7FFF, tl.uint16)
     mapped = tl.where(sign_set, bits, inv)
-    return (mapped >> 5).to(tl.int32)
+    # Use the same NaN-first order as the full-precision refinement keys.
+    return tl.where(x != x, 0, mapped >> 5).to(tl.int32)
 
 
 @triton.jit
@@ -509,7 +507,7 @@ def _process_histogram_step(
             offs = t * BLOCK_SIZE + lane
             in_range = offs < row_len
             x = tl.load(
-                logits_ptr + row_start + offs * stride1,
+                logits_ptr + (row_start + offs) * stride1,
                 mask=in_range,
                 other=float("-inf"),
             )
@@ -817,7 +815,7 @@ def _process_histogram_step(
             offs = t * BLOCK_SIZE + lane
             in_range = offs < row_len
             x = tl.load(
-                logits_ptr + row_start + offs * stride1,
+                logits_ptr + (row_start + offs) * stride1,
                 mask=in_range,
                 other=float("-inf"),
             )
@@ -1078,7 +1076,9 @@ def _top_k_per_row_job(
                     (pos + row_start).to(tl.int32),
                     mask=take_row,
                 )
-                logits = tl.load(logits_ptr + pos + row_start, mask=take_row)
+                logits = tl.load(
+                    logits_ptr + (pos + row_start) * stride1, mask=take_row
+                )
                 tl.store(out_logits_ptr + pos, logits, mask=take_row)
             else:
                 tl.store(
@@ -1158,25 +1158,23 @@ def _top_k_per_row_job(
                     mask=valid,
                     other=0,
                 )
+                key_i = _convert_to_uint32(logit_i)
                 out_rank = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
                 if not HAS_TLE and (CANONICAL_OUTPUT or MERGE_BLOCKS):
                     original_i = tl.load(s_histogram_ptr + pos, mask=valid, other=0)
                 for j in tl.range(0, final_cnt):
                     logit_j = tl.load(s_final_logits_ptr + j)
+                    key_j = _convert_to_uint32(logit_j)
                     if HAS_TLE:
-                        better = (logit_i < logit_j) | (
-                            (logit_i == logit_j) & (pos < j)
-                        )
+                        better = (key_i > key_j) | ((key_i == key_j) & (pos < j))
                     elif CANONICAL_OUTPUT or MERGE_BLOCKS:
                         original_j = tl.load(s_histogram_ptr + j)
-                        better = (logit_i < logit_j) | (
-                            (logit_i == logit_j) & (original_i > original_j)
+                        better = (key_i > key_j) | (
+                            (key_i == key_j) & (original_i > original_j)
                         )
                     else:
                         # Stable collection visits original indices in order.
-                        better = (logit_i < logit_j) | (
-                            (logit_i == logit_j) & (pos > j)
-                        )
+                        better = (key_i > key_j) | ((key_i == key_j) & (pos > j))
                     out_rank = out_rank + (valid & better).to(tl.int32)
                 dst_pos = base_idx + out_rank
                 take = valid & (dst_pos < TOPK)
