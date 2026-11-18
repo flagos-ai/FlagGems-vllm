@@ -1,6 +1,3 @@
-# Sparse FlashMLA prepared-handle factory, not a tensor operator.
-prepare_flash_mla_with_kvcache_sparse_w8a8
-
 # GEMM reduce-scatter configuration and cache lifecycle APIs, not tensor operators.
 GemmReduceScatterConfig
 clear_fused_matmul_reduce_scatter_cache

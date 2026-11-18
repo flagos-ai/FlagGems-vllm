@@ -320,7 +320,7 @@ class SparseMLAInt8PreparedHandle:
         return self.output, self.lse
 
 
-def prepare_flash_mla_with_kvcache_sparse_w8a8(
+def _prepare_flash_mla_sparse_fwd_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,
@@ -390,6 +390,8 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8(
         raise NotImplementedError("requires contiguous inputs and output")
     if any(t.numel() and t.data_ptr() % 16 for t in tensors[:6]):
         raise NotImplementedError("requires 16-byte aligned content, RoPE and scales")
+    if topk_length is not None and queries == 1 and topk_length.shape == (batch,):
+        topk_length = topk_length[:, None]
     if topk_length is not None and (
         topk_length.shape != (batch, queries) or topk_length.dtype != torch.int32
     ):
@@ -452,31 +454,29 @@ def prepare_flash_mla_with_kvcache_sparse_w8a8(
     return handle, handle()
 
 
-def flash_mla_with_kvcache_sparse_w8a8(
+def flash_mla_sparse_fwd_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     indices: torch.Tensor,
-    *,
     softmax_scale: Optional[float] = None,
-    topk_length: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, output = prepare_flash_mla_with_kvcache_sparse_w8a8(
+    """Sparse MLA on MetaX C550 with signed INT8 NoPE and FP16/BF16 RoPE."""
+    _, output = _prepare_flash_mla_sparse_fwd_w8a8(
         q_nope,
         q_rope,
-        k_nope,
-        k_rope,
+        k_cache_lora,
+        k_cache_rope,
         q_scale,
         k_scale,
         indices,
         softmax_scale=softmax_scale,
         topk_length=topk_length,
         attn_sink=attn_sink,
-        out=out,
     )
     return output

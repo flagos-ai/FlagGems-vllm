@@ -724,25 +724,6 @@ bmm_w8a8:
     - [4, 129, 17, 257]
   shape_desc: "B, M, N, K"
 
-flash_mla_with_kvcache_sparse_w8a8:
-  shapes:
-    - [16, 1, 64, 640, 17416, 0]
-    - [16, 1, 64, 8320, 1544, 0]
-    - [4, 1, 64, 640, 17416, 0]
-    - [4, 1, 64, 8320, 1544, 0]
-    - [16, 1, 64, 128, 1032, 0]
-    - [12, 1, 64, 640, 17416, 0]
-    - [12, 1, 64, 8320, 1544, 0]
-    - [8, 1, 64, 640, 17416, 0]
-    - [8, 1, 64, 8320, 1544, 0]
-    - [4, 1, 64, 128, 1032, 0]
-    - [9, 1, 64, 640, 17416, 0]
-    - [9, 1, 64, 8320, 1544, 0]
-    - [12, 1, 64, 128, 1032, 0]
-    - [8, 1, 64, 128, 1032, 0]
-    - [9, 1, 64, 128, 1032, 0]
-  shape_desc: "batch, queries, heads, topk, cache_pages, rope_dimension; DeepSeek-V4-Flash exported decode shapes"
-
 flash_mla_sparse_fwd_w8a8:
   shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV, sink, topk_length, seed"
   shapes:

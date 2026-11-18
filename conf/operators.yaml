@@ -721,8 +721,8 @@ ops:
   stages:
   - alpha: '5.3'
 - id: flash_mla_sparse_fwd_w8a8
-  description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and
-    shared key/value.
+  description: Sparse MLA decoding with per-token scales for FP8 NoPE on NVIDIA
+    or INT8 NoPE on MetaX, and separate RoPE.
   for:
   - flash_mla_sparse_fwd_w8a8
   labels:
@@ -738,19 +738,6 @@ ops:
     KV cache.
   for:
   - vllm.v1.attention.ops.flashmla.flash_mla_with_kvcache
-  labels:
-  - fused
-  - Attention
-  - vLLM
-  kind:
-  - NeuralNetwork
-  stages:
-  - alpha: '5.4'
-- id: flash_mla_with_kvcache_sparse_w8a8
-  description: Sparse MLA decode with per-token INT8 query and KV content on MetaX
-    C550.
-  for:
-  - flash_mla_with_kvcache_sparse_w8a8
   labels:
   - fused
   - Attention
