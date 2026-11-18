@@ -70,6 +70,11 @@ _DECODE_MAX_T = 16
 _DECODE_BLOCK_N = 128
 _DECODE_K_BLOCKS = 2
 _DECODE_WARPS = 4
+# G=16 decode is weight-read bound with only 128 CTAs (2 waves); splitting K
+# gives 512 CTAs and measured 80.6 -> 77.4 us at T=1 (neutral at T>=16).
+_DECODE_SPLIT = 4
+_DECODE_SPLIT_BN = 64
+_DECODE_SPLIT_MAX_T = 8
 
 
 @triton.jit
@@ -628,6 +633,135 @@ def _decode_bmm(act, weight, act_scale, weight_scale, out) -> None:
     )
 
 
+@triton.jit
+def _decode_splitk_kernel(
+    A,
+    W,
+    AS,
+    WS,
+    P,
+    T,
+    sa_g,
+    sas_g,
+    sas_t,
+    sw_g,
+    sw_n,
+    sws_g,
+    sws_n,
+    sp_s,
+    sp_t,
+    sp_g,
+    sp_n,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BN: tl.constexpr,
+    TB: tl.constexpr,
+    SPLIT: tl.constexpr,
+):
+    """Split-K decode GEMM (``g = 16``): each program owns a K slice.
+
+    The g=16 weight is 67 MB and the plain decode kernel only gets 128 CTAs
+    (two waves of 64 SMs), which reaches 0.83 TB/s. Splitting K by ``SPLIT``
+    raises the CTA count to ``g * N/BN * SPLIT`` and measured 80.6 -> 77.4 us
+    (T=1) / 78.5 us (T=4); partial sums are fp32 and reduced by
+    ``_decode_reduce_kernel``.
+    """
+    pid = tl.program_id(0)
+    n_blocks: tl.constexpr = N // BN
+    g = pid // (n_blocks * SPLIT)
+    rem = pid % (n_blocks * SPLIT)
+    s = rem // n_blocks
+    nb = rem % n_blocks
+
+    rn = nb * BN + tl.arange(0, BN)
+    rt = tl.arange(0, TB)
+    rk = tl.arange(0, 128)
+    t_mask = rt < T
+    acc = tl.zeros((BN, TB), tl.float32)
+
+    k_per_split: tl.constexpr = K // SPLIT
+    kb0 = s * (k_per_split // 128)
+    w_base = W + g * sw_g + rn[:, None] * sw_n + kb0 * 128
+    a_base = A + g * sa_g + rt[:, None] * K + kb0 * 128
+    as_base = AS + g * sas_g + rt * sas_t + kb0
+    ws_base = WS + g * sws_g + ((nb * BN) // 128) * sws_n + kb0
+
+    for kb in range(k_per_split // 128):
+        w = tl.load(w_base + kb * 128 + rk[None, :])
+        a = tl.load(a_base + kb * 128 + rk[None, :], mask=t_mask[:, None], other=0)
+        part = tl.dot(w, tl.trans(a), out_dtype=tl.int32).to(tl.float32)
+        asc = tl.load(as_base + kb, mask=t_mask, other=0.0)
+        wsc = tl.load(ws_base + kb)
+        acc = tl.fma(part, asc[None, :] * wsc, acc)
+
+    op = P + s * sp_s + rt[:, None] * sp_t + g * sp_g + rn[None, :]
+    tl.store(op, tl.trans(acc), mask=t_mask[:, None])
+
+
+@triton.jit
+def _decode_reduce_kernel(
+    P,
+    O,
+    total,
+    SPLIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Sum the ``SPLIT`` fp32 partials of ``_decode_splitk_kernel`` into bf16."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for s in tl.static_range(SPLIT):
+        acc += tl.load(P + s * total + offs, mask=mask, other=0.0)
+    tl.store(O + offs, acc.to(tl.bfloat16), mask=mask)
+
+
+def _decode_splitk_bmm(act, weight, act_scale, weight_scale, out) -> None:
+    """Split-K decode GEMM into a contiguous ``[T, G, N]`` output."""
+    batch, m, k = act.shape
+    n = weight.shape[1]
+    split = _DECODE_SPLIT
+    partial = torch.empty(
+        (split, m, batch, n), dtype=torch.float32, device=act.device
+    )
+    grid = (batch * (n // _DECODE_SPLIT_BN) * split,)
+    _decode_splitk_kernel[grid](
+        act,
+        weight,
+        act_scale,
+        weight_scale,
+        partial,
+        m,
+        act.stride(0),
+        act_scale.stride(0),
+        act_scale.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        weight_scale.stride(0),
+        weight_scale.stride(1),
+        partial.stride(0),
+        partial.stride(1),
+        partial.stride(2),
+        partial.stride(3),
+        N=n,
+        K=k,
+        BN=_DECODE_SPLIT_BN,
+        TB=_DECODE_MAX_T,
+        SPLIT=split,
+        num_warps=4,
+        num_stages=3,
+    )
+    total = m * batch * n
+    _decode_reduce_kernel[(triton.cdiv(total, 1024),)](
+        partial,
+        out,
+        total,
+        SPLIT=split,
+        BLOCK=1024,
+        num_warps=4,
+    )
+
+
 def _tile(m: int):
     """Tiles for the operator's ``n = 1024`` projection, measured on PPU-ZW810E.
 
@@ -859,6 +993,13 @@ def deep_gemm_fp8_o_proj(
         )
         z = out.permute(1, 0, 2)
         if (
+            o_lora_rank == 1024
+            and num_tokens <= _DECODE_SPLIT_MAX_T
+            and n_groups > 8
+            and reduction % (_QUANT_BLOCK * _DECODE_SPLIT) == 0
+        ):
+            _decode_splitk_bmm(act_i8, weight_i8, act_scale_i8, weight_scale_i8, out)
+        elif (
             o_lora_rank == 1024
             and num_tokens <= _DECODE_MAX_T
             and n_groups <= 8

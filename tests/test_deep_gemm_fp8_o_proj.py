@@ -292,6 +292,8 @@ TORCH_COMPOSED_CONFIGS = (
     (128, 64, 8, 1024, 7168),
     (4096, 64, 8, 1024, 7168),
     (16, 128, 16, 1024, 7168),
+    # G=16 decode goes through the split-K kernel (T <= 8).
+    (4, 128, 16, 1024, 7168),
 )
 
 
