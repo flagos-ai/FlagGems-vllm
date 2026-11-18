@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._mthreads.ops.bad_words import apply_bad_words
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
@@ -70,7 +69,6 @@ from flaggems_vllm.runtime.backend._mthreads.ops.watermark import (
 )
 
 __all__ = [
-    "apply_bad_words",
     "chunk_gated_delta_rule_w8a16_fp8",
     "dequantize_and_gather_k_cache",
     "draft_watermarking_mask",

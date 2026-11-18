@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import statistics
 from dataclasses import dataclass
 
 import pytest
@@ -21,6 +20,8 @@ import triton
 import triton.language as tl
 
 import flaggems_vllm
+
+from . import base
 
 try:
     from vllm.v1.worker.gpu.sample.bad_words import (
@@ -120,7 +121,6 @@ def _upstream_reference(
 
 
 REFERENCE_FN = apply_bad_words_reference or _upstream_reference
-REFERENCE_NAME = "vLLM" if apply_bad_words_reference is not None else "vLLM Triton"
 
 
 DEVICE = torch.device(flaggems_vllm.device)
@@ -131,11 +131,6 @@ DEFAULT_OUTPUT_LEN = 32
 MAX_BAD_WORDS = 128
 MAX_BAD_WORD_TOKENS = 1024
 MATCH_PATTERNS = ("miss", "hit", "mixed")
-BENCH_WARMUP_MS = 25
-BENCH_REP_MS = 100
-BENCH_REPEAT = 3
-PERF_RESULTS = []
-TIMING_BACKEND = "backend-aware Triton do_bench"
 
 
 @dataclass(frozen=True)
@@ -342,143 +337,62 @@ def _run_flaggems(*args) -> None:
     flaggems_vllm.apply_bad_words(*args)
 
 
-def _backend_do_bench(fn, warmup: int, rep: int, return_mode="median") -> float:
-    """Use the timing API supported by the active accelerator backend."""
-    if flaggems_vllm.vendor_name == "ascend":
-        return triton.backends.ascend.testing.do_bench_npu(fn)
-    return triton.testing.do_bench(
-        fn,
-        warmup=warmup,
-        rep=rep,
-        return_mode=return_mode,
-    )
+class ApplyBadWordsBenchmark(base.Benchmark):
+    DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
+    DEFAULT_SHAPE_DESC = "workload, match"
+    DEFAULT_SHAPES = [
+        (workload.name, match_pattern)
+        for workload in WORKLOADS
+        for match_pattern in MATCH_PATTERNS
+    ]
 
+    def __init__(self):
+        super().__init__(
+            op_name="apply_bad_words",
+            torch_op=_run_reference,
+            gems_op=_run_flaggems,
+            dtypes=[DTYPE],
+            is_inplace=True,
+        )
 
-def _time_us(fn, input_args: tuple) -> float:
-    latency_ms = _backend_do_bench(
-        lambda: fn(*input_args),
-        warmup=BENCH_WARMUP_MS,
-        rep=BENCH_REP_MS,
-        return_mode="median",
-    )
-    return latency_ms * 1000
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = self.DEFAULT_SHAPES
 
-
-def _measure(calls: dict[str, tuple]) -> dict[str, tuple[float, float, float]]:
-    names = list(calls)
-    samples = {name: [] for name in names}
-    for index in range(BENCH_REPEAT):
-        order = names if index % 2 == 0 else list(reversed(names))
-        for name in order:
-            fn, input_args = calls[name]
-            samples[name].append(_time_us(fn, input_args))
-    return {
-        name: (statistics.median(values), min(values), max(values))
-        for name, values in samples.items()
-    }
-
-
-def _print_performance_table() -> None:
-    if not PERF_RESULTS:
-        return
-
-    headers = (
-        "Workload",
-        "Match",
-        "Reqs",
-        "Tokens",
-        "Draft",
-        "Max Bad Words",
-        "Word Len",
-        f"{REFERENCE_NAME} (us)",
-        "FlagGems-vllm (us)",
-        "Ref/FlagGems",
-    )
-    rows = [headers]
-    for result in PERF_RESULTS:
-        rows.append(
-            (
-                result["workload"],
-                result["match_pattern"],
-                str(result["num_reqs"]),
-                str(result["num_tokens"]),
-                str(result["num_draft_tokens"]),
-                str(result["max_num_bad_words"]),
-                str(result["bad_word_len"]),
-                f'{result["reference_us"]:.3f}',
-                f'{result["flaggems_us"]:.3f}',
-                f'{result["speedup"]:.3f}x',
+    def get_input_iter(self, dtype):
+        workloads = {workload.name: workload for workload in WORKLOADS}
+        for workload_name, match_pattern in self.shapes:
+            workload = workloads[workload_name]
+            inputs = make_inputs(workload, match_pattern)
+            self._case = (
+                workload.name,
+                match_pattern,
+                workload.num_reqs,
+                workload.num_tokens,
+                workload.num_draft_tokens,
+                inputs.max_num_bad_words,
+                workload.bad_word_len,
             )
-        )
 
-    widths = [max(len(row[index]) for row in rows) for index in range(len(headers))]
-    separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+            reference_logits = inputs.logits.clone()
+            flaggems_logits = inputs.logits.clone()
+            _run_reference(*_kernel_args(reference_logits, inputs))
+            _run_flaggems(*_kernel_args(flaggems_logits, inputs))
+            torch.testing.assert_close(
+                flaggems_logits,
+                reference_logits,
+                rtol=0,
+                atol=0,
+            )
+            yield _kernel_args(inputs.logits, inputs)
 
-    def format_row(row: tuple[str, ...]) -> str:
-        return (
-            "| "
-            + " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
-            + " |"
-        )
+    def record_shapes(self, *args, **kwargs):
+        return self._case
 
-    print(f"\n\nBad Words performance summary ({TIMING_BACKEND}, median)")
-    print(
-        f"Active FlagGems backend: {flaggems_vllm.vendor_name} ({flaggems_vllm.device})"
-    )
-    print(
-        f"Warmup: {BENCH_WARMUP_MS} ms; Repetition: {BENCH_REP_MS} ms; "
-        f"Outer repeats: {BENCH_REPEAT}"
-    )
-    print(separator)
-    print(format_row(rows[0]))
-    print(separator)
-    for row in rows[1:]:
-        print(format_row(row))
-    print(separator)
-    print("Ref/FlagGems > 1: FlagGems-vllm is faster.")
-
-
-@pytest.fixture(scope="module", autouse=True)
-def report_performance_results():
-    yield
-    _print_performance_table()
+    def get_latency(self, op, *args, **kwargs):
+        logits = args[0].clone()
+        return super().get_latency(op, logits, *args[1:], **kwargs)
 
 
 @pytest.mark.apply_bad_words
-@pytest.mark.parametrize("match_pattern", MATCH_PATTERNS)
-@pytest.mark.parametrize("workload", WORKLOADS, ids=lambda item: item.name)
-def test_apply_bad_words(workload: Workload, match_pattern: str):
-    inputs = make_inputs(workload, match_pattern)
-    flaggems_logits = inputs.logits.clone()
-    flaggems_args = _kernel_args(flaggems_logits, inputs)
-
-    reference_logits = inputs.logits.clone()
-    reference_args = _kernel_args(reference_logits, inputs)
-    _run_reference(*reference_args)
-    _run_flaggems(*flaggems_args)
-    torch.testing.assert_close(flaggems_logits, reference_logits, rtol=0, atol=0)
-
-    timing = _measure(
-        {
-            "reference": (_run_reference, reference_args),
-            "flaggems": (_run_flaggems, flaggems_args),
-        }
-    )
-    reference_us = timing["reference"][0]
-    flaggems_us = timing["flaggems"][0]
-    speedup = reference_us / flaggems_us
-
-    PERF_RESULTS.append(
-        {
-            "workload": workload.name,
-            "match_pattern": match_pattern,
-            "num_reqs": workload.num_reqs,
-            "num_tokens": workload.num_tokens,
-            "num_draft_tokens": workload.num_draft_tokens,
-            "max_num_bad_words": inputs.max_num_bad_words,
-            "bad_word_len": workload.bad_word_len,
-            "reference_us": reference_us,
-            "flaggems_us": flaggems_us,
-            "speedup": speedup,
-        }
-    )
+def test_apply_bad_words():
+    ApplyBadWordsBenchmark().run()
