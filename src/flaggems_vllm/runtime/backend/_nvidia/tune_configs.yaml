@@ -1877,7 +1877,7 @@ cast_sigmoid:
     num_warps: 8
     num_stages: 1
 
-gemma4_routing_native:
+gemma4_routing_select:
   - META: {BLOCK_T: 1}
     num_warps: 1
     num_stages: 1

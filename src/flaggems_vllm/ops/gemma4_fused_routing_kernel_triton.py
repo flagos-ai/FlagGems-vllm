@@ -82,7 +82,7 @@ def _finish_routes(
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("gemma4_routing_native"),
+    configs=runtime.get_tuned_config("gemma4_routing_select"),
     key=["T", "E", "K", "HAS_PADDING", "CONTIGUOUS"],
     prune_configs_by={"early_config_prune": _prune_token_tiles},
     use_cuda_graph=True,
