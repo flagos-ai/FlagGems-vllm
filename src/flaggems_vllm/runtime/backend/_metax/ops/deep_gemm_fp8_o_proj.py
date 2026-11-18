@@ -215,7 +215,7 @@ def _compact_rope_supported(head_dim: int, rope_dim: int) -> bool:
 
 def _heads_per_cta(heads_per_group: int) -> int:
     """Largest head grouping that still splits a group evenly (CTA must not straddle)."""
-    for candidate in (4, 2):
+    for candidate in (8, 4, 2):
         if heads_per_group % candidate == 0:
             return candidate
     return 1
@@ -261,7 +261,9 @@ def _launch_quant_int8(
         HALF_ROPE=rope_dim // 2,
         NBLOCKS=head_dim // rope_dim,
         HEADS_PER_CTA=heads_per_cta,
-        num_warps=heads_per_cta,
+        # Four warps keep the wider 8-head tile at the same occupancy; tying
+        # num_warps to HEADS_PER_CTA made the 8-head case slower.
+        num_warps=min(heads_per_cta, 4),
         num_stages=1,
     )
 
