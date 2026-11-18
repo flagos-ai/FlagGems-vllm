@@ -124,6 +124,7 @@ from flaggems_vllm.ops.input_batch import get_num_sampled_and_rejected
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
+from flaggems_vllm.ops.logprob import compute_topk_scores
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
@@ -312,6 +313,7 @@ __all__ = [
     "clear_fused_matmul_reduce_scatter_cache",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
+    "compute_topk_scores",
     "concat_and_cache_mla",
     "concat_mla_q",
     "concat_query",
