@@ -116,6 +116,9 @@ from flaggems_vllm.ops.fused_moe import (
 )
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
+from flaggems_vllm.ops.gemma4_fused_routing_kernel_triton import (
+    gemma4_fused_routing_kernel_triton,
+)
 from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.ops.input_batch import get_num_sampled_and_rejected
 from flaggems_vllm.ops.grouped_topk import grouped_topk
@@ -359,6 +362,7 @@ __all__ = [
     "gdn_w8a16",
     "geglu",
     "gelu_and_mul",
+    "gemma4_fused_routing_kernel_triton",
     "gemma_rms_norm",
     "GemmReduceScatterConfig",
     "get_num_sampled_and_rejected",

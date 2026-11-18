@@ -51,6 +51,7 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 __all__ = [
     "disable_symm_mem",
     "enable_symm_mem",
+    "gemma4_fused_routing_kernel_triton",
     "SUPPORTED_FP8_DTYPE",
     "use_symm_mem",
 ]

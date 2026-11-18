@@ -1210,6 +1210,18 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
+- id: gemma4_fused_routing_kernel_triton
+  description: Gemma 4 MoE top-k softmax routing with learned per-expert scales and padding.
+  for:
+  - vllm.model_executor.models.gemma4.gemma4_fused_routing_kernel_triton
+  labels:
+  - fused
+  - NoCPU
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: gemma_rms_norm
   description: 'RMSNorm variant used by the Gemma model family. Unlike standard RMSNorm,
 
