@@ -1934,7 +1934,9 @@ ops:
 
     updates the persistent conv cache for decode, prefill, and speculative
 
-    decode modes, matching vLLM ops.ple.ple_conv.
+    decode modes, matching vLLM ops.ple.ple_conv. The MetaX backend supplies
+
+    the same entry with programmatic dependent launch disabled.
 
     '
   for:
