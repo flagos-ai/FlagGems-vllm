@@ -382,10 +382,17 @@ def mhc_post(
         # configs the sustained sweep showed to be fastest. Our configs are
         # validated through the raw JIT path (no aabs), so disable the
         # rewrite for this launch only and restore it afterwards.
-        _aabs = triton.knobs.autotuning.adjust_block_size
-        triton.knobs.autotuning.adjust_block_size = False
+        autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
+        _aabs = getattr(autotuning, "adjust_block_size", None)
+        if _aabs is not None:
+            autotuning.adjust_block_size = False
         try:
-            from triton._flagtree_backend import FLAGTREE_BACKEND
+            try:
+                from triton._flagtree_backend import FLAGTREE_BACKEND
+            except ModuleNotFoundError as exc:
+                if exc.name != "triton._flagtree_backend":
+                    raise
+                FLAGTREE_BACKEND = None
 
             if FLAGTREE_BACKEND == "ppu":
                 # PPU: same ABI, vendor-shaped launch (one CTA per token).
@@ -399,7 +406,8 @@ def mhc_post(
                     a, b, c, d, out, a_sn, a_sj, a_si, H=H
                 )
         finally:
-            triton.knobs.autotuning.adjust_block_size = _aabs
+            if _aabs is not None:
+                autotuning.adjust_block_size = _aabs
     else:
 
         def grid_generic(META):

@@ -13,7 +13,8 @@ from flaggems_vllm.utils import libentry, libtuner
 @libentry()
 @libtuner(configs=runtime.get_tuned_config("mhc_rms_norm"), key=["D"])
 @triton.jit
-def _norm_kernel(X, W, Y, D: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr):
+def _norm_kernel(X, W, Y, D: tl.constexpr, EPS: tl.constexpr):
+    BLOCK: tl.constexpr = triton.next_power_of_2(D)
     row = tl.program_id(0)
     d = tl.arange(0, BLOCK)
     value = tl.load(X + row * D + d, d < D, other=0).to(tl.float32)
@@ -33,14 +34,12 @@ def mhc_rms_norm(layer_input, norm_weight, norm_eps):
         layer_input.shape, dtype=layer_input.dtype, device=layer_input.device
     )
     if out.numel():
-        # BLOCK is the semantic reduction extent, fixed by D. Only warps tune.
         _norm_kernel[(out.numel() // dim,)](
             layer_input,
             norm_weight,
             out,
             dim,
             norm_eps,
-            BLOCK=triton.next_power_of_2(dim),
         )
     return out
 
