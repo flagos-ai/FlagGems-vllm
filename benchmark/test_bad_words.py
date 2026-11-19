@@ -68,6 +68,7 @@ class Inputs:
     input_ids: torch.Tensor
     expanded_local_pos: torch.Tensor
     max_num_bad_words: int
+    expected_masks: tuple[list[int], list[int]]
 
 
 WORKLOADS = (
@@ -151,6 +152,8 @@ def make_inputs(workload: Workload, match_pattern: str) -> Inputs:
         (workload.num_reqs, MAX_BAD_WORDS + 1),
         dtype=torch.int32,
     )
+    masked_rows = []
+    masked_tokens = []
 
     for req_idx, count in enumerate(counts):
         output = all_token_ids[req_idx, PROMPT_LEN:].tolist()
@@ -167,6 +170,12 @@ def make_inputs(workload: Workload, match_pattern: str) -> Inputs:
                 word_idx,
                 should_match,
             )
+            prefix = word[:-1]
+            for local_pos in range(rows_per_req):
+                history = output + drafts[:local_pos]
+                if not prefix or history[-len(prefix) :] == prefix:
+                    masked_rows.append(req_idx * rows_per_req + local_pos)
+                    masked_tokens.append(word[-1])
             next_cursor = cursor + len(word)
             bad_word_token_ids[req_idx, cursor:next_cursor] = torch.tensor(
                 word,
@@ -218,6 +227,7 @@ def make_inputs(workload: Workload, match_pattern: str) -> Inputs:
         input_ids=input_ids.flatten().to(DEVICE),
         expanded_local_pos=expanded_local_pos.to(DEVICE),
         max_num_bad_words=max(counts),
+        expected_masks=(masked_rows, masked_tokens),
     )
 
 
@@ -235,6 +245,41 @@ def _kernel_args(logits: torch.Tensor, inputs: Inputs) -> tuple:
         inputs.expanded_local_pos,
         inputs.max_num_bad_words,
     )
+
+
+def _expected_logits(inputs: Inputs) -> torch.Tensor:
+    expected = inputs.logits.clone()
+    expected[inputs.expected_masks] = -float("inf")
+    return expected
+
+
+def _shift_reference_input_ids(inputs: Inputs) -> torch.Tensor:
+    input_ids = inputs.input_ids.reshape(inputs.total_len.numel(), -1)
+    shifted = torch.empty_like(input_ids)
+    shifted[:, :-1] = input_ids[:, 1:]
+    shifted[:, -1] = 0  # The trailing padding is never part of a draft prefix.
+    return shifted.flatten()
+
+
+def _reference_needs_draft_shift() -> bool:
+    # vLLM fixed its repeated-committed-token offset in #52311 (v0.28).
+    # Probe both recognized contracts instead of assuming a version's behavior.
+    # https://github.com/vllm-project/vllm/pull/52311
+    inputs = make_inputs(Workload("reference_probe", 1, 2, 1, 3), "hit")
+    expected = _expected_logits(inputs)
+    reference = inputs.logits.clone()
+    apply_bad_words_reference(*_kernel_args(reference, inputs))
+    if torch.equal(reference, expected):
+        return False
+
+    # The old offset misses this prefix entirely. Reject any other behavior.
+    torch.testing.assert_close(reference, inputs.logits, rtol=0, atol=0)
+    reference = inputs.logits.clone()
+    arguments = list(_kernel_args(reference, inputs))
+    arguments[8] = _shift_reference_input_ids(inputs)
+    apply_bad_words_reference(*arguments)
+    torch.testing.assert_close(reference, expected, rtol=0, atol=0)
+    return True
 
 
 class ApplyBadWordsBenchmark(base.Benchmark):
@@ -260,6 +305,11 @@ class ApplyBadWordsBenchmark(base.Benchmark):
 
     def get_input_iter(self, dtype):
         workloads = {workload.name: workload for workload in WORKLOADS}
+        shift_reference_inputs = (
+            _reference_needs_draft_shift()
+            if apply_bad_words_reference is not None
+            else False
+        )
         for workload_name, match_pattern in self.shapes:
             workload = workloads[workload_name]
             inputs = make_inputs(workload, match_pattern)
@@ -273,13 +323,22 @@ class ApplyBadWordsBenchmark(base.Benchmark):
                 workload.bad_word_len,
             )
 
+            expected_logits = _expected_logits(inputs)
+            flaggems_logits = inputs.logits.clone()
+            flaggems_vllm.apply_bad_words(*_kernel_args(flaggems_logits, inputs))
+            torch.testing.assert_close(flaggems_logits, expected_logits, rtol=0, atol=0)
             if apply_bad_words_reference is not None:
+                self._reference_input_ids = (
+                    _shift_reference_input_ids(inputs)
+                    if shift_reference_inputs
+                    else inputs.input_ids
+                )
                 reference_logits = inputs.logits.clone()
-                flaggems_logits = inputs.logits.clone()
-                apply_bad_words_reference(*_kernel_args(reference_logits, inputs))
-                flaggems_vllm.apply_bad_words(*_kernel_args(flaggems_logits, inputs))
+                reference_args = list(_kernel_args(reference_logits, inputs))
+                reference_args[8] = self._reference_input_ids
+                apply_bad_words_reference(*reference_args)
                 torch.testing.assert_close(
-                    flaggems_logits, reference_logits, rtol=0, atol=0
+                    reference_logits, expected_logits, rtol=0, atol=0
                 )
             yield _kernel_args(inputs.logits, inputs)
 
@@ -287,6 +346,9 @@ class ApplyBadWordsBenchmark(base.Benchmark):
         return self._case
 
     def get_latency(self, op, logits, *args, **kwargs):
+        if op is apply_bad_words_reference:
+            # Reuse the prepared native input without charging conversion time.
+            args = (*args[:7], self._reference_input_ids, *args[8:])
         # Masking is idempotent; isolate each implementation's input, then
         # reuse the common benchmark timing without resetting every iteration.
         return super().get_latency(op, logits.clone(), *args, **kwargs)
