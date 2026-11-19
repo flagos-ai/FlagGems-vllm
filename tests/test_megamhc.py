@@ -1,7 +1,10 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import builtins
 import importlib
+import importlib.util
+from pathlib import Path
 
 import pytest
 import torch
@@ -16,6 +19,25 @@ pytestmark = [
 ]
 
 EPS = (1e-6, 1e-6, 1e-6, 2.0, 20)
+
+
+@pytest.fixture(scope="module")
+def vllm_reference():
+    # Load the installed pure-torch reference without initializing vLLM's
+    # serving runtime or requiring its CUDA/TileLang extensions on PPU.
+    spec = importlib.util.find_spec("vllm")
+    if spec is None or not spec.submodule_search_locations:
+        pytest.skip("vLLM is not installed")
+    path = (
+        Path(next(iter(spec.submodule_search_locations)))
+        / "model_executor/kernels/mhc/torch.py"
+    )
+    if not path.is_file():
+        pytest.skip("installed vLLM has no mHC torch reference")
+    spec = importlib.util.spec_from_file_location("_vllm_mhc_reference", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def make_inputs(tokens, hidden, streams, strided=False):
@@ -38,7 +60,7 @@ def make_inputs(tokens, hidden, streams, strided=False):
     return x, residual, post, comb, fn, scale, base, norm
 
 
-def reference(args, use_norm=True):
+def reference(args, use_norm=True, *, eps=None, norm_eps=1e-6):
     x, residual, post, comb, fn, scale, base, norm = (a.cpu() for a in args)
     streams = residual.shape[1]
     new_residual = (
@@ -46,7 +68,7 @@ def reference(args, use_norm=True):
         + torch.einsum("tij,tih->tjh", comb, residual.float())
     ).bfloat16()
     flat = new_residual.flatten(1).float()
-    rms_eps, pre_eps, sink_eps, multiplier, repeats = EPS
+    rms_eps, pre_eps, sink_eps, multiplier, repeats = EPS if eps is None else eps
     projection = (flat.double() @ fn.double().T).float() * torch.rsqrt(
         flat.square().mean(-1, keepdim=True) + rms_eps
     )
@@ -65,7 +87,9 @@ def reference(args, use_norm=True):
     if use_norm:
         y = y.float()
         y = (
-            y * torch.rsqrt(y.square().mean(-1, keepdim=True) + 1e-6) * norm.float()
+            y
+            * torch.rsqrt(y.square().mean(-1, keepdim=True) + norm_eps)
+            * norm.bfloat16().float()
         ).bfloat16()
     return new_residual, new_post, new_comb, y
 
@@ -83,9 +107,13 @@ def candidate(args, use_norm=True, *, packed_fn=None, implementation="auto"):
 def verify(result, expected):
     for actual, target in zip(result, expected, strict=True):
         if target.dtype is torch.float32:
-            torch.testing.assert_close(actual.cpu(), target, rtol=3e-4, atol=2e-5)
+            torch.testing.assert_close(
+                actual.cpu(), target, rtol=3e-4, atol=2e-5, equal_nan=True
+            )
         else:
-            torch.testing.assert_close(actual.cpu(), target, rtol=0.016, atol=0.008)
+            torch.testing.assert_close(
+                actual.cpu(), target, rtol=0.016, atol=0.008, equal_nan=True
+            )
 
 
 @pytest.mark.parametrize(
@@ -96,6 +124,9 @@ def verify(result, expected):
         (3, 513, 2),
         (5, 127, 1),
         (3, 129, 8),
+        (3, 16384, 8),
+        (3, 1, 1),
+        (3, 1, 8),
         (1029, 259, 1),
         (4097, 259, 4),
     ],
@@ -302,5 +333,201 @@ def test_mega_mhc_broadcast_comb_graph_replay(tokens, implementation):
         args[0].mul_(-0.75)
         args[5].mul_(-0.5)
         graph.replay()
+        sampled = tuple(value[rows] if i < 4 else value for i, value in enumerate(args))
+        verify(tuple(value[rows] for value in outputs), reference(sampled))
+
+
+@pytest.mark.parametrize("implementation", ["auto", "triton"])
+@pytest.mark.parametrize(
+    "outer,hidden,streams,norm_dtype",
+    [
+        ((), 127, 1, None),
+        ((1,), 129, 2, torch.float64),
+        ((0, 2), 129, 8, torch.float32),
+        ((2, 3), 259, 8, torch.bfloat16),
+        ((3, 43), 4096, 4, torch.bfloat16),
+        ((3, 43), 4104, 4, torch.float32),
+        ((3, 171), 768, 2, torch.float16),
+        ((1, 1029), 259, 1, torch.float32),
+        ((2, 1024), 4096, 4, torch.float32),
+        ((4097,), 521, 4, torch.bfloat16),
+    ],
+)
+@pytest.mark.megamhc
+def test_mega_mhc_vllm_reference(
+    outer, hidden, streams, norm_dtype, implementation, vllm_reference
+):
+    """Compare with vLLM's own post/pre, independently of our FP64 oracle."""
+    tokens = 1
+    for dim in outer:
+        tokens *= dim
+    args = list(make_inputs(tokens, hidden, streams, strided=True))
+    args[0] = args[0].view(*outer, hidden)
+    args[1] = args[1].view(*outer, streams, hidden)
+    # vLLM accepts post coefficients with or without a final singleton.
+    args[2] = args[2].view(*outer, streams)
+    args[3] = args[3].view(*outer, streams, streams)
+    norm = None
+    if norm_dtype is not None:
+        # Strided FP32/FP16 weights exercise vLLM's BF16 conversion as well.
+        norm = torch.empty(2 * hidden, dtype=norm_dtype, device=args[0].device)[::2]
+        norm.copy_(args[-1].float() + 0.0021)
+    eps = (2e-4, 3e-3, 4e-3, 1.25, 3)
+    norm_eps = 0.03
+
+    def call():
+        return gems.mega_mhc(
+            *args[:-1],
+            *eps,
+            n_splits=3,
+            tile_n=7,
+            norm_weight=norm,
+            norm_eps=norm_eps,
+            implementation=implementation,
+        )
+
+    frozen = [t.cpu().clone() for t in args]
+    outputs = call()
+    for value, original in zip(args, frozen, strict=True):
+        torch.testing.assert_close(value.cpu(), original, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    for replay in (False, True):
+        if replay:
+            args[0].mul_(-0.75)
+            args[4].neg_()
+            args[2].mul_(-0.5)
+            args[3].mul_(-0.75)
+            args[5].neg_()
+            args[6].add_(0.01)
+            if norm is not None:
+                norm.mul_(-0.8)
+            graph.replay()
+            outputs = captured
+        cpu = [a.cpu() for a in args[:-1]]
+        # The official torch pre uses view(-1, ...), which is ambiguous at zero.
+        if tokens:
+            updated = vllm_reference.mhc_post_torch(
+                cpu[0], cpu[1], cpu[2].unsqueeze(-1), cpu[3]
+            )
+            post, comb, y = vllm_reference.mhc_pre_torch(updated, *cpu[4:], *eps)
+            if norm is not None:
+                value = y.float()
+                y = (
+                    value
+                    * torch.rsqrt(value.square().mean(-1, keepdim=True) + norm_eps)
+                    * norm.cpu().bfloat16().float()
+                ).bfloat16()
+            expected = (updated, post, comb, y)
+            verify(outputs, expected)
+        expected_shapes = (
+            (*outer, streams, hidden),
+            (*outer, streams, 1),
+            (*outer, streams, streams),
+            (*outer, hidden),
+        )
+        assert tuple(t.shape for t in outputs) == expected_shapes
+
+
+@pytest.mark.parametrize("tokens,hidden", [(129, 4096), (513, 521)])
+@pytest.mark.parametrize("disable_tle", [False, True])
+@pytest.mark.parametrize("implementation", ["auto", "triton"])
+@pytest.mark.megamhc
+def test_mega_mhc_without_native_helpers(
+    tokens, hidden, disable_tle, implementation, monkeypatch
+):
+    mod = importlib.import_module("flaggems_vllm.runtime.backend._thead.ops.megamhc")
+
+    def unexpected_bitcode():
+        pytest.fail("Triton implementation requested device bitcode")
+
+    monkeypatch.setattr(
+        mod,
+        "device_bitcode",
+        unexpected_bitcode if implementation == "triton" else lambda: None,
+    )
+    if disable_tle:
+        monkeypatch.setattr(mod, "has_triton_tle_attrs", lambda attrs: False)
+        original_import = builtins.__import__
+
+        def no_tle_module(name, *args, **kwargs):
+            if name.endswith("megamhc_tle"):
+                pytest.fail("basic fusion or weight packing imported the TLE module")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_tle_module)
+    args = make_inputs(tokens, hidden, 4)
+    packed = gems.pack_mega_mhc_weights(args[4])
+    verify(
+        candidate(args, packed_fn=packed, implementation=implementation),
+        reference(args),
+    )
+
+
+@pytest.mark.parametrize("implementation", ["auto", "triton"])
+@pytest.mark.parametrize("tokens,hidden", [(129, 4104), (513, 521)])
+@pytest.mark.parametrize("special", ["zero", "nan", "inf"])
+@pytest.mark.megamhc
+def test_mega_mhc_special_values(implementation, tokens, hidden, special):
+    args = make_inputs(tokens, hidden, 4)
+    if special == "zero":
+        args[0].zero_()
+        args[1].zero_()
+    else:
+        args[0][tokens // 2, 0] = float(special)
+    verify(candidate(args, implementation=implementation), reference(args))
+
+
+@pytest.mark.parametrize("tokens", [0, 1])
+@pytest.mark.parametrize("invalid", ["packed", "post", "norm", "fn", "repeats"])
+@pytest.mark.megamhc
+def test_mega_mhc_invalid_inputs(tokens, invalid):
+    args = list(make_inputs(tokens, 127, 4))
+    kwargs = {}
+    eps = EPS
+    if invalid == "packed":
+        kwargs["packed_fn"] = torch.empty(1, device=args[0].device)
+    elif invalid == "post":
+        args[2] = args[2].to(torch.bfloat16)
+    elif invalid == "norm":
+        args[-1] = args[-1][:-1]
+    elif invalid == "fn":
+        args[4] = args[4].t()
+    else:
+        eps = (*EPS[:-1], 0)
+    with pytest.raises(ValueError):
+        gems.mega_mhc(*args[:-1], *eps, norm_weight=args[-1], **kwargs)
+
+
+@pytest.mark.parametrize("implementation", ["auto", "triton"])
+@pytest.mark.parametrize("prepacked", [False, True])
+@pytest.mark.megamhc
+def test_mega_mhc_concurrent_graphs(implementation, prepacked):
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    inputs = [make_inputs(1029, 768, 4), make_inputs(2049, 521, 2)]
+    packed = [gems.pack_mega_mhc_weights(a[4]) if prepacked else None for a in inputs]
+    runs = []
+    for stream, args, weights in zip(streams, inputs, packed, strict=True):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            candidate(args, packed_fn=weights, implementation=implementation)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = candidate(
+                    args, packed_fn=weights, implementation=implementation
+                )
+            runs.append((graph, outputs))
+    torch.cuda.synchronize()
+    for _ in range(8):
+        for stream, args, (graph, _) in zip(streams, inputs, runs, strict=True):
+            with torch.cuda.stream(stream):
+                args[0].mul_(-0.75)
+                if not prepacked:
+                    args[4].neg_()
+                graph.replay()
+        torch.cuda.synchronize()
+    for args, (_, outputs) in zip(inputs, runs, strict=True):
+        rows = [0, args[0].shape[0] // 2, args[0].shape[0] - 1]
         sampled = tuple(value[rows] if i < 4 else value for i, value in enumerate(args))
         verify(tuple(value[rows] for value in outputs), reference(sampled))

@@ -180,7 +180,7 @@ def pack_mega_mhc_weights(fn):
     ):
         raise ValueError("expected a nonempty contiguous FP32 inference weight matrix")
 
-    from .megamhc_tle import pack_mega_mhc_weights_kernel
+    from .megamhc_kernel import pack_mega_mhc_weights_kernel
 
     p, k = fn.shape
     q = max(16, triton.next_power_of_2(p))
@@ -226,7 +226,9 @@ def mega_mhc(
 ):
     """Fuse the normal mHC post-to-pre boundary for BF16 inference on PPU.
 
-    Combination weights index [token, source stream, destination stream].
+    Inputs may have arbitrary leading batch dimensions. Combination weights
+    index [..., source stream, destination stream]. Tiling arguments are retained
+    for vLLM compatibility; dispatch selects its own tiling.
     Returns the BF16 updated residual, FP32 post and combination coefficients,
     and the BF16 collapsed layer input with optional RMS normalization.
 
@@ -242,15 +244,17 @@ def mega_mhc(
         raise ValueError("MegaMHC implementation must be 'auto' or 'triton'")
     if device.vendor_name != "thead" or residual.device.type != "cuda":
         raise NotImplementedError("MegaMHC requires T-Head PPU")
-    if residual.ndim != 3:
-        raise ValueError("residual must have shape [tokens, streams, hidden]")
-    tokens, streams, hidden = residual.shape
+    if residual.ndim < 2:
+        raise ValueError("residual must have shape [..., streams, hidden]")
+    outer = residual.shape[:-2]
+    streams, hidden = residual.shape[-2:]
+    tokens = math.prod(outer)
+    if tokens >= 2**31:
+        raise NotImplementedError("MegaMHC token count exceeds the PPU grid limit")
     if streams not in (1, 2, 4, 8) or not 0 < hidden <= 16384:
         raise NotImplementedError(
             "MegaMHC supports 1/2/4/8 streams and hidden sizes up to 16384"
         )
-    if n_splits != 1 or tile_n != 1:
-        raise NotImplementedError("MegaMHC selects its tiling internally")
     if not isinstance(sinkhorn_repeat, int) or sinkhorn_repeat < 1:
         raise ValueError("sinkhorn_repeat must be positive")
     if not all(
@@ -263,15 +267,15 @@ def mega_mhc(
 
     mixes = streams * (streams + 2)
     specs = [
-        (x, (tokens, hidden), torch.bfloat16),
-        (residual, (tokens, streams, hidden), torch.bfloat16),
-        (post_layer_mix, (tokens, streams, 1), torch.float32),
+        (x, (*outer, hidden), torch.bfloat16),
+        (residual, (*outer, streams, hidden), torch.bfloat16),
         (fn, (mixes, streams * hidden), torch.float32),
         (hc_scale, (3,), torch.float32),
         (hc_base, (mixes,), torch.float32),
     ]
-    if norm_weight is not None:
-        specs.append((norm_weight, (hidden,), torch.bfloat16))
+    if post_layer_mix.shape not in ((*outer, streams), (*outer, streams, 1)):
+        raise ValueError("invalid MegaMHC post weights")
+    specs.append((post_layer_mix, post_layer_mix.shape, torch.float32))
     for tensor, shape, dtype in specs:
         if tensor.shape != shape or tensor.dtype != dtype or not tensor.is_contiguous():
             raise ValueError(
@@ -280,24 +284,27 @@ def mega_mhc(
         if tensor.device != residual.device or tensor.requires_grad:
             raise ValueError("MegaMHC requires inference tensors on one PPU")
     if (
-        comb_res_mix.shape != (tokens, streams, streams)
+        comb_res_mix.shape != (*outer, streams, streams)
         or comb_res_mix.dtype != torch.float32
         or comb_res_mix.device != residual.device
         or comb_res_mix.requires_grad
     ):
         raise ValueError("invalid MegaMHC combination weights")
 
-    new_post = torch.empty_like(post_layer_mix)
-    new_comb = torch.empty(
-        (tokens, streams, streams), device=x.device, dtype=torch.float32
-    )
-    y = torch.empty_like(x)
-    if not tokens:
-        return torch.empty_like(residual), new_post, new_comb, y
+    if norm_weight is not None:
+        if (
+            norm_weight.shape != (hidden,)
+            or not norm_weight.is_floating_point()
+            or norm_weight.device != residual.device
+            or norm_weight.requires_grad
+        ):
+            raise ValueError("invalid MegaMHC normalization weight")
+        # vLLM rounds normalization weights to BF16 before multiplication.
+        # Triton performs the cast while loading; native SIMD needs BF16 input.
+        norm_weight = norm_weight.contiguous()
 
-    block_p = triton.next_power_of_2(mixes)
-    block_h = triton.next_power_of_2(hidden)
     k = streams * hidden
+    block_p = triton.next_power_of_2(mixes)
     q = max(16, block_p)
     if packed_fn is not None and (
         packed_fn.shape not in ((3, q, k), _packed_weight_shape(q, k))
@@ -307,6 +314,17 @@ def mega_mhc(
         or packed_fn.requires_grad
     ):
         raise ValueError("invalid MegaMHC packed projection weights")
+
+    new_post = torch.empty((*outer, streams, 1), device=x.device, dtype=torch.float32)
+    new_comb = torch.empty(
+        (*outer, streams, streams), device=x.device, dtype=torch.float32
+    )
+    y = torch.empty_like(x)
+    if not tokens:
+        return torch.empty_like(residual), new_post, new_comb, y
+
+    block_h = triton.next_power_of_2(hidden)
+    comb_res_mix = comb_res_mix.view(tokens, streams, streams)
     properties = torch.cuda.get_device_properties(x.device)
     multiprocessors = properties.multi_processor_count
     norm = norm_weight if norm_weight is not None else x
@@ -328,7 +346,6 @@ def mega_mhc(
         if (
             (properties.major, properties.minor) == (8, 0)
             and tokens > 8 * multiprocessors
-            and tokens < 2**31
             and k >= 256
             and block_p <= 32
             and has_triton_tle_attrs(("load",))
@@ -350,7 +367,7 @@ def mega_mhc(
                     packed_fn=packed_fn,
                     bitcode=device_bitcode() if implementation == "auto" else None,
                 )
-                return new_residual, *outputs
+                return new_residual.view(residual.shape), *outputs
 
         new_residual = torch.empty_like(residual)
         # Reuse large FP32 weight matrices across a few rows. SIMD keeps
@@ -364,6 +381,7 @@ def mega_mhc(
             and hidden % 8 == 0
             and 2 * tokens * k <= 2**32
             and sinkhorn_repeat < 2**32
+            and norm.dtype == torch.bfloat16
             and all(t.data_ptr() % 16 == 0 for t in (x, residual, fn, norm))
             and has_triton_tle_attrs(("gpu.alloc", "gpu.local_ptr"))
         )

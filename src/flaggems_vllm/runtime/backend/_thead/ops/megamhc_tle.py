@@ -10,6 +10,8 @@ from triton.language import core
 
 from flaggems_vllm.ops.mhc.mhc_pre import _mhc_recip
 
+from .megamhc_kernel import _pack_weights
+
 
 @core.extern
 def _wait_native(address, expected, _semantic=None):
@@ -118,59 +120,6 @@ def _post_async(
         tl.full((), ROWS, tl.uint32),
         R,
     )
-
-
-@triton.jit
-def _pack_weights(
-    Fn,
-    Packed,
-    tile,
-    K: tl.constexpr,
-    P: tl.constexpr,
-    Q: tl.constexpr,
-    BLOCK: tl.constexpr,
-    PACKED_SPLITS: tl.constexpr = 1,
-):
-    flat = tile.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    p = flat // K
-    value = tl.load(Fn + flat, p < P, 0.0)
-    high = value.to(tl.bfloat16)
-    # The last finite FP32 bin rounds to infinity in BF16. Keep its excess
-    # in the residual components, and propagate explicit non-finite weights.
-    finite = tl.abs(value) < float("inf")
-    overflow = finite & (tl.abs(high.to(tl.float32)) == float("inf"))
-    truncated = (value.to(tl.uint32, bitcast=True) & 0xFFFF0000).to(
-        tl.float32, bitcast=True
-    )
-    high = tl.where(overflow, truncated, high.to(tl.float32)).to(tl.bfloat16)
-    rest = tl.where(finite, value - high.to(tl.float32), 0.0)
-    middle = rest.to(tl.bfloat16)
-    low = (rest - middle.to(tl.float32)).to(tl.bfloat16)
-    # Each component has contiguous K tiles. Offline packing can place one
-    # split's tiles together, so the AIU descriptor ends at its last tile.
-    if PACKED_SPLITS > 1:
-        PART_K: tl.constexpr = K // PACKED_SPLITS
-        k = flat % K
-        packed_offset = (k // PART_K * Q + p) * PART_K + k % PART_K
-    else:
-        packed_offset = flat
-    dst = Packed + packed_offset
-    tl.store(dst, high, p < Q)
-    tl.store(dst + K * Q, middle, p < Q)
-    tl.store(dst + 2 * K * Q, low, p < Q)
-
-
-@triton.jit
-def pack_mega_mhc_weights_kernel(
-    Fn,
-    Packed,
-    K: tl.constexpr,
-    P: tl.constexpr,
-    Q: tl.constexpr,
-    BLOCK: tl.constexpr,
-    PACKED_SPLITS: tl.constexpr,
-):
-    _pack_weights(Fn, Packed, tl.program_id(0), K, P, Q, BLOCK, PACKED_SPLITS)
 
 
 @triton.jit
@@ -470,8 +419,10 @@ def _epilogue(
             value = tl.load(
                 Y + off, mask, other, cache_modifier=".ca", eviction_policy="evict_last"
             ).to(tl.float32)
-            norm = tl.load(Norm + h, col_mask, None if H % BLOCK_H == 0 else 0).to(
-                tl.float32
+            norm = (
+                tl.load(Norm + h, col_mask, None if H % BLOCK_H == 0 else 0)
+                .to(tl.bfloat16)
+                .to(tl.float32)
             )
             tl.store(
                 Y + off,
