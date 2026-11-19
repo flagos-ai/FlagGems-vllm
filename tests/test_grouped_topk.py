@@ -806,3 +806,198 @@ def test_grouped_topk_padding_with_strided_scores():
     torch.testing.assert_close(ids[~mask], ref[1][~mask], rtol=0, atol=0)
     assert torch.all(w[mask] == 0)
     assert torch.all(ids[mask] == -1)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.parametrize("groups,keep", [(1, 1), (8, 4)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("separate_scores", [False, True])
+def test_grouped_topk_fast_path_fp32_order(groups, keep, dtype, separate_scores):
+    # Tiny FP32 bias differences must survive routing even with BF16 inputs.
+    scores = torch.ones((3, 256), device=device, dtype=dtype)
+    bias = torch.arange(256, device=device, dtype=torch.float32) * (
+        2**-20 if separate_scores else 0.0
+    )
+    weights, ids = flaggems_vllm.grouped_topk(
+        scores, groups, keep, 8, True, 2.5, bias, 0
+    )
+    expected = (
+        torch.arange(255, 247, -1, device=device)
+        if separate_scores
+        else torch.arange(8, device=device)
+    )
+    torch.testing.assert_close(ids, expected.expand(3, -1).int(), rtol=0, atol=0)
+    torch.testing.assert_close(weights, torch.full_like(weights, 2.5 / 8))
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.parametrize("experts,topk", [(8, 3), (17, 5), (63, 7), (129, 8)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_grouped_topk_single_group_strided_ties(experts, topk, dtype):
+    backing = torch.ones((5, experts + 11), device=device, dtype=dtype)
+    scores = backing[:, :experts]
+    bias = torch.zeros(experts, device=device, dtype=torch.float32)
+    weights, ids = flaggems_vllm.grouped_topk(scores, 1, 1, topk, True, 1.0, bias, 0)
+    expected = torch.arange(topk, device=device, dtype=torch.int32).expand(5, -1)
+    torch.testing.assert_close(ids, expected, rtol=0, atol=0)
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / topk))
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.parametrize("groups,keep", [(1, 1), (8, 4)])
+def test_grouped_topk_fast_path_infinity_and_signed_zero(groups, keep):
+    scores = torch.ones((2, 256), device=device)
+    scores[:, [1, 253]] = float("inf")
+    bias = torch.zeros(256, device=device)
+    weights, ids = flaggems_vllm.grouped_topk(
+        scores, groups, keep, 8, False, 1.0, bias, 0
+    )
+    expected = torch.tensor([1, 253, 0, 2, 3, 4, 5, 6], device=device).int()
+    torch.testing.assert_close(ids, expected.expand(2, -1), rtol=0, atol=0)
+    assert torch.isposinf(weights[:, :2]).all()
+    torch.testing.assert_close(weights[:, 2:], torch.ones_like(weights[:, 2:]))
+
+    scores.zero_()
+    scores[:, ::2] = -0.0
+    weights, ids = flaggems_vllm.grouped_topk(
+        scores, groups, keep, 8, False, 1.0, bias, 0
+    )
+    expected = torch.arange(8, device=device).int().expand(2, -1)
+    torch.testing.assert_close(ids, expected, rtol=0, atol=0)
+    assert torch.equal(torch.signbit(weights), torch.signbit(scores[:, :8]))
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.parametrize(
+    "experts,groups,keep,topk", [(384, 3, 2, 4), (512, 8, 4, 8), (1024, 8, 4, 16)]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_grouped_topk_generic_sigmoid_precision(
+    experts, groups, keep, topk, dtype, renormalize
+):
+    torch.manual_seed(0)
+    scores = torch.randn(9, experts, device=device, dtype=dtype)
+    bias = torch.randn(experts, device=device, dtype=dtype)
+    args = (scores, groups, keep, topk, renormalize, 2.5, bias, 1)
+    expected = _torch_padding_routing_reference(*args)
+    actual = flaggems_vllm.grouped_topk(*args)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+    torch.testing.assert_close(actual[0], expected[0], rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA register selection path")
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("experts,topk", [(17, 3), (129, 5), (256, 8)])
+@pytest.mark.parametrize("pattern", ["random", "refine", "boundary"])
+def test_grouped_topk_register_candidate_refinement(
+    compact, dtype, experts, topk, pattern
+):
+    from flaggems_vllm.ops.grouped_topk import _grouped_topk_register_select_kernel
+
+    torch.manual_seed(2026)
+    rows = 3
+    # Exercise both expert and bias strides, including the exact-refinement load.
+    scores = torch.randn(rows, 2 * experts, device=device, dtype=dtype)[:, ::2]
+    bias = torch.randn(2 * experts, device=device, dtype=torch.float32)[::2]
+    if pattern != "random":
+        scores.fill_(1.0)
+        if pattern == "refine":
+            # Only K candidates share the bucket: compact selection must sort
+            # their full FP32 keys, reversing the coarse index tie-break.
+            bias.fill_(-1.0)
+            bias[:topk] = 1.0 + torch.arange(topk, device=device) * 2**-20
+        else:
+            # The cutoff bucket contains more than K candidates: retry with
+            # full-width keys or a true winner would be discarded.
+            bias.copy_(torch.arange(experts, device=device) * 2**-20)
+    reference = _torch_padding_routing_reference(scores, 1, 1, topk, True, 2.5, bias, 1)
+    weights = torch.empty(rows, topk, device=device, dtype=torch.float32)
+    indices = torch.empty(rows, topk, device=device, dtype=torch.int32)
+    _grouped_topk_register_select_kernel.fn[(rows,)](
+        scores,
+        bias,
+        weights,
+        indices,
+        None,
+        rows,
+        experts,
+        topk,
+        scores.stride(0),
+        scores.stride(1),
+        bias.stride(0),
+        2.5,
+        SCORING_FUNC=1,
+        RENORMALIZE=True,
+        HAS_PADDING=False,
+        COMPACT=compact,
+        num_warps=1,
+        num_stages=1,
+    )
+    torch.testing.assert_close(indices, reference[1], rtol=0, atol=0)
+    torch.testing.assert_close(weights, reference[0], rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA fused routing path")
+@pytest.mark.parametrize(
+    "experts,groups,keep,topk",
+    [(256, 1, 1, 8), (256, 8, 4, 8), (384, 3, 2, 4), (512, 8, 4, 8), (1024, 8, 4, 16)],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scoring_func", [0, 1])
+@pytest.mark.parametrize("layout", ["row_gap", "expert_step", "transpose"])
+def test_grouped_topk_fused_layouts(
+    experts, groups, keep, topk, dtype, scoring_func, layout
+):
+    torch.manual_seed(2026)
+    rows = 9
+    if layout == "row_gap":
+        scores = torch.randn(rows, experts + 11, device=device, dtype=dtype)[
+            :, :experts
+        ]
+    elif layout == "expert_step":
+        scores = torch.randn(rows, 2 * experts, device=device, dtype=dtype)[:, ::2]
+    else:
+        scores = torch.randn(experts, rows, device=device, dtype=dtype).T
+    bias = torch.randn(2 * experts, device=device, dtype=torch.float32)[::2]
+    args = (groups, keep, topk, True, 2.5, bias, scoring_func)
+    expected = _torch_padding_routing_reference(scores, *args)
+    actual = flaggems_vllm.grouped_topk(scores, *args)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+    torch.testing.assert_close(actual[0], expected[0], rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA fused routing path")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "pattern", ["ties", "zeros", "all_neginf", "infinity", "one_finite", "nan"]
+)
+def test_grouped_topk_generic_nonfinite(dtype, pattern):
+    scores = torch.ones((3, 384), device=device, dtype=dtype)
+    bias = torch.zeros(384, device=device, dtype=dtype)
+    expected_ids = torch.arange(4, device=device).expand(3, -1).int()
+    expected_weights = torch.ones((3, 4), device=device)
+    if pattern == "zeros":
+        scores.zero_()
+        scores[:, ::2] = -0.0
+        expected_weights.zero_()
+    elif pattern == "all_neginf":
+        scores.fill_(-float("inf"))
+        expected_weights.fill_(0.25)
+    elif pattern == "infinity":
+        scores[:, 1] = float("inf")
+        expected_ids = expected_ids + 128
+    elif pattern == "one_finite":
+        scores.fill_(-float("inf"))
+        scores[:, 0] = 1.0
+        expected_weights.fill_(0.25)
+    elif pattern == "nan":
+        scores[:, 0] = float("nan")
+        expected_ids = expected_ids + 1
+    weights, ids = flaggems_vllm.grouped_topk(scores, 3, 2, 4, False, 1.0, bias, 0)
+    torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
