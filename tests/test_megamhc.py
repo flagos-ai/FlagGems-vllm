@@ -263,3 +263,23 @@ def test_mega_mhc_short_graph_replay(tokens, hidden, streams, use_norm, implemen
         args[4].mul_(-0.5)
         graph.replay()
         verify(outputs, reference(args, use_norm=use_norm))
+
+
+@pytest.mark.parametrize("repeats", [1, 31])
+@pytest.mark.parametrize("streams,hidden", [(4, 4096), (2, 16384)])
+@pytest.mark.parametrize("use_norm", [False, True])
+@pytest.mark.megamhc
+def test_mega_mhc_sinkhorn_graph_replay(
+    repeats, streams, hidden, use_norm, monkeypatch
+):
+    monkeypatch.setitem(globals(), "EPS", (*EPS[:-1], repeats))
+    args = make_inputs(385, hidden, streams, strided=True)
+    candidate(args, use_norm=use_norm)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = candidate(args, use_norm=use_norm)
+    for _ in range(3):
+        args[0].mul_(-0.75)
+        args[4].mul_(-0.5)
+        graph.replay()
+        verify(outputs, reference(args, use_norm=use_norm))

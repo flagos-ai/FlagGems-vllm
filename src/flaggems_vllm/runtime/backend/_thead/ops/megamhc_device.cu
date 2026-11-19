@@ -626,6 +626,7 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
   unsigned lane = threadIdx.x & 31, warp = threadIdx.x / 32;
   const float *scale = reinterpret_cast<const float *>(scale_p);
   const float *base = reinterpret_cast<const float *>(base_p);
+  float combination_logit = 0.f;
   if (warp < Rows) {
     const unsigned row = warp;
     constexpr unsigned P = R * (R + 2);
@@ -662,7 +663,7 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
       }
     }
     float post_logit = __shfl_sync(0xffffffff, logits, R + lane % R);
-    float combination_logit =
+    combination_logit =
         __shfl_sync(0xffffffff, logits, 2 * R + lane % (R * R));
     if (lane < R) {
       const float pre =
@@ -675,6 +676,12 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
       shared_store(shared, 2 * Rows * 32 + row * R + lane, pre);
       reinterpret_cast<float *>(np)[(token + row) * R + lane] = post;
     }
+  }
+  // Publish collapse weights before Sinkhorn so the other warps can start
+  // collapsing their residual rows while coefficient warps finish mixing.
+  __syncthreads();
+  if (warp < Rows) {
+    const unsigned row = warp;
     float c =
         lane < R * R ? combination_logit * scale[2] + base[2 * R + lane] : 0.f;
     float maximum = c;
@@ -707,7 +714,6 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
     if (lane < R * R)
       reinterpret_cast<float *>(nc)[(token + row) * R * R + lane] = c;
   }
-  __syncthreads();
   // Reuse registers released by a multi-head projection. Narrow projections
   // keep the streaming finish to avoid raising their register requirement.
   if constexpr (Warps < R * (R + 2)) {
