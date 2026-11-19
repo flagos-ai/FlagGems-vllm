@@ -32,10 +32,12 @@ CUDA_AVAILABLE = is_cuda_available()
 
 VENDOR = flaggems_vllm.vendor_name
 
-# Vendors whose vLLM build ships the Triton fused_experts_impl.
-VLLM_NATIVE_VENDORS = {"nvidia", "metax"}
+# Vendors whose quantized benchmark uses the functional vLLM
+# fused_experts_impl as a reference. Production quantized MoE baselines are
+# not wired up yet.
+VLLM_FUNCTIONAL_VENDORS = {"nvidia", "metax"}
 
-if VENDOR in VLLM_NATIVE_VENDORS:
+if VENDOR in VLLM_FUNCTIONAL_VENDORS:
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         fused_experts_impl as vllm_fused_experts_impl,
     )
@@ -310,7 +312,7 @@ def _gems_fused_moe_mxq_w8a16_wrapper(
 
 
 def _get_baseline_op():
-    if VENDOR in VLLM_NATIVE_VENDORS:
+    if VENDOR in VLLM_FUNCTIONAL_VENDORS:
         return _baseline_w8a16_mxq_wrapper_vllm
     return None
 
