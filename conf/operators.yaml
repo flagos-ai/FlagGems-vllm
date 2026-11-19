@@ -1805,6 +1805,18 @@ ops:
   - MoE
   stages:
   - stable: '4.2'
+- id: moe_weighted_sum_out
+  description: Apply FP32 route weights to BF16 expert outputs and reduce into a caller-provided column slice.
+  for:
+  - moe_weighted_sum_out
+  labels:
+  - fused
+  - Reduction
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.4'
 - id: mrope
   description: 'Applies multi-modal rotary positional embeddings to query and key
     tensors,

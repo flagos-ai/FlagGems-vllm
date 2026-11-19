@@ -15,6 +15,7 @@ from flaggems_vllm.runtime.backend._metax.fused.fused_inv_rope_fp8_quant import 
 from flaggems_vllm.runtime.backend._metax.fused.gdn_chunk import (
     chunk_gated_delta_rule_fwd,
 )
+from flaggems_vllm.runtime.backend._metax.fused.moe_sum import moe_weighted_sum_out
 from flaggems_vllm.runtime.backend._metax.fused.top_k_per_row_decode import (
     top_k_per_row_decode,
 )
@@ -23,6 +24,7 @@ from flaggems_vllm.runtime.backend._metax.fused.top_k_per_row_prefill import (
 )
 
 __all__ = [
+    "moe_weighted_sum_out",
     "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_inv_rope_fp8_quant",
