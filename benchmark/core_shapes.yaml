@@ -465,6 +465,12 @@ QuantLightningIndexerBenchmark:
     - [32, 64, 128, 40, 32, 8, 128]
   shape_desc: "tokens, heads, dimension, pages, block, columns, topk"
 
+QuantLightningIndexerVllmAscendBenchmark:
+  shapes:
+    - [1]
+    - [16]
+  shape_desc: "(tokens), heads=64, head_dim=128, TopK=32"
+
 # the default shapes info
 Benchmark:
   shapes:

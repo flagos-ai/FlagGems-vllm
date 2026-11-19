@@ -542,7 +542,7 @@ def test_strided_quantized_query_graph_reloads_input_and_metadata():
         check(args, output=output)
 
 
-def test_quant_lightning_indexer_matches_vllm_ascend():
+def require_vllm_ascend_indexer():
     utils = pytest.importorskip("vllm_ascend.utils")
     if not utils.enable_custom_op():
         pytest.skip("vLLM-Ascend custom operators are unavailable")
@@ -553,7 +553,11 @@ def test_quant_lightning_indexer_matches_vllm_ascend():
     if native is None or metadata_op is None:
         pytest.skip("vLLM-Ascend quantized indexer operators are unavailable")
 
-    tokens, heads, dim, topk = 16, 64, 128, 32
+    return native, metadata_op
+
+
+def make_vllm_ascend_case(tokens, metadata_op):
+    heads, dim, topk = 64, 128, 32
     # Binary weights give each logical key a distinct score.
     bits = torch.arange(7)
     keys = torch.zeros((128, dim), dtype=torch.int8)
@@ -588,17 +592,6 @@ def test_quant_lightning_indexer_matches_vllm_ascend():
         max_seqlen_k=512,
         **kwargs,
     )
-    expected, _ = native(
-        q,
-        keys.unsqueeze(2),
-        weights,
-        query_scale,
-        key_scale,
-        block_table=table,
-        metadata=metadata,
-        return_value=False,
-        **kwargs,
-    )
     args = [
         q,
         keys,
@@ -611,7 +604,20 @@ def test_quant_lightning_indexer_matches_vllm_ascend():
         query_scale,
         key_scale,
     ]
-    actual = check(args, exact_ids=True)
-    torch.testing.assert_close(
-        actual, expected.reshape(tokens, topk).cpu(), rtol=0, atol=0
+    return args, dict(
+        block_table=table, metadata=metadata, return_value=False, **kwargs
     )
+
+
+def call_vllm_ascend_indexer(native, args, kwargs):
+    q, keys, weights, _, _, _, _, topk, query_scale, key_scale = args
+    output, _ = native(q, keys.unsqueeze(2), weights, query_scale, key_scale, **kwargs)
+    return output.reshape(q.shape[0], topk)
+
+
+def test_quant_lightning_indexer_matches_vllm_ascend():
+    native, metadata_op = require_vllm_ascend_indexer()
+    args, kwargs = make_vllm_ascend_case(16, metadata_op)
+    expected = call_vllm_ascend_indexer(native, args, kwargs)
+    actual = check(args, exact_ids=True)
+    torch.testing.assert_close(actual, expected.cpu(), rtol=0, atol=0)

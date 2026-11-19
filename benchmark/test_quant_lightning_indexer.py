@@ -15,12 +15,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Adapted from vllm-plugin-FL quant_lightning_indexer.py.
-"""Independent device-reference comparison using repository benchmark modes.
+"""Torch reference and native vLLM-Ascend comparisons using shared benchmark modes.
 
 Active set covers small decode, model decode, odd/general, and bounded prefill.
 Latency is reported in milliseconds; SpeedUp = device reference / FlagGems-vllm
 (higher is better). Timing, warmup and recording follow the CLI mode. Acceptance
-uses the separate same-shape old-FL comparison.
+uses the independent CPU oracle before timing.
 """
 
 from types import SimpleNamespace
@@ -29,7 +29,14 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_quant_lightning_indexer import check, data, invoke
+from tests.test_quant_lightning_indexer import (
+    call_vllm_ascend_indexer,
+    check,
+    data,
+    invoke,
+    make_vllm_ascend_case,
+    require_vllm_ascend_indexer,
+)
 
 from . import base
 
@@ -149,4 +156,44 @@ def test_quant_lightning_indexer_benchmark():
         dtypes=[torch.int8],
     )
     bench.set_gems(_candidate)
+    bench.run()
+
+
+class QuantLightningIndexerVllmAscendBenchmark(base.Benchmark):
+    DEFAULT_SHAPES = [(1,), (16,)]
+    DEFAULT_SHAPE_DESC = "(tokens), heads=64, head_dim=128, TopK=32"
+
+    def __init__(self, native, metadata_op):
+        super().__init__(
+            op_name="quant_lightning_indexer_vllm_ascend",
+            torch_op=self.native_call,
+            dtypes=[torch.int8],
+        )
+        self.native = native
+        self.metadata_op = metadata_op
+
+    def native_call(self, args, native_kwargs):
+        return call_vllm_ascend_indexer(self.native, args, native_kwargs)
+
+    @staticmethod
+    def candidate_call(args, native_kwargs):
+        return _candidate(*args)
+
+    def get_input_iter(self, dtype):
+        for (tokens,) in self.shapes:
+            if not isinstance(tokens, int) or not 1 <= tokens <= 128:
+                raise ValueError("Native indexer benchmark expects 1 to 128 tokens")
+            args, kwargs = make_vllm_ascend_case(tokens, self.metadata_op)
+            assert args[0].dtype == dtype
+            expected = check(args, exact_ids=True)
+            actual = self.native_call(args, kwargs).cpu()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            # Native metadata is built once before the timed calls.
+            yield args, {"native_kwargs": kwargs}
+
+
+def test_quant_lightning_indexer_vllm_ascend_benchmark():
+    native, metadata_op = require_vllm_ascend_indexer()
+    bench = QuantLightningIndexerVllmAscendBenchmark(native, metadata_op)
+    bench.set_gems(bench.candidate_call)
     bench.run()
