@@ -91,9 +91,10 @@ def _input_fn(shape, dtype, device):
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    # Keep topk_weights float32: this is the production router contract and
-    # the mctlass stage2 weighted path reads float32 weights.
-    topk_ids = topk_ids.to(torch.int32)
+    # topk_weights stays float32 for every backend: this is the production
+    # router contract, and mctlass stage2 also reads float32 weights.
+    assert topk_weights.dtype == torch.float32
+    assert topk_ids.dtype == torch.int32
     yield hidden_states, w1, w2, topk_weights, topk_ids
 
 
