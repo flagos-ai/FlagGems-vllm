@@ -479,6 +479,34 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
 
 
 @pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.parametrize("topk_length", [0, 63, 64, 65, 4096])
+def test_flash_mla_sparse_topk_length_is_bounded(topk_length):
+    """Dynamic lengths must not read beyond the physical indices row (#1324)."""
+    torch.manual_seed(42)
+    s_q, h_q, d_qk, s_kv, topk = 2, 64, 512, 96, 64
+    device = flaggems_vllm.device
+    q = torch.randn(s_q, h_q, d_qk, device=device, dtype=torch.bfloat16) / 10
+    kv = torch.randn(s_kv, 1, d_qk, device=device, dtype=torch.bfloat16) / 10
+    indices = torch.randint(0, s_kv, (s_q, 1, topk), device=device, dtype=torch.int32)
+    indices[0, 0, 0] = -1
+    indices[0, 0, 1] = s_kv
+    lengths = torch.tensor([topk_length, topk], device=device, dtype=torch.int32)
+
+    reference_lengths = lengths.clamp_max(topk)
+    expected = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        s_q, s_kv, h_q, 1, d_qk, topk, q, kv, indices, 0.5, 512,
+        None, reference_lengths,
+    )
+    actual = flaggems_vllm.flash_mla_sparse_fwd(
+        q, kv, indices, 0.5, 512, topk_length=lengths,
+    )
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_tensor, expected_tensor, atol=8e-4, rtol=3.01 / 128,
+        )
+
+
+@pytest.mark.flash_mla_sparse_fwd
 def test_flash_mla_sparse_vendor_export_and_abi():
     from flaggems_vllm.ops import flashmla_sparse as generic
 
