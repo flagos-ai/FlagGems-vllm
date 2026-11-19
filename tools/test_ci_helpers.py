@@ -46,6 +46,30 @@ class TemporaryRepositoryTestCase(unittest.TestCase):
 
 
 class SelectTestsTest(TemporaryRepositoryTestCase):
+    def test_megamhc_helpers_select_operator_tests_and_benchmarks(self):
+        self.make_file("tests/test_megamhc.py")
+        self.make_file("benchmark/test_megamhc.py")
+        for source in (
+            "megamhc.py",
+            "megamhc_kernel.py",
+            "megamhc_pipeline.py",
+            "megamhc_runtime.py",
+            "megamhc_simt.py",
+            "megamhc_device.cu",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    select_tests.select_targets(
+                        self.repo_root,
+                        [f"src/flaggems_vllm/runtime/backend/_thead/ops/{source}"],
+                    ),
+                    (
+                        "smoke",
+                        ["tests/test_megamhc.py"],
+                        ["benchmark/test_megamhc.py"],
+                    ),
+                )
+
     def test_environment_and_operator_changes_are_combined(self):
         self.make_file("tests/test_mul.py")
 

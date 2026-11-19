@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Per-token Triton fusion for small grids and non-vector layouts."""
+
 import triton
 import triton.language as tl
 
@@ -20,8 +22,7 @@ from flaggems_vllm.ops.mhc.mhc_pre import _mhc_recip
 
 @triton.jit
 def _isfinite_f32(value):
-    # The SDK cannot lower vector llvm.is.fpclass. Keep classification in
-    # integer registers rather than changing the compiler or math precision.
+    # PPU has no vector fpclass lowering; classify the FP32 exponent directly.
     exponent = tl.inline_asm_elementwise(
         "and.b32 $0, $1, 0x7f800000;",
         constraints="=r,r",

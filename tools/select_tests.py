@@ -91,6 +91,7 @@ THEAD_MEGAMHC_SOURCES = (
     "megamhc_kernel.py",
     "megamhc_pipeline.py",
     "megamhc_runtime.py",
+    "megamhc_simt.py",
     "megamhc_device.cu",
 )
 

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Host validation, weight preparation, and PPU kernel dispatch."""
+
 import math
 
 import torch
@@ -27,6 +29,33 @@ _PROJECTION_BLOCK_K = 64
 _PROJECTION_MAX_SPLITS = 8
 # Native finish caches eight BF16x8 vectors per lane in a 32-lane warp.
 _SIMT_CACHED_H_PER_WARP = 8 * 32 * 8
+
+
+def _simt_launch_config(tokens, hidden, mixes, multiprocessors):
+    """Choose complete and half row tiles from occupancy and cache capacity."""
+    block_mix = triton.next_power_of_2(mixes)
+    if tokens <= 2 * multiprocessors:
+        rows, warps = 2, max(8, block_mix)
+    elif tokens <= 4 * multiprocessors:
+        rows, warps = 2, max(8, block_mix // 2)
+    else:
+        rows, warps = 4, max(8, block_mix // 4)
+    blocks = triton.cdiv(tokens, rows)
+    large_blocks = 0
+    # Cached row tiles can fill incomplete waves without increasing
+    # register use. Wider tiles retain their FP32 weight reuse.
+    target_blocks = 2 * multiprocessors
+    cached_hidden = _SIMT_CACHED_H_PER_WARP * (warps // rows)
+    if (
+        rows > 2
+        and warps < mixes
+        and hidden <= cached_hidden
+        and blocks < target_blocks
+    ):
+        half_rows = rows // 2
+        large_blocks = triton.cdiv(tokens - target_blocks * half_rows, rows - half_rows)
+        blocks = target_blocks
+    return rows, warps, blocks, large_blocks
 
 
 def _projection_splits(k):
@@ -245,29 +274,9 @@ def mega_mhc(
             if bitcode is not None:
                 from .megamhc_simt import mega_mhc_simt_kernel
 
-                if tokens <= 2 * multiprocessors:
-                    rows, warps = 2, max(8, block_p)
-                elif tokens <= 4 * multiprocessors:
-                    rows, warps = 2, max(8, block_p // 2)
-                else:
-                    rows, warps = 4, max(8, block_p // 4)
-                blocks = triton.cdiv(tokens, rows)
-                large_blocks = 0
-                # Cached row tiles can fill incomplete waves without increasing
-                # register use. Wider tiles retain their FP32 weight reuse.
-                target_blocks = 2 * multiprocessors
-                cached_hidden = _SIMT_CACHED_H_PER_WARP * (warps // rows)
-                if (
-                    rows > 2
-                    and warps < mixes
-                    and hidden <= cached_hidden
-                    and blocks < target_blocks
-                ):
-                    half_rows = rows // 2
-                    large_blocks = triton.cdiv(
-                        tokens - target_blocks * half_rows, rows - half_rows
-                    )
-                    blocks = target_blocks
+                rows, warps, blocks, large_blocks = _simt_launch_config(
+                    tokens, hidden, mixes, multiprocessors
+                )
                 mega_mhc_simt_kernel[(blocks,)](
                     *inputs,
                     new_residual,

@@ -1,16 +1,18 @@
 // Copyright 2026 FlagOS Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <hggc_runtime.h>
 #include <stdint.h>
 #include <type_traits>
-#include <hggc_runtime.h>
 
 extern "C" __device__ int megamhc_wait(uint64_t address, uint64_t expected) {
   if (threadIdx.x == 0) {
     uint64_t observed;
     do {
       asm volatile("ppu.ld.global.gpu.acquire.b64 %0, [ %1 + 0 ];"
-                   : "=l"(observed) : "l"(address) : "memory");
+                   : "=l"(observed)
+                   : "l"(address)
+                   : "memory");
     } while (observed < expected);
   }
   __syncthreads();
@@ -25,7 +27,9 @@ constexpr unsigned kRows = 2;
 
 __device__ __forceinline__ void copy_tile(unsigned addr, uint64_t src) {
   asm volatile("cp.async.cg.shared.global [ %0 + 0 ], [ %1 + 0 ], 0x10, 0x10;"
-               : : "r"(addr), "l"(src) : "memory");
+               :
+               : "r"(addr), "l"(src)
+               : "memory");
 }
 
 struct Bf16x8 {
@@ -35,14 +39,18 @@ struct Bf16x8 {
 __device__ __forceinline__ Bf16x8 read_tile(unsigned addr) {
   Bf16x8 v;
   asm volatile("ld.shared.v4.b32 { %0, %1, %2, %3 }, [ %4 + 0 ];"
-               : "=r"(v.word[0]), "=r"(v.word[1]), "=r"(v.word[2]), "=r"(v.word[3])
-               : "r"(addr) : "memory");
+               : "=r"(v.word[0]), "=r"(v.word[1]), "=r"(v.word[2]),
+                 "=r"(v.word[3])
+               : "r"(addr)
+               : "memory");
   return v;
 }
 
 __device__ __forceinline__ void write_tile(uint64_t addr, const Bf16x8 &v) {
   asm volatile("ppu.st.global.wt.v4.b32 [ %0 + 0 ], { %1, %2, %3, %4 };"
-               : : "l"(addr), "r"(v.word[0]), "r"(v.word[1]), "r"(v.word[2]), "r"(v.word[3])
+               :
+               : "l"(addr), "r"(v.word[0]), "r"(v.word[1]), "r"(v.word[2]),
+                 "r"(v.word[3])
                : "memory");
 }
 
@@ -267,6 +275,8 @@ project(uint64_t xp, uint64_t rp, uint64_t postp, uint64_t combp, uint64_t fnp,
                                           uint64_t>::type;
   constexpr unsigned P = R * (R + 2);
   constexpr unsigned Heads = (P + Warps - 1) / Warps;
+  static_assert(P < kLanes, "SIMD projection heads must fit in one warp");
+  static_assert(Warps % Rows == 0, "Rows must divide the CTA warp count");
   const unsigned lane = threadIdx.x & 31;
   const unsigned warp = threadIdx.x / 32;
   constexpr unsigned RowWarps = Warps / Rows;
@@ -663,8 +673,7 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
       }
     }
     float post_logit = __shfl_sync(0xffffffff, logits, R + lane % R);
-    combination_logit =
-        __shfl_sync(0xffffffff, logits, 2 * R + lane % (R * R));
+    combination_logit = __shfl_sync(0xffffffff, logits, 2 * R + lane % (R * R));
     if (lane < R) {
       const float pre =
           __fdividef(1.f, 1.f + __expf(-(logits * scale[0] + base[lane]))) +

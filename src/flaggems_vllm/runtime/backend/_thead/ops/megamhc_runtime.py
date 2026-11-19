@@ -1,6 +1,8 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+"""Lazy SDK bindings and cached compilation of PPU device helpers."""
+
 import ctypes
 import functools
 import hashlib

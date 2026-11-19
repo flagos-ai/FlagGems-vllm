@@ -283,3 +283,24 @@ def test_mega_mhc_sinkhorn_graph_replay(
         args[4].mul_(-0.5)
         graph.replay()
         verify(outputs, reference(args, use_norm=use_norm))
+
+
+@pytest.mark.parametrize("implementation", ["auto", "triton"])
+@pytest.mark.parametrize("tokens", [385, 4097])
+@pytest.mark.megamhc
+def test_mega_mhc_broadcast_comb_graph_replay(tokens, implementation):
+    args = make_inputs(tokens, 4096, 4)
+    comb = args[3][:, :1, :1].expand(tokens, 4, 4)
+    args = (*args[:3], comb, *args[4:])
+    packed = gems.pack_mega_mhc_weights(args[4])
+    candidate(args, packed_fn=packed, implementation=implementation)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = candidate(args, packed_fn=packed, implementation=implementation)
+    rows = [0, tokens // 2, tokens - 1]
+    for _ in range(3):
+        args[0].mul_(-0.75)
+        args[5].mul_(-0.5)
+        graph.replay()
+        sampled = tuple(value[rows] if i < 4 else value for i, value in enumerate(args))
+        verify(tuple(value[rows] for value in outputs), reference(sampled))

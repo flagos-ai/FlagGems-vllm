@@ -1,6 +1,8 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+"""Ticket-ordered CTA pipeline for post, split-K projection, and finish."""
+
 import triton
 import triton.language as tl
 from triton.experimental.tle import language as tle
