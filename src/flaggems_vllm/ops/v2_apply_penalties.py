@@ -35,6 +35,6 @@ def v2_apply_penalties(
     flattened request/position convention as vLLM's V2 batch. For draft rows,
     prior draft tokens contribute to output counts only for that row. Counts,
     masks and metadata are read-only. All operands are on the same supported
-    device. Empty logits need no launch. Invoke this outside model graph capture.
+    device. Empty logits need no launch. Capture support is backend-specific.
     """
-    raise NotImplementedError("v2_apply_penalties requires Kunlunxin")
+    raise NotImplementedError("v2_apply_penalties requires a backend implementation")

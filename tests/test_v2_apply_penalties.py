@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""V2 sampling penalty semantics against an independent CPU reference."""
+"""Shared V2 penalty contract for Ascend and Kunlunxin backends."""
 
 import pytest
 import torch
 
 
-def _penalty_fixture(vocab_size):
-    rows = 10
+def _penalty_fixture(vocab_size, backend):
+    rows = 10 if backend == "kunlunxin" else 9
     generator = torch.Generator().manual_seed(873)
     logits_storage = torch.full((rows, vocab_size + 7), 1234.0)
     logits = logits_storage[:, :vocab_size]
@@ -20,12 +20,13 @@ def _penalty_fixture(vocab_size):
     logits[2, 7] = -2
     logits[0, -1] = -4
     logits[-1, 0] = float("-inf")
-    logits[-1, 1] = -0.0
+    if backend == "kunlunxin":
+        logits[-1, 1] = -0.0
 
-    mapping = torch.tensor([2, 2, 2, 2, 0, 0, 0, 1, 3, 3], dtype=torch.int32)
-    local_pos = torch.tensor([0, 1, 2, 3, 0, 1, 2, 0, 0, 1], dtype=torch.int32)
+    mapping = torch.tensor([2, 2, 2, 2, 0, 0, 0, 1, 3, 3][:rows], dtype=torch.int32)
+    local_pos = torch.tensor([0, 1, 2, 3, 0, 1, 2, 0, 0, 1][:rows], dtype=torch.int32)
     token_ids = torch.tensor(
-        [31, 31, 7, 31, 32, 31, vocab_size - 1, 33, 1024, 7], dtype=torch.int32
+        [31, 31, 7, 31, 32, 31, vocab_size - 1, 33, 1024, 7][:rows], dtype=torch.int32
     )
     repetition = torch.tensor([1.2, 0.7, 1.7, 1.0], dtype=torch.float32)
     frequency = torch.tensor([0.4, -0.25, 0.5, 0.0], dtype=torch.float32)
@@ -124,27 +125,36 @@ def _verify_penalty_oracle(case, expected):
     assert int(case["packed"][2, 0]) < 0, "Packed bit 31 was not exercised"
 
 
-def _sampling_device():
+def _sampling_device(backend):
+    if backend == "ascend":
+        pytest.importorskip("torch_npu")
+        if not torch.npu.is_available():
+            pytest.skip("Ascend NPU is unavailable")
     import flaggems_vllm
 
-    if flaggems_vllm.vendor_name != "kunlunxin":
-        pytest.skip("Kunlunxin required")
-    return flaggems_vllm, torch.device("cuda", torch.cuda.current_device())
+    if flaggems_vllm.vendor_name != backend:
+        pytest.skip(f"{backend} backend required")
+    device_type = "npu" if backend == "ascend" else "cuda"
+    device_module = torch.npu if backend == "ascend" else torch.cuda
+    return flaggems_vllm, torch.device(device_type, device_module.current_device())
 
 
 @pytest.mark.v2_apply_penalties
 @pytest.mark.parametrize(
-    "vocab_size,dtype",
+    "backend,vocab_size,dtype",
     [
-        (1031, torch.bfloat16),
-        (2057, torch.float16),
-        (151939, torch.float32),
-        (248320, torch.float16),
+        ("ascend", 1031, torch.bfloat16),
+        ("ascend", 2057, torch.float16),
+        ("ascend", 151939, torch.float32),
+        ("kunlunxin", 1031, torch.bfloat16),
+        ("kunlunxin", 2057, torch.float16),
+        ("kunlunxin", 151939, torch.float32),
+        ("kunlunxin", 248320, torch.float16),
     ],
 )
-def test_v2_apply_penalties(vocab_size, dtype):
-    library, device = _sampling_device()
-    case = _penalty_fixture(vocab_size)
+def test_v2_apply_penalties(backend, vocab_size, dtype):
+    library, device = _sampling_device(backend)
+    case = _penalty_fixture(vocab_size, backend)
     case["logits_storage"] = case["logits_storage"].to(dtype)
     case["logits"] = case["logits_storage"][:, :vocab_size]
     expected = _penalty_cpu_reference({**case, "logits": case["logits"].float()})
@@ -174,7 +184,8 @@ def test_v2_apply_penalties(vocab_size, dtype):
     torch.testing.assert_close(
         logits.cpu(), expected.to(dtype), rtol=tolerance, atol=tolerance
     )
-    assert torch.signbit(logits[-1, 1].cpu())
+    if backend == "kunlunxin":
+        assert torch.signbit(logits[-1, 1].cpu())
     for actual, reference in (
         (logits_storage[:, vocab_size:], case["logits_storage"][:, vocab_size:]),
         (packed_storage, case["packed_storage"]),
@@ -184,8 +195,9 @@ def test_v2_apply_penalties(vocab_size, dtype):
 
 
 @pytest.mark.v2_apply_penalties
-def test_empty_penalties_preserve_logits_shape():
-    library, device = _sampling_device()
+@pytest.mark.parametrize("backend", ["ascend", "kunlunxin"])
+def test_empty_penalties_preserve_logits_shape(backend):
+    library, device = _sampling_device(backend)
     logits = torch.empty((0, 1031), device=device)
     index = torch.empty((0,), device=device, dtype=torch.int32)
     coeff = torch.empty((0,), device=device)
@@ -205,3 +217,39 @@ def test_empty_penalties_preserve_logits_shape():
         is None
     )
     assert logits.shape == (0, 1031)
+
+
+@pytest.mark.v2_apply_penalties
+@pytest.mark.parametrize("backend", ["ascend", "kunlunxin"])
+def test_penalty_cpu_reference_covers_backend_fixtures(backend):
+    case = _penalty_fixture(1031, backend)
+    expected = _penalty_cpu_reference(case)
+    _verify_penalty_oracle(case, expected)
+    if backend == "kunlunxin":
+        assert torch.signbit(expected[-1, 1])
+
+
+@pytest.mark.v2_apply_penalties
+@pytest.mark.parametrize("rows", [0, 1])
+def test_v2_apply_penalties_is_explicitly_unsupported_on_nvidia(rows):
+    import flaggems_vllm
+
+    if flaggems_vllm.vendor_name != "nvidia":
+        pytest.skip("NVIDIA generic contract")
+    device = flaggems_vllm.device
+    index = torch.zeros(rows, device=device, dtype=torch.int32)
+    coeff = torch.zeros(rows, device=device)
+    words = torch.zeros(rows, 33, device=device, dtype=torch.int32)
+    counts = torch.zeros(rows, 1031, device=device, dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="backend implementation"):
+        flaggems_vllm.v2_apply_penalties(
+            torch.empty(rows, 1031, device=device),
+            index,
+            index,
+            index,
+            torch.ones_like(coeff),
+            coeff,
+            coeff,
+            words,
+            counts,
+        )
