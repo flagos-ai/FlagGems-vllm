@@ -411,23 +411,4 @@ def mhc_post(
     return out
 
 
-__all__ = ["MixLayout", "mhc_post", "mhc_post_ref"]
-
-
-def mhc_post_ref(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_layer_mix: torch.Tensor,
-    comb_res_mix: torch.Tensor,
-    *,
-    mix_layout: MixLayout = MixLayout.TRANSPOSED,
-) -> torch.Tensor:
-    """PyTorch reference implementation (mirrors :func:`mhc_post` layouts)."""
-    if not isinstance(mix_layout, MixLayout):
-        raise TypeError(
-            "mix_layout must be a MixLayout enum member, "
-            f"got {type(mix_layout).__name__}"
-        )
-    mix = comb_res_mix.mT if mix_layout is MixLayout.TRANSPOSED else comb_res_mix
-    y = x.unsqueeze(-2) * post_layer_mix + torch.bmm(mix, residual.float())
-    return y.type_as(x)
+__all__ = ["MixLayout", "mhc_post"]
