@@ -108,3 +108,94 @@ def moe_sum(
         BLOCK_SIZE=block_size,
         **launch_kwargs,
     )
+
+
+@triton.jit
+def _weighted_sum(
+    ROUTE_OUTPUT,
+    WEIGHTS,
+    OUTPUT,
+    H: tl.constexpr,
+    TOPK: tl.constexpr,
+    RT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ROUTE_H: tl.constexpr = 0,
+    OUTPUT_START: tl.constexpr = 0,
+):
+    RH: tl.constexpr = H if ROUTE_H == 0 else ROUTE_H
+    tl.static_assert(0 <= OUTPUT_START and OUTPUT_START + RH <= H)
+    token = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    slots = tl.arange(0, RT)
+    values = tl.load(
+        ROUTE_OUTPUT + (token * TOPK + slots[:, None]) * RH + columns[None, :],
+        (slots[:, None] < TOPK) & (columns[None, :] < RH),
+        0,
+    ).to(tl.float32)
+    weights = tl.load(WEIGHTS + token * TOPK + slots, slots < TOPK, 0).to(tl.float32)
+    result = tl.sum(values * weights[:, None], axis=0)
+    tl.store(
+        OUTPUT + token * H + OUTPUT_START + columns,
+        result.to(tl.bfloat16),
+        columns < RH,
+    )
+
+
+def moe_weighted_sum_out(route_output, weights, out, *, column_start=0):
+    """Weight BF16 expert outputs in FP32, then store one BF16 output slice.
+
+    route_output has shape [tokens * topk, width]. Only columns
+    [column_start, column_start + width) of out are modified. Input buffers
+    must not share storage with out. No cross-call workspace is retained.
+    """
+    if not route_output.is_cuda:
+        raise NotImplementedError("This reduction is qualified on MetaX")
+    if type(column_start) is not int:
+        raise TypeError("column_start must be an integer column index")
+    if weights.ndim != 2 or out.ndim != 2 or route_output.ndim != 2:
+        raise ValueError("Expected matrix inputs and output")
+    tokens, topk = weights.shape
+    rows, width = route_output.shape
+    if (
+        rows != tokens * topk
+        or out.shape[0] != tokens
+        or not 1 <= topk <= 16
+        or width <= 0
+        or column_start < 0
+        or column_start + width > out.shape[1]
+    ):
+        raise ValueError("Invalid route shape or output slice")
+    if (
+        route_output.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+        or weights.dtype != torch.float32
+    ):
+        raise ValueError("Expected BF16 values/output and FP32 route weights")
+    if not all(
+        t.is_contiguous() and t.device == out.device
+        for t in (out, route_output, weights)
+    ):
+        raise ValueError("All tensors must be contiguous on one device")
+    # Triton computes the flattened row/column indices with int32 arithmetic.
+    if max(route_output.numel(), weights.numel(), out.numel()) >= 2**31:
+        raise ValueError("Weighted reduction exceeds the supported index range")
+    if tokens == 0:
+        return
+    if out.untyped_storage().data_ptr() in (
+        route_output.untyped_storage().data_ptr(),
+        weights.untyped_storage().data_ptr(),
+    ):
+        raise ValueError("Output may not alias an input")
+    _weighted_sum[(tokens, triton.cdiv(width, 256))](
+        route_output,
+        weights,
+        out,
+        out.shape[1],
+        topk,
+        triton.next_power_of_2(topk),
+        256,
+        ROUTE_H=width,
+        OUTPUT_START=column_start,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
