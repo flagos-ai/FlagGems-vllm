@@ -1454,18 +1454,6 @@ kda_safe_gate_cumsum:
   - META: {BD: 64}
     num_warps: 8
 
-# Sparse top-k overwrites only its output and private scratch on each launch.
-top_k_per_row_standard:
-  - META: {}
-    num_warps: 4
-    num_stages: 3
-  - META: {}
-    num_warps: 8
-    num_stages: 3
-  - META: {}
-    num_warps: 16
-    num_stages: 3
-
 concat_mla_q:
   - META: {BLOCK: 128}
     num_warps: 4
