@@ -23,21 +23,6 @@ from . import base
 
 VENDOR = flaggems_vllm.vendor_name
 
-VLLM_NATIVE_VENDORS = {
-    "nvidia",
-    "metax",
-}
-
-
-if VENDOR in VLLM_NATIVE_VENDORS:
-    import vllm._custom_ops  # noqa: F401
-
-if VENDOR == "metax":
-    try:
-        import mcoplib._C  # noqa: F401
-    except ImportError:
-        pass
-
 
 K = 512
 WORKSPACE_BYTES = 1 << 20
@@ -87,6 +72,22 @@ def _input_fn(shape, dtype, device):
     yield logits, lengths, indices, workspace, K, max_seq_len
 
 
+def _native_persistent_topk():
+    """Resolve torch.ops._C.persistent_topk when this vendor's vLLM exposes it."""
+    try:
+        import vllm._custom_ops  # noqa: F401
+
+        if VENDOR == "metax":
+            try:
+                import mcoplib._C  # noqa: F401
+            except ImportError:
+                pass
+        op = getattr(getattr(torch.ops, "_C", None), "persistent_topk", None)
+        return op if callable(op) else None
+    except Exception:
+        return None
+
+
 def _vllm_native_op(logits, lengths, indices, workspace, k, max_seq_len):
 
     torch.ops._C.persistent_topk(logits, lengths, indices, workspace, k, max_seq_len)
@@ -94,12 +95,35 @@ def _vllm_native_op(logits, lengths, indices, workspace, k, max_seq_len):
     return indices
 
 
+def _torch_persistent_topk(logits, lengths, indices, workspace, k, max_seq_len):
+    """torch reference (benchmark-only): top-k over each row's valid prefix.
+
+    Masks out the -inf tail beyond ``lengths[r]`` and pads the result with -1,
+    matching persistent_topk's semantics (ids unsorted).
+    """
+    width = logits.shape[1]
+    cols = torch.arange(width, device=logits.device)
+    valid = cols[None, :] < lengths[:, None].to(cols.dtype)
+    masked = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
+    take = min(k, width)
+    vals, idx = masked.topk(take, dim=-1, sorted=False)
+    idx = torch.where(
+        vals != float("-inf"),
+        idx.to(torch.int32),
+        torch.full_like(idx, -1, dtype=torch.int32),
+    )
+    indices[:, :take] = idx
+    if take < k:
+        indices[:, take:] = -1
+    return indices
+
+
 def _get_baseline_op():
 
-    if VENDOR in VLLM_NATIVE_VENDORS:
+    if _native_persistent_topk() is not None:
         return _vllm_native_op
 
-    return None
+    return _torch_persistent_topk
 
 
 class PersistentTopKBenchmark(base.GenericBenchmarkExcluse1D):

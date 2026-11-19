@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Separate torch and vLLM baselines; latency is ms, SpeedUp = base / gems.
+"""Benchmark FlagGems-vllm cooperative_topk against the native kernel.
 
-Each shape has homogeneous full-row lengths. The torch baseline includes the
+Each shape has homogeneous full-row lengths. The torch reference includes the
 int64-to-int32 output copy and short-row padding required by the public API.
 No device-to-host length reads occur in timed or graph-captured code.
 The core set covers the short-row path, the 16384 regression cases, padded
 rows and million-column rows. Comprehensive adds the rows/width/k sweep.
-Report each shape's latency and SpeedUp separately; the default kernel mode
-uses median latency and does not mix native-vLLM and torch baseline results.
+
+The baseline follows the repo convention: use vLLM's native
+``torch.ops._C.cooperative_topk`` when it is available on this build, and fall
+back to a vectorized torch reference otherwise (never skip).
 """
 
 import pytest
@@ -35,6 +37,7 @@ def torch_cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
         output[:, :width].copy_(torch.arange(width, device=logits.device))
     else:
         output.copy_(torch.topk(logits, k, dim=-1, sorted=False).indices)
+    return output
 
 
 class CooperativeTopKBenchmark(base.Benchmark):
@@ -73,28 +76,38 @@ class CooperativeTopKBenchmark(base.Benchmark):
             yield logits, lengths, output, workspace, k, width
 
 
-def test_cooperative_topk_torch():
-    bench = CooperativeTopKBenchmark(
-        op_name="cooperative_topk",
-        torch_op=torch_cooperative_topk,
-        gems_op=flaggems_vllm.cooperative_topk,
-        dtypes=[torch.float32],
-    )
-    bench.run()
-
-
-def test_cooperative_topk_vllm():
+def _native_cooperative_topk():
+    """Resolve torch.ops._C.cooperative_topk on a supported NVIDIA build."""
     if flaggems_vllm.vendor_name != "nvidia":
-        pytest.skip("vLLM cooperative_topk requires NVIDIA")
+        return None
+    if not torch.cuda.is_available():
+        return None
     major, _ = torch.cuda.get_device_capability()
     if major < 9 or major == 12:
-        pytest.skip("vLLM cooperative_topk requires SM90+ excluding SM12x")
-    pytest.importorskip("vllm._custom_ops")
-    if not hasattr(torch.ops._C, "cooperative_topk"):
-        pytest.skip("vLLM build does not expose cooperative_topk")
+        return None
+    try:
+        import vllm._custom_ops  # noqa: F401
+    except Exception:
+        return None
+    op = getattr(getattr(torch.ops, "_C", None), "cooperative_topk", None)
+    return op if callable(op) else None
+
+
+def _vllm_native_op(logits, lengths, output, workspace, k, max_seq_len):
+    torch.ops._C.cooperative_topk(logits, lengths, output, workspace, k, max_seq_len)
+    return output
+
+
+def _get_baseline_op():
+    if _native_cooperative_topk() is not None:
+        return _vllm_native_op
+    return torch_cooperative_topk
+
+
+def test_cooperative_topk():
     bench = CooperativeTopKBenchmark(
-        op_name="cooperative_topk_vllm",
-        torch_op=torch.ops._C.cooperative_topk,
+        op_name="cooperative_topk",
+        torch_op=_get_baseline_op(),
         gems_op=flaggems_vllm.cooperative_topk,
         dtypes=[torch.float32],
     )

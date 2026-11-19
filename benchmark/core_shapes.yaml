@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cooperative_topk: &cooperative_topk_shapes
+cooperative_topk:
   shapes:
     - [1, 127, 512]
     - [4, 4097, 512]
@@ -24,10 +24,6 @@ cooperative_topk: &cooperative_topk_shapes
     - [64, 262144, 2048]
     - [1, 1048576, 1024]
   shape_desc: "rows, width, k"
-
-# Keep the native-vLLM comparison on exactly the same workloads.
-cooperative_topk_vllm:
-  <<: *cooperative_topk_shapes
 
 fused_recurrent_gated_delta_rule:
   # Resolve names through baseline.PERF_CASES to preserve the full workloads.
