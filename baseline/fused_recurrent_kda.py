@@ -7,6 +7,8 @@ from typing import NamedTuple
 
 import torch
 
+from baseline import native_api
+
 OP_NAME = "fused_recurrent_kda"
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 IS_INPLACE = True
@@ -40,45 +42,33 @@ PERF_CASES = [
 ]
 
 
+# Which implementation ``native()`` resolved: "ascendc", a module name, or None.
+_NATIVE_KIND = None
+# AscendC recurrent_kda is compiled for bfloat16 only on Ascend 910B (see the
+# shipped kernel/ascend910b/recurrent_kda variants); fp16/fp32 launches fail at
+# tiling time with 161002.
+_ASCENDC_DTYPES = (torch.bfloat16,)
+
+
 def native():
-    global NATIVE_UNAVAILABLE_REASON
-    try:
-        from vllm.model_executor.layers.fla.ops.kda import fused_recurrent_kda
-    except (ImportError, AttributeError) as exc:
-        first_error = exc
-    else:
-        NATIVE_UNAVAILABLE_REASON = None
-        return fused_recurrent_kda
-    # On Ascend the vendor operator is the AscendC `recurrent_kda` in fla_npu
-    # (vllm-ascend's `run_recurrent_kda` calls exactly this). It needs the
-    # seq-first layout and reports the state as [.., V, K], which is the layout
-    # this benchmark's inputs use.
-    try:
-        from fla_npu.ops.ascendc import recurrent_kda as _ascendc_kda
-    except ImportError as exc:
-        ascendc_error = exc
-    else:
-
-        def _ascendc_native(**kwargs):
-            return _ascendc_kda(
-                **kwargs,
-                layout="BSND",
-                state_v_first=True,
-                output_final_state=True,
-            )
-
-        NATIVE_UNAVAILABLE_REASON = None
-        return _ascendc_native
-    # Last resort: vllm-ascend's Triton KDA, which has vLLM's own signature.
-    try:
-        from vllm_ascend.ops.triton.kda.kda import fused_recurrent_kda
-    except (ImportError, AttributeError) as exc:
-        NATIVE_UNAVAILABLE_REASON = (
-            f"{first_error!r}; AscendC: {ascendc_error!r}; Triton: {exc!r}"
-        )
+    global NATIVE_UNAVAILABLE_REASON, _NATIVE_KIND
+    fn, source = native_api.fused_recurrent_kda()
+    if fn is None:
+        NATIVE_UNAVAILABLE_REASON = "no native fused_recurrent_kda for this platform"
+        _NATIVE_KIND = None
         return None
     NATIVE_UNAVAILABLE_REASON = None
-    return fused_recurrent_kda
+    if source != "fla_npu.ops.ascendc":
+        _NATIVE_KIND = source
+        return fn
+    # The AscendC kernel needs the seq-first layout and reports the state as
+    # [.., V, K], which is the layout this benchmark's inputs already use.
+    _NATIVE_KIND = "ascendc"
+
+    def _ascendc_native(**kwargs):
+        return fn(**kwargs, layout="BSND", state_v_first=True, output_final_state=True)
+
+    return _ascendc_native
 
 
 def grid():
@@ -95,6 +85,11 @@ def build_inputs(binding, dtype, device):
 
 def unsupported_reason(binding, dtype):
     case = Case(*binding["case"])
+    if _NATIVE_KIND == "ascendc" and dtype not in _ASCENDC_DTYPES:
+        return (
+            "AscendC recurrent_kda ships bfloat16 kernels only on this part, "
+            f"so {dtype} cannot launch (aclnn returns 161002)"
+        )
     if case.key_dim != case.value_dim:
         return "Native vLLM 0.24.0 allocates output as empty_like(k), requiring K=V"
     if case.key_dim & (case.key_dim - 1):

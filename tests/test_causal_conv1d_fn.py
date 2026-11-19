@@ -34,6 +34,7 @@ pytest.importorskip("torch_npu")
 import torch.nn.functional as F  # noqa: E402
 
 import flaggems_vllm  # noqa: E402
+from baseline import native_api  # noqa: E402
 
 from .conftest import QUICK_MODE  # noqa: E402
 
@@ -102,11 +103,14 @@ def causal_conv1d_ref(
 
 
 def _load_vllm_ascend_ref():
-    """vllm-ascend's native causal_conv1d_fn, or None when unavailable.
+    """vllm-ascend's causal_conv1d_fn: Ascend only.
 
-    Resolved lazily so a plain (non-Ascend) environment still collects the
-    module: the import itself pulls in torch_npu and the vllm platform plugin.
+    ``native_api`` resolves the platform's own API (AscendC on Ascend, vLLM
+    elsewhere); this remains as the Ascend-specific fallback when the AscendC
+    kernel is unavailable.
     """
+    if flaggems_vllm.vendor_name != "ascend":
+        return None
     try:
         from vllm_ascend.ops.causal_conv1d import causal_conv1d_fn as native
     except Exception:  # ImportError, or an older tree that raises on import
@@ -115,9 +119,11 @@ def _load_vllm_ascend_ref():
 
 
 VLLM_ASCEND_FN = _load_vllm_ascend_ref()
+# Platform-isolated: AscendC/vllm-ascend on Ascend, vLLM's own op elsewhere.
+NATIVE_FN, NATIVE_SOURCE = native_api.causal_conv1d_fn()
 # "torch" is the local per-sequence reference; "vllm_ascend" is the vendor API
 # and is only collected when that API exists in the environment.
-REF_SOURCES = ["torch"] + (["vllm_ascend"] if VLLM_ASCEND_FN is not None else [])
+REF_SOURCES = ["torch"] + (["native"] if NATIVE_FN is not None else [])
 
 
 @pytest.mark.causal_conv1d_fn
@@ -224,18 +230,54 @@ def test_causal_conv1d_varlen(
     # Reference: the local per-sequence torch loop by default, or vllm-ascend's
     # native API when the environment has it. Both update the conv-state cache
     # in place, so they run on their own copy of the states.
-    if ref_source == "vllm_ascend":
-        out_ref_tensor = VLLM_ASCEND_FN(
-            x_ref.squeeze(0),
-            weight_ref,
-            bias=bias_ref,
-            activation=activation,
-            conv_states=final_states_ref,
-            has_initial_state=has_initial_states,
-            cache_indices=padded_state_indices,
-            query_start_loc=query_start_loc.npu(),
-            pad_slot_id=PAD_SLOT_ID,
-        ).unsqueeze(0)
+    if ref_source == "native" and padding:
+        # The AscendC kernel requires a dense cache-slot batch: with PAD slots
+        # in cache_indices its output diverges from this operator's compacted
+        # layout (and some shapes fail to tile at all, 561002). vllm-ascend
+        # never calls it that way -- it repacks the state rows into a dense
+        # batch and remaps the indices first.
+        pytest.skip("vendor causal_conv1d requires dense cache slots, no pad slots")
+
+    if ref_source == "native":
+        if NATIVE_SOURCE == "fla_npu.ops.ascendc":
+            # The AscendC kernel takes kernel layouts: x [tokens, channels],
+            # weight [width, channels], conv_states [cache, state_len, channels].
+            native_states = final_states_ref.transpose(1, 2).contiguous()
+            try:
+                out_native = NATIVE_FN(
+                    x_ref.squeeze(0).transpose(0, 1),
+                    weight_ref.transpose(0, 1).contiguous(),
+                    bias_ref,
+                    conv_states=native_states,
+                    query_start_loc=query_start_loc.npu(),
+                    cache_indices=padded_state_indices,
+                    has_initial_state=has_initial_states,
+                    activation=activation,
+                    pad_slot_id=PAD_SLOT_ID,
+                    null_block_id=PAD_SLOT_ID,
+                )
+            except RuntimeError as exc:
+                # The AscendC kernel rejects some padded shapes (561002, a
+                # tiling error); vllm-ascend itself repacks the state rows into
+                # a dense batch before calling it.
+                pytest.skip(f"vendor causal_conv1d rejects this case: {exc}")
+            final_states_ref = native_states.transpose(1, 2)
+            # The kernel writes the full padded token space, like this
+            # operator. The comparison below slices on the reference length, so
+            # a full-length reference is compared token-for-token.
+            out_ref_tensor = out_native.transpose(0, 1).unsqueeze(0)
+        else:
+            out_ref_tensor = NATIVE_FN(
+                x_ref.squeeze(0),
+                weight_ref,
+                bias=bias_ref,
+                activation=activation,
+                conv_states=final_states_ref,
+                has_initial_state=has_initial_states,
+                cache_indices=padded_state_indices,
+                query_start_loc=query_start_loc.npu(),
+                pad_slot_id=PAD_SLOT_ID,
+            ).unsqueeze(0)
     else:
         # Run the first batch_size sequences one by one (skip pad slots),
         # writing final conv states back into final_states_ref in place.

@@ -31,6 +31,7 @@ pytest.importorskip("torch_npu")
 import torch.nn.functional as F  # noqa: E402
 
 import flaggems_vllm  # noqa: E402
+from baseline import native_api  # noqa: E402
 
 from .conftest import QUICK_MODE  # noqa: E402
 
@@ -110,7 +111,13 @@ def causal_conv1d_update_ref(
 
 
 def _load_vllm_ascend_ref():
-    """vllm-ascend's native causal_conv1d_update, or None when unavailable."""
+    """vllm-ascend's causal_conv1d_update: Ascend only.
+
+    ``native_api`` resolves the platform's own API (AscendC on Ascend, vLLM
+    elsewhere); this remains as the Ascend-specific fallback.
+    """
+    if flaggems_vllm.vendor_name != "ascend":
+        return None
     try:
         from vllm_ascend.ops.causal_conv1d import causal_conv1d_update as native
     except Exception:  # ImportError, or an older tree that raises on import
@@ -119,7 +126,9 @@ def _load_vllm_ascend_ref():
 
 
 VLLM_ASCEND_UPDATE = _load_vllm_ascend_ref()
-REF_SOURCES = ["torch"] + (["vllm_ascend"] if VLLM_ASCEND_UPDATE is not None else [])
+# Platform-isolated: AscendC/vllm-ascend on Ascend, vLLM's own op elsewhere.
+NATIVE_UPDATE, NATIVE_UPDATE_SOURCE = native_api.causal_conv1d_update()
+REF_SOURCES = ["torch"] + (["native"] if NATIVE_UPDATE is not None else [])
 
 
 @pytest.mark.causal_conv1d_update
@@ -186,8 +195,8 @@ def test_causal_conv1d_update_with_batch_gather(
     activation = None if not silu_activation else "silu"
     # The kernel writes its result over x in place, so snapshot what the native
     # reference needs before the call.
-    native_x = x_channel_last.clone() if ref_source == "vllm_ascend" else None
-    native_state = conv_state.clone() if ref_source == "vllm_ascend" else None
+    native_x = x_channel_last.clone() if ref_source == "native" else None
+    native_state = conv_state.clone() if ref_source == "native" else None
     npu_out = flaggems_vllm.causal_conv1d_update(
         x,
         conv_state,
@@ -198,16 +207,34 @@ def test_causal_conv1d_update_with_batch_gather(
         pad_slot_id=PAD_SLOT_ID,
     )
 
-    if ref_source == "vllm_ascend":
-        out_ref = VLLM_ASCEND_UPDATE(
-            native_x,
-            native_state,
-            weight,
-            bias,
-            activation=activation,
-            conv_state_indices=padded_state_indices,
-            pad_slot_id=PAD_SLOT_ID,
-        ).transpose(1, 2)[:batch_size]
+    if ref_source == "native":
+        if NATIVE_UPDATE_SOURCE == "fla_npu.ops.ascendc":
+            # AscendC kernel layouts: x [batch, seqlen, channels], weight
+            # [width, channels], conv_state [cache, state_len, channels]; an
+            # unused slot is marked by null_block_id, not a pad_slot_id arg.
+            native_states = native_state.transpose(1, 2).contiguous()
+            try:
+                out_ref = NATIVE_UPDATE(
+                    native_x,
+                    native_states,
+                    weight.transpose(0, 1).contiguous(),
+                    bias,
+                    activation=activation,
+                    conv_state_indices=padded_state_indices,
+                    null_block_id=PAD_SLOT_ID,
+                ).transpose(1, 2)[:batch_size]
+            except RuntimeError as exc:
+                pytest.skip(f"vendor causal_conv1d rejects this case: {exc}")
+            native_state = native_states.transpose(1, 2)
+        else:
+            out_ref = NATIVE_UPDATE(
+                native_x,
+                native_state,
+                weight,
+                bias,
+                activation=activation,
+                conv_state_indices=padded_state_indices,
+            ).transpose(1, 2)[:batch_size]
         conv_state_ref = native_state[conv_state_indices, :].detach().clone()
     else:
         out_ref = causal_conv1d_update_ref(

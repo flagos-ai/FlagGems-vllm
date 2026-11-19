@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 import flaggems_vllm
+from baseline import native_api
 
 try:
     chunk_kda = import_module(
@@ -42,6 +43,8 @@ def _load_vllm_ascend_chunk_kda():
     operator's contract: raw gate plus ``A_log``/``dt_bias``/``lower_bound``
     and in-kernel q/k L2 norm, with beta already sigmoided by the caller.
     """
+    if flaggems_vllm.vendor_name != "ascend":
+        return None
     try:
         from vllm_ascend.ops.triton.kda.kda import chunk_kda_with_fused_gate
     except Exception:  # ImportError, or a tree without the KDA kernels
@@ -51,6 +54,8 @@ def _load_vllm_ascend_chunk_kda():
 
 def _load_fla_npu_chunk_kda():
     """The AscendC KDA prefill kernel vllm-ascend ships in production."""
+    if flaggems_vllm.vendor_name != "ascend":
+        return None
     try:
         from fla_npu.ops.ascendc import chunk_kda_fwd as native
     except Exception:
@@ -60,11 +65,17 @@ def _load_fla_npu_chunk_kda():
 
 VLLM_ASCEND_CHUNK_KDA = _load_vllm_ascend_chunk_kda()
 FLANPU_CHUNK_KDA = _load_fla_npu_chunk_kda()
+# Non-Ascend platforms reference vLLM's own KDA instead of a vendor NPU API.
+VLLM_CHUNK_KDA, VLLM_CHUNK_KDA_SOURCE = (
+    (None, None) if flaggems_vllm.vendor_name == "ascend" else native_api.chunk_kda()
+)
 REF_SOURCES = ["torch"]
 if FLANPU_CHUNK_KDA is not None:
     REF_SOURCES.append("flanpu")
 if VLLM_ASCEND_CHUNK_KDA is not None:
     REF_SOURCES.append("vllm_ascend")
+if VLLM_CHUNK_KDA is not None:
+    REF_SOURCES.append("vllm")
 
 
 pytestmark = pytest.mark.chunk_kda
@@ -253,6 +264,45 @@ def _flanpu_chunk_kda_reference(
     except (RuntimeError, ValueError) as exc:
         raise pytest.skip(f"AscendC chunk_kda_fwd rejects this case: {exc}")
     return out[0], out[1]
+
+
+def _vllm_chunk_kda_reference(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    *,
+    scale,
+    initial_state,
+    output_final_state,
+    A_log,
+    dt_bias,
+    state_v_first,
+    cu_seqlens,
+):
+    """Reference from vLLM's own KDA prefill (non-Ascend platforms).
+
+    Same call shape as the vllm-ascend helper: raw gate plus
+    ``A_log``/``dt_bias``/``lower_bound``, with beta pre-sigmoided and the q/k
+    L2 norm done in-kernel.
+    """
+    return VLLM_CHUNK_KDA(
+        q,
+        k,
+        v,
+        g,
+        beta.float().sigmoid(),
+        A_log.reshape(-1),
+        dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        safe_gate=True,
+        lower_bound=LOWER_BOUND,
+    )
 
 
 def _vllm_ascend_chunk_kda_reference(
@@ -536,6 +586,7 @@ def test_chunk_kda_matches_torch_reference(case, ref_source):
     ref = {
         "flanpu": _flanpu_chunk_kda_reference,
         "vllm_ascend": _vllm_ascend_chunk_kda_reference,
+        "vllm": _vllm_chunk_kda_reference,
     }.get(ref_source, _reference_chunk_kda)
     expected, expected_final = ref(
         *args,

@@ -266,11 +266,11 @@ def test_fused_recurrent_kda_invalid(invalid):
 def _native_candidates():
     """Vendor implementations, most-native first.
 
-    ``baseline.native()`` is the operator the benchmark times (the AscendC
-    ``fla_npu`` kernel on Ascend). Its aclnn launch still rejects some shapes
-    that the vendor's own Triton fallback accepts ("GetWorkspaceSize failed:
-    161002"), so that fallback is kept as a second reference and each case uses
-    the first implementation that accepts it.
+    ``baseline.native()`` is the operator the benchmark times: the AscendC
+    ``fla_npu`` kernel on Ascend, vLLM's own op elsewhere. On Ascend the vendor
+    Triton fallback is kept as a second reference because the AscendC kernel is
+    compiled for bfloat16 only (fp16/fp32 return 161002) and rejects a few
+    shapes; each case uses the first implementation that accepts it.
     """
     candidates = []
     try:
@@ -279,13 +279,16 @@ def _native_candidates():
         primary = None
     if primary is not None:
         candidates.append(primary)
-    try:
-        from vllm_ascend.ops.triton.kda.kda import fused_recurrent_kda as triton_kda
-    except Exception:
-        pass
-    else:
-        if triton_kda is not primary:
-            candidates.append(triton_kda)
+    # vllm-ascend's Triton KDA is Ascend-only; other platforms already resolved
+    # vLLM's own op as the primary candidate above.
+    if gems.vendor_name == "ascend":
+        try:
+            from vllm_ascend.ops.triton.kda.kda import fused_recurrent_kda as triton_kda
+        except Exception:
+            pass
+        else:
+            if triton_kda is not primary:
+                candidates.append(triton_kda)
     return candidates
 
 
