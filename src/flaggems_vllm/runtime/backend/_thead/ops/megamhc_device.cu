@@ -195,6 +195,9 @@ DEFINE_MHC_POST(4)
 namespace megamhc_simt {
 // Eight packed vectors cap the normalization cache at 32 registers per lane.
 constexpr unsigned kCachedVectors = 8;
+// Wider head groups use the CTA's vector loads for exceptional dot products.
+template <unsigned Warps, unsigned R, unsigned Rows>
+constexpr bool kCtaRetry = Rows >= 4 || (Rows >= 2 && R * (R + 2) > 2 * Warps);
 // Vector transactions move eight BF16 values (16 bytes). Each token reserves
 // one warp-sized projection row: the supported 1/2/4-stream mixes fit below
 // lane 32, leaving a lane for the row norm used by compensated retries.
@@ -627,7 +630,7 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
     const unsigned row = warp;
     constexpr unsigned P = R * (R + 2);
     float logits = shared_load(shared, row * 32 + lane);
-    if constexpr (Rows < 4) {
+    if constexpr (!kCtaRetry<Warps, R, Rows>) {
       const float magnitude = shared_load(shared, Rows * 32 + row * 32 + lane);
       const float inverse = __shfl_sync(0xffffffff, logits, P);
       unsigned redo =
@@ -719,18 +722,17 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
 } // namespace megamhc_simt
 
 #define MHC_SIMT(W, R, N)                                                      \
-  extern "C" __device__                                                        \
-      __attribute__((always_inline)) int megamhc_simt_##W##_##R##_##N(         \
-          uint64_t x, uint64_t residual, uint64_t post, uint64_t comb,         \
-          uint64_t fn, uint64_t scale, uint64_t base, uint64_t norm,           \
-          uint64_t output, uint64_t new_post, uint64_t new_comb, uint64_t y,   \
-          uint64_t token, uint64_t s0, uint64_t s1, uint64_t s2,               \
-          unsigned hidden, unsigned shared, unsigned repeat, float rms_eps,    \
-          float pre_eps, float sink_eps, float mult, float norm_eps,           \
-          unsigned has_norm) {                                                 \
+  extern "C" __device__ __attribute__((always_inline)) int                     \
+  megamhc_simt_##W##_##R##_##N(                                                \
+      uint64_t x, uint64_t residual, uint64_t post, uint64_t comb,             \
+      uint64_t fn, uint64_t scale, uint64_t base, uint64_t norm,               \
+      uint64_t output, uint64_t new_post, uint64_t new_comb, uint64_t y,       \
+      uint64_t token, uint64_t s0, uint64_t s1, uint64_t s2, unsigned hidden,  \
+      unsigned shared, unsigned repeat, float rms_eps, float pre_eps,          \
+      float sink_eps, float mult, float norm_eps, unsigned has_norm) {         \
     megamhc_simt::project<W, R, N>(x, residual, post, comb, fn, output, token, \
                                    s0, s1, s2, hidden, shared, rms_eps);       \
-    if constexpr (N >= 4)                                                      \
+    if constexpr (megamhc_simt::kCtaRetry<W, R, N>)                            \
       megamhc_simt::retry_projection<W, R, N>(output, fn, token, hidden,       \
                                               shared);                         \
     return megamhc_simt::epilogue<W, R, N>(                                    \

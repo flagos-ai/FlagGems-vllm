@@ -37,6 +37,25 @@ def _simt_tile(*args, W, R, N, _semantic=None):
 
 
 @triton.jit
+def _simt_rows(
+    pointers,
+    scalars,
+    first,
+    T: tl.constexpr,
+    W: tl.constexpr,
+    R: tl.constexpr,
+    N: tl.constexpr,
+):
+    if T % N == 0 or first + N <= T:
+        _simt_tile(*pointers, first, *scalars, W=W, R=R, N=N)
+    else:
+        for row in range(N):
+            token = first + row
+            if token < T:
+                _simt_tile(*pointers, token, *scalars, W=W, R=R, N=1)
+
+
+@triton.jit
 def mega_mhc_simt_kernel(
     X,
     Residual,
@@ -65,8 +84,8 @@ def mega_mhc_simt_kernel(
     HAS_NORM: tl.constexpr,
     ROWS: tl.constexpr,
     WARPS: tl.constexpr,
+    LARGE_BLOCKS: tl.constexpr = 0,
 ):
-    first = tl.program_id(0).to(tl.uint64) * ROWS
     shared = tle.gpu.alloc(
         [triton.next_power_of_2(2 * ROWS * 32 + ROWS * R + WARPS + ROWS)],
         dtype=tl.float32,
@@ -102,10 +121,12 @@ def mega_mhc_simt_kernel(
         norm_eps,
         tl.full((), int(HAS_NORM), tl.uint32),
     )
-    if T % ROWS == 0 or first + ROWS <= T:
-        _simt_tile(*pointers, first, *scalars, W=WARPS, R=R, N=ROWS)
+    pid = tl.program_id(0).to(tl.uint64)
+    if LARGE_BLOCKS:
+        if pid < LARGE_BLOCKS:
+            _simt_rows(pointers, scalars, pid * ROWS, T, WARPS, R, ROWS)
+        else:
+            first = LARGE_BLOCKS * ROWS + (pid - LARGE_BLOCKS) * (ROWS // 2)
+            _simt_rows(pointers, scalars, first, T, WARPS, R, ROWS // 2)
     else:
-        for row in range(ROWS):
-            token = first + row
-            if token < T:
-                _simt_tile(*pointers, token, *scalars, W=WARPS, R=R, N=1)
+        _simt_rows(pointers, scalars, pid * ROWS, T, WARPS, R, ROWS)

@@ -249,7 +249,17 @@ def mega_mhc(
                     rows, warps = 2, max(8, block_p // 2)
                 else:
                     rows, warps = 4, max(8, block_p // 4)
-                mega_mhc_simt_kernel[(triton.cdiv(tokens, rows),)](
+                blocks = triton.cdiv(tokens, rows)
+                large_blocks = 0
+                # Fill incomplete waves with a mixture of full and half row tiles.
+                target_blocks = 2 * multiprocessors
+                if rows > 2 and blocks < target_blocks:
+                    half_rows = rows // 2
+                    large_blocks = triton.cdiv(
+                        tokens - target_blocks * half_rows, rows - half_rows
+                    )
+                    blocks = target_blocks
+                mega_mhc_simt_kernel[(blocks,)](
                     *inputs,
                     new_residual,
                     *outputs,
@@ -260,6 +270,7 @@ def mega_mhc(
                     has_norm,
                     rows,
                     warps,
+                    LARGE_BLOCKS=large_blocks,
                     num_warps=warps,
                     num_stages=1,
                     enable_fp_fusion=False,
