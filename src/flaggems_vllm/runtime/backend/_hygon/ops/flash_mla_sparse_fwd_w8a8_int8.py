@@ -282,8 +282,7 @@ def _v32_prefill_weights(
     KScale,
     Indices,
     Length,
-    High,
-    Low,
+    Weights,
     TileStats,
     RowOffset,
     H: tl.constexpr,
@@ -332,13 +331,13 @@ def _v32_prefill_weights(
     quant = (scaled + tl.where(scaled >= 0.0, 0.5, -0.5)).to(tl.int32)
     high = (quant + 64) >> 7
     low = quant - (high << 7)
-    packed = (local_row * H + heads[:, None]) * K + offsets[None, :]
-    tl.store(High + packed, high.to(tl.int8))
-    tl.store(Low + packed, low.to(tl.int8))
-    stats = ((local_row * H + heads) * (K // 256) + tile) * 3
+    operands = ((high << 8) | (low & 255)).to(tl.int16)
+    weight_offsets = (local_row * H + heads[:, None]) * K + offsets[None, :]
+    tl.store(Weights + weight_offsets, operands)
+    stats = (local_row * (K // 256) + tile) * 3 * H + heads
     tl.store(TileStats + stats, maximum)
-    tl.store(TileStats + stats + 1, tl.sum(probability, 1))
-    tl.store(TileStats + stats + 2, quantum)
+    tl.store(TileStats + stats + H, tl.sum(probability, 1))
+    tl.store(TileStats + stats + 2 * H, quantum)
 
 
 @triton.jit
@@ -347,8 +346,7 @@ def _v32_prefill_values(
     Indices,
     Length,
     Sink,
-    High,
-    Low,
+    Weights,
     TileStats,
     Output,
     LSE,
@@ -384,23 +382,24 @@ def _v32_prefill_values(
             values = tl.load(
                 KV + token[:, None] * 512 + channels[None, :], valid[:, None], 0
             )
-            packed = (local_row * H + heads[:, None]) * K + offsets[None, :]
-            high_sum = tl.dot(
-                tl.load(High + packed), values, high_sum, out_dtype=tl.int32
-            )
-            low_sum = tl.dot(tl.load(Low + packed), values, low_sum, out_dtype=tl.int32)
+            weight_offsets = (local_row * H + heads[:, None]) * K + offsets[None, :]
+            operands = tl.load(Weights + weight_offsets)
+            high = (operands >> 8).to(tl.int8)
+            low = operands.to(tl.int8)
+            high_sum = tl.dot(high, values, high_sum, out_dtype=tl.int32)
+            low_sum = tl.dot(low, values, low_sum, out_dtype=tl.int32)
 
-        stats = ((local_row * H + heads) * (K // 256) + tile) * 3
+        stats = (local_row * (K // 256) + tile) * 3 * H + heads
         tile_maximum = tl.load(TileStats + stats)
         next_maximum = tl.maximum(maximum, tile_maximum)
         safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
         retain = tl.exp2(maximum - safe_maximum)
         include = tl.exp2(tile_maximum - safe_maximum)
-        denominator = denominator * retain + tl.load(TileStats + stats + 1) * include
+        denominator = denominator * retain + tl.load(TileStats + stats + H) * include
         contribution = high_sum.to(tl.float32) * 128.0 + low_sum.to(tl.float32)
         output = (
             output * retain[:, None]
-            + contribution * (tl.load(TileStats + stats + 2) * include)[:, None]
+            + contribution * (tl.load(TileStats + stats + 2 * H) * include)[:, None]
         )
         maximum = next_maximum
 
@@ -441,10 +440,9 @@ def _prepare_v32_prefill(
     tokens = k_cache_lora.shape[0] * 64
     # Process row chunks so the P14 workspace does not grow with the batch.
     chunk = min(rows, 512)
-    high = torch.empty((chunk, heads, topk), device=q_nope.device, dtype=torch.int8)
-    low = torch.empty_like(high)
+    weights = torch.empty((chunk, heads, topk), device=q_nope.device, dtype=torch.int16)
     stats = torch.empty(
-        (chunk, heads, topk // 256, 3), device=q_nope.device, dtype=torch.float32
+        (chunk, topk // 256, 3, heads), device=q_nope.device, dtype=torch.float32
     )
 
     def run():
@@ -459,8 +457,7 @@ def _prepare_v32_prefill(
                 k_scale,
                 indices,
                 topk_length,
-                high,
-                low,
+                weights,
                 stats,
                 base,
                 heads,
@@ -476,8 +473,7 @@ def _prepare_v32_prefill(
                 indices,
                 topk_length,
                 attn_sink,
-                high,
-                low,
+                weights,
                 stats,
                 output,
                 lse,
