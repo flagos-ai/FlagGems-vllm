@@ -1,0 +1,2215 @@
+{
+ "_environment": {
+  "hardware": {
+   "gpu": {
+    "name": "NVIDIA H100 80GB HBM3",
+    "total_memory_bytes": 84942979072,
+    "total_memory_gib": 79.11,
+    "compute_capability": "9.0",
+    "multiprocessor_count": 132,
+    "driver_version": "535.161.08"
+   },
+   "cpu_model": "Intel(R) Xeon(R) Platinum 8468",
+   "cpu_architecture": "x86_64",
+   "cpu_socket_count": 2,
+   "physical_cpu_core_count": 96,
+   "logical_cpu_count": 192,
+   "cpu_threads_per_core": 2,
+   "numa_node_count": 2,
+   "process_cpu_affinity_count": 192,
+   "hypervisor_vendor": null
+  },
+  "software": {
+   "os": "Linux",
+   "os_release": "5.15.0-105-generic",
+   "machine": "x86_64",
+   "python": "3.12.13",
+   "packages": {
+    "torch": "2.13.0",
+    "triton": "3.7.1",
+    "vllm": "0.32.0",
+    "sglang": null
+   },
+   "torch_cuda_version": "13.0",
+   "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Mon_Oct_12_19:25:48_PDT_2026\nCuda compilation tools, release 13.5, V13.5.37\nBuild cuda_13.5.r13.5/compiler.39125733_0",
+   "ncu_version": "NVIDIA (R) Nsight Compute Command Line Profiler\nCopyright (c) 2018-2026 NVIDIA Corporation\nVersion 2026.3.1.0 (build 38829034) (public-release)"
+  },
+  "environment_variables": {
+   "CUDA_DEVICE_ORDER": null
+  },
+  "reference_chip": "H800"
+ },
+ "_scaling_factors": {
+  "reference_chip": "H800",
+  "source_specs": "hardware_specs.json",
+  "chips": [
+   {
+    "vendor": "nvidia",
+    "chip": "H800",
+    "measured": {
+     "bandwidth_gbps": 1.0,
+     "tensor": {
+      "bf16": 1.0,
+      "fp16": 1.0,
+      "fp32": 1.0,
+      "tf32": 1.0,
+      "int8": 1.0,
+      "fp64": 1.0,
+      "fp8": 1.0
+     },
+     "vector": {
+      "bf16": 1.0,
+      "fp16": 1.0,
+      "fp32": 1.0,
+      "int8": 1.0,
+      "fp64": 1.0,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "nvidia",
+    "chip": "H100",
+    "measured": {
+     "bandwidth_gbps": 1.0,
+     "tensor": {
+      "bf16": 1.0,
+      "fp16": 1.043177,
+      "fp32": 1.0,
+      "tf32": 0.964248,
+      "int8": 0.988141,
+      "fp64": 58.895238,
+      "fp8": 1.048242
+     },
+     "vector": {
+      "bf16": 0.99985,
+      "fp16": 0.99985,
+      "fp32": 0.992618,
+      "int8": 1.0003,
+      "fp64": 29.304762,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "thead",
+    "chip": "PPU-ZW810E",
+    "measured": {
+     "bandwidth_gbps": 0.66226,
+     "tensor": {
+      "bf16": 0.133197,
+      "fp16": 0.142668,
+      "fp32": 0.561111,
+      "tf32": 0.119997,
+      "int8": 0.112969,
+      "fp64": 6.6,
+      "fp8": null
+     },
+     "vector": {
+      "bf16": 0.818522,
+      "fp16": 0.829162,
+      "fp32": 0.416993,
+      "int8": 0.198651,
+      "fp64": 6.114286,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "enflame",
+    "chip": "S60",
+    "measured": {
+     "bandwidth_gbps": 0.150341,
+     "tensor": {
+      "bf16": 0.135387,
+      "fp16": 0.144764,
+      "fp32": 0.672634,
+      "tf32": null,
+      "int8": 0.134389,
+      "fp64": null,
+      "fp8": null
+     },
+     "vector": {
+      "bf16": 0.026225,
+      "fp16": 0.026225,
+      "fp32": 0.029527,
+      "int8": 0.013338,
+      "fp64": null,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "ascend",
+    "chip": "Ascend910B4",
+    "measured": {
+     "bandwidth_gbps": 0.389412,
+     "tensor": {
+      "bf16": 0.035172,
+      "fp16": 0.037468,
+      "fp32": 0.416872,
+      "tf32": null,
+      "int8": 0.034847,
+      "fp64": null,
+      "fp8": null
+     },
+     "vector": {
+      "bf16": 0.024876,
+      "fp16": 0.03117,
+      "fp32": 0.025008,
+      "int8": 0.004721,
+      "fp64": null,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "metax",
+    "chip": "C550",
+    "measured": {
+     "bandwidth_gbps": 0.472539,
+     "tensor": {
+      "bf16": 0.285784,
+      "fp16": 0.298125,
+      "fp32": 0.816461,
+      "tf32": 0.265815,
+      "int8": 0.291016,
+      "fp64": null,
+      "fp8": null
+     },
+     "vector": {
+      "bf16": 0.04166,
+      "fp16": 0.136071,
+      "fp32": 0.542031,
+      "int8": 0.06804,
+      "fp64": 2.152381,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "kunlunxin",
+    "chip": "P800",
+    "measured": {
+     "bandwidth_gbps": 0.206687,
+     "tensor": {
+      "bf16": 0.032282,
+      "fp16": 0.034524,
+      "fp32": null,
+      "tf32": 0.062095,
+      "int8": null,
+      "fp64": null,
+      "fp8": null
+     },
+     "vector": {
+      "bf16": 0.017533,
+      "fp16": 0.036565,
+      "fp32": 0.038265,
+      "int8": 0.000899,
+      "fp64": null,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "mthreads",
+    "chip": "MTT-S5000",
+    "measured": {
+     "bandwidth_gbps": 0.42387,
+     "tensor": {
+      "bf16": 0.46863,
+      "fp16": 0.499849,
+      "fp32": 0.585391,
+      "tf32": 0.449552,
+      "int8": 0.463452,
+      "fp64": 13.533333,
+      "fp8": 0.504517
+     },
+     "vector": {
+      "bf16": 0.285029,
+      "fp16": 0.284879,
+      "fp32": 0.255348,
+      "int8": 0.095017,
+      "fp64": null,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "hygon",
+    "chip": "BW1000",
+    "measured": {
+     "bandwidth_gbps": 0.473529,
+     "tensor": {
+      "bf16": 0.494279,
+      "fp16": 0.526445,
+      "fp32": 1.253704,
+      "tf32": 0.475373,
+      "int8": 0.490587,
+      "fp64": 29.009524,
+      "fp8": 0.268358
+     },
+     "vector": {
+      "bf16": 0.109996,
+      "fp16": 0.454668,
+      "fp32": 0.228834,
+      "int8": 0.114125,
+      "fp64": 14.419048,
+      "fp8": null
+     }
+    }
+   },
+   {
+    "vendor": "iluvatar",
+    "chip": "BI-V150",
+    "measured": {
+     "bandwidth_gbps": 0.356378,
+     "tensor": {
+      "bf16": 0.220302,
+      "fp16": 0.234676,
+      "fp32": 0.940123,
+      "tf32": null,
+      "int8": 0.391076,
+      "fp64": null,
+      "fp8": null
+     },
+     "vector": {
+      "bf16": 0.461262,
+      "fp16": 0.469354,
+      "fp32": 0.230792,
+      "int8": 0.119895,
+      "fp64": null,
+      "fp8": null
+     }
+    }
+   }
+  ]
+ },
+ "deep_gemm_fp8_o_proj": {
+  "label": {
+   "vllm": "0.32.0"
+  },
+  "native_api": "ops.deep_gemm_fp8_o_proj",
+  "shapes": {
+   "[1, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         1,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         1
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         1,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 1,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 36.83200106024742,
+     "latency_ms": 0.03683200106024742,
+     "F_cuda": 8798208.0,
+     "F_tensor": 0.0,
+     "B_mem": 35179776.0,
+     "U_cuda": 0.6739195,
+     "U_tensor": 7.465752,
+     "U_mem": 28.856998,
+     "U_bottle_neck": 28.856998,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 147456.0,
+       "F_tensor": 0.0,
+       "B_mem": 75776.0,
+       "U_cuda": 0.307172,
+       "U_tensor": 0.014371,
+       "U_mem": 0.532834,
+       "T_us": 6.9808884612067255
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 8, 16, 64, 128, 128, 128, 128, 16, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 8650752.0,
+       "F_tensor": 0.0,
+       "B_mem": 35104000.0,
+       "U_cuda": 1.040667,
+       "U_tensor": 14.917133,
+       "U_mem": 57.181162,
+       "T_us": 29.851112599040697
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[4, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         4,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         4
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         4,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 4,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 39.903998374938965,
+     "latency_ms": 0.039903998374938965,
+     "F_cuda": 9240576.0,
+     "F_tensor": 0.0,
+     "B_mem": 35489536.0,
+     "U_cuda": 1.080356,
+     "U_tensor": 7.630174500000001,
+     "U_mem": 29.9950995,
+     "U_bottle_neck": 29.9950995,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 589824.0,
+       "F_tensor": 0.0,
+       "B_mem": 273408.0,
+       "U_cuda": 1.100037,
+       "U_tensor": 0.056412,
+       "U_mem": 1.889864,
+       "T_us": 7.73068914386282
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 8, 16, 64, 128, 128, 128, 128, 16, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 8650752.0,
+       "F_tensor": 0.0,
+       "B_mem": 35216128.0,
+       "U_cuda": 1.060675,
+       "U_tensor": 15.203937,
+       "U_mem": 58.100335,
+       "T_us": 32.173309231076146
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[16, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         16,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         16
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         16,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 16,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 39.29600119590759,
+     "latency_ms": 0.03929600119590759,
+     "F_cuda": 11010048.0,
+     "F_tensor": 0.0,
+     "B_mem": 36988928.0,
+     "U_cuda": 2.547125,
+     "U_tensor": 7.624947,
+     "U_mem": 32.737798,
+     "U_bottle_neck": 32.737798,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 2359296.0,
+       "F_tensor": 0.0,
+       "B_mem": 1062912.0,
+       "U_cuda": 4.04484,
+       "U_tensor": 0.207428,
+       "U_mem": 6.712364,
+       "T_us": 8.08874572600045
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 8, 16, 64, 128, 128, 128, 128, 16, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 8650752.0,
+       "F_tensor": 0.0,
+       "B_mem": 35926016.0,
+       "U_cuda": 1.04941,
+       "U_tensor": 15.042466,
+       "U_mem": 58.763232,
+       "T_us": 31.207255469907142
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[64, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         64,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         64
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         64,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 64,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 37.696000188589096,
+     "latency_ms": 0.037696000188589096,
+     "F_cuda": 44040192.0,
+     "F_tensor": 0.0,
+     "B_mem": 42084096.0,
+     "U_cuda": 6.928352,
+     "U_tensor": 7.8690514999999985,
+     "U_mem": 39.200331,
+     "U_bottle_neck": 39.200331,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 9437184.0,
+       "F_tensor": 0.0,
+       "B_mem": 4221184.0,
+       "U_cuda": 9.809899,
+       "U_tensor": 0.503072,
+       "U_mem": 16.173297,
+       "T_us": 11.359803254863873
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 8, 64, 64, 128, 128, 128, 128, 13, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 34603008.0,
+       "F_tensor": 0.0,
+       "B_mem": 37862912.0,
+       "U_cuda": 4.046805,
+       "U_tensor": 15.235031,
+       "U_mem": 62.227365,
+       "T_us": 26.336196933725223
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[128, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         128,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         128
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         128,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 128,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 37.59999945759773,
+     "latency_ms": 0.03759999945759773,
+     "F_cuda": 87031808.0,
+     "F_tensor": 0.0,
+     "B_mem": 48713472.0,
+     "U_cuda": 9.75569,
+     "U_tensor": 14.6817645,
+     "U_mem": 41.01392,
+     "U_bottle_neck": 41.01392,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 18874368.0,
+       "F_tensor": 0.0,
+       "B_mem": 8432640.0,
+       "U_cuda": 12.101085,
+       "U_tensor": 0.620568,
+       "U_mem": 19.849113,
+       "T_us": 14.897404974716867
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 8, 64, 128, 128, 128, 128, 128, 8, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 68157440.0,
+       "F_tensor": 0.0,
+       "B_mem": 40280832.0,
+       "U_cuda": 7.410295,
+       "U_tensor": 28.742961,
+       "U_mem": 62.178727,
+       "T_us": 22.702594482880865
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[512, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         512,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         512
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         512,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 512,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 73.05599749088287,
+     "latency_ms": 0.07305599749088287,
+     "F_cuda": 348127232.0,
+     "F_tensor": 0.0,
+     "B_mem": 94375936.0,
+     "U_cuda": 15.881620999999999,
+     "U_tensor": 33.8961765,
+     "U_mem": 37.8634365,
+     "U_bottle_neck": 37.8634365,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 75497472.0,
+       "F_tensor": 0.0,
+       "B_mem": 41042944.0,
+       "U_cuda": 14.476928,
+       "U_tensor": 0.742407,
+       "U_mem": 29.030739,
+       "T_us": 40.38917982088239
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 8, 256, 128, 128, 128, 128, 128, 3, 128, 256, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 272629760.0,
+       "F_tensor": 0.0,
+       "B_mem": 53332992.0,
+       "U_cuda": 17.286314,
+       "U_tensor": 67.049946,
+       "U_mem": 46.696134,
+       "T_us": 32.666817670000476
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[2048, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         2048,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         2048
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         2048,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 2048,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 265.4719948768616,
+     "latency_ms": 0.2654719948768616,
+     "F_cuda": 1392508928.0,
+     "F_tensor": 0.0,
+     "B_mem": 344659200.0,
+     "U_cuda": 18.0450525,
+     "U_tensor": 40.911847,
+     "U_mem": 34.8195955,
+     "U_bottle_neck": 40.911847,
+     "bottle_neck_unit": "tensor",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 301989888.0,
+       "F_tensor": 0.0,
+       "B_mem": 194361856.0,
+       "U_cuda": 15.195841,
+       "U_tensor": 0.779274,
+       "U_mem": 36.155272,
+       "T_us": 144.68483478122494
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 8, 256, 128, 128, 128, 128, 128, 3, 128, 256, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 1090519040.0,
+       "F_tensor": 0.0,
+       "B_mem": 150297344.0,
+       "U_cuda": 20.894264,
+       "U_tensor": 81.04442,
+       "U_mem": 33.483919,
+       "T_us": 120.78716009563661
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[8192, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         8192,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         8192
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         8192,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 8192,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 1082.3999643325806,
+     "latency_ms": 1.0823999643325806,
+     "F_cuda": 5570035712.0,
+     "F_tensor": 0.0,
+     "B_mem": 1734077440.0,
+     "U_cuda": 17.727728,
+     "U_tensor": 39.300069500000006,
+     "U_mem": 47.2933065,
+     "U_bottle_neck": 47.2933065,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 1207959552.0,
+       "F_tensor": 0.0,
+       "B_mem": 818228480.0,
+       "U_cuda": 15.394896,
+       "U_tensor": 0.789482,
+       "U_mem": 38.546688,
+       "T_us": 611.5521168930031
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 8, 256, 128, 128, 128, 128, 128, 3, 128, 256, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 4362076160.0,
+       "F_tensor": 0.0,
+       "B_mem": 915848960.0,
+       "U_cuda": 20.06056,
+       "U_tensor": 77.810657,
+       "U_mem": 56.039925,
+       "T_us": 470.8478474395773
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[1, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         1,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         1
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         1,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 1,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 39.744000881910324,
+     "latency_ms": 0.039744000881910324,
+     "F_cuda": 17334272.0,
+     "F_tensor": 0.0,
+     "B_mem": 69831424.0,
+     "U_cuda": 0.875424,
+     "U_tensor": 8.652774,
+     "U_mem": 33.456388499999996,
+     "U_bottle_neck": 33.456388499999996,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 294912.0,
+       "F_tensor": 0.0,
+       "B_mem": 141568.0,
+       "U_cuda": 0.605113,
+       "U_tensor": 0.028309,
+       "U_mem": 0.981889,
+       "T_us": 4.782032191673703
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 16, 16, 128, 128, 128, 128, 128, 12, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 17039360.0,
+       "F_tensor": 0.0,
+       "B_mem": 69689856.0,
+       "U_cuda": 1.145735,
+       "U_tensor": 17.277239,
+       "U_mem": 65.930888,
+       "T_us": 34.961968690236624
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[4, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         4,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         4
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         4,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 4,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 39.99999910593033,
+     "latency_ms": 0.03999999910593033,
+     "F_cuda": 18219008.0,
+     "F_tensor": 0.0,
+     "B_mem": 70430464.0,
+     "U_cuda": 1.6572795,
+     "U_tensor": 9.046764,
+     "U_mem": 36.055698,
+     "U_bottle_neck": 36.055698,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 1179648.0,
+       "F_tensor": 0.0,
+       "B_mem": 535552.0,
+       "U_cuda": 2.121908,
+       "U_tensor": 0.108816,
+       "U_mem": 3.552989,
+       "T_us": 5.160109674232549
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 16, 16, 128, 128, 128, 128, 128, 12, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 17039360.0,
+       "F_tensor": 0.0,
+       "B_mem": 69894912.0,
+       "U_cuda": 1.192651,
+       "U_tensor": 17.984712,
+       "U_mem": 68.558407,
+       "T_us": 34.83988943169778
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[16, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         16,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         16
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         16,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 16,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 39.903998374938965,
+     "latency_ms": 0.039903998374938965,
+     "F_cuda": 21757952.0,
+     "F_tensor": 0.0,
+     "B_mem": 72815872.0,
+     "U_cuda": 4.099676,
+     "U_tensor": 9.577194500000001,
+     "U_mem": 41.8229185,
+     "U_bottle_neck": 41.8229185,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 4718592.0,
+       "F_tensor": 0.0,
+       "B_mem": 2111488.0,
+       "U_cuda": 6.952779,
+       "U_tensor": 0.356553,
+       "U_mem": 11.481069,
+       "T_us": 6.319970276693832
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 16, 16, 128, 128, 128, 128, 128, 12, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 17039360.0,
+       "F_tensor": 0.0,
+       "B_mem": 70704384.0,
+       "U_cuda": 1.246573,
+       "U_tensor": 18.797836,
+       "U_mem": 72.164768,
+       "T_us": 33.58402809824513
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[64, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         64,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         64
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         64,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 64,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 46.08000069856644,
+     "latency_ms": 0.04608000069856644,
+     "F_cuda": 87031808.0,
+     "F_tensor": 0.0,
+     "B_mem": 82352640.0,
+     "U_cuda": 8.446702,
+     "U_tensor": 9.6228135,
+     "U_mem": 47.2226035,
+     "U_bottle_neck": 47.2226035,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 18874368.0,
+       "F_tensor": 0.0,
+       "B_mem": 8416000.0,
+       "U_cuda": 12.091504,
+       "U_tensor": 0.620077,
+       "U_mem": 19.71869,
+       "T_us": 13.907655278916799
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 16, 64, 128, 128, 128, 128, 128, 8, 128, 128, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 68157440.0,
+       "F_tensor": 0.0,
+       "B_mem": 73936640.0,
+       "U_cuda": 4.8019,
+       "U_tensor": 18.62555,
+       "U_mem": 74.726517,
+       "T_us": 32.17234541964964
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[128, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         128,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         128
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         128,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 128,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 57.11999908089638,
+     "latency_ms": 0.05711999908089638,
+     "F_cuda": 174063616.0,
+     "F_tensor": 0.0,
+     "B_mem": 95316992.0,
+     "U_cuda": 11.2283215,
+     "U_tensor": 17.5787355,
+     "U_mem": 47.2913695,
+     "U_bottle_neck": 47.2913695,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 37748736.0,
+       "F_tensor": 0.0,
+       "B_mem": 17082624.0,
+       "U_cuda": 13.572046,
+       "U_tensor": 0.696002,
+       "U_mem": 22.620613,
+       "T_us": 23.42617763352644
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 16, 128, 128, 128, 128, 128, 128, 5, 128, 256, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 136314880.0,
+       "F_tensor": 0.0,
+       "B_mem": 78234368.0,
+       "U_cuda": 8.884597,
+       "U_tensor": 34.461469,
+       "U_mem": 71.962126,
+       "T_us": 33.69382144736994
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[512, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         512,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         512
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         512,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 512,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 138.94400000572205,
+     "latency_ms": 0.13894400000572205,
+     "F_cuda": 696254464.0,
+     "F_tensor": 0.0,
+     "B_mem": 207125504.0,
+     "U_cuda": 17.061867,
+     "U_tensor": 37.577121,
+     "U_mem": 39.1184955,
+     "U_bottle_neck": 39.1184955,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 150994944.0,
+       "F_tensor": 0.0,
+       "B_mem": 92065280.0,
+       "U_cuda": 14.945629,
+       "U_tensor": 0.766443,
+       "U_mem": 33.614302,
+       "T_us": 71.57381525103149
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 16, 256, 128, 128, 128, 128, 128, 3, 128, 256, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 545259520.0,
+       "F_tensor": 0.0,
+       "B_mem": 115060224.0,
+       "U_cuda": 19.178105,
+       "U_tensor": 74.387799,
+       "U_mem": 44.622689,
+       "T_us": 67.37018475469056
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[2048, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         2048,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         2048
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         2048,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 2048,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 523.9359736442566,
+     "latency_ms": 0.5239359736442566,
+     "F_cuda": 2785017856.0,
+     "F_tensor": 0.0,
+     "B_mem": 719952384.0,
+     "U_cuda": 18.3395275,
+     "U_tensor": 41.808363500000006,
+     "U_mem": 38.365211,
+     "U_bottle_neck": 41.808363500000006,
+     "bottle_neck_unit": "tensor",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 603979776.0,
+       "F_tensor": 0.0,
+       "B_mem": 397800704.0,
+       "U_cuda": 15.324222,
+       "U_tensor": 0.785858,
+       "U_mem": 37.31856,
+       "T_us": 296.539942478953
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 16, 256, 128, 128, 128, 128, 128, 3, 128, 256, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 2181038080.0,
+       "F_tensor": 0.0,
+       "B_mem": 322151680.0,
+       "U_cuda": 21.354833,
+       "U_tensor": 82.830869,
+       "U_mem": 39.411862,
+       "T_us": 227.3960311653036
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[8192, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         8192,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         8192
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         8192,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 8192,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "T_us": 2167.423963546753,
+     "latency_ms": 2.167423963546753,
+     "F_cuda": 11140071424.0,
+     "F_tensor": 0.0,
+     "B_mem": 3677506000.0,
+     "U_cuda": 17.4440785,
+     "U_tensor": 38.135021,
+     "U_mem": 50.524676,
+     "U_bottle_neck": 50.524676,
+     "bottle_neck_unit": "mem",
+     "num_kernels": 2,
+     "per_kernel": [
+      {
+       "name": "kernel",
+       "F_cuda": 2415919104.0,
+       "F_tensor": 0.0,
+       "B_mem": 1644336000.0,
+       "U_cuda": 15.428773,
+       "U_tensor": 0.791219,
+       "U_mem": 38.825994,
+       "T_us": 1223.489305340063
+      },
+      {
+       "name": "void deep_gemm::sm90_fp8_gemm_1d2d_impl<0, 0, 1024, 4096, 16, 256, 128, 128, 128, 128, 128, 3, 128, 256, 1, 0, 132, 4, cutlass::bfloat16_t, deep_gemm::EpilogueIdentity>(float *, int *, unsigned int, unsigned int, unsigned int, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+       "F_cuda": 8724152320.0,
+       "F_tensor": 0.0,
+       "B_mem": 2033170000.0000002,
+       "U_cuda": 19.459384,
+       "U_tensor": 75.478823,
+       "U_mem": 62.223358,
+       "T_us": 943.9346582066898
+      }
+     ],
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+    }
+   },
+   "[4096, 64, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         4096,
+         64,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         4096
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         8,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         8,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 8
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         4096,
+         8192
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 4096,
+       "n_groups": 8,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median",
+     "latency_ms": 0.5285,
+     "bottle_neck_unit": "tensor"
+    }
+   },
+   "[4096, 128, 512]": {
+    "torch.bfloat16": {
+     "config": {
+      "inputs": {
+       "o": {
+        "shape": [
+         4096,
+         128,
+         512
+        ],
+        "dtype": "torch.bfloat16",
+        "fill": "randn"
+       },
+       "positions": {
+        "shape": [
+         4096
+        ],
+        "dtype": "torch.int64"
+       },
+       "cos_sin_cache": {
+        "shape": [
+         65536,
+         64
+        ],
+        "dtype": "torch.float32"
+       },
+       "wo_a.weight": {
+        "shape": [
+         16,
+         1024,
+         4096
+        ],
+        "dtype": "torch.float8_e4m3fn"
+       },
+       "wo_a.weight_scale_inv": {
+        "shape": [
+         16,
+         8,
+         32
+        ],
+        "dtype": "torch.float32"
+       },
+       "n_groups": {
+        "scalar": 16
+       },
+       "heads_per_group": {
+        "scalar": 8
+       },
+       "nope_dim": {
+        "scalar": 448
+       },
+       "rope_dim": {
+        "scalar": 64
+       },
+       "o_lora_rank": {
+        "scalar": 1024
+       }
+      },
+      "outputs": {
+       "out": {
+        "shape": [
+         4096,
+         16384
+        ],
+        "dtype": "torch.bfloat16"
+       }
+      },
+      "dims": {
+       "tokens": 4096,
+       "n_groups": 16,
+       "group_dim": 4096,
+       "o_lora_rank": 1024
+      }
+     },
+     "timing_protocol": "triton-do-bench-no-graph-25ms-warmup-100ms-median",
+     "latency_ms": 1.0534,
+     "bottle_neck_unit": "tensor"
+    }
+   }
+  }
+ },
+ "_note": "vLLM 0.32.0 H100 baseline from optest data/op_vllm032_h100_perf_baseline.json. The two 4096-token points were measured with the same vLLM 0.32.0 environment (H100 80GB, do_bench 25ms/100ms median) and roofline-classified as tensor-bound; all other points carry the collector's ncu-derived bottle_neck_unit."
+}

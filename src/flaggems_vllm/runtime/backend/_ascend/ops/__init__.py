@@ -34,6 +34,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import cooperati
 from flaggems_vllm.runtime.backend._ascend.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.deep_gemm_fp8_o_proj import (
+    deep_gemm_fp8_o_proj,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
@@ -153,6 +156,7 @@ __all__ = [
     "compute_slot_mapping_parallel",
     "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
+    "deep_gemm_fp8_o_proj",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",

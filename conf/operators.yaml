@@ -511,6 +511,29 @@ ops:
   - LinearAlg
   stages:
   - beta: '5.0'
+- id: deep_gemm_fp8_o_proj
+  description: 'DeepSeek-V4 attention output projection: inverse RoPE, group-wise
+    FP8 quantization, block-wise FP8 einsum over the o-LoRA weights, then wo_b.
+    Precisions: FP8 (E4M3) with 128x128 block scales on Hopper; Hygon, MetaX
+    and PPU transport the same block-quantized values as INT8 (INT8
+    tensor-core GEMM) because their Triton backends have no FP8 dot
+    lowering. Ascend keeps the block-quantized values but transports them
+    as FP16: it has neither an FP8 dot nor a device-side FP8 cast, and
+    folding the block scale into the GEMM K loop drops the throughput to
+    15 TFLOPS there.
+
+    '
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.o_proj.deep_gemm_fp8_o_proj
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - Quantization
+  stages:
+  - beta: '5.4'
 - id: dequantize_and_gather_k_cache
   description: 'Dequantizes FP8 K-cache entries and gathers them into a BF16 tensor
     for DeepSeekV4 attention.
