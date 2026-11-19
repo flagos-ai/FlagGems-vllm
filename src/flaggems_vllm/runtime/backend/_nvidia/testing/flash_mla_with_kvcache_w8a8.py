@@ -24,7 +24,11 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import HAS_TLE
+from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
+    HAS_TLE,
+    get_mla_fp8_metadata,
+    prepare_flash_mla_with_kvcache_fwd_w8a8_fp8,
+)
 from tests.accuracy_utils import gems_assert_equal, to_reference
 from tests.flash_mla_with_kvcache_w8a8_utils import (
     CapturedCall,
@@ -141,7 +145,7 @@ def benchmark_reference(inputs: DenseW8A8Inputs) -> tuple[torch.Tensor, torch.Te
 
 
 def prepare_gems(inputs: DenseW8A8Inputs) -> PreparedCall:
-    handle, (output, lse) = flaggems_vllm.prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
+    handle, (output, lse) = prepare_flash_mla_with_kvcache_fwd_w8a8_fp8(
         *inputs[:9],
         causal=True,
         initial_cache_seqlens=inputs.host_lengths,
@@ -165,7 +169,7 @@ def validate_functional(
     actual: tuple[torch.Tensor, torch.Tensor],
     reference: tuple[torch.Tensor, torch.Tensor],
 ) -> None:
-    metadata, splits = flaggems_vllm.get_mla_fp8_metadata(
+    metadata, splits = get_mla_fp8_metadata(
         inputs.lengths, inputs.q_nope.shape[1] * inputs.q_nope.shape[2]
     )
     planned = flaggems_vllm.flash_mla_with_kvcache_w8a8(

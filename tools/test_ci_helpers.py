@@ -24,7 +24,6 @@ import textwrap
 import unittest
 from pathlib import Path
 
-import check_ci_pins
 import run_ci_targets
 import select_backends
 import select_tests
@@ -425,7 +424,7 @@ class IluvatarForkSelectionIntegrationTest(TemporaryRepositoryTestCase):
             "iluvatar",
         )
         approved = run_ci_targets.apply_policy(
-            # Normal pull requests pass --no-benchmarks in basic-ci.yml.
+            # Normal pull requests pass --no-benchmarks in unittest.yaml.
             {"tests": selected_tests, "benchmarks": []},
             policy,
         )
@@ -443,7 +442,7 @@ class BenchmarkWorkflowPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         repo_root = Path(__file__).resolve().parents[1]
-        cls.workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        cls.workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
 
@@ -469,12 +468,52 @@ class BenchmarkWorkflowPolicyTest(unittest.TestCase):
         )
 
 
-class CiPinsTest(unittest.TestCase):
-    def test_three_flaggems_pins_are_identical(self):
+class NoFlagGemsSourceDependencyTest(unittest.TestCase):
+    """CI must not fetch or call anything from the FlagGems repository."""
+
+    def test_ci_files_do_not_reference_the_flaggems_repository(self):
+        import re
+
         repo_root = Path(__file__).resolve().parents[1]
-        pins = check_ci_pins.extract_pins(repo_root)
-        self.assertEqual(len(pins), 3)
-        self.assertEqual(len(set(pins)), 1)
+        # `flagos-ai/FlagGems` not followed by `-vllm`.
+        pattern = re.compile(r"flagos-ai/FlagGems(?!-vllm)", re.IGNORECASE)
+        paths = [
+            *(repo_root / ".github/workflows").glob("*.y*ml"),
+            *(repo_root / ".github/actions").rglob("*.y*ml"),
+        ]
+        self.assertTrue(paths)
+        for path in paths:
+            with self.subTest(path=path.name):
+                self.assertIsNone(
+                    pattern.search(path.read_text(encoding="utf-8")),
+                    f"{path} references the FlagGems repository",
+                )
+
+    def test_container_backends_are_not_in_the_bare_runner_registry(self):
+        import yaml
+
+        repo_root = Path(__file__).resolve().parents[1]
+        registry = select_backends.load_registry(repo_root / ".github/backends.json")
+        platforms = yaml.safe_load(
+            (repo_root / ".github/configs/ci-backends.yaml").read_text(encoding="utf-8")
+        )["platforms"]
+        # The H20 bare host (nvidia-cuda133) is recorded for reference only;
+        # select_backends never routes NVIDIA entries.
+        containerized = {
+            entry["backend"]
+            for entry in platforms.values()
+            if not entry["backend"].startswith("nvidia")
+        }
+        bare = {entry["backend"] for entry in registry}
+        self.assertEqual(containerized & bare, set())
+
+    def test_backend_registry_is_local(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        registry = select_backends.load_registry(repo_root / ".github/backends.json")
+        capabilities = select_backends.load_auto_selected_backends(
+            repo_root / ".github/backend-capabilities.json"
+        )
+        self.assertTrue(capabilities <= {entry["backend"] for entry in registry})
 
 
 class BackendTuneConfigTest(unittest.TestCase):
@@ -509,8 +548,14 @@ class BackendTuneConfigTest(unittest.TestCase):
             {},
         )
 
-    def test_iluvatar_comment_only_tune_config_loads(self):
-        self.assertEqual(self.backend_utils.get_tune_config("iluvatar"), {})
+    def test_iluvatar_tune_config_loads(self):
+        import yaml
+
+        config_path = (
+            Path(self.backend_utils.__file__).parent / "_iluvatar/tune_configs.yaml"
+        )
+        expected = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        self.assertEqual(self.backend_utils.get_tune_config("iluvatar"), expected)
 
     def test_non_empty_tune_config_is_preserved(self):
         directory = self.write_config("mul:\n  BLOCK_SIZE: 128\n")
@@ -633,8 +678,7 @@ class PrepareFlagGemsCiEnvironmentTest(unittest.TestCase):
 
         expected = {
             "HOME": inherited_home,
-            "FLAGGEMS_DIR": workspace / ".ci/flaggems",
-            "FLAGGEMS_VENV": workspace / ".ci/flaggems/.venv",
+            "FLAGGEMS_VENV": workspace / ".venv",
         }
         self.assertEqual(
             set(values),
@@ -722,12 +766,11 @@ class SetupFlagGemsActionContractTest(unittest.TestCase):
 
     def test_uses_explicit_caller_checkout_and_vendor_venv_paths(self):
         self.assertIn("tools/prepare-flaggems-ci-env.sh", self.action)
-        self.assertIn('cd "${FLAGGEMS_DIR}"', self.action)
+        self.assertIn('bash tools/setup.sh "${BACKEND}"', self.action)
         self.assertIn('source "${FLAGGEMS_VENV}/bin/activate"', self.action)
-        self.assertIn('-e "${GITHUB_WORKSPACE}"', self.action)
-        self.assertIn('script="${FLAGGEMS_DIR}/${GPU_CHECK_SCRIPT}"', self.action)
-        self.assertIn('ln -s "${FLAGGEMS_VENV}" .venv', self.action)
-        self.assertNotIn("cd .ci/flaggems", self.action)
+        self.assertIn('script="${GITHUB_WORKSPACE:?}/${GPU_CHECK_SCRIPT}"', self.action)
+        self.assertNotIn("FLAGGEMS_DIR", self.action)
+        self.assertNotIn(".ci/flaggems", self.action)
 
     def test_backend_test_prefers_the_physical_vendor_venv(self):
         self.assertIn('VENV_PATH="${FLAGGEMS_VENV:-.venv}"', self.test_script)
@@ -754,7 +797,7 @@ class SetupFlagGemsActionContractTest(unittest.TestCase):
 class CiWorkflowPolicyTest(unittest.TestCase):
     def test_backend_path_routing_uses_local_preflight_readiness(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         self.assertIn(
@@ -764,7 +807,7 @@ class CiWorkflowPolicyTest(unittest.TestCase):
 
     def test_all_backend_fanout_requires_an_explicit_request(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         all_enabled = workflow.split("ALL_ENABLED: >-", maxsplit=1)[1].split(
@@ -777,7 +820,7 @@ class CiWorkflowPolicyTest(unittest.TestCase):
 
     def test_forks_are_allowed_only_on_the_non_nvidia_lane(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         author_guard = "github.event.pull_request.user.login != 'dependabot[bot]'"
@@ -785,40 +828,52 @@ class CiWorkflowPolicyTest(unittest.TestCase):
             "github.event.pull_request.head.repo.full_name == github.repository"
         )
         nvidia_label_opt_in = (
-            "contains(github.event.pull_request.labels.*.name, 'ci/nvidia')"
+            "contains(fromJSON(needs.preprocess.outputs.labels), 'ci/nvidia')"
         )
-        nvidia_job = workflow.split("  nvidia-tests:", maxsplit=1)[1].split(
-            "  non-nvidia-tests:", maxsplit=1
+        nvidia_job = workflow.split("  python-op:", maxsplit=1)[1].split(
+            "  backend-tests:", maxsplit=1
         )[0]
-        non_nvidia_job = workflow.split("  non-nvidia-tests:", maxsplit=1)[1].split(
-            "  multi-backend-summary:", maxsplit=1
+        non_nvidia_job = workflow.split("  backend-tests:", maxsplit=1)[1].split(
+            "  vendor-container-tests:", maxsplit=1
         )[0]
 
         self.assertIn(repository_guard, nvidia_job)
         self.assertIn(nvidia_label_opt_in, nvidia_job)
         self.assertNotIn(repository_guard, non_nvidia_job)
-        self.assertNotIn(nvidia_label_opt_in, non_nvidia_job)
+        self.assertNotIn("ci/nvidia", non_nvidia_job)
         self.assertIn(author_guard, nvidia_job)
         self.assertIn(author_guard, non_nvidia_job)
         self.assertNotIn("github.actor != 'dependabot[bot]'", workflow)
+
+    def test_labels_come_from_the_api_after_triage(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            workflow.index("id: wait-for-triage"), workflow.index("id: get-labels")
+        )
+        self.assertLess(
+            workflow.index("id: get-labels"), workflow.index("id: select-backends")
+        )
+        self.assertNotIn("github.event.pull_request.labels.*.name, '", workflow)
 
 
 class CiSummaryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
-        summary = workflow.split("  multi-backend-summary:", maxsplit=1)[1]
+        summary = workflow.split("  unittest-required:", maxsplit=1)[1]
         cls.script = textwrap.dedent(
             summary.split("        run: |\n", maxsplit=1)[1]
         ).strip()
 
     def run_summary(self, **overrides):
         values = {
-            "CODE_STYLE_RESULT": "success",
-            "SELECT_TARGETS_RESULT": "success",
+            "PREPROCESS_RESULT": "success",
             "NVIDIA_RESULT": "skipped",
             "NON_NVIDIA_RESULT": "skipped",
             "SHOULD_RUN": "false",
@@ -836,7 +891,7 @@ class CiSummaryTest(unittest.TestCase):
             check=False,
         )
 
-    def test_expected_accelerator_results_succeed(self):
+    def test_expected_results_succeed(self):
         cases = {
             "trusted_nvidia_only": {
                 "SHOULD_RUN": "true",
@@ -877,7 +932,7 @@ class CiSummaryTest(unittest.TestCase):
 
     def test_missing_or_unexpected_results_fail(self):
         cases = {
-            "preparation_failed": {"CODE_STYLE_RESULT": "failure"},
+            "preparation_failed": {"PREPROCESS_RESULT": "failure"},
             "expected_nvidia_skipped": {
                 "SHOULD_RUN": "true",
                 "NVIDIA_RESULT": "skipped",
@@ -889,6 +944,7 @@ class CiSummaryTest(unittest.TestCase):
                 "NON_NVIDIA_RESULT": "failure",
             },
             "unexpected_backend_run": {"NON_NVIDIA_RESULT": "success"},
+            "unexpected_nvidia_run": {"NVIDIA_RESULT": "success"},
         }
 
         for name, values in cases.items():

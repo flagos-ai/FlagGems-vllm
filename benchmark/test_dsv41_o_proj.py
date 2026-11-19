@@ -12,20 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""dsv41_o_proj (wo_a part) vs vLLM ``deep_gemm_fp8_o_proj`` on Hopper.
+"""dsv41_o_proj (wo_a part) against each vendor's native path.
 
-Both sides run inverse RoPE + FP8 quant + grouped FP8 GEMM; wo_b is an identity
-callback on the vLLM side, so only the wo_a stage is timed.
+Hopper: vLLM ``deep_gemm_fp8_o_proj``. Both sides run inverse RoPE + FP8 quant +
+grouped FP8 GEMM; wo_b is an identity callback on the vLLM side, so only the wo_a
+stage is timed. Small batches take one kernel launch and large ones two; see
+``dsv41_o_proj``.
 
-Small batches take one kernel launch and large ones two; see ``dsv41_o_proj``. Also
-run ``--mode operator``: it counts the CPU launch time the default mode partly hides.
+Hygon: no matching native path. vllm_hcu (HYGON-AI/vllm-plugin-das) runs this
+projection in BF16 without quantization, and its FP8 branch is unreachable on the
+ROCm-type HCU platform. The baseline therefore comes from ``--base-data``; inputs
+are the same FP8 tensors as on Hopper, so the shapes match that baseline.
+
+Also run ``--mode operator``: it counts the CPU launch time the default mode partly
+hides.
 """
 
+import importlib
+import inspect
 import math
 import types
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
 
@@ -152,15 +162,99 @@ def _gems_wrapper(attn_out, pos, csc, w3, ws3):
     )
 
 
+def _default_vllm_launch_pdl(monkeypatch):
+    """Give vLLM's quant kernel a ``launch_pdl`` default so it can always launch.
+
+    ``_fused_inv_rope_fp8_quant_per_head`` declares ``launch_pdl: tl.constexpr``
+    with no default, and vLLM passes it only when
+    ``current_platform.is_arch_support_pdl()`` is true -- a live CUDA context is
+    needed for that check and every exception in it becomes False. Where it is
+    false the Triton binder is left without the argument and the launch raises
+    TypeError, so the vLLM reference cannot run at all; the FlagOS CI image does
+    that on H800. Default it to False without touching the kernel code; a stack
+    that does pass ``launch_pdl=True`` still gets PDL. Same fix as
+    ``benchmark/test_fused_inv_rope_fp8_quant.py``'s MUSA baseline, and pytest
+    restores the original kernel afterwards, including on failure.
+    """
+    module = importlib.import_module(
+        "vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant"
+    )
+    kernel_name = "_fused_inv_rope_fp8_quant_per_head"
+    kernel = getattr(module, kernel_name, None)
+    if kernel is None:
+        return
+    params = inspect.signature(kernel.fn).parameters
+    pdl = params.get("launch_pdl")
+    if pdl is None or pdl.default is not inspect.Parameter.empty:
+        return
+    if (
+        next(reversed(params)) != "launch_pdl"
+        or pdl.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ):
+        raise RuntimeError("unsupported vLLM launch_pdl signature")
+
+    fn = kernel.fn
+    adapted_fn = types.FunctionType(
+        fn.__code__, fn.__globals__, fn.__name__, (False,), fn.__closure__
+    )
+    adapted_fn.__annotations__ = fn.__annotations__.copy()
+    adapted_fn.__module__ = fn.__module__
+    adapted_fn.__qualname__ = fn.__qualname__
+    adapted_kernel = triton.jit(
+        adapted_fn,
+        do_not_specialize=kernel.do_not_specialize,
+        do_not_specialize_on_alignment=kernel.do_not_specialize_on_alignment,
+        version=kernel.version,
+        debug=kernel.debug,
+        noinline=kernel.noinline,
+        launch_metadata=kernel.launch_metadata,
+    )
+    monkeypatch.setattr(module, kernel_name, adapted_kernel)
+
+
 @pytest.mark.dsv41_o_proj
 @pytest.mark.skipif(
     not (HAS_VLLM and HOPPER),
     reason="requires NVIDIA Hopper and vLLM with DeepGEMM support",
 )
-def test_perf_dsv41_o_proj_gems_vs_vllm():
+def test_perf_dsv41_o_proj_gems_vs_vllm(monkeypatch):
+    _default_vllm_launch_pdl(monkeypatch)
     bench = Dsv41OProjBenchmark(
         op_name="dsv41_o_proj",
         torch_op=_vllm_wrapper,
+        dtypes=[torch.bfloat16],
+    )
+    bench.set_gems(_gems_wrapper)
+    bench.run()
+
+
+# ---------------------------------------------------------------------------
+# Hygon DCU
+# ---------------------------------------------------------------------------
+HYGON = flaggems_vllm.vendor_name == "hygon" and torch.cuda.is_available()
+
+
+class HygonDsv41OProjBenchmark(Dsv41OProjBenchmark):
+    """Same shapes and FP8 inputs as on Hopper; only the gems side runs here."""
+
+    def get_input_iter(self, cur_dtype):
+        del cur_dtype
+        device = flaggems_vllm.device
+        for t, g, h, r in self.shapes:
+            inputs = _make_inputs(t, g, h, r, device)
+            # Compile, and build the cached INT8 weight, outside the timed region.
+            _gems_wrapper(*inputs)
+            torch.cuda.synchronize()
+            yield inputs
+
+
+@pytest.mark.dsv41_o_proj
+@pytest.mark.skipif(not HYGON, reason="requires Hygon DCU")
+def test_perf_dsv41_o_proj_hygon():
+    bench = HygonDsv41OProjBenchmark(
+        op_name="dsv41_o_proj",
+        # No matching native implementation: --base-data supplies the baseline.
+        torch_op=None,
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_wrapper)
