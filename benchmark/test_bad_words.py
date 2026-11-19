@@ -16,12 +16,12 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-import triton
-import triton.language as tl
 
 import flaggems_vllm
+from flaggems_vllm.runtime import torch_device_fn
 
 from . import base
+from .conftest import Config
 
 try:
     from vllm.v1.worker.gpu.sample.bad_words import (
@@ -29,98 +29,6 @@ try:
     )
 except (ImportError, OSError):
     apply_bad_words_reference = None
-
-
-# vLLM.
-@triton.jit
-def _upstream_bad_words_kernel(
-    logits_ptr,
-    logits_stride,
-    expanded_idx_mapping_ptr,
-    bad_word_token_ids_ptr,
-    bad_word_token_ids_stride,
-    bad_word_offsets_ptr,
-    bad_word_offsets_stride,
-    num_bad_words_ptr,
-    all_token_ids_ptr,
-    all_token_ids_stride,
-    prompt_len_ptr,
-    total_len_ptr,
-    input_ids_ptr,
-    expanded_local_pos_ptr,
-):
-    token_idx = tl.program_id(0).to(tl.int64)
-    bw_idx = tl.program_id(1)
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    num_bad_words = tl.load(num_bad_words_ptr + req_state_idx)
-    if bw_idx >= num_bad_words:
-        return
-
-    pos = tl.load(expanded_local_pos_ptr + token_idx)
-    cur_req_first_pos = token_idx - pos
-    prompt_len = tl.load(prompt_len_ptr + req_state_idx)
-    total_len = tl.load(total_len_ptr + req_state_idx)
-    output_len = total_len - prompt_len
-    effective_len = output_len + pos
-
-    offsets_base = bad_word_offsets_ptr + req_state_idx * bad_word_offsets_stride
-    tokens_base = bad_word_token_ids_ptr + req_state_idx * bad_word_token_ids_stride
-    output_base = all_token_ids_ptr + req_state_idx * all_token_ids_stride + prompt_len
-    start = tl.load(offsets_base + bw_idx)
-    end = tl.load(offsets_base + bw_idx + 1)
-    prefix_len = end - start - 1
-    if prefix_len > effective_len:
-        return
-    last_token = tl.load(tokens_base + end - 1)
-    match = 1
-    for i in range(prefix_len):
-        expected = tl.load(tokens_base + start + i)
-        actual_pos = effective_len - prefix_len + i
-        if actual_pos >= output_len:
-            spec_offset = actual_pos - output_len
-            actual = tl.load(input_ids_ptr + cur_req_first_pos + spec_offset + 1)
-        else:
-            actual = tl.load(output_base + actual_pos)
-        match = match & (expected == actual)
-    if match:
-        tl.store(logits_ptr + token_idx * logits_stride + last_token, -float("inf"))
-
-
-def _upstream_reference(
-    logits,
-    expanded_idx_mapping,
-    bad_word_token_ids,
-    bad_word_offsets,
-    num_bad_words,
-    all_token_ids,
-    prompt_len,
-    total_len,
-    input_ids,
-    expanded_local_pos,
-    max_num_bad_words,
-):
-    num_tokens = logits.shape[0]
-    if num_tokens == 0 or max_num_bad_words == 0:
-        return
-    _upstream_bad_words_kernel[(num_tokens, max_num_bad_words)](
-        logits,
-        logits.stride(0),
-        expanded_idx_mapping,
-        bad_word_token_ids,
-        bad_word_token_ids.stride(0),
-        bad_word_offsets,
-        bad_word_offsets.stride(0),
-        num_bad_words,
-        all_token_ids,
-        all_token_ids.stride(0),
-        prompt_len,
-        total_len,
-        input_ids,
-        expanded_local_pos,
-    )
-
-
-REFERENCE_FN = apply_bad_words_reference or _upstream_reference
 
 
 DEVICE = torch.device(flaggems_vllm.device)
@@ -329,14 +237,6 @@ def _kernel_args(logits: torch.Tensor, inputs: Inputs) -> tuple:
     )
 
 
-def _run_reference(*args) -> None:
-    REFERENCE_FN(*args)
-
-
-def _run_flaggems(*args) -> None:
-    flaggems_vllm.apply_bad_words(*args)
-
-
 class ApplyBadWordsBenchmark(base.Benchmark):
     DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
     DEFAULT_SHAPE_DESC = "workload, match"
@@ -349,14 +249,14 @@ class ApplyBadWordsBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
             op_name="apply_bad_words",
-            torch_op=_run_reference,
-            gems_op=_run_flaggems,
+            torch_op=apply_bad_words_reference,
+            gems_op=flaggems_vllm.apply_bad_words,
             dtypes=[DTYPE],
             is_inplace=True,
         )
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = self.DEFAULT_SHAPES
+        self.shapes = list(self.DEFAULT_SHAPES)
 
     def get_input_iter(self, dtype):
         workloads = {workload.name: workload for workload in WORKLOADS}
@@ -373,26 +273,32 @@ class ApplyBadWordsBenchmark(base.Benchmark):
                 workload.bad_word_len,
             )
 
-            reference_logits = inputs.logits.clone()
-            flaggems_logits = inputs.logits.clone()
-            _run_reference(*_kernel_args(reference_logits, inputs))
-            _run_flaggems(*_kernel_args(flaggems_logits, inputs))
-            torch.testing.assert_close(
-                flaggems_logits,
-                reference_logits,
-                rtol=0,
-                atol=0,
-            )
+            if apply_bad_words_reference is not None:
+                reference_logits = inputs.logits.clone()
+                flaggems_logits = inputs.logits.clone()
+                apply_bad_words_reference(*_kernel_args(reference_logits, inputs))
+                flaggems_vllm.apply_bad_words(*_kernel_args(flaggems_logits, inputs))
+                torch.testing.assert_close(
+                    flaggems_logits, reference_logits, rtol=0, atol=0
+                )
             yield _kernel_args(inputs.logits, inputs)
 
     def record_shapes(self, *args, **kwargs):
         return self._case
 
-    def get_latency(self, op, *args, **kwargs):
-        logits = args[0].clone()
-        return super().get_latency(op, logits, *args[1:], **kwargs)
+    def get_latency(self, op, logits, *args, **kwargs):
+        # Masking is idempotent; isolate each implementation's input, then
+        # reuse the common benchmark timing without resetting every iteration.
+        return super().get_latency(op, logits.clone(), *args, **kwargs)
 
 
 @pytest.mark.apply_bad_words
 def test_apply_bad_words():
+    probe = getattr(torch_device_fn, "is_available", None)
+    if probe is None:
+        probe = getattr(torch_device_fn, "device_count", None)
+    if not Config.query and (
+        DEVICE.type == "cpu" or (probe is not None and not probe())
+    ):
+        pytest.skip("requires an available accelerator")
     ApplyBadWordsBenchmark().run()
