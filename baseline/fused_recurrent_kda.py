@@ -45,7 +45,37 @@ def native():
     try:
         from vllm.model_executor.layers.fla.ops.kda import fused_recurrent_kda
     except (ImportError, AttributeError) as exc:
-        NATIVE_UNAVAILABLE_REASON = repr(exc)
+        first_error = exc
+    else:
+        NATIVE_UNAVAILABLE_REASON = None
+        return fused_recurrent_kda
+    # On Ascend the vendor operator is the AscendC `recurrent_kda` in fla_npu
+    # (vllm-ascend's `run_recurrent_kda` calls exactly this). It needs the
+    # seq-first layout and reports the state as [.., V, K], which is the layout
+    # this benchmark's inputs use.
+    try:
+        from fla_npu.ops.ascendc import recurrent_kda as _ascendc_kda
+    except ImportError as exc:
+        ascendc_error = exc
+    else:
+
+        def _ascendc_native(**kwargs):
+            return _ascendc_kda(
+                **kwargs,
+                layout="BSND",
+                state_v_first=True,
+                output_final_state=True,
+            )
+
+        NATIVE_UNAVAILABLE_REASON = None
+        return _ascendc_native
+    # Last resort: vllm-ascend's Triton KDA, which has vLLM's own signature.
+    try:
+        from vllm_ascend.ops.triton.kda.kda import fused_recurrent_kda
+    except (ImportError, AttributeError) as exc:
+        NATIVE_UNAVAILABLE_REASON = (
+            f"{first_error!r}; AscendC: {ascendc_error!r}; Triton: {exc!r}"
+        )
         return None
     NATIVE_UNAVAILABLE_REASON = None
     return fused_recurrent_kda

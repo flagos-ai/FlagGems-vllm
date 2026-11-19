@@ -169,16 +169,68 @@ def _causal_conv1d_gems(
     )
 
 
+def _load_vllm_ascend_fn():
+    """vllm-ascend's native causal_conv1d_fn, or None when unavailable."""
+    try:
+        from vllm_ascend.ops.causal_conv1d import causal_conv1d_fn as native
+    except Exception:  # ImportError, or an older tree that raises on import
+        return None
+    return native
+
+
+VLLM_ASCEND_FN = _load_vllm_ascend_fn()
+
+
+def _causal_conv1d_vllm_ascend(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    cache_indices,
+    has_initial_state,
+    seqlens,
+    activation="silu",
+    pad_slot_id=PAD_SLOT_ID,
+):
+    """vllm-ascend native baseline. It also updates conv_states in place.
+
+    Note: on parts other than 310P, vllm-ascend ships this entry as a
+    per-sequence torch implementation (its AscendC variant,
+    ``npu_causal_conv1d_310``, is 310P-only). The resulting SpeedUp therefore
+    compares against the vendor API's *reference* path, not a vendor kernel.
+    """
+    _ = seqlens
+    return VLLM_ASCEND_FN(
+        x,
+        weight,
+        bias=bias,
+        activation=activation,
+        conv_states=conv_states,
+        has_initial_state=has_initial_state,
+        cache_indices=cache_indices,
+        query_start_loc=query_start_loc,
+        pad_slot_id=pad_slot_id,
+    )
+
+
 def _conv1d_input_fn(shape, dtype, device):
     batch, seqlen, dim = shape
     yield _varlen_inputs(batch, seqlen, dim, dtype, device)
 
 
 def test_causal_conv1d_fn_perf():
+    # Prefer vllm-ascend's native API as the baseline; fall back to the local
+    # per-sequence F.conv1d loop when it is not installed.
+    baseline = (
+        _causal_conv1d_vllm_ascend
+        if VLLM_ASCEND_FN is not None
+        else _causal_conv1d_torch
+    )
     bench = CausalConv1dBenchmark(
         input_fn=_conv1d_input_fn,
         op_name="causal_conv1d_fn",
-        torch_op=_causal_conv1d_torch,
+        torch_op=baseline,
         gems_op=_causal_conv1d_gems,
         dtypes=[torch.bfloat16],
     )

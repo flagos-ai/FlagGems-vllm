@@ -2,11 +2,25 @@
 # Copyright 2026 FlagOS Contributors
 """Independent FP64 oracle and recurrent state contracts."""
 
+from importlib import import_module
+
 import pytest
 import torch
 
 import flaggems_vllm as gems
+from baseline import fused_recurrent_kda as baseline_fused_recurrent_kda
 from baseline.fused_recurrent_kda import PERF_CASES, Case, build
+
+# Resolve the vendor implementation first, matching test_FLA/test_chunk_kda.py:
+# the generic public op needs vLLM's own FLA Triton core, which the Ascend tree
+# does not ship, while the Ascend backend keeps its kernels in
+# ``runtime.backend._<vendor>.FLA``.
+try:
+    fused_recurrent_kda = import_module(
+        f"flaggems_vllm.runtime.backend._{gems.vendor_name}.FLA"
+    ).fused_recurrent_kda
+except (ModuleNotFoundError, AttributeError):
+    fused_recurrent_kda = gems.fused_recurrent_kda
 
 CASES = PERF_CASES + [
     Case("min_dims", [1, 2], 1, 1, 1, "table"),
@@ -107,7 +121,7 @@ def test_fused_recurrent_kda(case, dtype, normalize):
         key: data[key].clone() for key in ("q", "k", "v", "g", "beta", "initial_state")
     }
     expected = reference(data)
-    result = gems.fused_recurrent_kda(**data)
+    result = fused_recurrent_kda(**data)
     assert result[0].shape == data["v"].shape
     assert result[0].dtype == dtype
     assert (result[1] is data["initial_state"]) == case.inplace
@@ -145,7 +159,7 @@ def test_fused_recurrent_kda_state_layout(dtype, inplace, layout):
     padding = torch.ones(flat.shape, dtype=torch.bool)
     padding.as_strided(state.shape, state.stride(), offset).fill_(False)
     expected = reference(data)
-    assert_result(gems.fused_recurrent_kda(**data), expected)
+    assert_result(fused_recurrent_kda(**data), expected)
     actual = flat.cpu()
     if inplace:
         wanted = before.clone()
@@ -167,16 +181,16 @@ def test_fused_recurrent_kda_live_metadata_and_values():
             torch.tensor([0, 1 + i % 2, 3], dtype=torch.int32, device=gems.device)
         )
         expected = reference(data)
-        assert_result(gems.fused_recurrent_kda(**data), expected)
+        assert_result(fused_recurrent_kda(**data), expected)
     data["q"].requires_grad_(True)
     with pytest.raises(NotImplementedError, match="inference-only"):
-        gems.fused_recurrent_kda(**data)
+        fused_recurrent_kda(**data)
     data["q"].requires_grad_(False)
-    assert_result(gems.fused_recurrent_kda(**data), reference(data))
+    assert_result(fused_recurrent_kda(**data), reference(data))
     shape = data["initial_state"].shape
     data["initial_state"].as_strided_(shape, (0, 256, 16, 1))
     with pytest.raises(ValueError, match="non-overlapping"):
-        gems.fused_recurrent_kda(**data)
+        fused_recurrent_kda(**data)
 
 
 @pytest.mark.fused_recurrent_kda
@@ -246,4 +260,88 @@ def test_fused_recurrent_kda_invalid(invalid):
         data["unknown"] = True
         error = NotImplementedError
     with pytest.raises(error):
-        gems.fused_recurrent_kda(**data)
+        fused_recurrent_kda(**data)
+
+
+def _native_candidates():
+    """Vendor implementations, most-native first.
+
+    ``baseline.native()`` is the operator the benchmark times (the AscendC
+    ``fla_npu`` kernel on Ascend). Its aclnn launch still rejects some shapes
+    that the vendor's own Triton fallback accepts ("GetWorkspaceSize failed:
+    161002"), so that fallback is kept as a second reference and each case uses
+    the first implementation that accepts it.
+    """
+    candidates = []
+    try:
+        primary = baseline_fused_recurrent_kda.native()
+    except Exception:  # ImportError, or a tree without the KDA kernels
+        primary = None
+    if primary is not None:
+        candidates.append(primary)
+    try:
+        from vllm_ascend.ops.triton.kda.kda import fused_recurrent_kda as triton_kda
+    except Exception:
+        pass
+    else:
+        if triton_kda is not primary:
+            candidates.append(triton_kda)
+    return candidates
+
+
+NATIVE_CANDIDATES = _native_candidates()
+# Two independent half-precision implementations differ by more than one of
+# them does from the fp64 oracle, so cross-vendor comparison gets its own budget.
+CROSS_IMPL_TOLERANCES = {
+    torch.float16: (1e-2, 1e-2),
+    torch.bfloat16: (3e-2, 3e-2),
+    torch.float32: (3e-3, 3e-3),
+}
+
+
+@pytest.mark.fused_recurrent_kda
+@pytest.mark.skipif(
+    not NATIVE_CANDIDATES,
+    reason="no vendor fused_recurrent_kda implementation is available",
+)
+@pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_fused_recurrent_kda_matches_vllm_ascend(case, dtype):
+    """Cross-check against vllm-ascend's native implementation.
+
+    The native kernel keeps the state live, so it runs on its own copy of the
+    inputs; cases the vendor API cannot express are skipped rather than failed.
+    """
+    # The vendor kernel shares vLLM's contract limits (it allocates the output
+    # as empty_like(k), assumes a dense state page, and so on). Skip the cases
+    # it cannot express instead of reporting a shape/semantics mismatch.
+    reason = baseline_fused_recurrent_kda.unsupported_reason({"case": case}, dtype)
+    if reason is not None:
+        pytest.skip(f"vendor API does not express this case: {reason}")
+    data = build(case, dtype, gems.device, True)
+    native_out = None
+    rejected = []
+    for candidate in NATIVE_CANDIDATES:
+        attempt = {
+            key: (value.clone() if isinstance(value, torch.Tensor) else value)
+            for key, value in data.items()
+        }
+        try:
+            native_out = candidate(**attempt)
+        except (NotImplementedError, ValueError, RuntimeError) as exc:
+            rejected.append(str(exc))
+            continue
+        break
+    if native_out is None:
+        pytest.skip(f"vendor fused_recurrent_kda rejects this case: {rejected}")
+
+    got = fused_recurrent_kda(**data)
+    rtol, atol = CROSS_IMPL_TOLERANCES[dtype]
+    for got_part, native_part in zip(got, native_out):
+        torch.testing.assert_close(
+            got_part.detach().cpu(),
+            native_part.detach().cpu(),
+            rtol=rtol,
+            atol=atol,
+            equal_nan=True,
+        )

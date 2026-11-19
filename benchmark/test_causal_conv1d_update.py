@@ -114,16 +114,59 @@ def _causal_conv1d_update_gems(
     )
 
 
+def _load_vllm_ascend_update():
+    """vllm-ascend's native causal_conv1d_update, or None when unavailable."""
+    try:
+        from vllm_ascend.ops.causal_conv1d import causal_conv1d_update as native
+    except Exception:  # ImportError, or an older tree that raises on import
+        return None
+    return native
+
+
+VLLM_ASCEND_UPDATE = _load_vllm_ascend_update()
+
+
+def _causal_conv1d_update_vllm_ascend(
+    x, conv_states, weight, bias, cache_indices, state_indices, activation="silu"
+):
+    """vllm-ascend native baseline. It also updates conv_states in place.
+
+    The native API derives the feature dim from ``x.shape[-1]``, so it wants
+    channel-last input; the benchmark builds channel-first tensors.
+
+    Note: on parts other than 310P, vllm-ascend ships this entry as a
+    per-sequence torch implementation, so the SpeedUp compares against the
+    vendor API's *reference* path rather than a vendor kernel.
+    """
+    _ = state_indices
+    return VLLM_ASCEND_UPDATE(
+        x.transpose(1, 2).contiguous(),
+        conv_states,
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=cache_indices,
+        pad_slot_id=PAD_SLOT_ID,
+    )
+
+
 def _update_input_fn(shape, dtype, device):
     batch, seqlen, dim = shape
     yield _update_inputs(batch, seqlen, dim, dtype, device)
 
 
 def test_causal_conv1d_update_perf():
+    # Prefer vllm-ascend's native API as the baseline; fall back to the local
+    # batched F.conv1d reference when it is not installed.
+    baseline = (
+        _causal_conv1d_update_vllm_ascend
+        if VLLM_ASCEND_UPDATE is not None
+        else _causal_conv1d_update_torch
+    )
     bench = CausalConv1dUpdateBenchmark(
         input_fn=_update_input_fn,
         op_name="causal_conv1d_update",
-        torch_op=_causal_conv1d_update_torch,
+        torch_op=baseline,
         gems_op=_causal_conv1d_update_gems,
         dtypes=[torch.bfloat16],
     )

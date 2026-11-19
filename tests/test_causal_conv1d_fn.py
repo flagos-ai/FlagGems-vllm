@@ -101,7 +101,27 @@ def causal_conv1d_ref(
     return (out, None) if not return_final_states else (out, final_states_out)
 
 
+def _load_vllm_ascend_ref():
+    """vllm-ascend's native causal_conv1d_fn, or None when unavailable.
+
+    Resolved lazily so a plain (non-Ascend) environment still collects the
+    module: the import itself pulls in torch_npu and the vllm platform plugin.
+    """
+    try:
+        from vllm_ascend.ops.causal_conv1d import causal_conv1d_fn as native
+    except Exception:  # ImportError, or an older tree that raises on import
+        return None
+    return native
+
+
+VLLM_ASCEND_FN = _load_vllm_ascend_ref()
+# "torch" is the local per-sequence reference; "vllm_ascend" is the vendor API
+# and is only collected when that API exists in the environment.
+REF_SOURCES = ["torch"] + (["vllm_ascend"] if VLLM_ASCEND_FN is not None else [])
+
+
 @pytest.mark.causal_conv1d_fn
+@pytest.mark.parametrize("ref_source", REF_SOURCES)
 @pytest.mark.parametrize("itype", ITYPES)
 @pytest.mark.parametrize("silu_activation", SILU)
 @pytest.mark.parametrize("has_bias", HAS_BIAS)
@@ -121,6 +141,7 @@ def test_causal_conv1d_varlen(
     silu_activation,
     itype,
     channel_first,
+    ref_source,
 ):
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -200,30 +221,48 @@ def test_causal_conv1d_varlen(
         pad_slot_id=PAD_SLOT_ID,
     )
 
-    # Reference: run the first batch_size sequences one by one (skip pad slots),
-    # writing final conv states back into final_states_ref in place.
-    out_ref_b = []
-    splits = torch.split(x_ref, seqlens[0], dim=-1)
-    for i in range(len(seqlens[0])):
-        x_s = splits[i]
-        if padded_state_indices[i] == PAD_SLOT_ID:
-            continue
-        out_ref_b.append(
-            causal_conv1d_ref(
-                x_s,
-                weight_ref,
-                bias_ref,
-                activation=activation,
-                return_final_states=True,
-                final_states_out=final_states_ref[padded_state_indices[i]].unsqueeze(0),
-                initial_states=(
-                    final_states_ref[padded_state_indices[i]].unsqueeze(0)
-                    if has_initial_states[i]
-                    else None
-                ),
+    # Reference: the local per-sequence torch loop by default, or vllm-ascend's
+    # native API when the environment has it. Both update the conv-state cache
+    # in place, so they run on their own copy of the states.
+    if ref_source == "vllm_ascend":
+        out_ref_tensor = VLLM_ASCEND_FN(
+            x_ref.squeeze(0),
+            weight_ref,
+            bias=bias_ref,
+            activation=activation,
+            conv_states=final_states_ref,
+            has_initial_state=has_initial_states,
+            cache_indices=padded_state_indices,
+            query_start_loc=query_start_loc.npu(),
+            pad_slot_id=PAD_SLOT_ID,
+        ).unsqueeze(0)
+    else:
+        # Run the first batch_size sequences one by one (skip pad slots),
+        # writing final conv states back into final_states_ref in place.
+        out_ref_b = []
+        splits = torch.split(x_ref, seqlens[0], dim=-1)
+        for i in range(len(seqlens[0])):
+            x_s = splits[i]
+            if padded_state_indices[i] == PAD_SLOT_ID:
+                continue
+            out_ref_b.append(
+                causal_conv1d_ref(
+                    x_s,
+                    weight_ref,
+                    bias_ref,
+                    activation=activation,
+                    return_final_states=True,
+                    final_states_out=final_states_ref[
+                        padded_state_indices[i]
+                    ].unsqueeze(0),
+                    initial_states=(
+                        final_states_ref[padded_state_indices[i]].unsqueeze(0)
+                        if has_initial_states[i]
+                        else None
+                    ),
+                )
             )
-        )
-    out_ref_tensor = torch.cat([t[0] for t in out_ref_b], dim=2)
+        out_ref_tensor = torch.cat([t[0] for t in out_ref_b], dim=2)
 
     # 1. in-place conv-state update matches the reference
     assert torch.allclose(
