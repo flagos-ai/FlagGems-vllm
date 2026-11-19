@@ -134,7 +134,11 @@ def _tile(m):
         return 64, 128, 4, 2, 8, 128, 1
     if m <= 128:
         return 128, 128, 8, 1, 8, 128, 1
-    return 256, 128, 8, 1, 8, 128, 2
+    if m < 2048:
+        return 256, 128, 8, 1, 8, 128, 2
+    # From 2048 tokens the L2 swizzle with 4 row groups measured 0.5-0.9%
+    # faster than 8; below that it is a wash or slightly worse.
+    return 256, 128, 8, 1, 4, 128, 2
 
 
 def _lean_bmm(act, weight, act_scale, weight_scale, out):
@@ -1067,7 +1071,15 @@ def deep_gemm_fp8_o_proj(
             act_i8, act_scale_i8 = _activation_to_int8(act, act_scale)
         else:
             act_i8, act_scale_i8 = _quant_buffers_cached(o, n_groups, heads_per_group)
-            block_t = 2 if num_tokens < 64 else 4
+            # 8-token tiles keep the vector units busy from 64 to 256 tokens
+            # (-2% to -15% vs 4); below 64 tokens there are not enough rows and
+            # from 512 the row-wise pass takes over.
+            if num_tokens < 64:
+                block_t = 2
+            elif num_tokens <= 256:
+                block_t = 8
+            else:
+                block_t = 4
             # 128/224-head models (g=16) run the row-wise pass 13-16% faster once
             # there are enough tokens to fill the device; with 64 heads (g=8) the
             # head-per-program layout already streams at ~0.9 TB/s and wins, and
