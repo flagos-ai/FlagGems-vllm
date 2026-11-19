@@ -2101,6 +2101,42 @@ def invoke_fused_moe_triton_kernel(
     out_top_k: int = 1,
 ) -> None:
     """Launch the fused_moe_kernel Triton kernel."""
+    if (
+        use_int8_w8a8
+        and per_channel_quant
+        and block_shape is None
+        and B_bias is None
+        and not (
+            FUSE_SILU or direct_sum or use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16
+        )
+        and A.device.type == "cuda"
+        and torch.version.cuda
+        and C.ndim == 3
+        and C.shape[0] in (1024, 2048, 4096, 8192)
+        and tuple(B.shape) in ((64, 3072, 1536), (64, 1536, 1536))
+        and torch.cuda.get_device_capability(A.device) == (9, 0)
+    ):
+        # FlagTree provides the TLE instructions required by these SM90 kernels.
+        try:
+            from flaggems_vllm.ops._hopper_w8a8_moe import try_invoke
+        except ImportError:
+            try_invoke = None
+        if try_invoke is not None and try_invoke(
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            top_k,
+            config,
+        ):
+            return
+
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
