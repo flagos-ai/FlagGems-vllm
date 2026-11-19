@@ -95,6 +95,12 @@ def sparse_int8_attention(
     if VSlice == 512:
         acc2 = tl.full(AccShape, 0.0, tl.float32)
         acc3 = tl.full(AccShape, 0.0, tl.float32)
+    if VSlice == 256:
+        tl.static_assert(HeadMajor and BK == 256)
+        # Reuse the same query panels for every sparse key tile.
+        query_base = Q + query_row[:, None] * 512 + dims[None, :]
+        query_low = tl.load(query_base)
+        query_high = tl.load(query_base + 256)
     begin = split * SplitTiles * BN
     end = tl.minimum(begin + SplitTiles * BN, length)
     for start in range(begin, end, BN):
@@ -108,13 +114,19 @@ def sparse_int8_attention(
             kv_base = KV + token[:, None].to(tl.int64) * 512
         qs_ptr = Q + query_row[:, None] * 512
         raw = tl.full((BH, BN) if HeadMajor else (BN, BH), 0, tl.int32)
-        for ck in tl.range(0, 512, BK, loop_unroll_factor=1):
-            q = tl.load(qs_ptr + ck + dims[None, :])
-            k = tl.load(kv_base + ck + dims[None, :], valid[:, None], 0)
-            if HeadMajor:
-                raw = tl.dot(q, tl.trans(k), raw, out_dtype=tl.int32)
-            else:
-                raw = tl.dot(k, tl.trans(q), raw, out_dtype=tl.int32)
+        if VSlice == 256:
+            key_low = tl.load(kv_base + dims[None, :], valid[:, None], 0)
+            raw = tl.dot(query_low, tl.trans(key_low), raw, out_dtype=tl.int32)
+            key_high = tl.load(kv_base + dims[None, :] + 256, valid[:, None], 0)
+            raw = tl.dot(query_high, tl.trans(key_high), raw, out_dtype=tl.int32)
+        else:
+            for ck in tl.range(0, 512, BK, loop_unroll_factor=1):
+                q = tl.load(qs_ptr + ck + dims[None, :])
+                k = tl.load(kv_base + ck + dims[None, :], valid[:, None], 0)
+                if HeadMajor:
+                    raw = tl.dot(q, tl.trans(k), raw, out_dtype=tl.int32)
+                else:
+                    raw = tl.dot(k, tl.trans(q), raw, out_dtype=tl.int32)
         score = raw.to(tl.float32)
         if Rope:
             kr = tl.load(
