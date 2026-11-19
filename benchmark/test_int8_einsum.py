@@ -25,10 +25,10 @@ from . import base, conftest
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 # The upstream FP8 einsum shape grid and quantization structure are shared by
-# the floating and low-precision routes. Hygon and MetaX quantize to signed INT8.
-IS_SUPPORTED_VENDOR = flaggems_vllm.vendor_name in ("hygon", "metax")
+# the floating and low-precision routes. Hygon, MetaX and PPU use signed INT8.
+IS_SUPPORTED_VENDOR = flaggems_vllm.vendor_name in ("hygon", "metax", "thead")
 pytestmark = pytest.mark.skipif(
-    not IS_SUPPORTED_VENDOR, reason="requires Hygon or MetaX int8_einsum"
+    not IS_SUPPORTED_VENDOR, reason="requires Hygon, MetaX or PPU int8_einsum"
 )
 EINSUM_LOW_PRECISION_DTYPE = torch.int8
 DEFAULT_BLOCK_SHAPE = (128, 128)
@@ -103,7 +103,7 @@ def _make_block_einsum_inputs(b, h, r, d, block_shape, device, dtype, seed=0):
     """Build upstream per-token x and per-block y inputs for bhr,hdr->bhd.
 
     Return x, xs, y, ys and the two original BF16 tensors used by baselines.
-    Hygon DCU quantized inputs are signed INT8.
+    Hygon, MetaX and PPU quantized inputs are signed INT8.
     """
     block_n, block_k = block_shape
     torch.manual_seed(seed)
@@ -194,6 +194,9 @@ class INT8EinsumBenchmark(base.Benchmark):
 class ParallelINT8EinsumBenchmark(ParallelBenchmarkMixin, INT8EinsumBenchmark):
     """Use the existing benchmark worker scheduling for exported shapes."""
 
+    # MetaX fp8_einsum has no single-process benchmark; record its results.
+    RECORD_PARALLEL_RESULTS = True
+
 
 def metax_vllm_einsum_bf16(
     x: torch.Tensor,
@@ -238,15 +241,15 @@ def _gems_einsum_bf16_wrapper(x, xs, y, ys, x_bf16, y_bf16):
         pytest.param(
             EINSUM_LOW_PRECISION_DTYPE,
             id="int8",
-            marks=pytest.mark.int8_einsum,
+            marks=pytest.mark.fp8_einsum,
         ),
     ],
 )
 def test_perf_int8_einsum(dtype):
     low_precision = dtype == EINSUM_LOW_PRECISION_DTYPE
     if low_precision and not _einsum_low_precision_available():
-        pytest.skip("requires Hygon or MetaX INT8 support")
-    op_name = "int8_einsum" if low_precision else "einsum"
+        pytest.skip("requires Hygon, MetaX or PPU INT8 support")
+    op_name = "fp8_einsum" if low_precision else "einsum"
     if flaggems_vllm.vendor_name == "metax":
         if not low_precision:
             pytest.skip("MetaX int8_einsum accepts INT8 inputs only")

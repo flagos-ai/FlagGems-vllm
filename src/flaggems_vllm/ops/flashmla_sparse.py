@@ -19,13 +19,16 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.tle_capabilities import supports_sparse_mla_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 
-        HAS_TLE_FLASHMLA_SPARSE = True
+        HAS_TLE_FLASHMLA_SPARSE = supports_sparse_mla_tle(tle)
     except ImportError:
         tle = None
         HAS_TLE_FLASHMLA_SPARSE = False
@@ -40,14 +43,17 @@ TLE_FLASHMLA_PREFILL_PAIR_BLOCKS = 2
 TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS = 4
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": 64, "BH": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BK": 64, "BH": 64}, num_warps=8, num_stages=4),
-    ],
-    key=["SQ", "HQ", "DQK", "SKV", "TOPK", "HAVE_ATTN_SINK", "HAVE_TOPK_LENGTH"],
+# SQ and SKV are deliberately absent from the autotune key: the winning config
+# is the same from SQ=128 to SQ=8192 (measured on H800/sm_90a), and SKV only
+# feeds a bounds check. Keying on them made every new token count or KV-cache
+# length re-benchmark the config set, costing 270-1040 ms per unseen shape in
+# serving. The remaining keys are exactly the ones that change the tile shape.
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("flash_mla_sparse_fwd"),
+    key=["HQ", "DQK", "TOPK", "HAVE_ATTN_SINK", "HAVE_TOPK_LENGTH"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["SQ", "SKV"])
 def triton_flash_mla_sparse_fwd(
     q,
     kv,

@@ -2,8 +2,25 @@
 
 import torch
 import triton
-import triton.experimental.tle as tle
 import triton.language as tl
+
+# Ascend-native slice extraction. It ships with the triton-ascend backend in
+# stock Triton, unlike the equivalent ``tle.dsa.extract_slice``, which needs a
+# FlagTree build. Prefer it so these kernels run on both toolchains; fall back
+# to TLE when the extension is absent.
+try:
+    from triton.language.extra.cann.extension import extract_slice
+except ImportError:  # pragma: no cover - depends on the Triton build
+    try:
+        import triton.experimental.tle as _tle
+
+        extract_slice = _tle.dsa.extract_slice
+    except (ImportError, AttributeError) as _exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "causal_conv1d_update needs extract_slice from either "
+            "triton.language.extra.cann.extension (triton-ascend) or "
+            "triton.experimental.tle (FlagTree)."
+        ) from _exc
 
 PAD_SLOT_ID = -1
 
@@ -320,162 +337,31 @@ def _causal_conv1d_update_kernel_npu_tiled(
         for idx_token in range(seqlen_run):
             acc = acc_preload
 
-            # same selection logic as original (unrolled by KERNEL_WIDTH)
-            # Use extract_slice to get weight columns on-demand from 1D vector
-            matrix_w = tle.dsa.extract_slice(
-                w_tile, offsets=(0 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-            )
+            # Tap j is row j of the staged [KERNEL_WIDTH, BLOCK_N] tile.
+            # KERNEL_WIDTH is a constexpr and this is a static_range, so
+            # `j * BLOCK_N` is a compile-time offset into the flattened tile.
+            # The last tap is the current token; earlier taps are the sliding
+            # window registers carried across iterations. Collapsing the
+            # per-width ladder into this single form removes ~140 lines of
+            # duplicated source and keeps the generated IR identical.
             matrix_x = col0
             for j in tl.static_range(KERNEL_WIDTH):
-                if KERNEL_WIDTH == 1:
-                    # only x[t] * w0
+                matrix_w = extract_slice(
+                    w_tile, offsets=(j * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
+                )
+                if j == KERNEL_WIDTH - 1:
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token
                     matrix_x = tl.load(
                         x_ptrs_1d, mask=lane_active & mask_w, other=0.0
                     ).to(tl.float16)
-                    matrix_w = tle.dsa.extract_slice(
-                        w_tile, offsets=(0 * BLOCK_N,), sizes=(BLOCK_N,), strides=(1,)
-                    )
-                elif KERNEL_WIDTH == 2:
-                    if j == 1:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(1 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token
-                        matrix_x = tl.load(
-                            x_ptrs_1d, mask=lane_active & mask_w, other=0.0
-                        ).to(tl.float16)
-                elif KERNEL_WIDTH == 3:
-                    if j == 1:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(1 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col1
-                    elif j == 2:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(2 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token
-                        matrix_x = tl.load(
-                            x_ptrs_1d, mask=lane_active & mask_w, other=0.0
-                        ).to(tl.float16)
-                elif KERNEL_WIDTH == 4:
-                    if j == 1:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(1 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col1
-                    elif j == 2:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(2 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col2
-                    elif j == 3:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(3 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token
-                        matrix_x = tl.load(
-                            x_ptrs_1d, mask=lane_active & mask_w, other=0.0
-                        ).to(tl.float16)
-                elif KERNEL_WIDTH == 5:
-                    if j == 1:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(1 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col1
-                    elif j == 2:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(2 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col2
-                    elif j == 3:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(3 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col3
-                    elif j == 4:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(4 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token
-                        matrix_x = tl.load(
-                            x_ptrs_1d, mask=lane_active & mask_w, other=0.0
-                        ).to(tl.float16)
-                elif KERNEL_WIDTH == 6:
-                    if j == 1:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(1 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col1
-                    elif j == 2:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(2 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col2
-                    elif j == 3:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(3 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col3
-                    elif j == 4:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(4 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        matrix_x = col4
-                    elif j == 5:
-                        matrix_w = tle.dsa.extract_slice(
-                            w_tile,
-                            offsets=(5 * BLOCK_N,),
-                            sizes=(BLOCK_N,),
-                            strides=(1,),
-                        )
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token
-                        matrix_x = tl.load(
-                            x_ptrs_1d, mask=lane_active & mask_w, other=0.0
-                        ).to(tl.float16)
+                elif j == 1:
+                    matrix_x = col1
+                elif j == 2:
+                    matrix_x = col2
+                elif j == 3:
+                    matrix_x = col3
+                elif j == 4:
+                    matrix_x = col4
 
                 acc += matrix_x.to(tl.float32) * matrix_w  # [BLOCK_N]
 
@@ -571,8 +457,14 @@ def causal_conv1d_update(
     elif activation is not None:
         assert activation in ["silu", "swish"]
 
-    original_x_dtype = x.dtype
-    x = x.to(conv_state.dtype)
+    # The kernel updates ``x`` in place (``out = x`` below), so it needs a
+    # single dtype for both operands. Reject the mixed case instead of casting:
+    # a cast would allocate a copy, silently break the documented in-place
+    # contract, and add a torch kernel to a path that must stay kernel-only.
+    if x.dtype != conv_state.dtype:
+        raise NotImplementedError(
+            "Ascend causal_conv1d_update requires x and conv_state to share a dtype"
+        )
     unsqueeze = query_start_loc is None and x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1
@@ -696,4 +588,4 @@ def causal_conv1d_update(
 
     if unsqueeze:
         out = out.squeeze(-1)
-    return out.to(original_x_dtype)
+    return out

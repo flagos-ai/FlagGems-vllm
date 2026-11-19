@@ -13,41 +13,79 @@
 # limitations under the License.
 
 
-from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_model1 import (
-    can_use_model1_thead,
-    sparse_decode_model1_thead,
+import flag_gems
+
+from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import cooperative_topk
+from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
 )
-from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_v32 import (
-    can_use_v32_thead,
-    sparse_decode_v32_thead,
+from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache import (
+    sparse_decode_thead,
 )
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._thead.ops.gdn_w8a16_int8 import (
+    chunk_gated_delta_rule_w8a16_int8,
+    gdn_w8a16_int8,
+    quantize_gdn_state_int8,
+)
 from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_norm
+from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
+    indexer_k_quant_and_cache,
+)
+from flaggems_vllm.runtime.backend._thead.ops.input_batch import (
+    get_num_sampled_and_rejected,
+)
+from flaggems_vllm.runtime.backend._thead.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._thead.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_int8_bmm import (
+    w8a8_block_int8_bmm,
+)
+from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_block_matmul
 
 __all__ = [
-    "SUPPORTED_FP8_DTYPE",
-    "can_use_model1_thead",
-    "can_use_v32_thead",
+    "chunk_gated_delta_rule_w8a16_int8",
+    "cooperative_topk",
     "fused_experts_impl",
+    "fused_q_kv_rmsnorm",
+    "gdn_w8a16_int8",
     "gemma_rms_norm",
+    "get_num_sampled_and_rejected",
+    "hc_combine",
+    "indexer_k_quant_and_cache",
     "inplace_fused_experts",
+    "int8_einsum",
     "outplace_fused_experts",
-    "SUPPORTED_FP8_DTYPE",
     "per_token_group_quant_fp8",
     "persistent_topk",
-    "sparse_decode_model1_thead",
-    "sparse_decode_v32_thead",
+    "qsa_prepare",
+    "quantize_gdn_state_int8",
+    "qwen4_hc_inject_combine",
+    "sparse_decode_thead",
+    "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
+    "w8a8_block_int8_bmm",
+    "w8a8_block_matmul",
 ]
+
+# Older FlagGems CI pins do not export the shared PPU INT8 MM implementation.
+if "mm_w8a8_int8" in vars(flag_gems):
+    from flaggems_vllm.runtime.backend._thead.ops.bmm_w8a8_int8 import bmm_w8a8_int8
+
+    __all__ += ["bmm_w8a8_int8"]
+
+from flaggems_vllm.runtime.backend._thead.ops.hc_combine import hc_combine
+from flaggems_vllm.runtime.backend._thead.ops.hyperconnection import (
+    qwen4_hc_inject_combine,
+)

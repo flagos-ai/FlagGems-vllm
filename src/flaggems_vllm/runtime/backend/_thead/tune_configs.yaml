@@ -117,3 +117,767 @@ compute_global_topk_indices_and_lens:
       TPP: 2
     num_warps: 1
     num_stages: 3
+
+bmm:
+  - META:
+      TILE_M: 32
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 1
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 64
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 128
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 128
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 128
+      TILE_N: 128
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      TILE_M: 32
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 1
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 64
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 64
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 32
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 64
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+  - META:
+      TILE_M: 128
+      TILE_N: 128
+      TILE_K: 32
+      GROUP_M: 2
+    num_warps: 4
+    num_stages: 3
+
+triton_reshape_and_cache_flash:
+  - META: {TILE: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {TILE: 1024}
+    num_warps: 8
+    num_stages: 1
+
+dequantize_and_gather_k_cache:
+  - META:
+      num_workers: 128
+    num_warps: 2
+  - META:
+      num_workers: 256
+    num_warps: 2
+  - META:
+      num_workers: 512
+    num_warps: 2
+  - META:
+      num_workers: 1024
+    num_warps: 2
+  - META:
+      num_workers: 2048
+    num_warps: 2
+  - META:
+      num_workers: 4096
+    num_warps: 2
+
+w8a8_block_int8_matmul_thead:
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      GROUP_M: 32
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BLOCK_M: 16
+      BLOCK_N: 32
+      GROUP_M: 4
+    num_warps: 2
+    num_stages: 2
+  - META:
+      BLOCK_M: 32
+      BLOCK_N: 32
+      GROUP_M: 4
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 32
+      BLOCK_N: 64
+      GROUP_M: 8
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      GROUP_M: 8
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 128
+      BLOCK_N: 128
+      GROUP_M: 8
+    num_warps: 8
+    num_stages: 2
+
+w8a8_block_int8_swap_thead:
+  - META:
+      BLOCK_M: 16
+      BLOCK_N: 32
+      GROUP_M: 4
+    num_warps: 2
+    num_stages: 2
+  - META:
+      BLOCK_M: 16
+      BLOCK_N: 64
+      GROUP_M: 8
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 16
+      BLOCK_N: 128
+      GROUP_M: 8
+    num_warps: 4
+    num_stages: 2
+
+w8a8_block_int8_gemv_thead:
+  - META:
+      BLOCK_N: 64
+      BLOCK_K: 128
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_N: 128
+      BLOCK_K: 128
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_N: 256
+      BLOCK_K: 128
+    num_warps: 8
+    num_stages: 2
+
+# Compact split-K candidates, timed together with the FP32 reduction.
+w8a8_block_int8_splitk_thead:
+  - META: {BLOCK_M: 16, BLOCK_N: 32, GROUP_M: 4, SPLITS: 4, SWAP: true}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 64, GROUP_M: 8, SPLITS: 4, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, GROUP_M: 8, SPLITS: 4, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 32, GROUP_M: 4, SPLITS: 8, SWAP: true}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 64, GROUP_M: 8, SPLITS: 8, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, GROUP_M: 8, SPLITS: 8, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 32, GROUP_M: 4, SPLITS: 16, SWAP: true}
+    num_warps: 2
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 64, GROUP_M: 8, SPLITS: 16, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_N: 128, GROUP_M: 8, SPLITS: 16, SWAP: false}
+    num_warps: 4
+    num_stages: 2
+
+# PPU fused-gate candidates selected from the complete core search.
+ckfg_inter:
+  - META: {BK: 32}
+    num_warps: 1
+    num_stages: 4
+
+ckfg_intra:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_inverse:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_recompute:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_output:
+  - META: {BK: 32, BV: 64}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_gate:
+  - META: {BD: 64}
+    num_warps: 4
+    num_stages: 2
+
+ckfg_state:
+  - META: {BV: 32}
+    num_warps: 4
+    num_stages: 2
+
+# Both row counts won core cases; retain their measured search.
+ckfg_norm:
+  - META: {ROWS: 8}
+    num_warps: 4
+    num_stages: 2
+  - META: {ROWS: 32}
+    num_warps: 4
+    num_stages: 2
+
+# Native fused-gate shortlist retains cold and warm full-search core winners.
+ckfg_native_gate:
+- META:
+    BD: 32
+  num_warps: 8
+  num_stages: 3
+- META:
+    BD: 64
+  num_warps: 4
+  num_stages: 3
+- META:
+    BD: 32
+  num_warps: 2
+  num_stages: 3
+- META:
+    BD: 32
+  num_warps: 4
+  num_stages: 3
+- META:
+    BD: 64
+  num_warps: 8
+  num_stages: 3
+ckfg_native_recompute:
+- META: {}
+  num_warps: 4
+  num_stages: 2
+- META: {}
+  num_warps: 8
+  num_stages: 3
+- META: {}
+  num_warps: 4
+  num_stages: 4
+- META: {}
+  num_warps: 8
+  num_stages: 2
+- META: {}
+  num_warps: 4
+  num_stages: 3
+ckfg_native_inter:
+- META:
+    BK: 64
+  num_warps: 1
+  num_stages: 2
+- META:
+    BK: 32
+  num_warps: 1
+  num_stages: 3
+- META:
+    BK: 32
+  num_warps: 1
+  num_stages: 4
+- META:
+    BK: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 64
+  num_warps: 4
+  num_stages: 3
+- META:
+    BK: 32
+  num_warps: 8
+  num_stages: 3
+- META:
+    BK: 32
+  num_warps: 1
+  num_stages: 2
+- META:
+    BK: 64
+  num_warps: 2
+  num_stages: 4
+ckfg_native_intra:
+- META: {}
+  num_warps: 4
+  num_stages: 3
+- META: {}
+  num_warps: 2
+  num_stages: 3
+- META: {}
+  num_warps: 8
+  num_stages: 3
+ckfg_native_output:
+- META:
+    BK: 32
+    BV: 128
+  num_warps: 8
+  num_stages: 3
+- META:
+    BK: 64
+    BV: 64
+  num_warps: 4
+  num_stages: 3
+- META:
+    BK: 32
+    BV: 64
+  num_warps: 2
+  num_stages: 4
+- META:
+    BK: 64
+    BV: 128
+  num_warps: 2
+  num_stages: 2
+- META:
+    BK: 64
+    BV: 64
+  num_warps: 8
+  num_stages: 4
+- META:
+    BK: 32
+    BV: 64
+  num_warps: 4
+  num_stages: 4
+- META:
+    BK: 32
+    BV: 128
+  num_warps: 4
+  num_stages: 3
+- META:
+    BK: 64
+    BV: 128
+  num_warps: 4
+  num_stages: 2
+- META:
+    BK: 32
+    BV: 64
+  num_warps: 4
+  num_stages: 3
+- META:
+    BK: 32
+    BV: 64
+  num_warps: 8
+  num_stages: 3
+- META:
+    BK: 32
+    BV: 128
+  num_warps: 8
+  num_stages: 4
+ckfg_native_inverse:
+- META: {}
+  num_warps: 8
+  num_stages: 5
+- META: {}
+  num_warps: 4
+  num_stages: 5
+- META: {}
+  num_warps: 8
+  num_stages: 4
+- META: {}
+  num_warps: 8
+  num_stages: 3
+- META: {}
+  num_warps: 8
+  num_stages: 2
+ckfg_native_state:
+- META:
+    BV: 32
+  num_warps: 4
+  num_stages: 2
+- META:
+    BV: 32
+  num_warps: 4
+  num_stages: 4
+- META:
+    BV: 32
+  num_warps: 4
+  num_stages: 3
+- META:
+    BV: 64
+  num_warps: 2
+  num_stages: 4
+- META:
+    BV: 64
+  num_warps: 4
+  num_stages: 4
+- META:
+    BV: 64
+  num_warps: 4
+  num_stages: 3
+- META:
+    BV: 32
+  num_warps: 2
+  num_stages: 2
+
+kda_kkt_pairs:
+  - META: {PAIRS: 16}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_inter:
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 1
+
+pad_indexer_heads:
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
+kda_kkt_diag:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    # The core dense/packed winners both use one warp, with BH=2 and BH=4.
+    head_tiles:
+      - 1
+      - 2
+      - 4
+    warps:
+      - 1
+    stages:
+      - 1
+
+hc_combine:
+  - META: {BLOCK_D: 512, LOOP: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 512, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+
+cast_sigmoid:
+  - META: {BLOCK_SIZE: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE: 4096}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE: 8192}
+    num_warps: 8
+    num_stages: 1
+
+# PPU-ZW810E measured configurations. Pipeline partition count is selected by
+# host dispatch because it defines the shared histogram/state geometry.
+cooperative_topk_thead_histogram:
+  - META:
+      BLOCK: 1024
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_thead_compact:
+  - META:
+      BLOCK: 1024
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_thead_finish:
+  - META:
+      BLOCK: 1024
+      TILE: 8
+    num_warps: 4
+    num_stages: 1
+
+
+# The coarse bucket is refined with exact FP32 integer keys.
+cooperative_topk_thead_small:
+  - META:
+      BINS: 32
+    num_warps: 32
+    num_stages: 1
+  - META:
+      BINS: 64
+    num_warps: 32
+    num_stages: 1
+
+# Register-resident coarse selection avoids a global histogram for medium rows.
+cooperative_topk_thead_medium:
+  - META: {}
+    num_warps: 32
+    num_stages: 1
+
+# Shifted mHC boundary (DSV4.1), PPU hc=4 path.  The generic spaces are the
+# NVIDIA ones; these replace them for the fused PPU kernels.
+#
+# H-tiled post + collapse + sum-of-squares kernel.  The token-fused kernel
+# below covers H <= 8192; this wider-row fallback tiles the hidden axis across
+# CTAs.  The sweep starts at 128 (the smallest tile the partials scratch is
+# sized for).
+mhc_shifted_post_collapse:
+  - META: {BLOCK_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 512}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_H: 1024}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 2048}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_H: 4096}
+    num_warps: 8
+    num_stages: 1
+
+# Pure split-K project GEMM: (N, hc*H) @ (hc*H, 24), BLOCK_N stays 32 so one
+# CTA covers all 24 mix columns.  Without the fused sum-of-squares reduction
+# the K loop can pipeline; the largest tile still fits the PPU's 256 KB smem.
+mhc_shifted_project_thead:
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [16, 32, 64, 128]
+    bk: [64, 128]
+    bn: [32]
+    w: [4, 8]
+    s: [1, 2, 3]
+  # Deep-pipeline variants: BK=32 with more stages wins for medium-N wide-H
+  # shapes, and stages 4 is the plateau for the large prefill GEMM.
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [128]
+    bk: [32]
+    bn: [32]
+    w: [8]
+    s: [4, 6, 8]
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [64, 128]
+    bk: [128]
+    bn: [32]
+    w: [8]
+    s: [4]
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [64]
+    bk: [64]
+    bn: [32]
+    w: [8]
+    s: [4, 6]
+
+# Project-partial + sum-of-squares reduction and Sinkhorn coefficients.
+# TOKEN_TILE tokens share a program so the serial Sinkhorn runs as [T]-vector
+# math; T=1 keeps the old per-token shape.
+mhc_shifted_coeff_thead:
+  - gen: true
+    param_map:
+      META: {TOKEN_TILE: tt}
+      num_warps: w
+      num_stages: 1
+    tt: [1, 2, 4, 8]
+    w: [2, 4, 8]
+
+# One CTA per token for H <= 8192: post + collapse + sum of squares + optional
+# RMSNorm.  BLOCK_H is next_power_of_2(H) and comes from the host, so only the
+# warp count is tuned.
+mhc_shifted_post_collapse_norm_thead:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+# Four-stream project GEMM: each residual stream is a separate K slab, so the
+# per-CTA loop is H (or H/split_k) instead of 4H and the four weight slabs stay
+# in L2.  Used for num_tokens >= 256; the full-K project kernel covers smaller
+# batches.  The stream sweep picked BM 32/64/128, BK 64/128, four warps.
+mhc_shifted_project_thead_stream:
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn}
+      num_warps: w
+      num_stages: s
+    bm: [32, 64, 128]
+    bk: [64, 128]
+    bn: [32]
+    w: [4]
+    s: [2, 3]
+
+# Token-loop fused post+collapse+ssq+norm.  The flat kernel keeps the whole
+# row in registers; this variant streams H in BLOCK_H tiles with an explicit
+# pipeline depth and pays one extra NH read for the norm's second pass.
+mhc_shifted_post_collapse_norm_loop_thead:
+  - gen: true
+    param_map:
+      META: {BLOCK_H: bh, PIPE_STAGES: ps}
+      num_warps: w
+      num_stages: 1
+    bh: [512, 1024, 2048]
+    ps: [1, 2, 3]
+    w: [4, 8]
+
+# Full-K project with an AIU async A load.  Only the contiguous (N, hc*H)
+# matrix is eligible: the stream-split A is a strided sub-matrix and keeps
+# regular loads.  PIPE_STAGES and num_stages must agree for the async copies.
+mhc_shifted_project_thead_aiu:
+  - gen: true
+    param_map:
+      META: {BLOCK_M: bm, BLOCK_K: bk, BLOCK_N: bn, PIPE_STAGES: ps}
+      num_warps: w
+      num_stages: ps
+    bm: [32, 64, 128]
+    bk: [64, 128]
+    bn: [32]
+    w: [4, 8]
+    ps: [3]
+
+# Small-shape full-K project + coefficient epilogue (one launch, no split).
+# The measured winner for every H <= 1280 shape is BLOCK_M=16/BLOCK_K=128 at
+# num_stages=3; the small sweep keeps response to shape changes without the
+# cost of the full project space.
+mhc_shifted_project_coeff_thead:
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 16, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+
+# Small-shape split-K project + last-CTA coefficient epilogue.  num_warps is
+# fixed at 4 because the release/acquire fence width is NTHREADS=128, and
+# BLOCK_N is fixed at 32 to match the packed weight stride used as the
+# partials/scratch row stride.
+mhc_shifted_project_coeff_splitk_thead:
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 16, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_M: 32, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 128, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 128, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2

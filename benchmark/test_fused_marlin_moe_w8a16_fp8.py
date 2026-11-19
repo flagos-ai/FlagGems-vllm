@@ -536,7 +536,7 @@ def _gems_call_fp8(
     )
 
 
-@pytest.mark.fused_marlin_moe_w8a16_fp8
+@pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
@@ -547,9 +547,10 @@ def test_fused_marlin_moe_w8a16_fp8():
     """Compare identical E4M3 weights and per-group-128 scales; on Hygon the
     baseline is vLLM's native BF16 fused_experts over the decoded weights."""
     bench = FusedMarlinMoEW8A16FP8Benchmark(
-        op_name="fused_marlin_moe_w8a16_fp8",
+        op_name="fused_marlin_moe_w8a16",
         torch_op=_vllm_baseline_fp8,
         dtypes=[torch.bfloat16],
     )
+    bench.base_variant = "fp8"
     bench.set_gems(_gems_call_fp8)
     bench.run()

@@ -504,9 +504,9 @@ def _check_paged_kv(
         or int(table.shape[1]) <= 0
     ):
         raise ValueError(f"{table_name} must have shape [batch_size, max_num_blocks].")
-    page_ids = table.detach().cpu()
+    page_ids = table.detach().cpu().reshape(-1).tolist()
     page_count = int(kv.shape[0])
-    if bool(torch.any(page_ids < 0)) or bool(torch.any(page_ids >= page_count)):
+    if any(page < 0 or page >= page_count for page in page_ids):
         raise ValueError(
             f"{table_name} contains a physical page id outside [0, {page_count})."
         )
@@ -556,12 +556,12 @@ def _validate_sparse_attn_sharedkv_inputs(
         raise ValueError(
             "cu_seqlens_q must be a 1-D tensor describing at least one batch."
         )
-    cu_seqlens_cpu = cu_seqlens_q.detach().cpu()
+    cu_seqlens_cpu = cu_seqlens_q.detach().cpu().tolist()
     if int(cu_seqlens_cpu[0]) != 0:
         raise ValueError("cu_seqlens_q must start at 0.")
-    if bool(torch.any(cu_seqlens_cpu[1:] < cu_seqlens_cpu[:-1])):
+    if any(right < left for left, right in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])):
         raise ValueError("cu_seqlens_q must be monotonically non-decreasing.")
-    if bool(torch.any(cu_seqlens_cpu < 0)) or bool(torch.any(cu_seqlens_cpu > total_q)):
+    if any(length < 0 or length > total_q for length in cu_seqlens_cpu):
         raise ValueError(f"cu_seqlens_q values must be within [0, {total_q}].")
     if int(cu_seqlens_cpu[-1]) != total_q:
         raise ValueError(f"cu_seqlens_q[-1] must equal q.shape[0] ({total_q}).")
@@ -595,11 +595,11 @@ def _validate_sparse_attn_sharedkv_inputs(
         raise ValueError(
             f"seqused_kv must contain one length for each of the {batch_size} batches."
         )
-    seqused_kv_cpu = seqused_kv.detach().cpu()
-    if bool(torch.any(seqused_kv_cpu < 0)):
+    seqused_kv_cpu = seqused_kv.detach().cpu().tolist()
+    if any(length < 0 for length in seqused_kv_cpu):
         raise ValueError("seqused_kv values must be non-negative.")
     ori_capacity = int(ori_block_table.shape[1]) * int(ori_kv.shape[1])
-    if bool(torch.any(seqused_kv_cpu > ori_capacity)):
+    if any(length > ori_capacity for length in seqused_kv_cpu):
         raise ValueError(
             f"seqused_kv exceeds ori_block_table capacity ({ori_capacity})."
         )
@@ -622,8 +622,8 @@ def _validate_sparse_attn_sharedkv_inputs(
             dtype=q.dtype,
         )
         cmp_capacity = int(cmp_block_table.shape[1]) * int(cmp_kv.shape[1])
-        compressed_lengths = seqused_kv_cpu // int(cmp_ratio)
-        if bool(torch.any(compressed_lengths > cmp_capacity)):
+        compressed_lengths = [length // int(cmp_ratio) for length in seqused_kv_cpu]
+        if any(length > cmp_capacity for length in compressed_lengths):
             raise ValueError(
                 f"compressed KV length exceeds cmp_block_table capacity ({cmp_capacity})."
             )

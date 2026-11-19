@@ -722,7 +722,19 @@ def test_fused_moe_fp8_blockwise(config, block_shape):
 
 
 @pytest.mark.fused_experts_impl
-@pytest.mark.parametrize("config", FUSED_MOE_QUANT_CONFIGS)
+@pytest.mark.parametrize(
+    "config",
+    FUSED_MOE_QUANT_CONFIGS
+    + (
+        [
+            (64, 128, 6144, 384, 4),
+            (1024, 128, 6144, 384, 4),
+            (8192, 128, 6144, 384, 4),
+        ]
+        if RUN_LARGE_MOE_TESTS
+        else []
+    ),
+)
 def test_fused_moe_int8(config):
     """Test FlagGems fused_moe with INT8 W8A8 per-channel quantization."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config

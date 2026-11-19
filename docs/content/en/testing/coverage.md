@@ -99,5 +99,5 @@ Target coverage by operator stage:
 
 ## Next Steps
 
-- [Unit test guide](unittest/)
-- [Contribution guide](/FlagGems-vllm/contribution/overview/)
+- [Unit test guide](unittest.md)
+- [Contribution guide](../contribution/overview.md)

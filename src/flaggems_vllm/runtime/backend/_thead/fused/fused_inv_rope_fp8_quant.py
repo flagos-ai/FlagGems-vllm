@@ -146,7 +146,8 @@ def _fused_inv_rope_fp8_quant_kernel(
         ).to(tl.float32)
         absmax_i = tl.maximum(tl.max(tl.abs(xi), axis=1), eps)
         if TMA_ALIGNED_SCALES:
-            ki = _pow2_ue8m0_exponent(tl.maximum(absmax_i, eps * fp8_max))
+            # The packed-scale floor is fixed, independently of the input eps.
+            ki = _pow2_ue8m0_exponent(tl.maximum(absmax_i, 1e-10 * fp8_max))
             rscale_i = ((127 - ki) << 23).to(tl.float32, bitcast=True)
             scale_bits_i = (127 + ki) << 23
             byte_i = (scale_bits_i >> 23) & 0xFF
@@ -199,7 +200,7 @@ def _fused_inv_rope_fp8_quant_kernel(
         tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi_rot), axis=1)), eps
     )
     if TMA_ALIGNED_SCALES:
-        k_last = _pow2_ue8m0_exponent(tl.maximum(absmax_last, eps * fp8_max))
+        k_last = _pow2_ue8m0_exponent(tl.maximum(absmax_last, 1e-10 * fp8_max))
         rscale_last = ((127 - k_last) << 23).to(tl.float32, bitcast=True)
         scale_bits_last = (127 + k_last) << 23
         byte_last = (scale_bits_last >> 23) & 0xFF

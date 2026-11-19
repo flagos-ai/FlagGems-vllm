@@ -226,6 +226,19 @@ hygon_marlin_gemv:
     num_warps: 8
     num_stages: 1
 
+expand_pools_and_append_tail:
+  - META:
+      BLOCK_COLS: 128
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_COLS: 512
+    num_warps: 4
+    num_stages: 1
 compute_global_topk_indices_and_lens:
   - META:
       BLOCK: 16
@@ -237,3 +250,194 @@ compute_global_topk_indices_and_lens:
       TPP: 8
     num_warps: 4
     num_stages: 3
+
+dequantize_and_gather_k_cache:
+  - META:
+      num_workers: 128
+    num_warps: 2
+  - META:
+      num_workers: 256
+    num_warps: 2
+  - META:
+      num_workers: 512
+    num_warps: 2
+  - META:
+      num_workers: 1024
+    num_warps: 2
+  - META:
+      num_workers: 2048
+    num_warps: 2
+  - META:
+      num_workers: 4096
+    num_warps: 2
+
+ckfg_state:
+  - META:
+      BV: 16
+    num_warps: 2
+    num_stages: 1
+  - META:
+      BV: 32
+    num_warps: 2
+    num_stages: 1
+
+ckfg_intra:
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+  - META: {}
+    num_warps: 8
+    num_stages: 2
+kda_kkt_pairs:
+  - META: {PAIRS: 16}
+    num_warps: 4
+    num_stages: 1
+
+gate_sigmoid_mul:
+  - META:
+      BLOCK_SIZE: 256
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 1024
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_SIZE: 2048
+    num_warps: 8
+    num_stages: 1
+kda_kkt_inter:
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BK: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BK: 64}
+    num_warps: 1
+    num_stages: 4
+
+kda_kkt_diag:
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+
+# Stateful decode: fixed offline policy, no online replay of live state.
+fused_recurrent_kda:
+  - META:
+      BV: 8
+    num_warps: 1
+    num_stages: 1
+
+chunk_kda_fwd_intra_token_parallel:
+  - gen: true
+    param_map:
+      META:
+        BH: head_tiles
+      num_warps: warps
+      num_stages: stages
+    head_tiles:
+      - 1
+      - 2
+      - 4
+      - 8
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
+    stages:
+      - 1
+
+fused_kimi_k3_mla_kv_concat:
+  - META: {BLOCK: 1, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 8, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+
+# Fixed BW1000 schedules chosen with complete no-graph device-event timing.
+cooperative_topk_hygon_histogram:
+  - META: {BLOCK: 1024}
+    num_warps: 8
+    num_stages: 1
+
+cooperative_topk_hygon_compact:
+  - META: {BLOCK: 1024}
+    num_warps: 8
+    num_stages: 1
+
+cooperative_topk_hygon_finish:
+  - META: {BLOCK: 1024, TILE: 8}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_hygon_medium_histogram:
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_hygon_medium_compact:
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_hygon_medium_finish:
+  - META: {BLOCK: 1024, TILE: 8}
+    num_warps: 2
+    num_stages: 1
+
+cooperative_topk_hygon_small:
+  - META: {BINS: 256}
+    num_warps: 8
+    num_stages: 1
+
+# Guarded boundary-interval compaction for the 4K/512 row family.
+cooperative_topk_hygon_bracket_small:
+  - META: {LOW: 1.0, HIGH: 1.375, CAP: 128}
+    num_warps: 8
+    num_stages: 1
+
+# Medium rows: uint16 suffix counts, then wave64 threshold/compaction fusion.
+cooperative_topk_hygon_suffix_histogram:
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_hygon_suffix_compact:
+  - META: {BLOCK: 1024}
+    num_warps: 1
+    num_stages: 1
+
+cooperative_topk_hygon_suffix_finish:
+  - META: {BLOCK: 1024, TILE: 4}
+    num_warps: 1
+    num_stages: 1
