@@ -178,7 +178,10 @@ def make_topk_routing(gating, topk, dtype):
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     # Production routing weights stay float32; only the ids use the int32
     # expert-id contract. mctlass stage2 also requires float32 weights.
-    return topk_weights, topk_ids.to(torch.int32)
+    topk_ids = topk_ids.to(torch.int32)
+    assert topk_weights.dtype == torch.float32
+    assert topk_ids.dtype == torch.int32
+    return topk_weights, topk_ids
 
 
 def torch_fused_moe_reference(
