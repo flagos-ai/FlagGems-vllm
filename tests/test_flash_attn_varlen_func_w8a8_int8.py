@@ -853,12 +853,13 @@ def test_small_batch_decode_split_kv_modifiers(cap, with_alibi):
 
 @pytest.mark.flash_attn_varlen_func_w8a8
 @pytest.mark.parametrize("batch", [16, 32, 64])
+@pytest.mark.parametrize("query_length", [2, 4])
 @pytest.mark.parametrize("kv_length", [129, 513, 2048])
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-def test_paged_two_query_gqa(batch, kv_length, broadcast_scales, causal):
+def test_paged_few_query_gqa(batch, query_length, kv_length, broadcast_scales, causal):
     _run_case(
-        [2] * batch,
+        [query_length] * batch,
         [kv_length + index % 5 for index in range(batch)],
         heads=32,
         kvheads=8,
@@ -951,7 +952,9 @@ def test_folded_causal_prefill_partial_query_tiles(query_length, dtype):
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
 @pytest.mark.parametrize("num_splits", [0, 1, 3, 32])
 @pytest.mark.parametrize("causal", [False, True])
@@ -971,7 +974,9 @@ def test_metax_gqa256_scheduling(heads, kvheads, num_splits, causal):
     assert torch.all(metadata == 17)
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged", [False, True])
 def test_metax_gqa256_prefill(dtype, paged):
@@ -989,16 +994,48 @@ def test_metax_gqa256_prefill(dtype, paged):
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
-@pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 schedule"
+)
+@pytest.mark.parametrize(
+    "heads,kvheads",
+    [
+        (4, 1),
+        (16, 2),
+        pytest.param(
+            6,
+            2,
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "thead",
+                reason="Unfolded non-power-of-two GQA",
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-def test_metax_gqa256_long_query_tiles(heads, kvheads, broadcast_scales, causal):
+@pytest.mark.parametrize(
+    "qlens,klens",
+    [
+        ([31, 1025, 0], [137, 2057, 0]),
+        pytest.param(
+            [1, 1025, 13, 0],
+            [8195, 2057, 8193, 0],
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "thead",
+                reason="Compact short-request split-KV rows",
+            ),
+        ),
+    ],
+)
+def test_metax_gqa256_long_query_tiles(
+    heads, kvheads, broadcast_scales, causal, qlens, klens
+):
     # Cross both the 64-row query tile and the 128-token scale boundaries.
     # Include an empty request and a partial final KV tile in the same batch.
     _run_case(
-        [31, 1025, 0],
-        [137, 2057, 0],
+        qlens,
+        klens,
         dim=256,
         heads=heads,
         kvheads=kvheads,
@@ -1010,7 +1047,9 @@ def test_metax_gqa256_long_query_tiles(heads, kvheads, broadcast_scales, causal)
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 schedule"
+)
 @pytest.mark.parametrize("kv_length", [2047, 2048])
 @pytest.mark.parametrize("query_bound", [1023, 1024])
 def test_metax_gqa256_schedule_boundary(kv_length, query_bound):
@@ -1059,7 +1098,9 @@ def test_real_shape_reader_preserves_sequence_metadata(missing):
         assert pages == [19, 13]
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize(
     "num_splits,error",
     [(-1, ValueError), (33, ValueError), (True, TypeError), (1.5, TypeError)],
@@ -1073,7 +1114,9 @@ def test_metax_invalid_splits(num_splits, error):
         )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize("dim,kvheads,qlen", [(256, 1, 1), (128, 2, 129)])
 def test_metax_int8_large_physical_page_offset(dim, kvheads, qlen):
     # Real TP4 pool extent: 605550 pages. Each page has 4096 INT8 elements,
@@ -1118,11 +1161,15 @@ def test_metax_int8_large_physical_page_offset(dim, kvheads, qlen):
             causal=True,
             return_softmax_lse=True,
         )
-        gems_assert_close(out.float(), ref, dtype=torch.float32, atol=0.025)
-        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5)
+        gems_assert_close(
+            out.float(), ref, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
+        )
+        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5, rtol=LSE_RTOL)
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize(
     "window,cap,with_alibi",
     [((64, 0), 0.0, False), ((-1, -1), 20.0, False), ((-1, -1), 0.0, True)],
@@ -1148,7 +1195,9 @@ def test_metax_gqa256_split_score_modifiers(window, cap, with_alibi):
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize("kind", ["dtype", "rank", "stride"])
 def test_metax_invalid_scheduler_metadata(kind):
     q = torch.empty((1, 4, 256), device=flaggems_vllm.device, dtype=torch.int8)
@@ -1165,7 +1214,9 @@ def test_metax_invalid_scheduler_metadata(kind):
         )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 dispatch"
+)
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
@@ -1195,7 +1246,9 @@ def test_metax_d256_single_key_mixed_lengths(
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 dispatch"
+)
 @pytest.mark.parametrize("batch", [17, 64])
 def test_metax_d256_large_batch_packing(batch):
     _run_case(
