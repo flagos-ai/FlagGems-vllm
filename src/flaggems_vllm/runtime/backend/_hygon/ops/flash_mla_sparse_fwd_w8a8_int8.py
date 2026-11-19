@@ -273,6 +273,39 @@ def merge_sparse_int8_attention(
 
 
 @triton.jit
+def _v32_order_qk_tiles(
+    Indices,
+    Order,
+    Rows: tl.constexpr,
+    Tokens: tl.constexpr,
+    Chunk: tl.constexpr,
+    Tiles: tl.constexpr,
+    Block: tl.constexpr,
+    Shift: tl.constexpr,
+):
+    block = tl.program_id(0)
+    tasks = tl.arange(0, Block)
+    row_start = block * Chunk
+    count = tl.minimum(Chunk, Rows - row_start) * Tiles
+    valid = tasks < count
+    offset = (row_start * Tiles + tasks) * 128
+    first = tl.load(Indices + offset, valid, -1)
+    middle = tl.load(Indices + offset + 64, valid, -1)
+    pair_valid = (first >= 0) & (first < Tokens) & (middle >= 0) & (middle < Tokens)
+    distance = tl.abs(tl.where(pair_valid, first, 0) - tl.where(pair_valid, middle, 0))
+    distance = tl.minimum(distance, Tokens - distance)
+    nearby = tl.sum((pair_valid & (distance < Tokens // 8)).to(tl.int32), 0)
+    # Order CTAs by KV location when at least three quarters of tiles have nearby samples.
+    if nearby * 4 >= count * 3:
+        keys = tl.where(pair_valid, middle >> Shift, 0).to(tl.uint32)
+        encoded = tl.where(valid, keys * Block + tasks.to(tl.uint32), 0xFFFFFFFF)
+        order = (tl.sort(encoded, descending=False) & (Block - 1)).to(tl.int32)
+    else:
+        order = tasks
+    tl.store(Order + block * Block + tasks, order, valid)
+
+
+@triton.jit
 def _v32_prefill_weights(
     Q,
     QRope,
@@ -284,6 +317,7 @@ def _v32_prefill_weights(
     Length,
     Weights,
     TileStats,
+    Order,
     RowOffset,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -291,7 +325,15 @@ def _v32_prefill_weights(
     Scale: tl.constexpr,
     HasLength: tl.constexpr,
 ):
-    tile, head_tile, local_row = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if Order is None:
+        tile, head_tile, local_row = (
+            tl.program_id(0),
+            tl.program_id(1),
+            tl.program_id(2),
+        )
+    else:
+        task = tl.load(Order + tl.program_id(0))
+        tile, head_tile, local_row = task % (K // 128), 0, task // (K // 128)
     row = RowOffset + local_row
     heads = head_tile * 64 + tl.arange(0, 64)
     offsets = tile * 128 + tl.arange(0, 128)
@@ -455,15 +497,42 @@ def _prepare_v32_prefill(
     pv_warps = 8 if bv == 256 else 4
     # Process row chunks so the P14 workspace does not grow with the batch.
     chunk = min(rows, 512)
+    tiles = topk // 128
     weights = torch.empty((chunk, heads, topk), device=q_nope.device, dtype=torch.int16)
     stats = torch.empty(
-        (chunk, topk // 128, 3, heads), device=q_nope.device, dtype=torch.float32
+        (chunk, tiles, 3, heads), device=q_nope.device, dtype=torch.float32
     )
+    order = None
+    if heads == 64 and tokens >= 65536:
+        chunks = triton.cdiv(rows, chunk)
+        order_block = triton.next_power_of_2(chunk * tiles)
+        # Reserve bits for the task ID and leave the largest key for padding.
+        key_shift = max(0, (tokens - 1).bit_length() + order_block.bit_length() - 32)
+        order = torch.empty(
+            (chunks, order_block), device=indices.device, dtype=torch.int32
+        )
 
     def run():
-        for base in range(0, rows, chunk):
+        if order is not None:
+            _v32_order_qk_tiles[(chunks,)](
+                indices,
+                order,
+                rows,
+                tokens,
+                chunk,
+                tiles,
+                order_block,
+                key_shift,
+                num_warps=8,
+            )
+        for i, base in enumerate(range(0, rows, chunk)):
             count = min(chunk, rows - base)
-            _v32_prefill_weights[(topk // 128, heads // 64, count)](
+            qk_grid = (
+                (count * tiles, 1, 1)
+                if order is not None
+                else (tiles, heads // 64, count)
+            )
+            _v32_prefill_weights[qk_grid](
                 q_nope,
                 q_rope,
                 k_cache_lora,
@@ -474,6 +543,7 @@ def _prepare_v32_prefill(
                 topk_length,
                 weights,
                 stats,
+                order[i] if order is not None else None,
                 base,
                 heads,
                 topk,
