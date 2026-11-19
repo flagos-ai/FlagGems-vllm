@@ -1990,3 +1990,33 @@ gumbel_sample:
   - META: {}
     num_warps: 8
     num_stages: 1
+
+# Short generic routing: narrow register pairs after same-dtype preprocessing.
+grouped_topk_fused_select:
+  - META: {USE_SORT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {USE_SORT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {USE_SORT: true}
+    num_warps: 1
+    num_stages: 1
+  - META: {USE_SORT: false}
+    num_warps: 1
+    num_stages: 1
+
+# Exact FP32 ordering: compact candidates are always refined or retried at full width.
+grouped_topk_register_select:
+  - META: {COMPACT: false}
+    num_warps: 1
+    num_stages: 1
+  - META: {COMPACT: true}
+    num_warps: 1
+    num_stages: 1
+
+# Preserve the latency-oriented single-warp path for short batches.
+grouped_topk_single_register:
+  - META: {}
+    num_warps: 1
+    num_stages: 3
