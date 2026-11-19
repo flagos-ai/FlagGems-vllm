@@ -135,21 +135,50 @@ def _round_e4m3(v):
 
 
 @triton.jit
+def _quant_blocks(src, ROWS: tl.constexpr, WIDTH: tl.constexpr):
+    """Per-128 block absmax quantize a [ROWS, WIDTH] tile, FP32 out."""
+    q = tl.reshape(src, (ROWS * (WIDTH // 128), 128))
+    amax = tl.max(tl.abs(q), axis=1)
+    scale = amax * (1.0 / 448.0)
+    inv = 1.0 / tl.where(scale == 0, 1.0, scale)
+    return _round_e4m3(q * inv[:, None]) * scale[:, None]
+
+
+@triton.jit
 def _quant_store(src, out_ptr, off, valid, ROWS: tl.constexpr, WIDTH: tl.constexpr):
     """Per-128 block absmax quantize ``src`` [ROWS, WIDTH] and store FP16.
 
     The reciprocal is taken once per row: an FP32 division per element costs
     ~2.5x the whole pass on the Ascend vector unit.
     """
-    q = tl.reshape(src, (ROWS * (WIDTH // 128), 128))
-    amax = tl.max(tl.abs(q), axis=1)
-    scale = amax * (1.0 / 448.0)
-    inv = 1.0 / tl.where(scale == 0, 1.0, scale)
-    dq = _round_e4m3(q * inv[:, None]) * scale[:, None]
     cols = tl.arange(0, WIDTH)
     tl.store(
         out_ptr + off[:, None] + cols[None, :],
-        tl.reshape(dq, (ROWS, WIDTH)).to(tl.float16),
+        tl.reshape(_quant_blocks(src, ROWS, WIDTH), (ROWS, WIDTH)).to(tl.float16),
+        mask=valid[:, None],
+    )
+
+
+@triton.jit
+def _quant_pair_store(even, odd, out_ptr, off, valid, ROWS: tl.constexpr):
+    """Quantize a rotated rope block from its even/odd halves and store it.
+
+    The 128-wide block is reduced as two [ROWS, 64] halves instead of the
+    joined tile: reducing a ``tl.join`` result is correct but compiles to a
+    cross-lane storm on FlagTree 0.7.0 (CANN 9.0.0), where it costs ~45x the
+    rest of the pass. Both halves share the block scale, so the result is the
+    same tile.
+    """
+    amax = tl.maximum(tl.max(tl.abs(even), axis=1), tl.max(tl.abs(odd), axis=1))
+    scale = amax * (1.0 / 448.0)
+    inv = 1.0 / tl.where(scale == 0, 1.0, scale)
+    dq = tl.join(
+        _round_e4m3(even * inv[:, None]) * scale[:, None],
+        _round_e4m3(odd * inv[:, None]) * scale[:, None],
+    )
+    tl.store(
+        out_ptr + off[:, None] + tl.arange(0, 128)[None, :],
+        tl.reshape(dq, (ROWS, 128)).to(tl.float16),
         mask=valid[:, None],
     )
 
@@ -177,6 +206,12 @@ def _inv_rope_quant_kernel(
     are one head apart. The output is group-major (``[G, T, K]``) so the GEMM
     reads contiguous tiles; the inner 128 block that holds the rope columns is
     rotated with a pair split/join.
+
+    Loads are deliberately unmasked: the token index is clamped to the last
+    valid row, so every load stays in bounds and only the store is predicated.
+    A masked 128-wide load out of this tile shape is miscompiled by FlagTree
+    0.7.0 (CANN 9.0.0): it returns garbage, which turns the rope block into
+    inf/NaN even though the same expression is exact without the mask.
     """
     pid_t = tl.program_id(0)
     group = tl.program_id(1).to(tl.int64)
@@ -188,8 +223,10 @@ def _inv_rope_quant_kernel(
     head_valid = heads < heads_per_group
     for j in tl.static_range(TOKENS):
         token = pid_t * TOKENS + j
-        valid = head_valid & (token < num_tokens)
-        in_base = (token * rows_per_token + group * heads_per_group) * HEAD_DIM
+        in_range = token < num_tokens
+        valid = head_valid & in_range
+        token_ld = tl.minimum(token, num_tokens - 1).to(tl.int64)
+        in_base = (token_ld * rows_per_token + group * heads_per_group) * HEAD_DIM
         out_base = (group * num_tokens + token) * GROUP_DIM
         row_off = heads * HEAD_DIM
         _quant_store(
@@ -197,9 +234,7 @@ def _inv_rope_quant_kernel(
                 o_ptr
                 + in_base
                 + row_off[:, None]
-                + tl.arange(0, nope_cols)[None, :],
-                mask=valid[:, None],
-                other=0.0,
+                + tl.arange(0, nope_cols)[None, :]
             ).to(tl.float32),
             out_ptr,
             out_base + row_off,
@@ -208,29 +243,20 @@ def _inv_rope_quant_kernel(
             nope_cols,
         )
         last = tl.load(
-            o_ptr + in_base + row_off[:, None] + nope_cols + last_cols[None, :],
-            mask=valid[:, None],
-            other=0.0,
+            o_ptr + in_base + row_off[:, None] + nope_cols + last_cols[None, :]
         ).to(tl.float32)
         pair = tl.reshape(last, (heads_per_group, pairs, 2))
         even, odd = tl.split(pair)
-        pos = tl.load(pos_ptr + token).to(tl.int64)
+        pos = tl.load(pos_ptr + token_ld).to(tl.int64)
         cos_v = tl.load(tab_ptr + pos * tab_stride + pair_cols)
         sin_v = tl.load(tab_ptr + pairs + pos * tab_stride + pair_cols)
-        rot = tl.reshape(
-            tl.join(
-                even * cos_v[None, :] + odd * sin_v[None, :],
-                odd * cos_v[None, :] - even * sin_v[None, :],
-            ),
-            (heads_per_group, 128),
-        )
-        _quant_store(
-            rot,
+        _quant_pair_store(
+            even * cos_v[None, :] + odd * sin_v[None, :],
+            odd * cos_v[None, :] - even * sin_v[None, :],
             out_ptr,
             out_base + row_off + nope_cols,
             valid,
             heads_per_group,
-            128,
         )
 
 
