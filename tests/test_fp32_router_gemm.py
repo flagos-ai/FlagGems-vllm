@@ -56,7 +56,7 @@ def test_fp32_router_graph():
         flaggems_vllm.fp32_router_gemm(x, w.bfloat16())
 
 
-@pytest.mark.parametrize("m", [0, 1, 32, 33, 64, 8192])
+@pytest.mark.parametrize("m", [0, 1, 8, 16, 32, 33, 48, 64, 1024, 2048, 4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_fp32_router_512_experts(m, dtype):
     torch.manual_seed(329)
