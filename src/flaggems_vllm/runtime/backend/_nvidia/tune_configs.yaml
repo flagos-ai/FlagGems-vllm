@@ -2008,3 +2008,15 @@ grouped_topk_single_register:
   - META: {}
     num_warps: 1
     num_stages: 3
+
+# BK=64 / BH=64 / 8 warps is the optimum of this space on sm_90a: BK=128 needs
+# 144 KB of KV tiles and spills 242 regs, while BK=32 loses MMA efficiency
+# (measured 30% slower) despite spilling less. num_stages 2 vs 4 is the only
+# dimension worth re-checking per shape.
+flash_mla_sparse_fwd:
+  - META: {BK: 64, BH: 64}
+    num_warps: 8
+    num_stages: 2
+  - META: {BK: 64, BH: 64}
+    num_warps: 8
+    num_stages: 4
