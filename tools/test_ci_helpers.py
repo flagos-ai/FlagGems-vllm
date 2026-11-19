@@ -52,9 +52,7 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
         for source in (
             "megamhc.py",
             "megamhc_kernel.py",
-            "megamhc_pipeline.py",
-            "megamhc_runtime.py",
-            "megamhc_simt.py",
+            "megamhc_tle.py",
             "megamhc_device.cu",
         ):
             with self.subTest(source=source):

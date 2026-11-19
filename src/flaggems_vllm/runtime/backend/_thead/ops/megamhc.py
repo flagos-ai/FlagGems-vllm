@@ -12,18 +12,116 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host validation, weight preparation, and PPU kernel dispatch."""
+"""PPU MegaMHC host dispatch, validation, and lazy SDK bindings."""
 
+import ctypes
+import functools
+import hashlib
 import math
+import os
+import subprocess
+import tempfile
+from pathlib import Path
 
 import torch
 import triton
+from triton.runtime.cache import get_cache_manager
 
 from flaggems_vllm.runtime import device, torch_device_fn
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
 from .megamhc_kernel import mega_mhc_kernel
-from .megamhc_runtime import clear_counters, counter_memset, device_bitcode
+
+
+@functools.lru_cache(maxsize=1)
+def counter_memset():
+    """Bind the stream-ordered PPU counter initialization."""
+    try:
+        memset = ctypes.CDLL("libhggc.so").hgMemsetD8Async
+    except (OSError, AttributeError):
+        return None
+    memset.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_ubyte,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    memset.restype = ctypes.c_int
+
+    return memset
+
+
+@functools.lru_cache(maxsize=1)
+def device_bitcode():
+    """Compile the optional PPU device helpers for the fused pipeline."""
+    sdk = Path(os.environ.get("PPU_SDK", "/usr/local/PPU_SDK"))
+    compiler = sdk / "bin" / "clang++"
+    headers = sdk / "CUDA_SDK" / "include"
+    if not compiler.is_file() or not (headers / "hggc_runtime.h").is_file():
+        return None
+    source = Path(__file__).with_name("megamhc_device.cu")
+    compiler_stat = compiler.stat()
+    digest = hashlib.sha256(
+        source.read_bytes()
+        + f"{compiler.resolve()}:{compiler_stat.st_size}:{compiler_stat.st_mtime_ns}".encode()
+    )
+    version_file = sdk / "VERSION.txt"
+    if version_file.is_file():
+        digest.update(version_file.read_bytes())
+    cache = get_cache_manager(digest.hexdigest())
+    name = "megamhc-ppu001.bc"
+    path = cache.get_file(name)
+    if path is None:
+        with tempfile.TemporaryDirectory(dir=cache.cache_dir) as temporary:
+            bitcode = Path(temporary) / name
+            try:
+                subprocess.run(
+                    [
+                        str(compiler),
+                        "-x",
+                        "hggc",
+                        "--hggc-device-only",
+                        "--cuda-gpu-arch=ppu001",
+                        "-std=c++17",
+                        "-O2",
+                        "-ffp-contract=off",
+                        "-fgpu-rdc",
+                        "-emit-llvm",
+                        "-c",
+                        "-I",
+                        str(sdk / "include"),
+                        "-I",
+                        str(headers),
+                        "-Xclang",
+                        "-fno-cuda-host-device-constexpr",
+                        "-D___HGGC_CG_HELPER_H___",
+                        "-D__CUDACC_RDC__",
+                        str(source),
+                        "-o",
+                        str(bitcode),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            except (OSError, subprocess.CalledProcessError):
+                return None
+            path = cache.put(bitcode.read_bytes(), name, binary=True)
+    return path
+
+
+def clear_counters(counters, memset):
+    stream = torch.cuda.current_stream(counters.device)
+    status = memset(
+        counters.data_ptr(),
+        0,
+        counters.numel() * counters.element_size(),
+        stream.cuda_stream,
+    )
+    if status:
+        raise RuntimeError(
+            f"MegaMHC counter initialization failed with status {status}"
+        )
+
 
 _PROJECTION_BLOCK_K = 64
 _PROJECTION_MAX_SPLITS = 8
@@ -82,7 +180,7 @@ def pack_mega_mhc_weights(fn):
     ):
         raise ValueError("expected a nonempty contiguous FP32 inference weight matrix")
 
-    from .megamhc_pipeline import pack_mega_mhc_weights_kernel
+    from .megamhc_tle import pack_mega_mhc_weights_kernel
 
     p, k = fn.shape
     q = max(16, triton.next_power_of_2(p))
@@ -272,7 +370,7 @@ def mega_mhc(
         if native_simt:
             bitcode = device_bitcode()
             if bitcode is not None:
-                from .megamhc_simt import mega_mhc_simt_kernel
+                from .megamhc_tle import mega_mhc_simt_kernel
 
                 rows, warps, blocks, large_blocks = _simt_launch_config(
                     tokens, hidden, mixes, multiprocessors
@@ -339,7 +437,7 @@ def _launch_pipeline(
     packed_fn=None,
     bitcode=None,
 ):
-    from .megamhc_pipeline import mega_mhc_pipeline
+    from .megamhc_tle import mega_mhc_pipeline
 
     device = inputs[0].device
     m, bk, pack_block = 64, _PROJECTION_BLOCK_K, 2048

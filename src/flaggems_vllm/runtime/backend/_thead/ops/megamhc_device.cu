@@ -755,13 +755,14 @@ epilogue(uint64_t residual, uint64_t fnp, uint64_t np, uint64_t nc, uint64_t yp,
         shared, repeat, pre_eps, sink_eps, mult, norm_eps, has_norm);          \
   }
 #define MHC_SIMT_STREAMS(R)                                                    \
-  MHC_SIMT(32, R, 1)                                                           \
-  MHC_SIMT(16, R, 1)                                                           \
   MHC_SIMT(8, R, 1)                                                            \
   MHC_SIMT(8, R, 2)                                                            \
-  MHC_SIMT(32, R, 2)                                                           \
-  MHC_SIMT(16, R, 2)                                                           \
   MHC_SIMT(8, R, 4)
 MHC_SIMT_STREAMS(1)
 MHC_SIMT_STREAMS(2)
 MHC_SIMT_STREAMS(4)
+// Only the 24-head projection selects wider CTAs; narrow mixes use 8 warps.
+MHC_SIMT(16, 4, 1)
+MHC_SIMT(16, 4, 2)
+MHC_SIMT(32, 4, 1)
+MHC_SIMT(32, 4, 2)

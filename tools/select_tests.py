@@ -89,9 +89,7 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 THEAD_MEGAMHC_SOURCES = (
     "megamhc.py",
     "megamhc_kernel.py",
-    "megamhc_pipeline.py",
-    "megamhc_runtime.py",
-    "megamhc_simt.py",
+    "megamhc_tle.py",
     "megamhc_device.cu",
 )
 
