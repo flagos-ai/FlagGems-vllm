@@ -82,7 +82,9 @@ __device__ __forceinline__ int post(
     }
   }
 
-  auto prefetch = [&](unsigned column, unsigned slot) {
+  // Inline the capture to avoid stack accesses in the copy loop.
+  auto prefetch = [&](unsigned column, unsigned slot)
+      __attribute__((always_inline)) {
     const unsigned base = smem_lane + slot * slot_size;
     copy_tile(base, x + x_offset + 2 * column);
 #pragma unroll
