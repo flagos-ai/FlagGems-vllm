@@ -294,7 +294,7 @@ def _v32_prefill_weights(
     tile, head_tile, local_row = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     row = RowOffset + local_row
     heads = head_tile * 64 + tl.arange(0, 64)
-    offsets = tile * 256 + tl.arange(0, 256)
+    offsets = tile * 128 + tl.arange(0, 128)
     length = tl.minimum(K, tl.load(Length + row)) if HasLength else K
     token = tl.load(Indices + row * K + offsets, offsets < length, -1)
     valid = (token >= 0) & (token < Tokens)
@@ -305,14 +305,14 @@ def _v32_prefill_weights(
     key_base = KV + token[None, :].to(tl.int64) * 512 + channels[:, None]
     qs = tl.load(QScale + query_row) * (Scale * 1.4426950408889634)
     ks = tl.load(KScale + token, valid, 0.0)
-    content = tl.full((64, 256), 0, tl.int32)
+    content = tl.full((64, 128), 0, tl.int32)
     for panel in range(4):
         query = tl.load(query_base + panel * 128)
         key = tl.load(key_base + panel * 128, valid[None, :], 0)
         content = tl.dot(query, key, content, out_dtype=tl.int32)
 
-    rope = tl.full((64, 256), 0.0, tl.float32)
-    if tile * 256 < length:
+    rope = tl.full((64, 128), 0.0, tl.float32)
+    if tile * 128 < length:
         # Keeping the RoPE dot in this region also matches the INT8 warp layout.
         rope_channels = tl.arange(0, 64)
         qr = tl.load(QRope + query_row[:, None] * 64 + rope_channels[None, :])
@@ -341,7 +341,7 @@ def _v32_prefill_weights(
     operands = ((high << 8) | (low & 255)).to(tl.int16)
     weight_offsets = (local_row * H + heads[:, None]) * K + offsets[None, :]
     tl.store(Weights + weight_offsets, operands)
-    stats = (local_row * (K // 256) + tile) * 3 * H + heads
+    stats = (local_row * (K // 128) + tile) * 3 * H + heads
     tl.store(TileStats + stats, maximum)
     tl.store(TileStats + stats + H, tl.sum(probability, 1))
     tl.store(TileStats + stats + 2 * H, quantum)
@@ -361,8 +361,8 @@ def _v32_normalize_tile_stats(
     head_tile, local_row = tl.program_id(0), tl.program_id(1)
     row = RowOffset + local_row
     heads = head_tile * 32 + tl.arange(0, 32)
-    tiles = tl.arange(0, K // 256)
-    stats_offsets = (local_row * (K // 256) + tiles[:, None]) * 3 * H + heads[None, :]
+    tiles = tl.arange(0, K // 128)
+    stats_offsets = (local_row * (K // 128) + tiles[:, None]) * 3 * H + heads[None, :]
     tile_maxima = tl.load(TileStats + stats_offsets)
     tile_masses = tl.load(TileStats + stats_offsets + H)
     quantum = tl.load(TileStats + stats_offsets + 2 * H)
@@ -379,7 +379,7 @@ def _v32_normalize_tile_stats(
     if HasSink:
         sink = tl.load(Sink + heads)
         inverse *= tl.where(denominator > 0.0, 1.0 / (1.0 + tl.exp(sink - lse)), 0.0)
-    # Reuse the quantum slots for factors shared by all four value blocks.
+    # Reuse the quantum slots for factors shared by all value blocks.
     tl.store(TileStats + stats_offsets + 2 * H, quantum * retain * inverse[None, :])
     tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, lse)
 
@@ -397,6 +397,7 @@ def _v32_prefill_values(
     K: tl.constexpr,
     Tokens: tl.constexpr,
     HasLength: tl.constexpr,
+    BV: tl.constexpr,
 ):
     value_tile, head_tile, local_row = (
         tl.program_id(0),
@@ -405,31 +406,27 @@ def _v32_prefill_values(
     )
     row = RowOffset + local_row
     heads = head_tile * 64 + tl.arange(0, 64)
-    channels = value_tile * 128 + tl.arange(0, 128)
+    channels = value_tile * BV + tl.arange(0, BV)
     lanes = tl.arange(0, 128)
     length = tl.minimum(K, tl.load(Length + row)) if HasLength else K
-    output = tl.full((64, 128), 0.0, tl.float32)
-    for tile in tl.range(0, K // 256, loop_unroll_factor=1):
-        numerator = tl.full((64, 128), 0, tl.int32)
-        for half in tl.static_range(2):
-            offsets = tile * 256 + half * 128 + lanes
-            token = tl.load(Indices + row * K + offsets, offsets < length, -1)
-            valid = (token >= 0) & (token < Tokens)
-            token = tl.where(valid, token, 0).to(tl.int64)
-            values = tl.load(
-                KV + token[:, None] * 512 + channels[None, :], valid[:, None], 0
-            )
-            weight_offsets = (local_row * H + heads[:, None]) * K + offsets[None, :]
-            operands = tl.load(Weights + weight_offsets)
-            high = (operands >> 8).to(tl.int8)
-            low = operands.to(tl.int8)
-            high_sum = tl.dot(high, values, out_dtype=tl.int32)
-            # 256 signed P14-by-INT8 products fit in INT32.
-            numerator = tl.dot(
-                low, values, numerator + high_sum * 128, out_dtype=tl.int32
-            )
+    output = tl.full((64, BV), 0.0, tl.float32)
+    for tile in tl.range(0, K // 128, loop_unroll_factor=1):
+        offsets = tile * 128 + lanes
+        token = tl.load(Indices + row * K + offsets, offsets < length, -1)
+        valid = (token >= 0) & (token < Tokens)
+        token = tl.where(valid, token, 0).to(tl.int64)
+        values = tl.load(
+            KV + token[:, None] * 512 + channels[None, :], valid[:, None], 0
+        )
+        weight_offsets = (local_row * H + heads[:, None]) * K + offsets[None, :]
+        operands = tl.load(Weights + weight_offsets)
+        high = (operands >> 8).to(tl.int8)
+        low = operands.to(tl.int8)
+        high_sum = tl.dot(high, values, out_dtype=tl.int32)
+        # A tile's signed P14-by-INT8 products fit in INT32.
+        numerator = tl.dot(low, values, high_sum * 128, out_dtype=tl.int32)
 
-        stats = (local_row * (K // 256) + tile) * 3 * H + heads
+        stats = (local_row * (K // 128) + tile) * 3 * H + heads
         scale = tl.load(TileStats + stats + 2 * H)
         output += numerator.to(tl.float32) * scale[:, None]
     tl.store(Output + (row * H + heads[:, None]) * 512 + channels[None, :], output)
@@ -453,17 +450,20 @@ def _prepare_v32_prefill(
     rows = batch * sq
     topk = indices.shape[-1]
     tokens = k_cache_lora.shape[0] * 64
+    # Wider value tiles reduce repeated weight reads for larger KV caches.
+    bv = 256 if tokens > 16384 else 128
+    pv_warps = 8 if bv == 256 else 4
     # Process row chunks so the P14 workspace does not grow with the batch.
     chunk = min(rows, 512)
     weights = torch.empty((chunk, heads, topk), device=q_nope.device, dtype=torch.int16)
     stats = torch.empty(
-        (chunk, topk // 256, 3, heads), device=q_nope.device, dtype=torch.float32
+        (chunk, topk // 128, 3, heads), device=q_nope.device, dtype=torch.float32
     )
 
     def run():
         for base in range(0, rows, chunk):
             count = min(chunk, rows - base)
-            _v32_prefill_weights[(topk // 256, heads // 64, count)](
+            _v32_prefill_weights[(topk // 128, heads // 64, count)](
                 q_nope,
                 q_rope,
                 k_cache_lora,
@@ -494,7 +494,7 @@ def _prepare_v32_prefill(
                 attn_sink is not None,
                 num_warps=4,
             )
-            _v32_prefill_values[(4, heads // 64, count)](
+            _v32_prefill_values[(512 // bv, heads // 64, count)](
                 k_cache_lora,
                 indices,
                 topk_length,
@@ -506,7 +506,8 @@ def _prepare_v32_prefill(
                 topk,
                 tokens,
                 topk_length is not None,
-                num_warps=4,
+                bv,
+                num_warps=pv_warps,
                 num_stages=1,
             )
         return output, lse
