@@ -540,3 +540,78 @@ def test_strided_quantized_query_graph_reloads_input_and_metadata():
         graph.replay()
         torch.npu.synchronize()
         check(args, output=output)
+
+
+def test_quant_lightning_indexer_matches_vllm_ascend():
+    utils = pytest.importorskip("vllm_ascend.utils")
+    if not utils.enable_custom_op():
+        pytest.skip("vLLM-Ascend custom operators are unavailable")
+    native = getattr(torch.ops._C_ascend, "npu_vllm_quant_lightning_indexer", None)
+    metadata_op = getattr(
+        torch.ops._C_ascend, "npu_vllm_quant_lightning_indexer_metadata", None
+    )
+    if native is None or metadata_op is None:
+        pytest.skip("vLLM-Ascend quantized indexer operators are unavailable")
+
+    tokens, heads, dim, topk = 16, 64, 128, 32
+    # Binary weights give each logical key a distinct score.
+    bits = torch.arange(7)
+    keys = torch.zeros((128, dim), dtype=torch.int8)
+    keys[:, :7] = ((torch.arange(128)[:, None] >> bits) & 1).to(torch.int8)
+    q = torch.zeros((tokens, heads, dim), dtype=torch.int8)
+    q[:, bits, bits] = 1
+    weights = torch.zeros((tokens, heads), dtype=torch.float16)
+    weights[:, :7] = 2**bits
+    q, keys, weights = q.npu(), keys.reshape(4, 32, dim).npu(), weights.npu()
+    query_scale = torch.ones_like(weights)
+    key_scale = torch.ones((4, 32, 1), dtype=torch.float16, device=q.device)
+    table = torch.arange(4, dtype=torch.int32, device=q.device).reshape(1, 4)
+    query_ends = torch.tensor([tokens], dtype=torch.int32, device=q.device)
+    original_lengths = torch.tensor([512], dtype=torch.int32, device=q.device)
+    kwargs = dict(
+        actual_seq_lengths_query=query_ends,
+        actual_seq_lengths_key=original_lengths,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=topk,
+        sparse_mode=3,
+        cmp_ratio=4,
+    )
+    metadata = metadata_op(
+        heads,
+        1,
+        dim,
+        0,
+        0,
+        batch_size=1,
+        max_seqlen_q=tokens,
+        max_seqlen_k=512,
+        **kwargs,
+    )
+    expected, _ = native(
+        q,
+        keys.unsqueeze(2),
+        weights,
+        query_scale,
+        key_scale,
+        block_table=table,
+        metadata=metadata,
+        return_value=False,
+        **kwargs,
+    )
+    args = [
+        q,
+        keys,
+        weights,
+        table,
+        torch.zeros(tokens, dtype=torch.int32, device=q.device),
+        torch.arange(512 - tokens, 512, dtype=torch.int32, device=q.device),
+        torch.tensor([128], dtype=torch.int32, device=q.device),
+        topk,
+        query_scale,
+        key_scale,
+    ]
+    actual = check(args, exact_ids=True)
+    torch.testing.assert_close(
+        actual, expected.reshape(tokens, topk).cpu(), rtol=0, atol=0
+    )
