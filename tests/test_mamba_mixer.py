@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 import math
@@ -21,7 +20,6 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("vllm")
-
 try:
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
         causal_conv1d_fn,
@@ -37,7 +35,6 @@ except ImportError as exc:  # pragma: no cover - depends on installed vLLM build
         f"Installed vLLM does not expose the Mamba-1 reference ops: {exc}",
         allow_module_level=True,
     )
-
 try:
     from flaggems_vllm.ops.mamba_mixer import mamba_mixer as triton_mamba_mixer
 except ImportError as exc:  # pragma: no cover - indicates the op was not installed
@@ -153,7 +150,6 @@ def _make_weights(
         "b_norm_weight": None,
         "c_norm_weight": None,
     }
-
     if use_rms_norm:
         weights["dt_norm_weight"] = 1.0 + _randn(
             (time_step_rank,), device=device, dtype=dtype, scale=0.02
@@ -194,7 +190,6 @@ def _make_cache_pair(
 ]:
     """
     Build vLLM's default SD Conv State layout.
-
     The stored tensor is [slots, K-1, I]. The view passed to MambaMixer is
     [slots, I, K-1], which is intentionally non-contiguous.
     """
@@ -211,7 +206,6 @@ def _make_cache_pair(
         dtype=torch.float32,
         scale=0.02,
     )
-
     reference_cache = (
         _clone_preserve_strides(conv_initial),
         _clone_preserve_strides(ssm_initial),
@@ -254,7 +248,6 @@ def _ssm_transform_reference(
         [time_step_rank, state_size, state_size],
         dim=-1,
     )
-
     if use_rms_norm:
         dt = _rms_norm_reference(dt, weights["dt_norm_weight"], rms_norm_eps)
         b = _rms_norm_reference(b, weights["b_norm_weight"], rms_norm_eps)
@@ -283,14 +276,12 @@ def _vllm_prefill_reference(
         weights["x_proj_weight"].shape[0] - weights["dt_proj_weight"].shape[1]
     ) // 2
     time_step_rank = weights["dt_proj_weight"].shape[1]
-
     projected = F.linear(
         hidden_states,
         weights["in_proj_weight"],
         weights["in_proj_bias"],
     )
     x, gate = projected.split(intermediate_size, dim=-1)
-
     # vLLM causal_conv1d_fn expects [I, T], and mutates Conv State in-place.
     conv_out = causal_conv1d_fn(
         x.transpose(0, 1),
@@ -303,7 +294,6 @@ def _vllm_prefill_reference(
         activation=activation,
         null_block_id=NULL_BLOCK_ID,
     )
-
     dt, b, c = _ssm_transform_reference(
         conv_out.transpose(0, 1).contiguous(),
         weights,
@@ -312,7 +302,6 @@ def _vllm_prefill_reference(
         use_rms_norm=use_rms_norm,
         rms_norm_eps=rms_norm_eps,
     )
-
     # vLLM selective_scan_fn writes the gated result into its z argument.
     scan_gate = gate.transpose(0, 1).contiguous()
     scan_out = selective_scan_fn(
@@ -331,7 +320,6 @@ def _vllm_prefill_reference(
         has_initial_state=has_initial_state,
         null_block_id=NULL_BLOCK_ID,
     )
-
     return F.linear(
         scan_out.transpose(0, 1).contiguous(),
         weights["out_proj_weight"],
@@ -356,14 +344,12 @@ def _vllm_decode_reference(
         weights["x_proj_weight"].shape[0] - weights["dt_proj_weight"].shape[1]
     ) // 2
     time_step_rank = weights["dt_proj_weight"].shape[1]
-
     projected = F.linear(
         hidden_states,
         weights["in_proj_weight"],
         weights["in_proj_bias"],
     )
     x, gate = projected.split(intermediate_size, dim=-1)
-
     # causal_conv1d_update expects [batch, I] for one-token decode.
     conv_out = causal_conv1d_update(
         x.contiguous(),
@@ -374,7 +360,6 @@ def _vllm_decode_reference(
         conv_state_indices=cache_indices,
         null_block_id=NULL_BLOCK_ID,
     )
-
     dt, b, c = _ssm_transform_reference(
         conv_out,
         weights,
@@ -383,7 +368,6 @@ def _vllm_decode_reference(
         use_rms_norm=use_rms_norm,
         rms_norm_eps=rms_norm_eps,
     )
-
     scan_out = torch.empty_like(conv_out)
     selective_state_update(
         ssm_state,
@@ -401,7 +385,6 @@ def _vllm_decode_reference(
         null_block_id=NULL_BLOCK_ID,
         out=scan_out,
     )
-
     return F.linear(
         scan_out,
         weights["out_proj_weight"],
@@ -427,7 +410,6 @@ def _assert_close(
         atol, rtol = 1e-3, 1e-3
     else:
         raise AssertionError(f"unexpected dtype in correctness test: {dtype}")
-
     torch.testing.assert_close(
         actual,
         expected,
@@ -437,6 +419,7 @@ def _assert_close(
     )
 
 
+@pytest.mark.mamba_mixer
 @pytest.mark.parametrize(
     "dtype",
     [torch.float16, torch.bfloat16, torch.float32],
@@ -447,7 +430,6 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
     """Packed variable-length Prefill, including short sequences and cache reuse."""
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(2026)
-
     hidden_size = 64
     intermediate_size = 128
     state_size = 16
@@ -460,7 +442,6 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
     cache_slots = batch_size + 1
     rms_norm_eps = 1e-5
     activation = "silu"
-
     weights = _make_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -471,7 +452,6 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
         device=device,
         use_rms_norm=use_rms_norm,
     )
-
     reference_cache, triton_cache = _make_cache_pair(
         cache_slots=cache_slots,
         intermediate_size=intermediate_size,
@@ -482,7 +462,6 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
     )
     conv_state_ref, ssm_state_ref = reference_cache
     conv_state_tri, ssm_state_tri = triton_cache
-
     hidden_states = _randn(
         (padded_tokens, hidden_size),
         device=device,
@@ -498,7 +477,6 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
     cache_indices = torch.tensor([1, 2], dtype=torch.int32, device=device)
     # Exercise both a fresh request and a request continuing from cache.
     has_initial_state = torch.tensor([False, True], dtype=torch.bool, device=device)
-
     with torch.inference_mode():
         expected = _vllm_prefill_reference(
             hidden_states[:num_actual_tokens],
@@ -512,7 +490,6 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
             rms_norm_eps=rms_norm_eps,
             activation=activation,
         )
-
         sentinel = 123.0
         output = torch.full(
             (padded_tokens, hidden_size),
@@ -549,7 +526,6 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
             null_block_id=NULL_BLOCK_ID,
         )
         torch.cuda.synchronize()
-
     _assert_close(
         actual[:num_actual_tokens],
         expected,
@@ -562,7 +538,6 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
         actual[num_actual_tokens:],
         torch.full_like(actual[num_actual_tokens:], sentinel),
     )
-
     _assert_close(
         conv_state_tri,
         conv_state_ref,
@@ -577,6 +552,7 @@ def test_mamba_mixer_prefill_matches_vllm(dtype, use_rms_norm):
     )
 
 
+@pytest.mark.mamba_mixer
 @pytest.mark.parametrize(
     "dtype",
     [torch.float16, torch.bfloat16, torch.float32],
@@ -587,7 +563,6 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
     """One-token-per-sequence Decode with non-contiguous vLLM Conv State."""
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(2027)
-
     hidden_size = 64
     intermediate_size = 128
     state_size = 16
@@ -608,7 +583,6 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
         device=device,
         use_rms_norm=use_rms_norm,
     )
-
     reference_cache, triton_cache = _make_cache_pair(
         cache_slots=cache_slots,
         intermediate_size=intermediate_size,
@@ -619,7 +593,6 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
     )
     conv_state_ref, ssm_state_ref = reference_cache
     conv_state_tri, ssm_state_tri = triton_cache
-
     hidden_states = _randn(
         (batch_size, hidden_size),
         device=device,
@@ -627,7 +600,6 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
         scale=0.2,
     )
     cache_indices = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
-
     with torch.inference_mode():
         expected = _vllm_decode_reference(
             hidden_states,
@@ -639,7 +611,6 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
             rms_norm_eps=rms_norm_eps,
             activation=activation,
         )
-
         actual = triton_mamba_mixer(
             hidden_states,
             weights["in_proj_weight"],
@@ -668,7 +639,6 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
             null_block_id=NULL_BLOCK_ID,
         )
         torch.cuda.synchronize()
-
     _assert_close(actual, expected, dtype, name="Decode output")
     _assert_close(
         conv_state_tri,
