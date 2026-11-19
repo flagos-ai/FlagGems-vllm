@@ -482,6 +482,7 @@ def _prepare_v32_prefill(
                 topk_length is not None,
                 num_warps=4,
                 num_stages=1,
+                kpack=2,
             )
             _v32_normalize_tile_stats[(heads // 32, count)](
                 stats,
