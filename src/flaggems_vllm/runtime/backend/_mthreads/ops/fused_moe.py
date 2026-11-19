@@ -3046,6 +3046,99 @@ def _grouped_gemm_kernel(
     tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty))
 
 
+try:
+    import triton.experimental.tle.language as tle
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _HAS_TLE = True
+except ImportError:  # pragma: no cover - older FlagTree builds
+    tle = None
+    TensorDescriptor = None
+    _HAS_TLE = False
+
+
+@triton.jit
+def _tle_gemm_producer(writer, A, B, pm, pn, expert, N, K,
+                       BM: tl.constexpr, BN: tl.constexpr, TK: tl.constexpr):
+    brow = expert * N + pn * BN
+    for it in tl.range(0, tl.cdiv(K, TK), num_stages=1):
+        slot = writer.acquire(it)
+        tle.gpu.copy(A, slot.a, (BM, TK), (pm * BM, it * TK))
+        tle.gpu.copy(B, slot.b, (BN, TK), (brow, it * TK))
+        writer.commit(it)
+
+
+@triton.jit
+def _tle_gemm_consumer(reader, C, pm, pn, N, K,
+                       BM: tl.constexpr, BN: tl.constexpr, TK: tl.constexpr):
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for it in tl.range(0, tl.cdiv(K, TK), num_stages=1):
+        wait = reader.wait(it)
+        partial = tle.gpu.wgmma(wait.slot.a, wait.slot.b, trans_b=True)
+        partial = tle.gpu.wgmma_wait(0, partial)
+        reader.release(it)
+        acc += partial
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(C.dtype.element_ty))
+
+
+@triton.jit
+def _tle_grouped_gemm_kernel(A, B, C, mi_ptr, N, K,
+                             BM: tl.constexpr, BN: tl.constexpr,
+                             TK: tl.constexpr, STAGES: tl.constexpr):
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(N, BN)
+    pm = pid // num_n
+    pn = pid % num_n
+    expert = tl.load(mi_ptr + pm * BM)
+    a = tle.gpu.alloc((STAGES, BM, TK), tl.bfloat16, scope=tle.gpu.smem,
+                      nv_mma_shared_layout=True)
+    b = tle.gpu.alloc((STAGES, BN, TK), tl.bfloat16, scope=tle.gpu.smem,
+                      nv_mma_shared_layout=True)
+    pipe = tle.pipe(capacity=STAGES, scope="cta", name="moetle", a=a, b=b)
+    tle.gpu.warp_specialize(
+        [
+            (_tle_gemm_consumer, (pipe.reader(), C, pm, pn, N, K, BM, BN, TK)),
+            (_tle_gemm_producer, (pipe.writer(), A, B, pm, pn, expert, N, K, BM, BN, TK)),
+        ],
+        worker_num_warps=[4],
+        worker_num_regs=[24],
+    )
+
+
+def _tle_desc(t, block):
+    # Built per call: caching by data_ptr would alias a recycled allocation of
+    # a freed weight and silently compute with the wrong tensor.
+    return TensorDescriptor.from_tensor(t, list(block))
+
+
+def _tle_ready(w1, w2, total, H, n_inter):
+    if not _HAS_TLE:
+        return False
+    if not (w1.is_contiguous() and w2.is_contiguous()):
+        return False
+    if w1.dtype is not torch.bfloat16:
+        return False
+    if total % 128 or H % 128 or (2 * n_inter) % 128:
+        return False
+    # Below this the TLE setup (SMEM stages, warp squads, descriptors) costs
+    # more than the GEMM saves; measured on the 25-shape sweep.
+    if total < 65536:
+        return False
+    return True
+
+
+def _tle_gemm(a_buf, w, out, m_indices, E, total, N, K, STAGES):
+    b2 = w.view(E * N, K)
+    A = _tle_desc(a_buf, (128, 64))
+    B = _tle_desc(b2, (128, 64))
+    grid = ((total // 128) * triton.cdiv(N, 128),)
+    _tle_grouped_gemm_kernel[grid](
+        A, B, out, m_indices, N, K, BM=128, BN=128, TK=64, STAGES=STAGES
+    )
+
+
 _DENSE_TW_DENSE_CACHE = {}
 
 
@@ -3150,24 +3243,26 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         num_warps=4,
     )
 
-    w1t = _dense_transpose_weights(w1)
-    w2t = _dense_transpose_weights(w2)
-
-    g1 = (total // BM) * triton.cdiv(2 * n_inter, 128)
-    _grouped_gemm_kernel[(g1,)](
-        hidden_perm,
-        w1t,
-        gate_up,
-        m_indices,
-        total,
-        2 * n_inter,
-        H,
-        BM=128,
-        BN=128,
-        BK=64,
-        num_warps=4,
-        num_stages=2,
-    )
+    use_tle = _tle_ready(w1, w2, total, H, n_inter)
+    if use_tle:
+        _tle_gemm(hidden_perm, w1, gate_up, m_indices, E, total, 2 * n_inter, H, STAGES=3)
+    else:
+        w1t = _dense_transpose_weights(w1)
+        g1 = (total // BM) * triton.cdiv(2 * n_inter, 128)
+        _grouped_gemm_kernel[(g1,)](
+            hidden_perm,
+            w1t,
+            gate_up,
+            m_indices,
+            total,
+            2 * n_inter,
+            H,
+            BM=128,
+            BN=128,
+            BK=64,
+            num_warps=4,
+            num_stages=2,
+        )
     _silu_mul_kernel[(triton.cdiv(total * n_inter, 1024),)](
         gate_up,
         act,
@@ -3176,24 +3271,28 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         BLOCK=1024,
         num_warps=4,
     )
-    g2 = (total // BM) * triton.cdiv(H, 128)
     # GEMM2 must not write back into hidden_perm: that buffer is consumed by
     # GEMM1, and reusing it here triggers an IMA on MUSA/Triton.
     mm2 = torch.empty((max_tokens, H), dtype=dtype, device=device)
-    _grouped_gemm_kernel[(g2,)](
-        act,
-        w2t,
-        mm2,
-        m_indices,
-        total,
-        H,
-        n_inter,
-        BM=128,
-        BN=128,
-        BK=64,
-        num_warps=4,
-        num_stages=2,
-    )
+    if use_tle:
+        _tle_gemm(act, w2, mm2, m_indices, E, total, H, n_inter, STAGES=2)
+    else:
+        w2t = _dense_transpose_weights(w2)
+        g2 = (total // BM) * triton.cdiv(H, 128)
+        _grouped_gemm_kernel[(g2,)](
+            act,
+            w2t,
+            mm2,
+            m_indices,
+            total,
+            H,
+            n_inter,
+            BM=128,
+            BN=128,
+            BK=64,
+            num_warps=4,
+            num_stages=2,
+        )
     out = torch.empty((M, H), dtype=dtype, device=device)
     _unpermute_kernel[(M, triton.cdiv(H, 512))](
         mm2,
