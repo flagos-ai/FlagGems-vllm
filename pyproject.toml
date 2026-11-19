@@ -63,6 +63,12 @@ nvidia = [
 ascend = [
     "vllm-ascend==0.32.0rc1",
 ]
+metax = [
+    # vLLM-MetaX 0.29.0 wheel; mcoplib is pinned to the matching maca3.9.0.31 build.
+    "mcoplib @ https://repos.metax-tech.com/r/maca-pypi/packages/mcoplib/0.4.14+gf3794c4.maca3.9.0.31.torch2.10/mcoplib-0.4.14+gf3794c4.maca3.9.0.31.torch2.10-cp312-cp312-linux_x86_64.whl#sha256=2733e4d1bb338ef3f6b2e152c41ebdeddff03bd5b28ae87f58177bdcca3adc23",
+    "vllm-metax @ https://repos.metax-tech.com/r/maca-pypi/packages/vllm-metax/0.29.0+gdc48c1.d20261030.maca3.9.0.9.torch2.10.0/vllm_metax-0.29.0+gdc48c1.d20261030.maca3.9.0.9.torch2.10.0-cp312-cp312-linux_x86_64.whl#sha256=873329f1dd3d6b01e45d41f9812a576fe792644fb07d80f56817a0a23849a5b8",
+]
+
 iluvatar = [
     "vllm @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/vllm/0.24.0+flagos/vllm-0.24.0+flagos-cp312-cp312-linux_x86_64.whl#sha256=ca0450ff49eecb2c2954edd6e2350fb4a5bbe63f1512b6160aac8a798440010c",
     "ixformer @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/ixformer/0.7.0+corex.4.5.0.20260804/ixformer-0.7.0+corex.4.5.0.20260804-cp312-cp312-linux_x86_64.whl#sha256=413fe629b4ee707df83fd99a19366dd35ae757a2f495acdc2cffa7a49be7a688",
