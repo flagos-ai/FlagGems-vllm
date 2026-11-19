@@ -20,7 +20,6 @@ import triton
 import triton.language as tl
 
 
-# No autotune: replay mutates sampled in place, so keep a single launch per call.
 @triton.jit
 def _trace_replay_kernel(
     sampled_ptr,

@@ -17,75 +17,23 @@
 
 import pytest
 import torch
-import triton
-import triton.language as tl
 
 import flaggems_vllm
 from flaggems_vllm import apply_trace_tokens as flaggems_apply_trace_tokens
 
 
-@triton.jit
-def _trace_replay_kernel(
-    sampled_ptr,  # [num_reqs], int64, mutated in place
-    idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx
-    trace_token_ids_ptr,  # [max_num_reqs, max_model_len], int32
-    trace_token_ids_stride,
-    trace_len_ptr,  # [max_num_reqs], int32
-    total_len_ptr,  # [max_num_reqs], int32
-    prompt_len_ptr,  # [max_num_reqs], int32
-):
-    batch_idx = tl.program_id(0)
-    req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
-    if req_state_idx < 0:
-        return
-
-    trace_len = tl.load(trace_len_ptr + req_state_idx)
-    if trace_len <= 0:
-        return
-
-    # Subtract prompt tokens to find the current decode step.
-    step = tl.load(total_len_ptr + req_state_idx) - tl.load(
-        prompt_len_ptr + req_state_idx
+try:
+    from vllm.v1.worker.gpu.sample.trace_replay import (
+        apply_trace_tokens as vllm_reference,
     )
-    if step < 0 or step >= trace_len:
-        return
-
-    token_id = tl.load(
-        trace_token_ids_ptr + req_state_idx * trace_token_ids_stride + step
-    )
-    tl.store(sampled_ptr + batch_idx, token_id.to(tl.int64))
+except (ImportError, OSError):
+    vllm_reference = None
 
 
-def apply_trace_tokens(
-    sampled: torch.Tensor,
-    idx_mapping: torch.Tensor,
-    trace_token_ids: torch.Tensor,
-    trace_len: torch.Tensor,
-    total_len: torch.Tensor,
-    prompt_len: torch.Tensor,
-) -> None:
-    """Overwrite ``sampled`` in place with trace tokens for the current step."""
-    num_reqs = idx_mapping.shape[0]
-    _trace_replay_kernel[(num_reqs,)](
-        sampled,
-        idx_mapping,
-        trace_token_ids,
-        trace_token_ids.stride(0),
-        trace_len,
-        total_len,
-        prompt_len,
-    )
-
-
-_kernel_mark = pytest.MarkDecorator(
-    pytest.Mark("_trace_replay_kernel", (), {}, _ispytest=True),
-    _ispytest=True,
-)
 DEVICE = flaggems_vllm.device
 _device_module = getattr(torch, DEVICE, None)
 _HAS_DEVICE = _device_module is not None and _device_module.is_available()
 pytestmark = [
-    _kernel_mark,
     pytest.mark.skipif(
         not _HAS_DEVICE, reason=f"requires an available {DEVICE} device"
     ),
@@ -124,7 +72,7 @@ def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected=No
     if expected is not None:
         assert cpu_expected == expected
     reference_sampled = (
-        sampled.clone() if flaggems_vllm.vendor_name == "nvidia" else None
+        sampled.clone() if vllm_reference is not None else None
     )
     pointer = sampled.data_ptr()
     assert (
@@ -136,7 +84,7 @@ def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected=No
 
     if reference_sampled is not None:
         assert (
-            apply_trace_tokens(
+            vllm_reference(
                 reference_sampled, mapping, traces, lengths, total, prompt
             )
             is None
