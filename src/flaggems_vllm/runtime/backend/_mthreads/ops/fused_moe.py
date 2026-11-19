@@ -2109,7 +2109,7 @@ def _fused_experts_impl(
 ) -> torch.Tensor:
     if (
         hidden_states.dtype in (torch.bfloat16, torch.float16)
-        and hidden_states.size(0) >= 8192
+        and hidden_states.size(0) >= 4096
         and w1.size(1) >= 512
         and w1.size(1) % 128 == 0
         and hidden_states.size(1) % 64 == 0
@@ -3121,10 +3121,6 @@ def _tle_ready(w1, w2, total, H, n_inter):
     if w1.dtype is not torch.bfloat16:
         return False
     if total % 128 or H % 128 or (2 * n_inter) % 128:
-        return False
-    # Below this the TLE setup (SMEM stages, warp squads, descriptors) costs
-    # more than the GEMM saves; measured on the 25-shape sweep.
-    if total < 65536:
         return False
     return True
 
