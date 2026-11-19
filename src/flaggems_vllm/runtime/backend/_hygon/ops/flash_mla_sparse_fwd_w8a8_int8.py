@@ -303,22 +303,25 @@ def _v32_prefill_weights(
     channels = tl.arange(0, 128)
     query_base = Q + query_row[:, None] * 512 + channels[None, :]
     key_base = KV + token[None, :].to(tl.int64) * 512 + channels[:, None]
+    qs = tl.load(QScale + query_row) * (Scale * 1.4426950408889634)
+    ks = tl.load(KScale + token, valid, 0.0)
     content = tl.full((64, 256), 0, tl.int32)
     for panel in range(4):
         query = tl.load(query_base + panel * 128)
         key = tl.load(key_base + panel * 128, valid[None, :], 0)
         content = tl.dot(query, key, content, out_dtype=tl.int32)
 
-    rope_channels = tl.arange(0, 64)
-    qr = tl.load(QRope + query_row[:, None] * 64 + rope_channels[None, :])
-    kr = tl.load(
-        KRope + token[None, :].to(tl.int64) * 64 + rope_channels[:, None],
-        valid[None, :],
-        0,
-    )
-    rope = tl.dot(qr, kr, out_dtype=tl.float32)
-    qs = tl.load(QScale + query_row) * (Scale * 1.4426950408889634)
-    ks = tl.load(KScale + token, valid, 0.0)
+    rope = tl.full((64, 256), 0.0, tl.float32)
+    if tile * 256 < length:
+        # Keeping the RoPE dot in this region also matches the INT8 warp layout.
+        rope_channels = tl.arange(0, 64)
+        qr = tl.load(QRope + query_row[:, None] * 64 + rope_channels[None, :])
+        kr = tl.load(
+            KRope + token[None, :].to(tl.int64) * 64 + rope_channels[:, None],
+            valid[None, :],
+            0,
+        )
+        rope = tl.dot(qr, kr, out_dtype=tl.float32)
     score = (content.to(tl.float32) + rope) * (qs[:, None] * ks[None, :])
     score = tl.where(valid[None, :], score, -float("inf"))
     maximum = tl.max(score, 1)
