@@ -23,7 +23,7 @@ from baseline.hc_expand import (
     build_inputs,
     torch_reference,
 )
-from vllm.utils.torch_utils import set_random_seed
+
 
 def _assert_bits_equal(actual, expected):
     assert actual.shape == expected.shape
@@ -48,7 +48,7 @@ def test_hc_expand_preserves_bits_in_eager(
     num_tokens, hidden_size, hc_mult, dtype, layout
 ):
     """Expansion preserves every input bit, including NaNs and signed zero."""
-    set_random_seed(42)
+    torch.manual_seed(42)
     binding = {
         "num_tokens": num_tokens,
         "hidden_size": hidden_size,
