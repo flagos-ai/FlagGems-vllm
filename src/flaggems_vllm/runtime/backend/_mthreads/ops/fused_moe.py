@@ -2846,12 +2846,20 @@ _META_CACHE = {}
 _DATA_CACHE = {}
 
 
+def _prune_dead_entries(cache):
+    """Drop cached transposes whose owner weight has already been released."""
+    for key, entry in list(cache.items()):
+        if entry[0]() is None:
+            del cache[key]
+
+
 def _transposed(w, cache):
     """Cache the k-major transpose (E, K, N) of a (E, N, K) weight."""
     key = (w.data_ptr(), w.shape, w.dtype)
     entry = cache.get(key)
     if entry is not None and entry[0]() is w:
         return entry[1]
+    _prune_dead_entries(cache)
     t = w.permute(0, 2, 1).contiguous()
     cache[key] = (__import__("weakref").ref(w), t)
     return t
@@ -2862,6 +2870,10 @@ def _get_buffers(M, E, H, n_inter, topk, device, dtype, need_gate_up=False):
     numel = M * topk
     key = (M, E, H, n_inter, topk, device, dtype)
     if key not in _META_CACHE:
+        # One entry serves every layer in a step, so keep only the current
+        # shape: a long shape sweep must not pile up working buffers.
+        _META_CACHE.clear()
+        _DATA_CACHE.clear()
         meta = torch.zeros(
             3 * E + 1 + 2 * numel + M * topk, dtype=torch.int32, device=device
         )
@@ -3042,6 +3054,7 @@ def _dense_transpose_weights(w):
     entry = _DENSE_TW_DENSE_CACHE.get(key)
     if entry is not None and entry[0]() is w:
         return entry[1]
+    _prune_dead_entries(_DENSE_TW_DENSE_CACHE)
     t = w.permute(0, 2, 1).contiguous()
     _DENSE_TW_DENSE_CACHE[key] = (__import__("weakref").ref(w), t)
     return t
