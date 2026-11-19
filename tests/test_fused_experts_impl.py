@@ -283,20 +283,12 @@ def test_fused_moe_vs_ref(config, dtype):
     assert_moe_close(result, ref)
 
 
-VLLM_SMALL_E_CRASH = vendor_name == "hygon"
-
-
 @pytest.mark.fused_experts_impl
 @pytest.mark.parametrize("config", FUSED_MOE_CONFIGS)
 @pytest.mark.parametrize("dtype", _VLLM_REF_DTYPES)
 def test_fused_moe_vs_vllm(config, dtype):
     """Test FlagGems fused_moe against the vLLM reference implementation."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
-    if VLLM_SMALL_E_CRASH and num_experts < 256:
-        pytest.skip(
-            "vLLM fused_moe segfaults/errs for small-E shapes on Hygon HCU "
-            "(upstream kernel, no HCU adaptation)"
-        )
     device = flaggems_vllm.device
 
     torch.manual_seed(0)
