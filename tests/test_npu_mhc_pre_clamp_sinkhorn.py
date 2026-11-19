@@ -412,3 +412,62 @@ def test_npu_mhc_pre_clamp_sinkhorn_generic_parity(n, hidden_size, hc_mult):
     _assert_close(out_post, post_ref, case + "/post")
     _assert_close(out_comb, comb_ref, case + "/comb")
     _assert_close(out_li, li_ref, case + "/li")
+
+
+@requires_ascend
+def test_npu_mhc_pre_clamp_sinkhorn_tle_unavailable_still_clamps(monkeypatch):
+    """hc_mult == 4 without TLE must still apply the model-contract clamp.
+
+    The fallback used to delegate to the generic ``mhc_pre``, whose Ascend
+    kernels do not clamp, so a stock-Triton build silently dropped the clamp.
+    The comb scale is inflated until the logits leave the +-30 band, which makes
+    the clamp observable: the result must track the clamped reference and must
+    stay clearly away from the unclamped one.
+    """
+    from flaggems_vllm.runtime.backend._ascend.ops import mhc_pre as mhc_mod
+
+    data = dict(generate_mhc_pre_data(256, 4, 1280))
+    device = data["fn"].device
+    data["hc_scale"] = torch.tensor(
+        [0.0, 0.0, 5000.0], dtype=torch.float32, device=device
+    )
+    data["hc_base"] = torch.zeros_like(data["hc_base"])
+    data.update(MODEL_KWARGS)
+    data_cpu = {k: v.cpu() if torch.is_tensor(v) else v for k, v in data.items()}
+
+    _, ref_comb_clamped, _ = mhc_pre_ref_clamped(**data_cpu)
+    _, _, comb_logits, _ = _common_stages(
+        data_cpu["residual"],
+        data_cpu["fn"],
+        data_cpu["hc_scale"],
+        data_cpu["hc_base"],
+        MODEL_KWARGS["rms_eps"],
+    )
+    ref_comb_raw = _sinkhorn(
+        comb_logits,
+        False,
+        MODEL_KWARGS["hc_sinkhorn_eps"],
+        MODEL_KWARGS["sinkhorn_repeat"],
+    )
+    # The stress data must actually leave the clamp band, otherwise this test
+    # would pass even with the clamp missing.
+    assert int((comb_logits.abs() > CLAMP_MAX).sum()) > 0
+
+    monkeypatch.setattr(mhc_mod, "_HAS_TLE", False)
+    _, out_comb, _ = flaggems_vllm.npu_mhc_pre_clamp_sinkhorn(**data)
+    torch.npu.synchronize()
+    out_comb = out_comb.float().cpu()
+
+    d_clamped = (out_comb - ref_comb_clamped.float()).abs()
+    d_raw = (out_comb - ref_comb_raw.float()).abs()
+    # bf16 logits near the clamp boundary cost a few 1e-2; the clamp itself is
+    # worth ~1.0 here, so the two checks cannot be confused.
+    assert (
+        d_clamped.max() < 5e-2
+    ), "TLE-less fallback deviates from the clamped reference: {}".format(
+        d_clamped.max()
+    )
+    assert d_raw.max() > 0.2, (
+        "TLE-less fallback did not apply clamp(-30, 30): max diff vs unclamped "
+        "reference is only {}".format(d_raw.max())
+    )
