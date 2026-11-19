@@ -12,30 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.ops.mhc.hc_head_fused_kernel import (
-    hc_head_fused_kernel,
-    hc_head_fused_kernel_ref,
-)
-from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
-    hc_split_sinkhorn,
-    mhc_split_sinkhorn_torch_ref,
-)
-from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
+from flaggems_vllm.ops.mhc.hc_head_fused_kernel import hc_head_fused_kernel
+from flaggems_vllm.ops.mhc.hc_split_sinkhorn import hc_split_sinkhorn
+from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout, mhc_post
 
 # ref functions (mhc_pre_ref, sinkhorn_normalize_ref) live in tests/test_mhc_ops.py
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
+from flaggems_vllm.ops.mhc.mhc_pre_broadcast import (
+    derive_fn_broadcast,
+    mhc_pre_broadcast,
+)
+from flaggems_vllm.ops.mhc.mhc_shifted_post_pre import mhc_shifted_post_pre
 
 __all__ = [
     "hc_head_fused_kernel",
-    "hc_head_fused_kernel_ref",
     "hc_split_sinkhorn",
     "mhc_bwd",
-    "mhc_bwd_ref",
     "mhc_post",
-    "mhc_post_ref",
     "mhc_pre",
-    "mhc_split_sinkhorn_torch_ref",
+    "mhc_pre_broadcast",
+    "derive_fn_broadcast",
+    "mhc_shifted_post_pre",
     "MixLayout",
-    "sinkhorn_forward",
 ]

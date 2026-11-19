@@ -98,6 +98,7 @@ def test_hc_combine_dtype_matrix(rd, bd, idt):
     b = torch.randn((7, 17), device=gems.device, dtype=bd)
     i = None if idt is None else torch.randn((7, 3), device=gems.device, dtype=idt)
     check((r, b, i, 3))
+    check((r, b, i, 3), lambda r, b, i, h: gems.qwen4_hc_inject_combine(i, b, r, h))
 
 
 @pytest.mark.hc_combine
@@ -135,7 +136,9 @@ def test_hc_combine_overlapping_rows(injection, stride):
         storage = torch.randn((3 * stride + width,), device=gems.device)
         return storage.as_strided((4, width), (stride, 1))
 
-    check((make(21), make(7), None if injection is None else make(3), 3))
+    data = (make(21), make(7), None if injection is None else make(3), 3)
+    check(data)
+    check(data, lambda r, b, i, h: gems.qwen4_hc_inject_combine(i, b, r, h))
 
 
 @pytest.mark.hc_combine
@@ -148,6 +151,10 @@ def test_hc_combine_projection_slice(dtype, injection_dtype):
     residual = torch.randn((9, 72), dtype=dtype, device=gems.device)[1:8, 3:72]
     block = torch.randn((9, 31), dtype=dtype, device=gems.device)[1:8, 5:28]
     check((residual, block, injection, 3))
+    check(
+        (residual, block, injection, 3),
+        lambda r, b, i, h: gems.qwen4_hc_inject_combine(i, b, r, h),
+    )
 
 
 @pytest.mark.hc_combine
@@ -202,6 +209,12 @@ def test_hc_combine_errors(kind):
         i = i.cpu()
     with pytest.raises((ValueError, TypeError)):
         gems.hc_combine(r, b, i, h)
+    with pytest.raises((ValueError, TypeError, RuntimeError)):
+        gems.qwen4_hc_inject_combine(i, b, r, h)
+    if kind == "hcbool":
+        # Reject bool even when it describes an otherwise valid HC=1 workload.
+        with pytest.raises((ValueError, TypeError)):
+            gems.qwen4_hc_inject_combine(i[:, :1], b, b, True)
 
 
 @pytest.mark.hc_combine
@@ -214,19 +227,28 @@ def test_hc_combine_legacy_leading_dims():
         actual.reshape(6, 21),
         reference(r.reshape(6, 21), b.reshape(6, 7), i.reshape(6, 3), 3),
     )
+    for index in range(3):
+        data = [i, b, r]
+        # Swapping equal leading dimensions preserves shape but prevents flattening.
+        data = [tensor[:2, :2].contiguous() for tensor in data]
+        data[index] = data[index].transpose(0, 1)
+        with pytest.raises(ValueError, match="flattenable"):
+            gems.qwen4_hc_inject_combine(*data, 3)
 
 
 @pytest.mark.hc_combine
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("injection", ["none", "same", "fp32"])
-def test_hc_combine_native(dtype, injection):
-    native = baseline.native()
-    if native is None:
-        pytest.skip(baseline.NATIVE_UNAVAILABLE_REASON)
+def test_hc_combine_cpu_reference_tail(dtype, injection):
+    # Keep all nine packed projection-tail configurations against the CPU oracle.
+    # Native qualification belongs to the benchmark, not accuracy tests.
     data, _ = baseline.build_inputs(
         dict(n=7, hc=3, d=513, layout="packed", injection=injection), dtype, gems.device
     )
-    check(data, native)
+    check(data)
+    if injection != "none":
+        r, b, i, h = data
+        check((r, b, i, h), lambda r, b, i, h: gems.qwen4_hc_inject_combine(i, b, r, h))
 
 
 @pytest.mark.hc_combine
@@ -235,7 +257,7 @@ def test_hc_combine_native(dtype, injection):
     ["ready", "versionless", "missing_module", "missing_attribute", "not_callable"],
 )
 def test_hc_combine_native_resolution(monkeypatch, mode):
-    # Resolver fault injection is separate from the numerical native tests above.
+    # Resolver fault injection is separate from candidate numerical accuracy.
     # Successful resolution must return and call the original imported function.
     calls = []
     output = object()

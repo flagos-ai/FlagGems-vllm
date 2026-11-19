@@ -19,9 +19,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm.ops.qwen4.hc_combine import _combine
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -70,10 +76,15 @@ def qwen4_hc_inject_combine(
     residual: torch.Tensor,
     hc_count: int,
 ) -> torch.Tensor:
+    logger.debug("GEMS_HYGON QWEN4_HC_INJECT_COMBINE")
+    if isinstance(hc_count, bool) or not isinstance(hc_count, int) or hc_count <= 0:
+        raise ValueError("Qwen4 HC injection requires a positive integer HC count")
+    if injection_logits is None:
+        return _combine(residual, block_output, injection_logits, hc_count, legacy=True)
+    if block_output.ndim < 2:
+        raise ValueError("Qwen4 HC injection requires rank-2 or higher inputs")
     if injection_logits.shape != (*block_output.shape[:-1], hc_count):
         raise ValueError("Qwen4 HC injection logits have an invalid shape")
-    if hc_count <= 0:
-        raise ValueError("Qwen4 HC injection requires a positive HC count")
     if residual.shape != (
         *block_output.shape[:-1],
         hc_count * block_output.shape[-1],
@@ -81,7 +92,7 @@ def qwen4_hc_inject_combine(
         raise ValueError("Qwen4 HC residual and block output shapes are incompatible")
     if any(
         t.device.type in ("cpu", "meta")
-        or t.dtype not in (torch.bfloat16, torch.float16)
+        or t.dtype not in (torch.bfloat16, torch.float16, torch.float32)
         for t in (injection_logits, block_output, residual)
     ):
         raise RuntimeError(
@@ -89,8 +100,20 @@ def qwen4_hc_inject_combine(
         )
     if len({t.device for t in (injection_logits, block_output, residual)}) != 1:
         raise RuntimeError("Qwen4 HC injection requires same-device tensors")
+    if any(t.stride(-1) != 1 for t in (injection_logits, block_output, residual)):
+        raise ValueError("Qwen4 HC injection requires unit inner stride")
+    if block_output.ndim > 2:
+        for tensor in (injection_logits, block_output, residual):
+            shape, strides = tensor.shape, tensor.stride()
+            if any(
+                strides[axis] != shape[axis + 1] * strides[axis + 1]
+                for axis in range(tensor.ndim - 2)
+            ):
+                raise ValueError(
+                    "Qwen4 HC injection leading dimensions must be flattenable"
+                )
 
-    output = torch.empty_like(residual)
+    output = torch.empty_like(residual, memory_format=torch.contiguous_format)
     if not residual.numel():
         return output
 
