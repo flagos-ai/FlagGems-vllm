@@ -230,7 +230,8 @@ def _score(
                 ).to(tl.float32)
                 dots = dots * ks[None, :]
             weight = tl.load(W + t * W0 + h * W1, h < H, other=0).to(tl.float32)
-            scores = tl.sum(tl.maximum(dots, 0) * weight[:, None], axis=0)
+            activated = tl.maximum(dots, 0, propagate_nan=tl.PropagateNan.ALL)
+            scores = tl.sum(activated * weight[:, None], axis=0)
             tl.store(S + t * CAP + j, tl.where(valid, scores, -float("inf")), j < CAP)
         else:
             tl.store(S + t * CAP + j, -float("inf"), j < CAP)
@@ -264,7 +265,9 @@ def _sort_segments(S, V, INDEX, CAP, P: tl.constexpr, NS, START):
     r = tl.arange(0, P)
     j = seg * P + r
     value = tl.load(S + t * CAP + j, j < CAP, other=-float("inf"))
-    index = tl.where(j < CAP, j, 2147483647).to(tl.int32)
+    finite = (value > -float("inf")) & (value < float("inf"))
+    value = tl.where(finite, value, -float("inf"))
+    index = tl.where(finite, j, 2147483647).to(tl.int32)
     value, index = _paired_sort(value, index, P)
     tl.store(V + (t * NS + seg) * P + r, value)
     tl.store(INDEX + (t * NS + seg) * P + r, index)
@@ -410,9 +413,11 @@ def quant_lightning_indexer(
     Queries/keys accept INT8, FP16, BF16 or FP32 (including mixed dtypes).
     INT8 requires per-query/head and per-key/row multiplicative scales.
     Device-resident request IDs, positions, lengths and block tables are read
-    on every call/replay. Invalid metadata masks candidates; missing ranks are
-    padded with -1. Inputs are read-only; output and scratch are independent
-    per-call allocations. This forward-only API does not manage graph lifetime.
+    on every call/replay. Invalid metadata and non-finite scores are excluded;
+    missing ranks are padded with -1. At most 512 candidates may be selected
+    per token. Wider outputs are supported when the extra ranks are padding.
+    Inputs are read-only; output and scratch are independent per-call
+    allocations. This forward-only API does not manage graph lifetime.
     """
     if compress_ratio != 4 or topk < 1:
         raise ValueError("The compressed indexer requires C4 and positive topk")
@@ -468,8 +473,11 @@ def quant_lightning_indexer(
         or key_scale_cache.shape[1:] != (key_cache.shape[1], 1)
     ):
         raise ValueError("Expected paged per-row key scales")
-    if block_table.shape[1] * key_cache.shape[1] > 2**31 - 1:
+    cap = block_table.shape[1] * key_cache.shape[1]
+    if cap > 2**31 - 1:
         raise ValueError("Logical candidate IDs must fit in INT32")
+    if min(topk, cap) > 512:
+        raise ValueError("Indexer supports selecting at most 512 candidates per token")
     t = query.shape[0]
     out = torch.empty((t, topk), dtype=torch.int32, device=query.device)
     if not t:
@@ -485,7 +493,6 @@ def quant_lightning_indexer(
         query_scale,
         key_scale_cache,
     )
-    cap = scores.shape[1]
     p = triton.next_power_of_2(min(max(topk, 32), max(cap, 1)))
     ns = max(1, triton.cdiv(cap, p))
     values = torch.empty((t, ns, p), dtype=torch.float32, device=query.device)

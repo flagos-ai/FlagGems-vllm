@@ -97,17 +97,17 @@ def check(args, *, exact_ids=False, mod=None, output=None):
         if count:
             assert bool((ids < expected.shape[1]).all())
             assert bool(finite[row, ids].all())
-            wanted = expected[row].topk(count).values
+            wanted = expected[row].masked_fill(~finite[row], -torch.inf).topk(count)
             actual = expected[row, ids]
-            # This compares ranks and tie membership, without imposing tie IDs.
+            # Allow near-tie reordering within the measured score error.
             torch.testing.assert_close(
-                actual.sort(descending=True).values,
-                wanted,
+                actual,
+                wanted.values,
                 atol=2 * max_abs + 1e-8,
                 rtol=0,
             )
             if exact_ids:
-                assert torch.equal(ids, expected[row].topk(count).indices)
+                assert torch.equal(ids, wanted.indices)
         assert bool((out[row, count:] == -1).all())
     max_abs = (
         float((score[finite] - expected[finite]).abs().max()) if finite.any() else 0
@@ -280,7 +280,7 @@ def test_topk_transport_exact_bits():
 
     # Every logical ID must survive subnormal FP32 bit transport, including
     # IDs beyond 256. Negative scores and ties exercise both comparisons.
-    for cap, top in [(1024, 1024), (1301, 512)]:
+    for cap, top in [(512, 512), (1301, 512)]:
         cpu = (
             torch.randperm(cap, generator=torch.Generator().manual_seed(91)).float()
             - cap / 2
@@ -471,6 +471,33 @@ def test_short_key_scale_cache_masks_missing_pages():
     a = data()
     a[9] = a[9][:3]
     check(a)
+
+
+def test_nonfinite_scores_excluded_across_segments():
+    a = data(t=1, h=1, d=1, pages=3, block=32, cols=3, top=5, floating=True)
+    a[0].fill_(1)
+    a[1].fill_(1)
+    a[2].fill_(1)
+    a[3].copy_(torch.tensor([[0, 1, 2]], device="npu").expand_as(a[3]))
+    a[4].zero_()
+    a[5].fill_(383)
+    a[6].fill_(96)
+    a[8] = None
+    a[9] = torch.full((3, 32, 1), torch.inf, device="npu")
+    a[9][0, 1] = torch.nan
+    a[9][0, 2] = 3
+    a[9][1, 0] = 8
+    a[9][2, 0] = 2
+    actual = check(a)
+    assert actual.tolist() == [[32, 2, 64, -1, -1]]
+
+
+def test_topk_limit_and_padding():
+    a = data(top=513)
+    assert check(a).shape == (4, 513)
+    a[3] = a[3][:, :1].expand(2, 65)
+    with pytest.raises(ValueError, match="at most 512"):
+        invoke(flaggems_vllm, a)
 
 
 def test_candidate_id_overflow_rejected_before_launch():
