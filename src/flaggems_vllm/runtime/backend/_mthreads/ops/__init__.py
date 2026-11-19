@@ -46,9 +46,6 @@ from flaggems_vllm.runtime.backend._mthreads.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
-from flaggems_vllm.runtime.backend._mthreads.ops.mhc_pre_broadcast import (
-    mhc_pre_broadcast,
-)
 from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -85,7 +82,6 @@ __all__ = [
     "gemma_rms_norm",
     "grouped_topk",
     "hc_combine",
-    "mhc_pre_broadcast",
     "inplace_fused_experts",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",

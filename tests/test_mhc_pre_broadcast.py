@@ -1,15 +1,14 @@
 import pytest
 import torch
 
-import flaggems_vllm
-from flaggems_vllm.ops.mhc.mhc_pre_broadcast import derive_fn_broadcast
+from flaggems_vllm.ops.mhc.mhc_pre_broadcast import (
+    derive_fn_broadcast,
+    mhc_pre_broadcast,
+)
 from tests.test_mhc_ops import sinkhorn_normalize_ref
 
-mhc_pre_broadcast = flaggems_vllm.mhc_pre_broadcast
 
-
-def generate_mhc_pre_broadcast_data(n, hc_mult, hidden_size, device=None):
-    device = device or flaggems_vllm.device
+def generate_mhc_pre_broadcast_data(n, hc_mult, hidden_size, device="cuda"):
     hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
     hc_hidden_size = hc_mult * hidden_size
     residual = torch.randn(n, hidden_size, device=device).bfloat16()
