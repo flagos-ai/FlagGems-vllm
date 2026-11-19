@@ -31,6 +31,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import device as _device
+from flaggems_vllm.runtime import get_tuned_config
 
 _MHC_PRE_MIX_PAD = tl.constexpr(32)
 
@@ -49,6 +50,9 @@ def _mhc_fn_cache(fn: torch.Tensor) -> dict:
     """Store for the weight copies this op derives, validated by identity plus
     _version and data_ptr so that an in-place edit invalidates them.
     """
+    if fn.is_inference():
+        # These weights can change without updating a version counter.
+        return {}
     key = id(fn)
     version = fn._version
     ptr = fn.data_ptr()
@@ -1158,7 +1162,8 @@ def _mhc_pre_reader_s4(num_tokens, block_m, block_k, hc_hidden_size, target_ctas
 
 
 @triton.autotune(
-    configs=[
+    configs=get_tuned_config("mhc_pre_packed_reader")
+    or [
         triton.Config({"BLOCK_M": 32, "BLOCK_K": 32}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_M": 32, "BLOCK_K": 32}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
