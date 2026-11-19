@@ -40,6 +40,7 @@ weight_norm_interface_backward: test_weight_norm_interface
 gather_sampler_output: test_batch_shard
 draft_watermarking_mask: test_watermark
 act_quant_triton: test_quant
+apply_trace_tokens: test_trace_replay
 apply_logit_bias: test_logit_bias
 apply_min_p: test_min_p
 apply_thinking_budget: test_thinking_budget
