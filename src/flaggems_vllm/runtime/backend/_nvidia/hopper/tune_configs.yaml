@@ -173,3 +173,105 @@ chunk_kda_fwd_intra_token_parallel:
       - 8
     stages:
       - 1
+
+
+# Hopper W8A16 multistage candidates fault with FlagTree 0.7.0.
+
+# Use the verified single-stage tiles for INT8 and FP8 autotuning.
+
+fused_marlin_moe_w8a16_int8_gateup_silu:
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_int8_unified:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_fp8_gateup_silu:
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_fp8_down:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 1
+
+fused_marlin_moe_w8a16_fp8_unified:
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 1
