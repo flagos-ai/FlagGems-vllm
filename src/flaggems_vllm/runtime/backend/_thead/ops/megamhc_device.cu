@@ -318,35 +318,74 @@ project(uint64_t xp, uint64_t rp, uint64_t postp, uint64_t combp, uint64_t fnp,
   }
 
   float acc[Rows][Heads][8] = {};
-  // A single head per warp can overlap two iterations without growing the
-  // multi-head accumulator's register footprint.
-  constexpr unsigned Unroll = Heads == 1 ? 2 : 1;
+  // Uneven multi-head groups split once before K. Keep the established
+  // schedule for the full and one-head groups.
+  if constexpr (Heads > 1 && P % Warps != 0) {
+    auto accumulate_heads = [&](auto count) {
+      constexpr unsigned ActiveHeads = decltype(count)::value;
+      constexpr unsigned Unroll = ActiveHeads == 1 ? 2 : 1;
 #pragma unroll Unroll
-  for (unsigned start = lane * 8; start < R * hidden; start += 32 * 8) {
-    PackedBf16 av[Rows];
+      for (unsigned start = lane * 8; start < R * hidden; start += 32 * 8) {
+        PackedBf16 av[Rows];
 #pragma unroll
-    for (unsigned row = 0; row < Rows; ++row)
-      av[row] =
-          load_bf16(outp + 2 * ((Index(token) + row) * R * hidden + start));
+        for (unsigned row = 0; row < Rows; ++row)
+          av[row] =
+              load_bf16(outp + 2 * ((Index(token) + row) * R * hidden + start));
 #pragma unroll
-    for (unsigned j = 0; j < Heads; ++j) {
-      const unsigned head = warp + j * Warps;
-      if (head < P) {
-        const float *weights =
-            reinterpret_cast<const float *>(fnp) + head * R * hidden + start;
-        float4 lo = load_float4(reinterpret_cast<uint64_t>(weights));
-        float4 hi = load_float4(reinterpret_cast<uint64_t>(weights + 4));
-        const float w[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        for (unsigned j = 0; j < ActiveHeads; ++j) {
+          const unsigned head = warp + j * Warps;
+          const float *weights =
+              reinterpret_cast<const float *>(fnp) + head * R * hidden + start;
+          float4 lo = load_float4(reinterpret_cast<uint64_t>(weights));
+          float4 hi = load_float4(reinterpret_cast<uint64_t>(weights + 4));
+          const float w[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
 #pragma unroll
-        for (unsigned row = 0; row < Rows; ++row) {
+          for (unsigned row = 0; row < Rows; ++row) {
 #pragma unroll
-          for (unsigned i = 0; i < 8; ++i)
-            acc[row][j][i] =
-                __fmaf_rn(w[i], bf16_at(av[row], i), acc[row][j][i]);
+            for (unsigned i = 0; i < 8; ++i)
+              acc[row][j][i] =
+                  __fmaf_rn(w[i], bf16_at(av[row], i), acc[row][j][i]);
+          }
+        }
+      }
+    };
+    if (warp < P % Warps) {
+      accumulate_heads(std::integral_constant<unsigned, Heads>{});
+    } else {
+      accumulate_heads(std::integral_constant<unsigned, Heads - 1>{});
+    }
+  } else {
+    // A single head per warp can overlap two iterations without growing the
+    // multi-head accumulator's register footprint.
+    constexpr unsigned Unroll = Heads == 1 ? 2 : 1;
+#pragma unroll Unroll
+    for (unsigned start = lane * 8; start < R * hidden; start += 32 * 8) {
+      PackedBf16 av[Rows];
+#pragma unroll
+      for (unsigned row = 0; row < Rows; ++row)
+        av[row] =
+            load_bf16(outp + 2 * ((Index(token) + row) * R * hidden + start));
+#pragma unroll
+      for (unsigned j = 0; j < Heads; ++j) {
+        const unsigned head = warp + j * Warps;
+        if (head < P) {
+          const float *weights =
+              reinterpret_cast<const float *>(fnp) + head * R * hidden + start;
+          float4 lo = load_float4(reinterpret_cast<uint64_t>(weights));
+          float4 hi = load_float4(reinterpret_cast<uint64_t>(weights + 4));
+          const float w[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+          for (unsigned row = 0; row < Rows; ++row) {
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i)
+              acc[row][j][i] =
+                  __fmaf_rn(w[i], bf16_at(av[row], i), acc[row][j][i]);
+          }
         }
       }
     }
   }
+
 #pragma unroll
   for (unsigned row = 0; row < Rows; ++row) {
 #pragma unroll
