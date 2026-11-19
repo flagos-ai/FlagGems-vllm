@@ -525,6 +525,17 @@ def get_default_config(
                 }
             )
 
+    # A 4-stage GEMM1 pipeline is faster for the Qwen I=512 prefill
+    # geometry at large M; the I=128 variant regresses.
+    if (
+        M >= 8192
+        and E == 256
+        and topk == 8
+        and gemm_stage == "gemm1"
+        and (N, K) == (1024, 2048)
+    ):
+        config["num_stages"] = 4
+
     # MC550 FlagTree pipeline selections retained from real-shape tuning.
     if (
         M >= 8192
