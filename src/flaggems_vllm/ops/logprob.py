@@ -74,6 +74,11 @@ except ImportError:
         cu_num_generated_tokens_tensor: torch.Tensor | None
 
 
+_HAS_TENSOR_LOGPROBS_METADATA = (
+    "cu_num_generated_tokens_tensor" in LogprobsTensors._fields
+)
+
+
 try:
     from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
@@ -103,7 +108,8 @@ HAS_TLE = _TLE_CLUSTER_SUPPORTED
 _MAX_TOPK_BLOCK = 1024
 ORIGINAL_RANK_BLOCK_SIZE = tl.constexpr(8192)
 _BATCH_CLUSTER_THRESHOLD = 59
-_SMALL_BATCH_CLUSTER_SIZE = 16
+# SM90 guarantees portable clusters of up to eight blocks.
+_SMALL_BATCH_CLUSTER_SIZE = 8
 _LARGE_BATCH_CLUSTER_SIZE = 8
 _SMALL_BATCH_MESH = (
     tle.device_mesh({"block_cluster": [("cluster_x", _SMALL_BATCH_CLUSTER_SIZE)]})
@@ -1047,6 +1053,12 @@ def compute_topk_scores(
     max_per_req_token_ids: int = 0,
     logits_mode: bool = False,
 ) -> LogprobsTensors:
+    is_tensor = isinstance(cu_num_logits, torch.Tensor)
+    if is_tensor and not _HAS_TENSOR_LOGPROBS_METADATA:
+        raise NotImplementedError(
+            "Tensor cu_num_logits requires vLLM LogprobsTensors with "
+            "cu_num_generated_tokens_tensor support"
+        )
     assert num_logprobs >= 0
     batch_size, vocab_size = logits.shape
     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
@@ -1164,14 +1176,17 @@ def compute_topk_scores(
                 COMPUTE_LOGPROBS=False,
                 HAS_MASK=max_per_req_token_ids > 0,
             )
-    is_tensor = isinstance(cu_num_logits, torch.Tensor)
-    return LogprobsTensors(
+    output_fields = dict(
         logprob_token_ids=logprob_token_ids,
         logprobs=scores,
         selected_token_ranks=token_ranks,
         cu_num_generated_tokens=None if is_tensor else cu_num_logits,
-        cu_num_generated_tokens_tensor=cu_num_logits if is_tensor else None,
     )
+    if _HAS_TENSOR_LOGPROBS_METADATA:
+        output_fields["cu_num_generated_tokens_tensor"] = (
+            cu_num_logits if is_tensor else None
+        )
+    return LogprobsTensors(**output_fields)
 
 
 @triton.jit
