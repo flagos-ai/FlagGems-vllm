@@ -7,13 +7,12 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.mhc.mhc_pre_broadcast import (
-    derive_fn_broadcast,
-    mhc_pre_broadcast,
-)
+from flaggems_vllm.ops.mhc.mhc_pre_broadcast import derive_fn_broadcast
 from tests.test_mhc_pre_broadcast import mhc_pre_broadcast_ref
 
 from . import base
+
+mhc_pre_broadcast = flaggems_vllm.mhc_pre_broadcast
 
 VENDOR = flaggems_vllm.vendor_name
 
