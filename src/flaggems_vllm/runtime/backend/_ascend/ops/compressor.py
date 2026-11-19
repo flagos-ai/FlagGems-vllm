@@ -2858,7 +2858,15 @@ def _bind_compressor_launches(
         )
         # Only the concat path needs the fused (2 * proj_dim, hidden) weight;
         # the pair path below reads wkv_t / wgate_t directly.
-        projection_weight_t = torch.cat((wkv_t, wgate_t), dim=0)
+        if wkv_t.device != wgate_t.device:
+            raise RuntimeError("wkv and wgate must be on the same device")
+        projection_weight_t = torch.empty(
+            (2 * proj_dim, hidden_size),
+            dtype=torch.promote_types(wkv_t.dtype, wgate_t.dtype),
+            device=wkv_t.device,
+        )
+        projection_weight_t[:proj_dim].copy_(wkv_t)
+        projection_weight_t[proj_dim:].copy_(wgate_t)
         project_args = (
             x_2d,
             projection_weight_t,
