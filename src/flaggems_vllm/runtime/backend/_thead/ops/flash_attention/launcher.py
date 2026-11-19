@@ -1331,7 +1331,7 @@ def launch_tp2_mixed(
         write_lse=write_lse,
         fold=4,
         order=1,
-        mode=2 if common.supports_tle() else 0,
+        mode=2 if common.supports_tle() else -1,
         short=short,
         early=True,
         norm_short=1 if use_medium else 64,
