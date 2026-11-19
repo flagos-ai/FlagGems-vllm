@@ -161,8 +161,16 @@ def _lean_bmm(act, weight, act_scale, weight_scale, out):
             cfg["ACC_FP32"],
             cfg["SWAP_AB"],
         )
+    n_tiles = triton.cdiv(n, block_n)
+    # g=8 at 64-128 tokens lands on 64 CTAs (one m tile x 8 n tiles x 8 groups),
+    # i.e. 80% of one wave on the 80 CUs. Halving the N tile fills the wave and
+    # measured 24% faster there; the extra activation re-read costs nothing at
+    # this size (512 KiB per group) and hurts the larger batches.
+    if block_n > 64 and m >= 64 and triton.cdiv(m, block_m) * n_tiles * batch < 80:
+        block_n //= 2
+        n_tiles = triton.cdiv(n, block_n)
     aligned = m % block_m == 0 and n % block_n == 0 and k % tile_k == 0
-    grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n), batch)
+    grid = (triton.cdiv(m, block_m) * n_tiles, batch)
     weight_t = weight.transpose(1, 2)
     scale_t = weight_scale.transpose(1, 2)
     args = (
@@ -612,6 +620,43 @@ def _quant_buffers(
     return out, scale
 
 
+_SCRATCH: dict = {}
+_SCRATCH_LIMIT = 8
+
+
+def _scratch(shape, dtype: torch.dtype, device) -> torch.Tensor:
+    """Reuse the per-call intermediates across launches.
+
+    Every buffer below is fully written before it is read and never escapes the
+    call (``wo_b`` returns a fresh tensor), so reuse is safe on a single stream.
+    Each ``torch.empty`` costs 2-4 us of host time, which is 5-10% of a 128-token
+    launch on this CPU.
+    """
+    key = (tuple(shape), dtype, device)
+    buf = _SCRATCH.get(key)
+    if buf is None:
+        if len(_SCRATCH) >= _SCRATCH_LIMIT:
+            _SCRATCH.pop(next(iter(_SCRATCH)))
+        buf = torch.empty(shape, dtype=dtype, device=device)
+        _SCRATCH[key] = buf
+    return buf
+
+
+def _quant_buffers_cached(
+    o: torch.Tensor, n_groups: int, heads_per_group: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens, _, head_dim = o.shape
+    group_dim = heads_per_group * head_dim
+    return (
+        _scratch((n_groups, num_tokens, group_dim), torch.int8, o.device),
+        _scratch(
+            (n_groups, num_tokens, group_dim // _QUANT_BLOCK),
+            torch.float32,
+            o.device,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Group-major -> token-major output reorder
 # ---------------------------------------------------------------------------
@@ -645,8 +690,8 @@ def _reorder_groups_kernel(
 def _reorder_groups(
     src: torch.Tensor, num_tokens: int, n_groups: int, inner: int
 ) -> torch.Tensor:
-    dst = torch.empty(
-        (num_tokens, n_groups * inner), dtype=src.dtype, device=src.device
+    dst = _scratch(
+        (num_tokens, n_groups * inner), src.dtype, src.device
     )
     if dst.numel() == 0:
         return dst
@@ -1021,7 +1066,7 @@ def deep_gemm_fp8_o_proj(
         if prequantized:
             act_i8, act_scale_i8 = _activation_to_int8(act, act_scale)
         else:
-            act_i8, act_scale_i8 = _quant_buffers(o, n_groups, heads_per_group)
+            act_i8, act_scale_i8 = _quant_buffers_cached(o, n_groups, heads_per_group)
             block_t = 2 if num_tokens < 64 else 4
             # 128/224-head models (g=16) run the row-wise pass 13-16% faster once
             # there are enough tokens to fill the device; with 64 heads (g=8) the
@@ -1064,17 +1109,13 @@ def deep_gemm_fp8_o_proj(
         # large: below ~512 tokens the extra launch costs more than the stride.
         dense = num_tokens >= 512 and n_groups * o_lora_rank <= 8192
         if dense:
-            out = torch.empty(
-                (n_groups, num_tokens, o_lora_rank),
-                dtype=torch.bfloat16,
-                device=device,
+            out = _scratch(
+                (n_groups, num_tokens, o_lora_rank), torch.bfloat16, device
             )
             z = out
         else:
-            out = torch.empty(
-                (num_tokens, n_groups, o_lora_rank),
-                dtype=torch.bfloat16,
-                device=device,
+            out = _scratch(
+                (num_tokens, n_groups, o_lora_rank), torch.bfloat16, device
             )
             z = out.permute(1, 0, 2)
         try:
