@@ -29,6 +29,17 @@ from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
 from flaggems_vllm.utils.device_info import get_device_capability, get_sm_count
 
+# Older Triton dependency scanners resolve attributes even in constexpr branches.
+# Bind optional builtins by name so importing this module does not require PDL.
+try:
+    from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+
+    _HAS_PDL = runtime.device.vendor_name == "nvidia"
+except ImportError:
+    gdc_launch_dependents = None
+    gdc_wait = None
+    _HAS_PDL = False
+
 if has_triton_tle_attrs(("load",), 3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
@@ -81,7 +92,7 @@ def _select_fixed_launch_config(
             source_tile_size=4,
             num_warps=8,
             num_stages=2,
-            enable_pdl=True,
+            enable_pdl=_HAS_PDL,
         )
 
     use_persistent_token_loop = (
@@ -665,7 +676,7 @@ def _execute_attn_res_steps(
     )
 
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
+        gdc_launch_dependents()
 
     _normalize_and_store_output(
         output_norm_weight_ptr,
@@ -685,7 +696,11 @@ def _execute_attn_res_steps(
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("attn_res_post"),
+    configs=[
+        config
+        for config in runtime.get_tuned_config("attn_res_post")
+        if _HAS_PDL or not config.kwargs["launch_pdl"]
+    ],
     key=[
         "TOKEN_COUNT_BUCKET",
         "NUM_BLOCKS",
@@ -731,7 +746,7 @@ def _attn_res_post_kernel(
     hidden_mask = hidden_offsets < HIDDEN_SIZE
 
     if launch_pdl:
-        tl.extra.cuda.gdc_wait()
+        gdc_wait()
 
     unused_prefix = tl.zeros((HIDDEN_TILE_SIZE,), tl.float32)
     unused_norm_qk_weight = tl.zeros((HIDDEN_TILE_SIZE,), tl.float32)
@@ -763,7 +778,7 @@ def _attn_res_post_kernel(
     )
 
     if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
+        gdc_launch_dependents()
 
     _normalize_and_store_output(
         output_norm_weight_ptr,
@@ -876,7 +891,7 @@ def _attn_res_fixed_config_kernel(
             )
     else:
         if launch_pdl:
-            tl.extra.cuda.gdc_wait()
+            gdc_wait()
 
         _execute_attn_res_steps(
             prefix_ptr,

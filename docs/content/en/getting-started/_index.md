@@ -6,42 +6,25 @@ bookCollapseSection: true
 
 # Getting Started with FlagGems-vllm
 
-This section covers installation, setup, and basic usage of FlagGems-vllm.
+This section covers the environment prerequisites and installation options for FlagGems-vllm.
 
 ## Prerequisites
 
-- Python ≥ 3.8 (CI uses 3.11/3.12)
-- PyTorch ≥ 2.6.0
-- Triton or FlagTree compiler
-- CUDA-capable GPU (for NVIDIA backend) or other supported accelerator
-- vLLM (optional, for integration testing)
+- **Python**: Python ≥ 3.8 (CI uses 3.11/3.12)
+- **PyTorch**: PyTorch ≥ 2.6.0
+- **FlagGems**: Required dependency; install via `pip install flag-gems==5.4.0` (some FlagGems-vllm operators invoke general FlagGems operators internally)
+- **Compiler**: Triton (≥ 3.0) or FlagTree compiler
+- **Hardware**: CUDA-capable GPU (NVIDIA) or other supported accelerators (Ascend, AMD, Cambricon, Hygon, etc.)
+- **vLLM**: Optional, for end-to-end inference and plugin integration
 
 ## Installation
 
-See the [installation guide](install/) for detailed instructions.
+FlagGems-vllm supports source installation, editable development installation, automated bootstrapping scripts, and full-stack integration with FlagGems and vllm-plugin-fl.
 
-## Quick Start
-
-After installation, verify FlagGems-vllm is working:
-
-```python
-import torch
-import flaggems_vllm
-
-print(f"FlagGems-vllm version: {flaggems_vllm.__version__}")
-print(f"Vendor: {flaggems_vllm.vendor_name}")
-print(f"Device: {flaggems_vllm.device}")
-
-# Test a simple operator
-topk_ids = torch.randint(0, 16, (128, 2), device='cuda', dtype=torch.int32)
-sorted_ids, expert_ids, num_tokens = flaggems_vllm.moe_align_block_size(
-    topk_ids, block_size=32, num_experts=16
-)
-print("✓ moe_align_block_size works!")
-```
+See the [Installation Guide](install.md) for detailed instructions.
 
 ## Next Steps
 
-- [Installation details](install/)
-- [Basic usage patterns](/FlagGems-vllm/usage/basic/)
-- [Integration with vllm-plugin-fl](/FlagGems-vllm/usage/vllm-plugin/)
+- [Installation Guide](install.md) - Environment setup and installation options
+- [Usage Guide](../usage/basic.md) - Operator invocation, global dispatch, and APIs
+- [Integration with vllm-plugin-fl](../usage/vllm-plugin.md) - vLLM plugin orchestration

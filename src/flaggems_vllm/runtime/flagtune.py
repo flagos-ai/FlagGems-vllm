@@ -205,19 +205,14 @@ register_flagtune_op(
     description="DeepSeekV4 global top-k index conversion and length computation",
 )
 register_flagtune_op(
-    "w8a8_block_fp8_matmul",
+    "w8a8_block_matmul",
     default=False,
-    description="W8A8 block FP8 matrix multiplication",
+    description="W8A8 block FP8/INT8 matrix multiplication",
 )
 register_flagtune_op(
     "w8a8_block_fp8_bmm",
     default=False,
     description="W8A8 block FP8 batched matrix multiplication",
-)
-register_flagtune_op(
-    "w8a8_block_int8_matmul",
-    default=False,
-    description="W8A8 block INT8 matrix multiplication",
 )
 
 # DEFAULT_FLAGTUNE_INCLUDE and SUPPORTED_FLAGTUNE_OPS are provided by __getattr__.

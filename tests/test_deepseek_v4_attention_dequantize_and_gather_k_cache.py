@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
 import flaggems_vllm.testing as fg_testing
@@ -115,19 +118,14 @@ def _fill_cache(k_cache, expected_rows, block_size, nope_dim, rope_dim, scale_sl
         row[..., nope_dim : nope_dim + rope_dim] = rope.view(torch.bfloat16)
 
 
-@pytest.mark.parametrize(
-    ("batch", "seq_len", "gather_len", "block_size", "nope_dim", "rope_dim"),
-    [
-        (1, 6, 3, 4, 64, 16),
-        (2, 12, 5, 64, 448, 64),
-    ],
-)
-@pytest.mark.skipif(
-    not _OP_RUNS,
-    reason="requires a backend able to run this operator",
-)
-def test_dequantize_and_gather_k_cache_accuracy(
-    batch, seq_len, gather_len, block_size, nope_dim, rope_dim
+def _check_gather(
+    batch,
+    seq_len,
+    gather_len,
+    block_size,
+    nope_dim,
+    rope_dim,
+    init_nan=False,
 ):
     device = flaggems_vllm.device
     scale_slots = (nope_dim + 63) // 64 + (1 if nope_dim % 64 == 0 else 0)
@@ -137,9 +135,18 @@ def test_dequantize_and_gather_k_cache_accuracy(
     blocks_per_seq = (seq_len + block_size - 1) // block_size
     num_blocks = batch * blocks_per_seq
     k_cache = torch.zeros((num_blocks, block_stride), device=device, dtype=torch.uint8)
-    out = torch.empty(
-        (batch, gather_len, output_dim), device=device, dtype=torch.bfloat16
-    )
+    if init_nan:
+        # Unwritten rows keep this value, so a partial gather cannot pass silently.
+        out = torch.full(
+            (batch, gather_len, output_dim),
+            float("nan"),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+    else:
+        out = torch.empty(
+            (batch, gather_len, output_dim), device=device, dtype=torch.bfloat16
+        )
     expected = torch.empty_like(out)
     rows = {}
     for req in range(batch):
@@ -169,6 +176,64 @@ def test_dequantize_and_gather_k_cache_accuracy(
     )
 
     fg_testing.assert_close(out, expected, dtype=torch.bfloat16, equal_nan=True)
+
+
+def _kernel_tuner():
+    """Return the tuner that owns the kernel's configs."""
+    module = importlib.import_module(
+        "flaggems_vllm.ops.deepseek_v4_attention_dequantize_and_gather_k_cache"
+    )
+    return module._dequantize_and_gather_k_cache_kernel
+
+
+@pytest.mark.parametrize(
+    ("batch", "seq_len", "gather_len", "block_size", "nope_dim", "rope_dim"),
+    [
+        (1, 6, 3, 4, 64, 16),
+        (2, 12, 5, 64, 448, 64),
+        # gather_len above the legacy fixed grid of 128 workers
+        (1, 2048, 512, 64, 448, 64),
+        (1, 2048, 2048, 64, 448, 64),
+    ],
+)
+@pytest.mark.skipif(
+    not _OP_RUNS,
+    reason="requires a backend able to run this operator",
+)
+def test_dequantize_and_gather_k_cache_accuracy(
+    batch, seq_len, gather_len, block_size, nope_dim, rope_dim
+):
+    _check_gather(batch, seq_len, gather_len, block_size, nope_dim, rope_dim)
+
+
+@pytest.mark.skipif(
+    not _OP_RUNS,
+    reason="requires a backend able to run this operator",
+)
+def test_dequantize_and_gather_k_cache_wide_num_workers():
+    """Every gathered token must be written for any tuned num_workers.
+
+    The launcher has to derive the grid from the tuner's meta-parameters. With
+    the grid pinned to a constant 128 while ``num_workers`` is larger, only the
+    tokens ``{w + k * num_workers}`` for ``w < 128`` are written, so everything
+    from 128 up to ``gather_len - 1`` is skipped.
+    """
+    entry = _kernel_tuner()
+    tuner = entry.fn
+    saved_configs = tuner.configs
+    # ``num_workers`` is not part of the entry key, so a compiled kernel from an
+    # earlier case would be reused and the injected config would never be read.
+    saved_caches = [dict(cache) for cache in entry.kernel_cache]
+    try:
+        tuner.configs = [triton.Config({"num_workers": 512})]
+        for cache in entry.kernel_cache:
+            cache.clear()
+        _check_gather(1, 2048, 2048, 64, 448, 64, init_nan=True)
+    finally:
+        tuner.configs = saved_configs
+        for cache, saved in zip(entry.kernel_cache, saved_caches):
+            cache.clear()
+            cache.update(saved)
 
 
 @pytest.mark.skipif(

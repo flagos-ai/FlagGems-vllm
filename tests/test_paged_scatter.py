@@ -103,7 +103,7 @@ def _make_inputs(cache_shape, n, block_size, dtype, seed=0):
     return cache, slots, values
 
 
-@pytest.mark.paged_scatter
+@pytest.mark.paged_scatter_triton
 @pytest.mark.parametrize("cache_shape,n,block_size", CASES)
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 def test_paged_scatter_accuracy(cache_shape, n, block_size, dtype):
@@ -115,7 +115,7 @@ def test_paged_scatter_accuracy(cache_shape, n, block_size, dtype):
     assert torch.equal(new, ref)
 
 
-@pytest.mark.paged_scatter
+@pytest.mark.paged_scatter_triton
 def test_paged_scatter_all_invalid_is_noop():
     cache = torch.randn(64, 4, 256, dtype=torch.bfloat16, device="npu")
     before = cache.clone()

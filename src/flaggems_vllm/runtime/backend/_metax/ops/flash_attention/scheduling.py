@@ -375,6 +375,10 @@ class MetaXAttentionScheduler:
                         decode_splits = 16
                     else:
                         decode_splits = 2
+                elif batch_size in (3, 6, 7):
+                    decode_splits = 96
+                elif batch_size in (4, 5):
+                    decode_splits = 64
                 elif batch_size <= 8:
                     decode_splits = 128
                 elif batch_size <= 24:
@@ -418,9 +422,12 @@ class MetaXAttentionScheduler:
             selected_splits = 0
         split_kv_enabled = selected_splits >= 2
         if split_kv_enabled and tn_packed_decode:
-            # Large page32 decode batches benefit from the narrower synchronous
-            # MMA tile; small batches retain the Async-TN split configuration.
-            if block_size == 32 and batch_size >= 49:
+            # Narrow tiles reduce idle GQA8 rows and shared-memory pressure.
+            # Keep B1/B2 on Async-TN; the measured B3..B8 auto policies use
+            # more resident CTAs without changing the public split range.
+            if block_size == 32 and (
+                batch_size >= 49 or (num_splits == 0 and 3 <= batch_size <= 8)
+            ):
                 split_kv_block_m, split_kv_block_n = 16, 64
             else:
                 split_kv_block_m, split_kv_block_n = 32, 128

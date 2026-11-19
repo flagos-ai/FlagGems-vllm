@@ -34,6 +34,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
+    "flag-gems",
     "packaging",
     "pybind11",
     "PyYAML",
@@ -45,8 +46,50 @@ test = [
     "pytest>=7.1.0",
     "scipy>=1.14,<1.18.0",  # Keep the existing NumPy version
     "einops>=0.6",
-    "cupy-cuda12x>=12.0.0,<14.0.0",  # Keep the existing NumPy version
     "distro>=1.9.0",
+]
+# CUDA-only test dependency. Kept out of `test` so non-NVIDIA backends can
+# install the base test set without pulling a CUDA wheel into their vendor
+# environment. `tools/setup.sh` installs the equivalent package from
+# src/flaggems_vllm/backends.yaml for NVIDIA profiles.
+test-nvidia = [
+    "cupy-cuda12x>=12.0.0,<14.0.0",  # Keep the existing NumPy version
+]
+# Native vLLM builds that carry the reference kernels used by the benchmark
+# baselines. Each extra targets exactly one backend image.
+nvidia = [
+    "vllm @ https://files.pythonhosted.org/packages/a5/0d/0b15fda9a56ac485ebb607e466f0e3386c8c115bafeced6514298bd325b5/vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+]
+ascend = [
+    "vllm-ascend==0.32.0rc1",
+]
+iluvatar = [
+    "vllm @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/vllm/0.24.0+flagos/vllm-0.24.0+flagos-cp312-cp312-linux_x86_64.whl#sha256=ca0450ff49eecb2c2954edd6e2350fb4a5bbe63f1512b6160aac8a798440010c",
+    "ixformer @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/ixformer/0.7.0+corex.4.5.0.20260804/ixformer-0.7.0+corex.4.5.0.20260804-cp312-cp312-linux_x86_64.whl#sha256=413fe629b4ee707df83fd99a19366dd35ae757a2f495acdc2cffa7a49be7a688",
+    "numpy<2",
+]
+
+thead = [
+    # Vendor wheel for benchmark baselines; torch is pinned to the ppu2.2 build
+    # the wheel is compiled against.
+    "torch @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/torch/2.13.0+v0.1.0.ppu2.2.0/torch-2.13.0+cu130ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
+    "vllm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm/0.31.0+v0.1.0.ppu2.2.0/vllm-0.31.0+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
+    "scikit-learn>=1.5",
+]
+
+[tool.uv]
+exclude-dependencies = [
+    # Image-provided runtimes that must not be replaced.
+    "numpy", "triton", "triton-ascend", "flagtree", "torch-npu",
+    # CUDA runtime pulled by the upstream vLLM wheel (nvidia extra).
+    "cuda-bindings", "cuda-core", "cuda-python", "cuda-tile", "cuda-toolkit",
+    "nvidia-cuda-cccl", "nvidia-cuda-crt", "nvidia-cuda-nvcc", "nvidia-cuda-nvrtc",
+    "nvidia-cuda-runtime", "nvidia-cuda-tileiras", "nvidia-cudnn-frontend",
+    "nvidia-cutlass-dsl", "nvidia-cutlass-dsl-libs-base", "nvidia-cutlass-dsl-libs-cu13",
+    "quack-kernels", "tilelang", "tokenspeed-mla", "tokenspeed-triton",
+    "apache-tvm-ffi",
+    # Transitive pins of the plugin wheels: letting them resolve downgrades the base image.
+    "transformers", "tokenizers", "starlette", "xgrammar",
 ]
 
 [project.urls]
@@ -59,7 +102,11 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
+"flaggems_vllm" = ["backends.yaml"]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
+"flaggems_vllm.testing" = ["*.hip"]
+"flaggems_vllm.utils" = ["configs/*.yaml"]
 
 [tool.black]
 line-length = 88

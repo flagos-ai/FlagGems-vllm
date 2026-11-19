@@ -12,12 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 import torch
 
 import flaggems_vllm
 
 from . import accuracy_utils as utils
+
+try:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8 as _vllm_per_token_group_quant_fp8,
+    )
+
+    _HAS_VLLM_FP8_REF = True
+    _VLLM_FP8_HAS_UE8M0 = (
+        "use_ue8m0" in inspect.signature(_vllm_per_token_group_quant_fp8).parameters
+    )
+except (ImportError, TypeError):
+    _HAS_VLLM_FP8_REF = False
+    _VLLM_FP8_HAS_UE8M0 = False
 
 
 def _f32_to_fp8_e4m3fn(y):
@@ -87,25 +102,64 @@ def native_per_token_group_quant_fp8(
 
 
 @pytest.mark.per_token_group_quant_fp8
+@pytest.mark.parametrize(
+    "output_dtype",
+    [None, torch.float8_e4m3fn] if flaggems_vllm.vendor_name == "thead" else [None],
+)
+@pytest.mark.parametrize(
+    "column_major_scales",
+    [False, True] if flaggems_vllm.vendor_name == "thead" else [False],
+)
 @pytest.mark.parametrize("seed", utils.FP8_QUANT_SHAPES["SEEDS"])
 @pytest.mark.parametrize("group_size", utils.FP8_QUANT_SHAPES["GROUP_SIZE"])
 @pytest.mark.parametrize("dtype", utils.FP8_QUANT_SHAPES["DTYPES"])
 @pytest.mark.parametrize("d", utils.FP8_QUANT_SHAPES["D"])
 @pytest.mark.parametrize("num_tokens", utils.FP8_QUANT_SHAPES["NUM_TOKENS"])
 @pytest.mark.parametrize("scale_ue8m0", [True, False])
-def test_per_token_group_quant_fp8(num_tokens, d, dtype, group_size, seed, scale_ue8m0):
+def test_per_token_group_quant_fp8(
+    num_tokens,
+    d,
+    dtype,
+    group_size,
+    seed,
+    scale_ue8m0,
+    output_dtype,
+    column_major_scales,
+):
     torch.manual_seed(seed)
 
     x = torch.rand(num_tokens, d, dtype=dtype, device=flaggems_vllm.device)
     ref_x = utils.to_reference(x)
 
-    ref_out, ref_scale = native_per_token_group_quant_fp8(
-        ref_x, group_size, scale_ue8m0=scale_ue8m0
-    )
-    with flaggems_vllm.use_gems():
-        out, scale = flaggems_vllm.per_token_group_quant_fp8(
-            x, group_size, scale_ue8m0=scale_ue8m0
+    if _HAS_VLLM_FP8_REF and not column_major_scales:
+        # Use the vllm reference implementation when available
+        # (vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8)
+        # column_major_scales is FlagGems-only; fall through to the torch reference for that path.
+        if scale_ue8m0 and _VLLM_FP8_HAS_UE8M0:
+            ref_out, ref_scale = _vllm_per_token_group_quant_fp8(
+                ref_x, group_size, use_ue8m0=scale_ue8m0
+            )
+        elif not scale_ue8m0:
+            ref_out, ref_scale = _vllm_per_token_group_quant_fp8(ref_x, group_size)
+        else:
+            ref_out, ref_scale = native_per_token_group_quant_fp8(
+                ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
+            )
+    else:
+        ref_out, ref_scale = native_per_token_group_quant_fp8(
+            ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
         )
+    out, scale = flaggems_vllm.per_token_group_quant_fp8(
+        x,
+        group_size,
+        dtype=output_dtype,
+        column_major_scales=column_major_scales,
+        scale_ue8m0=scale_ue8m0,
+    )
+
+    assert out.dtype == ref_out.dtype
+    if column_major_scales:
+        assert scale.stride(0) == 1
 
     utils.gems_assert_close(scale, ref_scale, dtype=torch.float32)
 

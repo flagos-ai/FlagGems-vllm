@@ -17,8 +17,8 @@ FlagGems-vllm 算子针对 vLLM 推理场景优化:
 
 ## 主题
 
-- [运行基准测试](benchmark/) - 如何运行性能基准测试
-- [基准测试结果](results/) - 性能数据和加速指标
+- [运行基准测试](benchmark.md) - 如何运行性能基准测试
+- [基准测试结果](results.md) - 性能数据和加速指标
 
 ## 快速基准测试
 
@@ -42,11 +42,11 @@ PYTHONPATH=src pytest -q benchmark/test_grouped_topk.py \
 基准测试报告:
 - **延迟**(ms): 每次操作的时间
 - **吞吐量**(tokens/s 或 GB/s): 处理速率
-- **加速比**: `latency_torch_baseline / latency_flaggems_vllm`
+- **加速比**: `latency_vllm_baseline / latency_flaggems_vllm`
 
 验收目标: 核心形状的**加速比 ≥ 0.9**。
 
 ## 下一步
 
-- [基准测试指南](benchmark/)
-- [查看结果](results/)
+- [基准测试指南](benchmark.md)
+- [查看结果](results.md)
