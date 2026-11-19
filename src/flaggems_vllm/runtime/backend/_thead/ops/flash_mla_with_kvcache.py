@@ -72,6 +72,7 @@ def sparse_decode_thead(
     lse,
     sm_scale,
     sched_meta=None,
+    pow2_kv_scales=False,
 ):
     """Runs the kernel for whichever layout q and kv are in and returns True.
 
@@ -79,6 +80,10 @@ def sparse_decode_thead(
     -- another device, another dtype, a layout neither kernel handles -- so the
     caller falls back to its portable kernel. Writes out [B, 1, 64, 512] and
     lse [B, 64, 1].
+
+    pow2_kv_scales is the V32 layout's optional promise that every cache scale
+    is a power of two, which buys 2.7% there; MODEL1 ignores it, since its
+    scales are ue8m0 exponent bytes by layout and never anything else.
     """
     if not _usable():
         return False
@@ -123,6 +128,7 @@ def sparse_decode_thead(
             lse=lse,
             sm_scale=sm_scale,
             sched_meta=sched_meta,
+            pow2_kv_scales=pow2_kv_scales,
         )
         return True
     return False

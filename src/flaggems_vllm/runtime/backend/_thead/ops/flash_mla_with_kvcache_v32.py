@@ -162,16 +162,18 @@ def _spread(value):
 
 
 @triton.jit
-def _dequant(raw, scales):
+def _dequant(raw, scales, POW2_SCALES: tl.constexpr):
     """[64, 512] BF16 NoPE tile: e4m3 values times their 128-wide group's scale.
 
     Each scale is split into its power of two, which the exponent arithmetic
     below carries for nothing, and its significand in [1, 2), which needs a
-    real multiply, which a ue8m0 scale -- rounded to a power of two, what
-    indexer_k_quant_and_cache writes with scale_fmt="ue8m0" -- leaves at 1 but
-    still pays for. Skipping it on a data-dependent branch does not compile
-    (make_ttgir rejects the loop), and the interface says nothing about the
-    format, so every tile pays: 3.5% of the call.
+    real multiply over the tile. A ue8m0 scale -- rounded to a power of two,
+    what indexer_k_quant_and_cache writes with scale_fmt="ue8m0" -- leaves
+    every significand at 1, and POW2_SCALES then drops the multiply, worth 2.7%
+    of the call. That has to be a compile-time choice: deciding per tile from
+    the tile's own scales either does not compile (make_ttgir rejects the loop)
+    or, written so that it does, costs 4.9x by breaking the pipeline, and a
+    device-side probe over the scales this call reads costs 7-11% of it.
     """
     bits = scales.to(tl.uint32, bitcast=True)
     pow2 = (bits & 0xFF800000).to(tl.float32, bitcast=True)
@@ -222,6 +224,8 @@ def _dequant(raw, scales):
         is_pure=True,
         pack=4,
     )
+    if POW2_SCALES:
+        return tile
     return tile * _spread(significand)
 
 
@@ -240,10 +244,11 @@ def _tile_step(
     kr_shared,
     p_shared,
     scale_log2,
+    POW2_SCALES: tl.constexpr,
 ):
     """One tile: dequantize into the shared NoPE tile, S = Q K^T over both
     halves, online softmax, then O += P V with V the same tile."""
-    tl.store(kv_shared, _dequant(raw, scales))
+    tl.store(kv_shared, _dequant(raw, scales, POW2_SCALES))
     tl.store(kr_shared, krope)
     s = tl.dot(q_a, tl.trans(tl.load(kv_shared)))
     s = tl.dot(qr_a, tl.trans(tl.load(kr_shared)), acc=s)
@@ -283,6 +288,7 @@ def _attention(
     PAGE_SHIFT: tl.constexpr,
     HAS_SINK: tl.constexpr,
     WHOLE_REQUESTS: tl.constexpr,
+    POW2_SCALES: tl.constexpr,
 ):
     """One partition: for each request in its range, Q goes to shared memory;
     per tile the dequantized NoPE tile and the raw RoPE tile go to shared
@@ -389,6 +395,7 @@ def _attention(
                 kr_shared,
                 p_shared,
                 scale_log2,
+                POW2_SCALES,
             )
             raw, scales, krope, valid = raw_next, scales_next, krope_next, next_valid
             next_token, next_valid = token_after, valid_after
@@ -456,9 +463,25 @@ def can_use_v32_thead(q, kv, indices, out, lse, topk_length=None):
 
 
 def sparse_decode_v32_thead(
-    q, kv, indices, *, attn_sink, out, lse, sm_scale, sched_meta=None
+    q,
+    kv,
+    indices,
+    *,
+    attn_sink,
+    out,
+    lse,
+    sm_scale,
+    sched_meta=None,
+    pow2_kv_scales=False,
 ):
     """Writes out [B, 1, 64, 512] and lse [B, 64, 1].
+
+    pow2_kv_scales says the cache's scales are all powers of two, as they are
+    when the producer quantized with scale_fmt="ue8m0"; it drops a multiply
+    worth 2.7% of the call. It defaults to off because the interface carries no
+    such promise -- FlagGems-vllm's own generate_v32_fp8_kv_cache writes
+    amax / 448 -- and a caller that passes it wrongly gets wrong results, not a
+    slower kernel.
 
     The tile schedule is kept in sched_meta.tile_scheduler_metadata /
     num_splits and reused while set, which is sound here because without
@@ -533,6 +556,7 @@ def sparse_decode_v32_thead(
         kv.shape[1].bit_length() - 1,
         attn_sink is not None,
         whole_requests,
+        pow2_kv_scales,
         num_warps=16,
     )
     if not whole_requests:
