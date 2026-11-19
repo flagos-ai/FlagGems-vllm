@@ -53,6 +53,7 @@ def _post_async_call(
     comb_stride_dst,
     shared,
     hidden,
+    rows,
     R: tl.constexpr,
     _semantic=None,
 ):
@@ -73,8 +74,9 @@ def _post_async_call(
             comb_stride_dst,
             shared,
             hidden,
+            rows,
         ],
-        {(tl.uint64,) * 10 + (tl.uint32, tl.uint32): (name, tl.int32)},
+        {(tl.uint64,) * 10 + (tl.uint32,) * 3: (name, tl.int32)},
         is_pure=False,
         _semantic=_semantic,
     )
@@ -95,6 +97,7 @@ def _post_async(
     shared_buffer,
     H: tl.constexpr,
     R: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
     address = tle.gpu.local_ptr(shared_buffer, (0,)).to(tl.uint64).to(tl.uint32)
     _post_async_call(
@@ -110,6 +113,7 @@ def _post_async(
         tl.cast(comb_stride_dst, tl.uint64),
         address,
         tl.full((), H, tl.uint32),
+        tl.full((), ROWS, tl.uint32),
         R,
     )
 
@@ -648,24 +652,22 @@ def mega_mhc_pipeline(
                         scope=tle.gpu.smem,
                         layout=None,
                     )
-                    for step in tl.range(
-                        ROWS_PER_JOB // POST_ROWS, loop_unroll_factor=1
-                    ):
-                        _post_async(
-                            X,
-                            Residual,
-                            Post,
-                            Comb,
-                            NewResidual,
-                            SumSq,
-                            row_start + step * POST_ROWS,
-                            comb_stride_token,
-                            comb_stride_src,
-                            comb_stride_dst,
-                            shared_buffer,
-                            H,
-                            R,
-                        )
+                    _post_async(
+                        X,
+                        Residual,
+                        Post,
+                        Comb,
+                        NewResidual,
+                        SumSq,
+                        row_start,
+                        comb_stride_token,
+                        comb_stride_src,
+                        comb_stride_dst,
+                        shared_buffer,
+                        H,
+                        R,
+                        ROWS_PER_JOB,
+                    )
                 else:
                     for step in tl.range(
                         ROWS_PER_JOB // POST_ROWS, loop_unroll_factor=1

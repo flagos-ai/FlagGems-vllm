@@ -174,6 +174,8 @@ def test_mega_mhc_projection_cancellation(tokens, hidden, implementation):
         (512, 4, True),
         (768, 2, False),
         (768, 4, False),
+        (4096, 4, False),
+        (16384, 2, False),
         (521, 4, False),
         (259, 2, False),
     ],
@@ -208,7 +210,7 @@ def test_mega_mhc_prepacked_graph_replay(
         outputs = candidate(args, packed_fn=packed, implementation=implementation)
 
     args[4].neg_()
-    sample_rows = [0, 2048, 4096]
+    sample_rows = [0, 1, 2, 3, 6, 7, 8, 63, 64, 2048, 4095, 4096]
     for _ in range(2):
         args[0].mul_(-0.75)
         graph.replay()

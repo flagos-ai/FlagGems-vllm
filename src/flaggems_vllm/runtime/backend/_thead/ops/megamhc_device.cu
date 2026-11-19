@@ -57,10 +57,11 @@ __device__ __forceinline__ uint32_t to_bf16(float lo, float hi) {
 }
 
 template <unsigned R>
-__device__ __forceinline__ int post(
-    uint64_t x, uint64_t residual, uint64_t post_weights, uint64_t comb_weights,
-    uint64_t output, uint64_t squares, uint64_t row_start, uint64_t comb_t,
-    uint64_t comb_s, uint64_t comb_d, unsigned shared_slot, unsigned hidden) {
+__device__ __forceinline__ int
+post(uint64_t x, uint64_t residual, uint64_t post_weights,
+     uint64_t comb_weights, uint64_t output, uint64_t squares,
+     uint64_t row_start, uint64_t comb_t, uint64_t comb_s, uint64_t comb_d,
+     unsigned shared_slot, unsigned hidden, unsigned rows) {
   constexpr unsigned slot_plane = kRows * kColumns * sizeof(uint16_t);
   constexpr unsigned slot_size = slot_plane * (R + 1);
   const unsigned local_row = threadIdx.x / kLanes;
@@ -70,27 +71,23 @@ __device__ __forceinline__ int post(
   const uint64_t x_offset = (row * hidden + kValues * lane) * sizeof(uint16_t);
   const uint64_t residual_offset =
       (row * R * hidden + kValues * lane) * sizeof(uint16_t);
+  const unsigned tiles_per_pair = hidden / kColumns;
+  const unsigned tiles = (rows / kRows) * tiles_per_pair;
   float post[R];
   float comb[R][R];
-#pragma unroll
-  for (unsigned dst = 0; dst < R; ++dst) {
-    post[dst] = reinterpret_cast<const float *>(post_weights)[row * R + dst];
-#pragma unroll
-    for (unsigned src = 0; src < R; ++src) {
-      comb[src][dst] = reinterpret_cast<const float *>(comb_weights)
-          [row * comb_t + src * comb_s + dst * comb_d];
-    }
-  }
 
-  // Inline the capture to avoid stack accesses in the copy loop.
-  auto prefetch = [&](unsigned column, unsigned slot)
-      __attribute__((always_inline)) {
+  // Keep the two shared slots in flight across row pairs as well as H tiles.
+  auto prefetch = [&](unsigned tile,
+                      unsigned slot) __attribute__((always_inline)) {
+    const unsigned pair = tile / tiles_per_pair;
+    const unsigned column = tile % tiles_per_pair * kColumns;
     const unsigned base = smem_lane + slot * slot_size;
-    copy_tile(base, x + x_offset + 2 * column);
+    copy_tile(base, x + x_offset + 2 * (pair * kRows * hidden + column));
 #pragma unroll
     for (unsigned src = 0; src < R; ++src) {
       copy_tile(base + (src + 1) * slot_plane,
-                residual + residual_offset + 2 * (src * hidden + column));
+                residual + residual_offset +
+                    2 * ((pair * kRows * R + src) * hidden + column));
     }
     asm volatile("cp.async.commit_group;" : : : "memory");
   };
@@ -98,11 +95,26 @@ __device__ __forceinline__ int post(
   float sum[kValues] = {};
   unsigned current = 0;
   prefetch(0, current);
-  if (hidden > kColumns)
-    prefetch(kColumns, 1);
-  for (unsigned column = 0; column < hidden; column += kColumns) {
-    // Keep the next tile in flight; the final tile drains the remaining group.
-    if (hidden - column > kColumns)
+  if (tiles > 1)
+    prefetch(1, 1);
+  for (unsigned tile = 0; tile < tiles; ++tile) {
+    const unsigned pair = tile / tiles_per_pair;
+    const unsigned column = tile % tiles_per_pair * kColumns;
+    if (column == 0) {
+#pragma unroll
+      for (unsigned dst = 0; dst < R; ++dst) {
+        post[dst] = reinterpret_cast<const float *>(
+            post_weights)[(row + pair * kRows) * R + dst];
+#pragma unroll
+        for (unsigned src = 0; src < R; ++src) {
+          comb[src][dst] = reinterpret_cast<const float *>(
+              comb_weights)[(row + pair * kRows) * comb_t + src * comb_s +
+                            dst * comb_d];
+        }
+      }
+    }
+    // Only the final tile drains the queue; a row boundary keeps it active.
+    if (tiles - tile > 1)
       asm volatile("cp.async.wait_group 1;" : : : "memory");
     else
       asm volatile("cp.async.wait_group 0;" : : : "memory");
@@ -113,9 +125,10 @@ __device__ __forceinline__ int post(
     for (unsigned src = 0; src < R; ++src) {
       residuals[src] = read_tile(base + (src + 1) * slot_plane);
     }
-    // Each lane has read its own slot into registers. Refill it two tiles ahead.
-    if (hidden - column > 2 * kColumns)
-      prefetch(column + 2 * kColumns, current);
+    // Each lane has read its own slot into registers. Refill it two tiles
+    // ahead.
+    if (tiles - tile > 2)
+      prefetch(tile + 2, current);
 #pragma unroll
     for (unsigned dst = 0; dst < R; ++dst) {
       Bf16x8 rounded;
@@ -125,8 +138,10 @@ __device__ __forceinline__ int post(
         float hi = post[dst] * as_float(xv.word[word], 1);
 #pragma unroll
         for (unsigned src = 0; src < R; ++src) {
-          lo = __fmaf_rn(comb[src][dst], as_float(residuals[src].word[word], 0), lo);
-          hi = __fmaf_rn(comb[src][dst], as_float(residuals[src].word[word], 1), hi);
+          lo = __fmaf_rn(comb[src][dst], as_float(residuals[src].word[word], 0),
+                         lo);
+          hi = __fmaf_rn(comb[src][dst], as_float(residuals[src].word[word], 1),
+                         hi);
         }
         rounded.word[word] = to_bf16(lo, hi);
         const float rounded_lo = as_float(rounded.word[word], 0);
@@ -135,35 +150,42 @@ __device__ __forceinline__ int post(
         sum[2 * word + 1] =
             __fmaf_rn(rounded_hi, rounded_hi, sum[2 * word + 1]);
       }
-      write_tile(output + residual_offset + 2 * (dst * hidden + column), rounded);
+      write_tile(output + residual_offset +
+                     2 * ((pair * kRows * R + dst) * hidden + column),
+                 rounded);
     }
     current ^= 1;
-  }
+    if (column + kColumns == hidden) {
 #pragma unroll
-  for (unsigned distance = kValues / 2; distance > 0; distance /= 2) {
+      for (unsigned distance = kValues / 2; distance > 0; distance /= 2) {
 #pragma unroll
-    for (unsigned i = 0; i < distance; ++i) {
-      sum[i] += sum[i + distance];
+        for (unsigned i = 0; i < distance; ++i) {
+          sum[i] += sum[i + distance];
+        }
+      }
+#pragma unroll
+      for (unsigned mask = kLanes / 2; mask > 0; mask /= 2) {
+        sum[0] += __shfl_xor_sync(0xffffffff, sum[0], mask);
+      }
+      if (lane == 0)
+        reinterpret_cast<float *>(squares)[row + pair * kRows] = sum[0];
+#pragma unroll
+      for (unsigned i = 0; i < kValues; ++i)
+        sum[i] = 0.f;
     }
-  }
-#pragma unroll
-  for (unsigned mask = kLanes / 2; mask > 0; mask /= 2) {
-    sum[0] += __shfl_xor_sync(0xffffffff, sum[0], mask);
-  }
-  if (lane == 0) {
-    reinterpret_cast<float *>(squares)[row] = sum[0];
   }
   return 0;
 }
 } // namespace
 
 #define DEFINE_MHC_POST(R)                                                     \
-  extern "C" __device__ __attribute__((always_inline)) int megamhc_post_##R(    \
-      uint64_t x, uint64_t residual, uint64_t weights, uint64_t comb,            \
-      uint64_t output, uint64_t squares, uint64_t row_start, uint64_t comb_t,    \
-      uint64_t comb_s, uint64_t comb_d, unsigned smem, unsigned hidden) {         \
-    return post<R>(x, residual, weights, comb, output, squares, row_start,        \
-                   comb_t, comb_s, comb_d, smem, hidden);                       \
+  extern "C" __device__ __attribute__((always_inline)) int megamhc_post_##R(   \
+      uint64_t x, uint64_t residual, uint64_t weights, uint64_t comb,          \
+      uint64_t output, uint64_t squares, uint64_t row_start, uint64_t comb_t,  \
+      uint64_t comb_s, uint64_t comb_d, unsigned smem, unsigned hidden,        \
+      unsigned rows) {                                                         \
+    return post<R>(x, residual, weights, comb, output, squares, row_start,     \
+                   comb_t, comb_s, comb_d, smem, hidden, rows);                \
   }
 
 DEFINE_MHC_POST(2)
