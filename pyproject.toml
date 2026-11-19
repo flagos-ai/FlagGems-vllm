@@ -79,6 +79,8 @@ thead = [
     # Vendor wheel for benchmark baselines; torch is pinned to the ppu2.2 build
     # the wheel is compiled against.
     "torch @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/torch/2.13.0+v0.1.0.ppu2.2.0/torch-2.13.0+cu130ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
+    "torchaudio @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/torchaudio/2.11.0+v0.1.0.ppu2.2.0/torchaudio-2.11.0+cu130torch2.13.0ubuntu2404ce-cp312-cp312-linux_x86_64.whl",
+    "torchvision @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/torchvision/0.28.0+v0.1.0.ppu2.2.0/torchvision-0.28.0+cu130torch2.13.0ubuntu2404ce-cp312-cp312-linux_x86_64.whl",
     "vllm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm/0.31.0+v0.1.0.ppu2.2.0/vllm-0.31.0+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
     "scikit-learn>=1.5",
 ]
