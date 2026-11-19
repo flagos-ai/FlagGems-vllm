@@ -235,6 +235,10 @@ def _sparse_decode_kernel(
         kv_ids = tl.load(t_ptr, t_msk, other=-1)
         mask_ids = (kv_ids < SKV) & (kv_ids >= 0)
         kv_ids = tl.where(mask_ids, kv_ids, 0)
+        # int64, or the byte offsets below wrap once the cache passes 2**31
+        # elements -- 4.19M tokens, which a long-context batch reaches -- and
+        # the kernel reads the wrong tokens or faults.
+        kv_ids = kv_ids.to(tl.int64)
 
         if IS_FP8:
             # FP8 mode: load FP8 values and dequantize with per-128-element scales
