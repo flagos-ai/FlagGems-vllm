@@ -33,19 +33,6 @@ else:
     tle = None
 
 
-HAS_PAGED_PIPE = False
-if HAS_AIU_K and has_triton_tle_attrs(
-    ("pipe", "gpu.alloc", "gpu.copy", "gpu.local_ptr", "gpu.swizzled_shared_layout"),
-    3,
-    6,
-    0,
-):
-    try:
-        HAS_PAGED_PIPE = ppu.passes.ttppugpuir.add_tle_lower_pipe is not None
-    except AttributeError:
-        HAS_PAGED_PIPE = False
-
-
 LOG2E = tl.constexpr(1.4426950408889634)
 LN2 = tl.constexpr(0.6931471805599453)
 # Signed INT8 stores 0..255 probability levels with a -128 zero point.
@@ -156,9 +143,10 @@ def _flash_int8_pack_kv(
     n = tl.program_id(0) * PACK_TILE + tl.arange(0, PACK_TILE)
     d = tl.arange(0, D)
     if LOGICAL:
-        batch, h = tl.program_id(1), tl.program_id(2)
+        batch, h = tl.program_id(1).to(tl.int64), tl.program_id(2)
     else:
         batch, h = 0, tl.program_id(1)
+    h = h.to(tl.int64)
     should_pack = tl.full((), True, tl.int1)
     if SKIP_SHORT:
         nq = tl.load(CUQ + batch + 1) - tl.load(CUQ + batch)
@@ -172,13 +160,14 @@ def _flash_int8_pack_kv(
             page = n // PAGE
         # Shared with MetaX: page IDs are int32, but cache offsets may not fit.
         page = page.to(tl.int64)
+        in_page = (n % PAGE).to(tl.int64)
         k = tl.load(
-            K + page[:, None] * PK + (n[:, None] % PAGE) * SK + h * HK + d[None, :],
+            K + page[:, None] * PK + in_page[:, None] * SK + h * HK + d[None, :],
             n[:, None] < nk,
             0,
         )
         v = tl.load(
-            V + page[:, None] * PV + (n[:, None] % PAGE) * SV + h * HV + d[None, :],
+            V + page[:, None] * PV + in_page[:, None] * SV + h * HV + d[None, :],
             n[:, None] < nk,
             0,
         )
@@ -190,44 +179,6 @@ def _flash_int8_pack_kv(
             else off
         )
         tl.store(VP + v_off, v.to(tl.float16), n[:, None] < N)
-
-
-@triton.jit
-def _flash_int8_stage_paged(
-    writer,
-    tile_index,
-    first,
-    K,
-    V,
-    TABLE,
-    batch,
-    head,
-    TS: tl.constexpr,
-    PAGE: tl.constexpr,
-    PK: tl.constexpr,
-    SK: tl.constexpr,
-    HK: tl.constexpr,
-    PV: tl.constexpr,
-    SV: tl.constexpr,
-    HV: tl.constexpr,
-    BN: tl.constexpr,
-    D: tl.constexpr,
-):
-    n = (first + tile_index) * BN + tl.arange(0, BN)
-    d = tl.arange(0, D)
-    page = tl.load(TABLE + batch * TS + n // PAGE).to(tl.int64)
-    slot = writer.acquire(tile_index)
-    tle.gpu.copy(
-        K + page[:, None] * PK + (n[:, None] % PAGE) * SK + head * HK + d[None, :],
-        slot.k,
-        [BN, D],
-    )
-    tle.gpu.copy(
-        V + page[:, None] * PV + (n[:, None] % PAGE) * SV + head * HV + d[None, :],
-        slot.v,
-        [BN, D],
-    )
-    writer.commit(tile_index)
 
 
 @libentry()
@@ -287,7 +238,7 @@ def _flash_int8_fwd(
     PRECISE_PV: tl.constexpr,
     ASYNC_K: tl.constexpr,
     PREFETCH_V: tl.constexpr,
-    PIPE_DEPTH: tl.constexpr,
+    WIDE_STRIDES: tl.constexpr,
     REORDER_CAUSAL: tl.constexpr,
     TAIL_N: tl.constexpr,
     KV_SPLITS: tl.constexpr,
@@ -314,6 +265,8 @@ def _flash_int8_fwd(
     )
     split_id = program_tile % KV_SPLITS
     kv_head = head if FOLD else head // GROUP
+    if WIDE_STRIDES:
+        kv_head = kv_head.to(tl.int64)
     query_tile: tl.constexpr = BM // GROUP if FOLD else BM
     active = tl.full((), True, tl.int1)
     if USE_WORKLIST:
@@ -334,9 +287,14 @@ def _flash_int8_fwd(
             tl.sum(((tile >= cumulative) & (batches < BATCH)).to(tl.int32)), BATCH - 1
         )
         tile -= tl.sum(tl.where(batches < batch, counts, 0))
+    # Host-side layout bounds select wide arithmetic before any stride product.
+    if WIDE_STRIDES:
+        batch = batch.to(tl.int64)
     q_start = tl.load(CUQ + batch)
+    q_index = q_start.to(tl.int64) if WIDE_STRIDES else q_start
     nq = tl.load(CUQ + batch + 1) - q_start
     output_q_start = batch * SHORT_QUERY_LIMIT if SHORT_OUTPUT else q_start
+    output_index = output_q_start.to(tl.int64) if WIDE_STRIDES else output_q_start
     if REORDER_CAUSAL:
         # Later causal query tiles have more KV work. Schedule them first.
         count_q_tiles = tl.cdiv(nq, query_tile)
@@ -383,6 +341,8 @@ def _flash_int8_fwd(
             one_heads = (
                 kv_head * GROUP + one_rows if FOLD else tl.full((BM,), head, tl.int32)
             )
+            if WIDE_STRIDES:
+                one_heads = one_heads.to(tl.int64)
             one_mask = one_rows < (GROUP if FOLD else 1)
             one_d = tl.arange(0, D)
             if LOGICAL_KV:
@@ -391,14 +351,15 @@ def _flash_int8_fwd(
                 one_page = tl.load(TABLE + batch * table_stride).to(tl.int64)
                 one_k_row, one_v_row = one_page * pk, one_page * pv
             else:
-                one_k_row, one_v_row = k_start * sk, k_start * sv
+                one_k_row = k_start.to(tl.int64) * sk
+                one_v_row = k_start.to(tl.int64) * sv
             one_v = tl.load(V + one_v_row + kv_head * hv + one_d * dv)
             one_vs = tl.load(VS + batch * vs0 + kv_head * vs1)
             one_result = tl.where(split_id == 0, one_v.to(tl.float32) * one_vs, 0.0)
             tl.store(
                 O
                 + split_id * OUT_SPLIT_STRIDE
-                + output_q_start * so
+                + output_index * so
                 + one_heads[:, None] * ho
                 + one_d[None, :],
                 tl.broadcast_to(one_result[None, :], (BM, D)),
@@ -406,7 +367,7 @@ def _flash_int8_fwd(
             )
             if WRITE_LSE:
                 one_q = tl.load(
-                    Q + q_start * sq + one_heads[:, None] * hq + one_d[None, :],
+                    Q + q_index * sq + one_heads[:, None] * hq + one_d[None, :],
                     one_mask[:, None],
                     0,
                 )
@@ -456,15 +417,20 @@ def _flash_int8_fwd(
                 if FOLD
                 else tl.full((BM,), head, tl.int32)
             )
+        if WIDE_STRIDES:
+            h = h.to(tl.int64)
         d = tl.arange(0, D)
+        v_columns = d.to(tl.int64) if WIDE_STRIDES else d
         if active & (current_tile * query_tile < nq):
             q = tl.load(
-                Q + (q_start + m[:, None]) * sq + h[:, None] * hq + d[None, :],
+                Q + (q_index + m[:, None]) * sq + h[:, None] * hq + d[None, :],
                 m[:, None] < nq,
                 0,
             )
             q_scale = tl.load(
-                QS + batch * qs0 + h * qs1 + (m // DESCALE_BLOCK) * qs2, m < nq, 0
+                QS + batch * qs0 + h * qs1 + (m // DESCALE_BLOCK).to(tl.int64) * qs2,
+                m < nq,
+                0,
             )
             if HALF_PV and not COMPACT and CAP <= 0 and not HAS_ALIBI:
                 q_scale = q_scale * (SCALE * LOG2E)
@@ -522,52 +488,14 @@ def _flash_int8_fwd(
                     stop_block = tl.minimum(
                         stop_block, (split_id + 1) * blocks_per_split * split_tile_scale
                     )
-                if PIPE_DEPTH > 0 and use_dense and mask_phase == 0:
-                    k_layout: tl.constexpr = tle.gpu.swizzled_shared_layout(
-                        16, 1, 8, [2, 1, 0], [1, 1, 1], [1, 1, 1], [1, 1, 1], [2, 1, 0]
-                    )
-                    k_ring = tle.gpu.alloc(
-                        [PIPE_DEPTH, BN, D], dtype=tl.int8, layout=k_layout
-                    )
-                    v_ring = tle.gpu.alloc(
-                        [PIPE_DEPTH, BN, D], dtype=tl.int8, layout=k_layout
-                    )
-                    pipe = tle.pipe(capacity=PIPE_DEPTH, k=k_ring, v=v_ring)
-                    writer = pipe.writer()
-                    reader = pipe.reader()
-                    tile_count = tl.maximum(stop_block - begin_block, 0)
-                    for initial in range(tl.minimum(tile_count, PIPE_DEPTH)):
-                        _flash_int8_stage_paged(
-                            writer,
-                            initial,
-                            begin_block,
-                            K,
-                            V,
-                            TABLE,
-                            batch,
-                            kv_head,
-                            table_stride,
-                            PAGE,
-                            pk,
-                            sk,
-                            hk,
-                            pv,
-                            sv,
-                            hv,
-                            BN,
-                            D,
-                        )
                 for start in range(begin_block, stop_block):
                     n = start * phase_blocks[mask_phase] + tl.arange(
                         0, phase_blocks[mask_phase]
                     )
-                    if PIPE_DEPTH > 0 and use_dense and mask_phase == 0:
-                        pipe_index = start - begin_block
-                        slot = reader.wait(pipe_index).slot
-                        k = tl.trans(tl.load(tle.gpu.local_ptr(slot.k)))
-                    elif LOGICAL_KV:
-                        k_row = batch * pk + n * sk
-                        v_row = batch * pv + n * sv
+                    if LOGICAL_KV:
+                        packed_n = n.to(tl.int64) if WIDE_STRIDES else n
+                        k_row = batch * pk + packed_n * sk
+                        v_row = batch * pv + packed_n * sv
                     elif PAGED:
                         if not use_dense or mask_phase == 1:
                             page = tl.load(
@@ -577,14 +505,16 @@ def _flash_int8_fwd(
                             page = tl.load(TABLE + batch * table_stride + n // PAGE)
                         # A large physical cache can exceed int32 element offsets.
                         page = page.to(tl.int64)
-                        k_row = page * pk + (n % PAGE) * sk
-                        v_row = page * pv + (n % PAGE) * sv
+                        in_page = (n % PAGE).to(tl.int64) if WIDE_STRIDES else n % PAGE
+                        k_row = page * pk + in_page * sk
+                        v_row = page * pv + in_page * sv
                     else:
-                        k_row = (k_start + n) * sk
-                        v_row = (k_start + n) * sv
-                    if PIPE_DEPTH > 0 and use_dense and mask_phase == 0:
-                        pass
-                    elif ASYNC_K and use_dense and mask_phase == 0:
+                        # Convert before multiplication; contiguous token offsets
+                        # can exceed int32 even when every sequence index fits.
+                        token = k_start.to(tl.int64) + n
+                        k_row = token * sk
+                        v_row = token * sv
+                    if ASYNC_K and use_dense and mask_phase == 0:
                         # AIU copies contiguous packed K without materializing a
                         # per-element global-load address in every thread.
                         k_ptr = tl.make_block_ptr(
@@ -604,12 +534,10 @@ def _flash_int8_fwd(
                         )
                     else:
                         k = tl.load(K + k_row[None, :] + kv_head * hk + d[:, None])
-                    if PREFETCH_V and not (
-                        PIPE_DEPTH > 0 and use_dense and mask_phase == 0
-                    ):
+                    if PREFETCH_V:
                         # Loading raw V before score updates reduces short-query spills.
                         v = tl.load(
-                            V + v_row[:, None] + kv_head * hv + d[None, :] * dv,
+                            V + v_row[:, None] + kv_head * hv + v_columns[None, :] * dv,
                             (
                                 n[:, None] < nk
                                 if not use_dense or mask_phase == 1
@@ -617,7 +545,9 @@ def _flash_int8_fwd(
                             ),
                             0,
                         )
-                    descale_block = start * phase_blocks[mask_phase] // DESCALE_BLOCK
+                    descale_block = (
+                        start * phase_blocks[mask_phase] // DESCALE_BLOCK
+                    ).to(tl.int64)
                     if ks2 == 0 and HALF_PV:
                         ks = head_k_scale
                     else:
@@ -684,31 +614,7 @@ def _flash_int8_fwd(
                             p_int8 = (
                                 (p * PROB_QUANT_LEVELS + 0.5).to(tl.int32) - 128
                             ).to(tl.int8)
-                    if PIPE_DEPTH > 0 and use_dense and mask_phase == 0:
-                        v = tl.load(tle.gpu.local_ptr(slot.v))
-                        reader.release(pipe_index)
-                        if pipe_index + PIPE_DEPTH < tile_count:
-                            _flash_int8_stage_paged(
-                                writer,
-                                pipe_index + PIPE_DEPTH,
-                                begin_block,
-                                K,
-                                V,
-                                TABLE,
-                                batch,
-                                kv_head,
-                                table_stride,
-                                PAGE,
-                                pk,
-                                sk,
-                                hk,
-                                pv,
-                                sv,
-                                hv,
-                                BN,
-                                D,
-                            )
-                    elif (
+                    if (
                         not PREFETCH_V
                         and (COMPENSATE_PV or dv != 1)
                         and ASYNC_K
@@ -730,12 +636,14 @@ def _flash_int8_fwd(
                         v = tle.load(v_ptr, is_async=True)
                     elif not PREFETCH_V and (not use_dense or mask_phase == 1):
                         v = tl.load(
-                            V + v_row[:, None] + kv_head * hv + d[None, :] * dv,
+                            V + v_row[:, None] + kv_head * hv + v_columns[None, :] * dv,
                             n[:, None] < nk,
                             0,
                         )
                     elif not PREFETCH_V:
-                        v = tl.load(V + v_row[:, None] + kv_head * hv + d[None, :] * dv)
+                        v = tl.load(
+                            V + v_row[:, None] + kv_head * hv + v_columns[None, :] * dv
+                        )
                     if HALF_PV:
                         p_scaled = p * PV_SCALE if COMPENSATE_PV or SCALED_PV else p
                         p_hi = p_scaled.to(tl.float16)
@@ -802,7 +710,7 @@ def _flash_int8_fwd(
             tl.store(
                 O
                 + split_id * OUT_SPLIT_STRIDE
-                + (output_q_start + m[:, None]) * so
+                + (output_index + m[:, None]) * so
                 + h[:, None] * ho
                 + d[None, :],
                 result,
@@ -882,8 +790,6 @@ def flash_attn_varlen_func_w8a8_int8(
     boundary blocks use 16 KV positions when the query tile is narrower than
     the dense KV block. Dense blocks keep their original width. Selected
     short-query paths also use FP16 PV, converting V inside the kernel.
-    Four-token paged GQA may stage raw K/V in a shared buffer when the
-    compiler supports TLE pipes; partial KV tiles retain masked loads.
     Remaining paths quantize probabilities to 256 levels and use INT8 PV
     with zero-point correction. D=128, GQA=4 queries of up to four tokens with
     at most 256 KV positions use two signed INT8 probability components to reduce
@@ -892,10 +798,13 @@ def flash_attn_varlen_func_w8a8_int8(
     at least 512 maximum KV positions. Partial FP32 accumulators and softmax
     statistics are merged by a Triton kernel. Softmax and online accumulation
     use FP32.
-    D=256 accepts a split-count hint capped by available parallelism and a
-    256 MiB workspace budget. Its scheduler metadata is validated but the
-    kernel builds its own schedule. Single-query, single-key requests directly
-    dequantize V and calculate QK only when LSE is requested.
+    Nonpaged KV token bases and physical page offsets always use INT64.
+    Other indices use INT64 when host-side layout bounds can exceed INT32.
+    D=256 uses num_splits=0 for automatic splitting; 1 disables splitting,
+    and larger values bound the split count. Available parallelism and a
+    256 MiB workspace budget may lower that count. Scheduler metadata is
+    validated but the kernel builds its own schedule. Single-query, single-key
+    requests directly dequantize V and calculate QK only when LSE is requested.
     Mixed batches reuse the long-request worklist. Short requests with long KV
     split their reduction into compact per-request workspaces, avoiding partial
     buffers for the long-prefill rows. The existing merge computation maps these
@@ -1061,6 +970,7 @@ def flash_attn_varlen_func_w8a8_int8(
     short_splits = 1
     if (
         dim == 256
+        and num_splits == 0
         and split_queries
         and not split_kv
         and max_seqlen_k >= SHORT_SPLIT_KV_MIN_LENGTH
@@ -1197,6 +1107,31 @@ def flash_attn_varlen_func_w8a8_int8(
             pv_passes = (
                 (False, True) if half_pv and v_descale.stride(2) == 0 else (True,)
             )
+            # Keep narrow index arithmetic only when every non-page offset fits.
+            # Physical page IDs and nonpaged token bases always use int64.
+            address_tensors = [q, kernel_out, q_descale, k_descale, v_descale]
+            if kernel_stats is not None:
+                address_tensors.append(kernel_stats)
+            if block_table is not None:
+                address_tensors.append(block_table)
+            if alibi_slopes is not None:
+                address_tensors.append(alibi_slopes)
+            wide_strides = any(
+                sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+                >= 2**31
+                for t in address_tensors
+            )
+            for cache in (k, v):
+                first_axis = 0 if logical_kv else 1
+                wide_strides |= (
+                    sum(
+                        (size - 1) * stride
+                        for size, stride in zip(
+                            cache.shape[first_axis:], cache.stride()[first_axis:]
+                        )
+                    )
+                    >= 2**31
+                )
             for compensate_pv in pv_passes:
                 _flash_int8_fwd[launch_grid](
                     q,
@@ -1247,17 +1182,9 @@ def flash_attn_varlen_func_w8a8_int8(
                     return_softmax_lse or phase_splits > 1,
                     HALF_PV=half_pv,
                     COMPENSATE_PV=compensate_pv,
+                    WIDE_STRIDES=wide_strides,
                     SCALED_PV=max_seqlen_k > PV_UNSCALED_MAX_LENGTH,
                     ASYNC_K=use_aiu_k and not short_phase,
-                    PIPE_DEPTH=(
-                        1
-                        if HAS_PAGED_PIPE
-                        and common_gqa
-                        and max_seqlen_q == 4
-                        and left < 0
-                        and right < 0
-                        else 0
-                    ),
                     PREFETCH_V=(
                         common_gqa
                         and 4 < max_seqlen_q <= SHORT_QUERY_LIMIT.value
@@ -1347,7 +1274,8 @@ def _flash_int8_merge_splits(
     OUT_HEAD: tl.constexpr,
     WRITE_LSE: tl.constexpr,
 ):
-    row, head = tl.program_id(0), tl.program_id(1)
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
     first_q = tl.load(CUQ)
     end_q = tl.load(CUQ + BATCH)
     valid_q = (row >= first_q) & (row < end_q)
@@ -1406,6 +1334,7 @@ def flash_int8_merge_short_splits(
     WRITE_LSE: tl.constexpr,
 ):
     row, head, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    head = head.to(tl.int64)
     begin = tl.load(CUQ + batch)
     length = tl.load(CUQ + batch + 1) - begin
     if (length <= SHORT_QUERY_LIMIT) & (row < length):
@@ -1415,7 +1344,7 @@ def flash_int8_merge_short_splits(
         merge_splits_jit(
             PARTIAL + batch * SHORT_QUERY_LIMIT * HEADS * D,
             STATS + batch * SHORT_QUERY_LIMIT,
-            OUT + begin * OUT_ROW,
+            OUT + begin.to(tl.int64) * OUT_ROW,
             LSE,
             WORK + CAPACITY + 1,
             SHORT_TOTAL,

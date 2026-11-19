@@ -14,7 +14,9 @@
 
 import inspect
 import itertools
+import json
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -133,6 +135,9 @@ def _run_case(
     metax_kwargs=None,
     page_size=16,
     return_lse=True,
+    query_strides=None,
+    output_strides=None,
+    kv_strides=None,
 ):
     q, qs, qr, cuq = _inputs(qlens, heads, dim, broadcast_scales, max_query_bound)
     k, ks, kr, cuk = _inputs(klens, kvheads, dim, broadcast_scales)
@@ -197,6 +202,24 @@ def _run_case(
         qs, ks, vs = [
             x.transpose(1, 2).contiguous().transpose(1, 2) for x in (qs, ks, vs)
         ]
+    if query_strides is not None:
+        strided_q = torch.empty_strided(
+            q.shape, query_strides, dtype=q.dtype, device=q.device
+        )
+        strided_q.copy_(q)
+        q = strided_q
+    if output_strides is not None:
+        out = torch.empty_strided(q.shape, output_strides, dtype=dtype, device=q.device)
+    if kv_strides is not None:
+        strided_k = torch.empty_strided(
+            k.shape, kv_strides, dtype=k.dtype, device=k.device
+        )
+        strided_v = torch.empty_strided(
+            v.shape, kv_strides, dtype=v.dtype, device=v.device
+        )
+        strided_k.copy_(k)
+        strided_v.copy_(v)
+        k, v = strided_k, strided_v
     actual = flaggems_vllm.flash_attn_varlen_func(
         q,
         k,
@@ -1261,3 +1284,197 @@ def test_metax_d256_large_batch_packing(batch):
         broadcast_scales=False,
         strided=True,
     )
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="PPU address regression"
+)
+@pytest.mark.parametrize("qlen,klen", [(1, 1), (2, 17)])
+def test_thead_int8_nonpaged_large_kv_offset(qlen, klen):
+    if torch.cuda.mem_get_info()[0] < 7 * 1024**3:
+        pytest.skip("large contiguous cache regression requires 7 GiB free")
+    dim, heads, prefix = 256, 8, 2**20
+    q, qs, qr, _ = _inputs([qlen], heads, dim, broadcast_scales=True)
+    k, ks, kr, _ = _inputs([klen], heads, dim, broadcast_scales=True)
+    v, vs, vr, _ = _inputs([klen], heads, dim, broadcast_scales=True)
+    v, vr = -v, -vr
+    # The first request has no queries, but its KV range advances the next
+    # request's base offset to 2**31 elements without an expensive reference.
+    cache_k = torch.empty(
+        (prefix + klen, heads, dim), dtype=torch.int8, device=q.device
+    )
+    cache_v = torch.empty_like(cache_k)
+    cache_k[prefix:].copy_(k)
+    cache_v[prefix:].copy_(v)
+    cuq = torch.tensor([0, 0, qlen], dtype=torch.int32, device=q.device)
+    cuk = torch.tensor([0, prefix, prefix + klen], dtype=torch.int32, device=q.device)
+    out, lse = flaggems_vllm.flash_attn_varlen_func(
+        q,
+        cache_k,
+        cache_v,
+        qlen,
+        cuq,
+        prefix,
+        cuk,
+        q_descale=qs.expand(2, heads, -1),
+        k_descale=ks[:, :, :1].expand(2, heads, prefix // DESCALE_BLOCK),
+        v_descale=vs[:, :, :1].expand(2, heads, prefix // DESCALE_BLOCK),
+        causal=True,
+        return_softmax_lse=True,
+    )
+    expected, expected_lse = _reference(qr, kr, vr, [qlen], [klen], True)
+    gems_assert_close(
+        out.float(), expected, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
+    )
+    gems_assert_close(lse, expected_lse, dtype=torch.float32, atol=2e-5, rtol=LSE_RTOL)
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="PPU address regression"
+)
+@pytest.mark.parametrize("axis", ["token", "head"])
+@pytest.mark.parametrize("splits", [1, 3])
+def test_thead_int8_large_query_output_strides(axis, splits):
+    if torch.cuda.mem_get_info()[0] < 12 * 1024**3:
+        pytest.skip("large strided Q/output regression requires 12 GiB free")
+    strides = (2**30, 256, 1) if axis == "token" else (256, 2**30, 1)
+    # Three-query ordinary attention and a single-key request exercise both
+    # address paths; explicit splitting also checks the merge destination.
+    _run_case(
+        [3, 1],
+        [17, 1],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        causal=True,
+        query_strides=strides,
+        output_strides=strides,
+        metax_kwargs={"num_splits": splits},
+    )
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="PPU address regression"
+)
+def test_thead_int8_short_merge_large_output_stride():
+    if torch.cuda.mem_get_info()[0] < 7 * 1024**3:
+        pytest.skip("large short-merge output regression requires 7 GiB free")
+    _run_case(
+        [1025, 1, 0, 0],
+        [1025, 8193, 0, 0],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        paged=True,
+        causal=True,
+        output_strides=(2**21, 256, 1),
+    )
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="PPU address regression"
+)
+@pytest.mark.parametrize("axis", ["token", "head"])
+@pytest.mark.parametrize("qlen", [3, 1025])
+def test_thead_int8_large_paged_kv_strides(axis, qlen):
+    if torch.cuda.mem_get_info()[0] < 8 * 1024**3:
+        pytest.skip("large paged K/V regression requires 8 GiB free")
+    strides = (2**32, 2**30, 256, 1) if axis == "token" else (1024, 256, 2**30, 1)
+    # The short case reads the original cache; the long case first packs it.
+    _run_case(
+        [qlen],
+        [4],
+        dim=256,
+        heads=4,
+        kvheads=4,
+        causal=True,
+        paged=True,
+        page_size=4,
+        kv_strides=strides,
+    )
+
+
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="PPU split contract")
+@pytest.mark.parametrize("splits", [0, 1, 3, 32])
+def test_thead_mixed_requests_respect_split_limit(monkeypatch, splits):
+    from flaggems_vllm.runtime.backend._thead.fused import attention
+
+    original = attention._flash_int8_fwd
+    launches = []
+
+    class RecordedLaunch:
+        def __getitem__(self, grid):
+            kernel = original[grid]
+
+            def launch(*args, **kwargs):
+                launches.append((kwargs["SHORT_ONLY"], kwargs["KV_SPLITS"]))
+                return kernel(*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(attention, "_flash_int8_fwd", RecordedLaunch())
+    _run_case(
+        [1, 1025, 13, 0],
+        [8195, 2057, 8193, 0],
+        dim=256,
+        heads=4,
+        kvheads=1,
+        paged=True,
+        causal=True,
+        broadcast_scales=True,
+        metax_kwargs={"num_splits": splits},
+    )
+    assert any(short for short, _ in launches)
+    if splits:
+        assert all(1 <= count <= splits for _, count in launches)
+    else:
+        assert any(short and count > 1 for short, count in launches)
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="PPU capture benchmark"
+)
+@pytest.mark.parametrize("level", ["core", "comprehensive"])
+def test_thead_int8_benchmark_capture_selection(monkeypatch, tmp_path, level):
+    from benchmark import conftest as benchmark_config
+    from benchmark.consts import BenchLevel
+    from benchmark.test_flash_attn_varlen_func_w8a8_int8 import (
+        FlashAttnVarlenInt8Benchmark,
+    )
+    from tools.benchmark_metax_int8_real_shapes import read_captured_shape
+
+    monkeypatch.setattr(
+        benchmark_config, "Config", SimpleNamespace(bench_level=BenchLevel(level))
+    )
+    bench = FlashAttnVarlenInt8Benchmark(
+        op_name="flash_attn_varlen_func_w8a8", torch_op=None
+    )
+    bench.init_default_config()
+    assert len(bench.shapes) == 18
+    assert len(bench.captured_shapes) == 10
+    assert sum(entry["count"] for entry in bench.captured_shapes) == 700
+    assert all(
+        read_captured_shape(entry)[0]["q_dim2"] == 256
+        for entry in bench.captured_shapes
+    )
+
+    # Duplicate capture records must contribute their counts before core ranking.
+    template = bench.captured_shapes[0]
+    labels = template["labels"].split(",")
+    entries = []
+    for index in range(12):
+        values = list(template["shape"])
+        values[labels.index("max_seqlen_k")] += index
+        entries.append(dict(template, shape=values, count=index + 1, index=index))
+    entries.append(dict(entries[0], count=100))
+    path = tmp_path / "captured.json"
+    path.write_text(json.dumps(entries))
+    bench.set_shapes(path)
+    expected_indices = [0, *range(11, 0, -1)]
+    if level == "core":
+        expected_indices = expected_indices[:10]
+    assert bench.shapes == []
+    assert [entry["index"] for entry in bench.captured_shapes] == expected_indices
+    assert bench.captured_shapes[0]["count"] == 101
+    for entry in bench.captured_shapes:
+        assert read_captured_shape(entry)[1:3] == read_captured_shape(template)[1:3]
