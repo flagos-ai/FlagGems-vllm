@@ -94,8 +94,7 @@ class LogitBiasBenchmark(base.Benchmark):
 
     def make_inputs(self, batch, vocab, allowed_width, bias_width, scenario, dtype):
         self._shape_description = (
-            f"({batch}, {vocab}) allow={allowed_width} "
-            f"bias={bias_width} {scenario}"
+            f"({batch}, {vocab}) allow={allowed_width} " f"bias={bias_width} {scenario}"
         )
         original = torch.randn((batch, vocab), device=self.device, dtype=dtype)
         mapping = torch.arange(batch, device=self.device, dtype=torch.int32)
@@ -108,15 +107,22 @@ class LogitBiasBenchmark(base.Benchmark):
         ).repeat(batch, 1)
         if scenario == "restore":
             allowed.fill_(vocab - 1)
-        bias_count = torch.full((batch,), bias_width, device=self.device, dtype=torch.int32)
+        bias_count = torch.full(
+            (batch,), bias_width, device=self.device, dtype=torch.int32
+        )
         bias_ids = torch.arange(bias_width, device=self.device, dtype=torch.int32)
         bias_ids = (bias_ids + 64).repeat(batch, 1)
         bias = torch.full((batch, bias_width), 0.1, device=self.device)
         min_lens = torch.full((batch,), 10, device=self.device, dtype=torch.int32)
         stop_count = torch.full(
-            (batch,), int(scenario != "bias_only"), device=self.device, dtype=torch.int32
+            (batch,),
+            int(scenario != "bias_only"),
+            device=self.device,
+            dtype=torch.int32,
         )
-        stop_ids = torch.full((batch, 1), vocab - 1, device=self.device, dtype=torch.int32)
+        stop_ids = torch.full(
+            (batch, 1), vocab - 1, device=self.device, dtype=torch.int32
+        )
         restore = torch.full(
             (batch,), int(scenario == "restore"), device=self.device, dtype=torch.int32
         )
