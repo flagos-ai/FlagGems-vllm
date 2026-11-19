@@ -61,7 +61,6 @@ from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
 from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
-from flaggems_vllm.runtime.backend._mthreads.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
     w8a8_block_matmul,
 )
@@ -70,7 +69,6 @@ from flaggems_vllm.runtime.backend._mthreads.ops.watermark import (
 )
 
 __all__ = [
-    "apply_trace_tokens",
     "chunk_gated_delta_rule_w8a16_fp8",
     "dequantize_and_gather_k_cache",
     "draft_watermarking_mask",
