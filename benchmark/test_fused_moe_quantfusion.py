@@ -28,7 +28,7 @@ class OperatorBenchmark(base.Benchmark):
 @pytest.mark.fused_moe
 def test_perf_fused_moe_quantfusion():
     bench = OperatorBenchmark(
-        op_name="fused_moe",
+        op_name="fused_moe_int8_quantize_per_token",
         torch_op=reference,
         gems_op=_int8_quantize_per_token_triton,
         dtypes=[torch.bfloat16, torch.float16],
