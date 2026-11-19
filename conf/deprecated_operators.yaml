@@ -1,0 +1,54 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Operators removed from the active inventory in conf/operators.yaml.
+# Implementations may still be exported. Keep ids sorted by id.casefold().
+ops:
+- id: fp8_fp4_mqa_logits
+  description: 'Compute weighted MQA logits with FP8 quantized Q and K tensors.
+
+    Uses head-batched tiled dot products with K reuse for high throughput
+
+    on DeepSeek V4 sparse attention indexer workloads.
+
+    '
+  for:
+  - vllm.utils.deep_gemm.fp8_fp4_mqa_logits
+  labels:
+  - fused
+  - vLLM
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.1'
+- id: fp8_fp4_paged_mqa_logits
+  description: 'Compute paged multi-query attention logits from FP8 queries against
+
+    FP8/FP4 paged KV cache with per-token scaling. Used in DeepSeek-V4
+
+    decode-phase inference with adaptive tile sizing.
+
+    '
+  for:
+  - vllm.utils.deep_gemm.fp8_fp4_paged_mqa_logits
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'

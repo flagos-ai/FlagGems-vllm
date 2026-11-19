@@ -33,8 +33,8 @@ A pre-existing backlog of unregistered exports is carried in
 tools/ci_checks/unregistered_exports_baseline.txt, generated with
 --update-baseline, so this check can be enforced going forward without
 failing every PR on the existing gap at once. New exports must either be
-registered in conf/operators.yaml, or (temporarily, with justification)
-added to the baseline file.
+registered in conf/operators.yaml, listed in conf/deprecated_operators.yaml,
+or (temporarily, with justification) added to the baseline file.
 
 Exit codes:
   0 - all checks pass
@@ -52,6 +52,7 @@ from pathlib import Path
 
 OPS_INIT = Path("src/flaggems_vllm/ops/__init__.py")
 OPERATORS_YAML = Path("conf/operators.yaml")
+DEPRECATED_OPERATORS_YAML = Path("conf/deprecated_operators.yaml")
 BASELINE_FILE = Path("tools/ci_checks/unregistered_exports_baseline.txt")
 
 ID_PATTERN = re.compile(r"^\s*-\s*id:\s*(\S+)", re.MULTILINE)
@@ -112,6 +113,8 @@ def main() -> int:
         return 2
 
     registered = registered_ids(OPERATORS_YAML)
+    if DEPRECATED_OPERATORS_YAML.exists():
+        registered |= registered_ids(DEPRECATED_OPERATORS_YAML)
     unregistered = exported - registered
 
     if args.update_baseline:
