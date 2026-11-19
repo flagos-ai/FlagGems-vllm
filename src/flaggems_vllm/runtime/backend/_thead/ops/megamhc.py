@@ -25,6 +25,8 @@ from .megamhc_runtime import clear_counters, counter_memset, device_bitcode
 
 _PROJECTION_BLOCK_K = 64
 _PROJECTION_MAX_SPLITS = 8
+# Native finish caches eight BF16x8 vectors per lane in a 32-lane warp.
+_SIMT_CACHED_H_PER_WARP = 8 * 32 * 8
 
 
 def _projection_splits(k):
@@ -251,9 +253,16 @@ def mega_mhc(
                     rows, warps = 4, max(8, block_p // 4)
                 blocks = triton.cdiv(tokens, rows)
                 large_blocks = 0
-                # Fill incomplete waves with a mixture of full and half row tiles.
+                # Cached row tiles can fill incomplete waves without increasing
+                # register use. Wider tiles retain their FP32 weight reuse.
                 target_blocks = 2 * multiprocessors
-                if rows > 2 and blocks < target_blocks:
+                cached_hidden = _SIMT_CACHED_H_PER_WARP * (warps // rows)
+                if (
+                    rows > 2
+                    and warps < mixes
+                    and hidden <= cached_hidden
+                    and blocks < target_blocks
+                ):
                     half_rows = rows // 2
                     large_blocks = triton.cdiv(
                         tokens - target_blocks * half_rows, rows - half_rows
