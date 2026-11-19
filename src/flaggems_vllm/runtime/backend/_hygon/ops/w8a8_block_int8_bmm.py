@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from functools import lru_cache
 
 import torch
 import triton
@@ -23,6 +24,14 @@ from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=16)
+def _single_head_split_workspace(device, raw_stream):
+    # Independent streams need separate partials and self-resetting counters.
+    partial = torch.empty((2, 80, 64, 64), dtype=torch.int32, device=device)
+    counter = torch.zeros((80,), dtype=torch.int32, device=device)
+    return partial, counter
 
 
 @libentry()
@@ -813,13 +822,18 @@ def _single_head_integer_body(
     BM: tl.constexpr,
     BN: tl.constexpr,
     STAGES: tl.constexpr,
+    Partial=None,
+    Counter=None,
+    SPLIT_K: tl.constexpr = 1,
 ):
     acc = tl.zeros((BM, BN), tl.int32)
     rk = tl.arange(0, 128)
-    for outer in range(2):
-        words = tl.where(outer == 0, word0, word1)
+    split = tl.program_id(1) if SPLIT_K > 1 else 0
+    for outer in range(2 // SPLIT_K):
+        half = split * (2 // SPLIT_K) + outer
+        words = tl.where(half == 0, word0, word1)
         for sub in tl.range(16, num_stages=STAGES):
-            kk = (outer * 16 + sub) * 128 + rk
+            kk = (half * 16 + sub) * 128 + rk
             shift = words & 3
             left = tl.load(
                 A + rm[:, None] * 4096 + kk[None, :], rm[:, None] < M, other=0
@@ -835,9 +849,26 @@ def _single_head_integer_body(
                 pack=1,
             )
             words = words >> 2
-    scale = ((base - 127) << 23).to(tl.float32, bitcast=True)
-    value = acc.to(tl.float32) * scale[:, None]
-    tl.store(Out + rm[:, None] * 1024 + rn[None, :], value, rm[:, None] < M)
+    if SPLIT_K > 1:
+        tile = tl.program_id(0)
+        offset = tl.arange(0, BM)[:, None] * BN + tl.arange(0, BN)[None, :]
+        tl.store(Partial + (tile * SPLIT_K + split) * (BM * BN) + offset, acc)
+        tl.debug_barrier()
+        ticket = tl.atomic_add(Counter + tile, 1, sem="acq_rel")
+        if ticket == SPLIT_K - 1:
+            total = tl.zeros((BM, BN), tl.int32)
+            for other in tl.static_range(SPLIT_K):
+                total += tl.load(
+                    Partial + (tile * SPLIT_K + other) * (BM * BN) + offset
+                )
+            scale = ((base - 127) << 23).to(tl.float32, bitcast=True)
+            value = total.to(tl.float32) * scale[:, None]
+            tl.store(Out + rm[:, None] * 1024 + rn[None, :], value, rm[:, None] < M)
+            tl.atomic_xchg(Counter + tile, 0, sem="release")
+    else:
+        scale = ((base - 127) << 23).to(tl.float32, bitcast=True)
+        value = acc.to(tl.float32) * scale[:, None]
+        tl.store(Out + rm[:, None] * 1024 + rn[None, :], value, rm[:, None] < M)
 
 
 @triton.jit
@@ -856,6 +887,9 @@ def int8_single_head_integer_kernel(
     BN: tl.constexpr,
     GM: tl.constexpr,
     STAGES: tl.constexpr,
+    Partial=None,
+    Counter=None,
+    SPLIT_K: tl.constexpr = 1,
 ):
     tl.static_assert(BN <= 128 and 128 % BN == 0)
     pid = tl.program_id(0)
@@ -900,9 +934,23 @@ def int8_single_head_integer_kernel(
         )
         word0, word1 = tl.split(packed)
         _single_head_integer_body(
-            A, W, Out, rm, rn, base, word0, word1, M, BM, BN, STAGES
+            A,
+            W,
+            Out,
+            rm,
+            rn,
+            base,
+            word0,
+            word1,
+            M,
+            BM,
+            BN,
+            STAGES,
+            Partial,
+            Counter,
+            SPLIT_K,
         )
-    else:
+    elif SPLIT_K == 1 or tl.program_id(1) == 0:
         _int8_block_bmm_kernel(
             A,
             W,
@@ -943,6 +991,8 @@ def int8_single_head_paired_k_kernel(
     XS_M: tl.constexpr,
     XS_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    UNMASK_A: tl.constexpr = False,
+    UNMASK_S: tl.constexpr = False,
 ):
     block_m: tl.constexpr = 16
     n: tl.constexpr = 1024
@@ -961,16 +1011,23 @@ def int8_single_head_paired_k_kernel(
     asp = XS + row * XS_M
     wsp = WS + (pn * BLOCK_N // scale_block) * k_groups
     acc = tl.zeros((block_m, BLOCK_N), tl.float32)
-    for pair in range(k_groups // 2):
+    for pair in tl.range(k_groups // 2, num_stages=2 if UNMASK_S else None):
         group = pair * 2
         groups = group + tl.arange(0, 2)
-        scales = tl.load(asp[:, None] + groups[None, :] * XS_K, valid[:, None], 0).to(
-            tl.float32
-        ) * tl.load(wsp + groups)[None, :].to(tl.float32)
+        if UNMASK_S:
+            row_scales = tl.load(asp[:, None] + groups[None, :] * XS_K).to(tl.float32)
+        else:
+            row_scales = tl.load(
+                asp[:, None] + groups[None, :] * XS_K, valid[:, None], 0
+            ).to(tl.float32)
+        scales = row_scales * tl.load(wsp + groups)[None, :].to(tl.float32)
         scale0, scale1 = tl.split(scales)
         for sub in tl.static_range(2):
             offset = (group + sub) * scale_block
-            a = tl.load(ap + offset, valid[:, None], 0)
+            if UNMASK_A:
+                a = tl.load(ap + offset)
+            else:
+                a = tl.load(ap + offset, valid[:, None], 0)
             w = tl.load(wp + offset)
             scale = scale0 if sub == 0 else scale1
             dot = tl.dot(a, w, out_dtype=tl.int32)
@@ -1238,6 +1295,43 @@ def _int8_block_bmm(
             return out
         a_scale_stride = A_scale.stride()
         if (
+            160 < m <= 320
+            and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
+            and A.stride()[1:] == (4096, 1)
+            and B.stride()[1:] == (1, 4096)
+            and a_scale_stride[1:] == (32, 1)
+            and B_scale.stride()[1:] == (1, 32)
+            and out.stride()[1:] == (1024, 1)
+            and A_scale.dtype == B_scale.dtype == torch.float32
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            partial, counter = _single_head_split_workspace(
+                A.device, torch.cuda.current_stream(A.device).cuda_stream
+            )
+            int8_single_head_integer_kernel[(triton.cdiv(m, 64) * 16, 2)](
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out,
+                m,
+                32,
+                1,
+                32,
+                1,
+                BM=64,
+                BN=64,
+                GM=4,
+                STAGES=2,
+                Partial=partial,
+                Counter=counter,
+                SPLIT_K=2,
+                num_warps=4,
+                num_stages=2,
+                kpack=1,
+            )
+            return out
+        if (
             224 < m <= 512
             and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
             and A.stride()[1:] == (4096, 1)
@@ -1288,6 +1382,8 @@ def _int8_block_bmm(
                 a_scale_stride[1],
                 a_scale_stride[2],
                 bn,
+                UNMASK_A=m <= 160 and m % 16 == 0,
+                UNMASK_S=m <= 96 and m % 16 == 0,
                 num_warps=2,
                 num_stages=2,
                 kpack=2,
