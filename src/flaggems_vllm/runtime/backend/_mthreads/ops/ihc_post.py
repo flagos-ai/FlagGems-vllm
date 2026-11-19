@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MThreads iHC tile with exact FP16 writeback."""
+"""MThreads iHC tile with separate FP32 rounding and exact FP16 writeback."""
 
 import triton
 import triton.language as tl
@@ -85,5 +85,20 @@ def _ihc_post_kernel(
     gate = tl.load(post_ptr + token * HC_MULT + channel, mask=channel_valid, other=0)
     x = tl.load(x_ptr + token * HIDDEN_SIZE + hidden, mask=hidden_valid, other=0)
     residual = tl.load(residual_ptr + offsets, mask=mask, other=0)
-    result = gate * x.to(tl.float32) + residual.to(tl.float32)
-    tl.store(output_ptr + offsets, _fp16_rne(result), mask=mask)
+    # Explicit FMAs retain the FP32 rounding boundary on MUSA, including the
+    # low-precision store. A negative zero preserves the product's zero sign.
+    x32 = x.to(tl.float32)
+    residual32 = residual.to(tl.float32)
+    product = tl.fma(gate, x32, -0.0)
+    result = tl.fma(1.0, product, residual32)
+    # MUSA can canonicalize the zero FMA addend. Restore IEEE addition's zero
+    # sign: an exact cancellation is +0; two negative zeros sum to -0.
+    product_sign = gate.to(tl.uint32, bitcast=True) ^ x32.to(tl.uint32, bitcast=True)
+    negative_zero = product_sign & residual32.to(tl.uint32, bitcast=True) & 0x80000000
+    zero_bits = tl.where((product == 0) & (residual32 == 0), negative_zero, 0)
+    result = tl.where(result == 0, zero_bits.to(tl.float32, bitcast=True), result)
+    if output_ptr.dtype.element_ty == tl.float16:
+        output = _fp16_rne(result)
+    else:
+        output = result.to(output_ptr.dtype.element_ty)
+    tl.store(output_ptr + offsets, output, mask=mask)

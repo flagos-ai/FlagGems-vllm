@@ -37,6 +37,41 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: apply_bad_words
+  description: Masks logits for tokens that would complete configured bad-word sequences.
+  for:
+  - apply_bad_words
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
+- id: apply_logit_bias
+  description: |
+    Apply allowed-token filtering, per-token logit biases, and minimum-length
+    stop-token masking to vLLM sampling logits in place.
+  for:
+    - apply_logit_bias
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - NeuralNetwork
+  stages:
+    - alpha: '5.4'
+- id: apply_min_p
+  description: Filter logits in place using per-request minimum probability ratios.
+  for:
+  - apply_min_p
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: apply_repetition_penalties
   description: 'Modifies logit tensors in place to penalize tokens that have already
     appeared in the generated sequence.
@@ -69,6 +104,17 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
+- id: apply_thinking_budget
+  description: Update reasoning-marker caches and force the budgeted end token.
+  for:
+  - apply_thinking_budget
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: apply_trace_tokens
   description: |
     Overwrite sampled tokens with request-specific trace tokens at the current decode step.
@@ -412,6 +458,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: compute_topk_scores
+  description: Collect sampled and top-k token scores and sampled-token ranks for vLLM.
+  for:
+  - vllm.v1.worker.gpu.sample.logprob.compute_topk_scores
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
 - id: concat_and_cache_mla
   description: 'Writes the latent and RoPE value into KV cache for Multi-head Latent
     Attention forward case.
@@ -427,11 +484,11 @@ ops:
   stages:
   - beta: '3.0'
 - id: cooperative_topk
-  description: 'Select exact top-k indices from FP32 CUDA logits through vLLM''s in-place
+  description: 'Select exact top-k indices from FP32 logits through vLLM''s in-place
 
-    interface. Supports up to 64 rows, k in {512, 1024, 2048}, variable lengths,
+    interface, with Ascend and Iluvatar fast paths. Supports up to 64 rows,
 
-    and -1 padding for short rows.
+    k in {512, 1024, 2048}, variable lengths, and -1 padding for short rows.
 
     '
   for:
@@ -573,6 +630,12 @@ ops:
     tuned TMA/WGMMA kernels; other NVIDIA GPUs (compute capability 8.9 for FP8,
 
     8.0 for BF16) use plain Triton kernels.
+
+    On Hygon BW1000, which has no FP8
+
+    compute, an FP8 wo_a runs in INT8 with the same per-128 activation scales,
+
+    and a BF16 wo_a is read in place without a full copy.
 
     '
   for:
@@ -812,6 +875,26 @@ ops:
   stages:
   - stable: '2.0'
   cpp: '4.0'
+- id: fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
+  description: 'Horizontally-fused DeepseekV4-MLA full-cache path.
+
+    Optional weight-free RMSNorm + GPT-J RoPE for Q, GPT-J RoPE + per-tensor FP8
+
+    (e4m3) quant for both Q and KV, and paged cache insert for KV, all in one
+
+    kernel launch.
+
+    '
+  for:
+  - torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
   description: 'Horizontally-fused DeepseekV4-MLA.
 
@@ -914,6 +997,23 @@ ops:
   - Quantization
   stages:
   - beta: '5.4'
+- id: fused_kimi_k3_mla_kv_concat
+  description: 'Copy Kimi-K3 NoPE keys and broadcast the shared PE component into a
+
+    caller-provided contiguous full-key output, preserving FP16/BF16 bits.
+
+    No cache, query, RoPE, or quantization work. Output/input overlap rejected.
+
+    '
+  for:
+  - _C.fused_kimi_k3_mla_kv_concat
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '5.4'
 - id: fused_marlin_moe_w4a16
   description: 'Fused mixture-of-experts computation with 4-bit weights and 16-bit
 
@@ -944,6 +1044,22 @@ ops:
   - MoE
   kind:
   - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: fused_matmul_reduce_scatter
+  description: |
+    Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
+    Matches the symm_mem argument signature; currently inference-only, NVIDIA SM90+
+    or an experimental HCU descriptor-lowering path (BF16 sum validated on two BW nodes),
+    FP16/BF16 2D inputs, sum/avg, scatter_dim=0, aligned shapes, eager execution.
+    Uses process-group-scoped communication resources and explicit configuration.
+  for:
+  - symm_mem.fused_matmul_reduce_scatter
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Distributed
   stages:
   - alpha: '5.4'
 - id: fused_moe
@@ -1037,6 +1153,29 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: gather_draft_sampled
+  description: Gather logits-aligned draft tokens and positions for speculative verification.
+  for:
+  - gather_draft_sampled
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: gather_sampler_output
+  description: Pack and restore batch-sharded tokens, counts, and logprobs around
+    vLLM all-gather.
+  for:
+  - gather_sampler_output
+  labels:
+  - vLLM
+  - Sampling
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: gdn_950dt_triton_ascend
   description: 'Gated delta rule for Ascend 950DT (A5 / arch35), triton-ascend only.
 
@@ -1086,11 +1225,16 @@ ops:
 
     FP8 supports decode, prefill and speculative state-slot updates.
 
+    MThreads exposes native decode/MTP and prefill with FP8 VK state, independent
+    indexed state pools, initialization flags and quantized rollback buffers.
+
     INT8 supports packed decode and chunked prefill on PPU, Hygon and Ascend.
 
     '
   for:
   - gdn_w8a16
+  - chunk_gated_delta_rule_w8a16_fp8
+  - gated_delta_rule_decode_w8a16_fp8
   - gdn_w8a16_int8
   - chunk_gated_delta_rule_w8a16_int8
   - quantize_gdn_state_int8
@@ -1148,6 +1292,16 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: get_num_sampled_and_rejected
+  description: Update sampled and rejected token counts per request.
+  for:
+    - get_num_sampled_and_rejected
+  labels:
+    - fused
+  kind:
+    - Sampling
+  stages:
+    - beta: '0.3'
 - id: group_list_cumsum
   description: 'Computes expert token-count offsets (cumsum) for expert-parallel MoE
 
@@ -1195,6 +1349,20 @@ ops:
   - MoE
   stages:
   - stable: '5.0'
+- id: gumbel_sample
+  description: |
+    Stateless Murmur3 Gumbel-max sampling from logits for vLLM Model Runner V2,
+    with request temperatures, draft streams, bias and pre-temperature logits cache.
+    NaN logits and invalid device-side indices/temperatures are outside the contract.
+  for:
+    - vllm.v1.worker.gpu.sample.gumbel.gumbel_sample
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - Sampling
+  stages:
+    - alpha: '5.4'
 - id: hc_combine
   description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
   for:
@@ -1205,6 +1373,17 @@ ops:
   - Pointwise
   stages:
   - beta: '0.3'
+- id: hc_down_silu
+  description: BF16 HC down projection with FP32 accumulation and SiLU after BF16 rounding.
+  for:
+    - vllm.models.qwen4_exp.nvidia.ops.cute_dsl.hc_down_silu.hc_down_silu
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - NeuralNetwork
+  stages:
+    - beta: '0.3'
 - id: hc_head_fused_kernel
   description: 'The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
 
@@ -1224,6 +1403,21 @@ ops:
   stages:
   - beta: '5.2'
   - stable: '5.3'
+- id: hc_split_sinkhorn
+  description: 'Splits the mHC mix coefficients into the pre/post gates and the comb
+    matrix, then runs the Sinkhorn normalisation on the comb matrix.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: hc_split_sinkhorn_forward
   description: 'Computes a differentiable approximation of the Wasserstein distance
     (Optimal Transport)
@@ -1533,6 +1727,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: mhc_pre_broadcast
+  description: Triton implementation of mHC Pre Broadcast operator (hc_mult=4).
+  for:
+  - vllm.model_executor.kernels.mhc.tilelang.mhc_pre_broadcast_tilelang
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
 - id: mhc_shifted_post_pre
   description: 'DSV4.1 shifted mHC boundary: applies the previous sublayer''s post/comb
 
@@ -1794,6 +1999,29 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: ple_conv
+  description: 'Upstream-compatible Qwen4Exp PLE dilated short convolution. Writes
+
+    SiLU(conv) into residual (optionally fused with outer residual) and
+
+    updates the persistent conv cache for decode, prefill, and speculative
+
+    decode modes, matching vLLM ops.ple.ple_conv. The MetaX backend supplies
+
+    the same entry with programmatic dependent launch disabled.
+
+    '
+  for:
+  - vllm.models.qwen4_exp.common.ops.ple.ple_conv
+  labels:
+  - fused
+  - vLLM
+  - Qwen4Exp
+  - NoCPU
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: qsa_prepare
   description: 'Horizontally-fused Qwen4Exp QSA prepare: Gemma RMSNorm and MRoPE for
     the
@@ -1868,6 +2096,18 @@ ops:
   stages:
   - stable: '3.0'
   cpp: '4.0'
+- id: reshape_and_cache_flash_strided
+  description: Write unquantized keys and values into independently strided paged
+    cache views on Sunrise PTPU.
+  for:
+  - reshape_and_cache_flash_strided
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '0.3'
 - id: rwkv_ka_fusion
   description: 'Merges, aligns, and enhances features from different data sources
     or spatial directions
@@ -1895,6 +2135,23 @@ ops:
   stages:
   - stable: '4.1'
   cpp: '4.0'
+- id: select_candidate_blocks_cooperative
+  description: |
+    DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM's
+    select_candidate_blocks_cooperative: per-block NaN-propagating max with
+    the newest block pinned, top-k over each row's valid block prefix (the
+    Triton persistent_topk / cooperative_topk in place of the CUDA
+    cooperative_topk), then -inf / out-of-range ids dropped to -1.
+  for:
+  - vllm.models.deepseek_v41.nvidia.specialized_decode.attention.candidate_topk.select_candidate_blocks_cooperative
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
 - id: silu_and_mul
   description: A custom operator in vLLM as activation function for SwiGLU.
   for:
@@ -2135,13 +2392,21 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: topk_sigmoid
+  description: Selects MoE experts using sigmoid scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and scaling and marks padded experts.
+  for:
+  - _moe_C.topk_sigmoid
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.5'
 - id: topk_softmax
-  description: 'Selects the k most likely next-token candicates, sets all others to
-    zero,
-
-    and renormalize the prbabilities of these top candidates.
-
-    '
+  description: Selects MoE experts using softmax scores and optional correction bias.
+    Returns uncorrected weights with optional normalization and marks padded experts.
   for:
   - _moe_C.topk_softmax
   labels:
@@ -2171,6 +2436,17 @@ ops:
   description: iHC gated residual scatter with unfused FP32 multiply and addition.
   for:
   - triton_ihc_post
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.4'
+- id: triton_ihc_pre
+  description: iHC RMS-normalized FP32 gates and pre-gated channel reduction.
+  for:
+  - triton_ihc_pre
   labels:
   - fused
   - vLLM
