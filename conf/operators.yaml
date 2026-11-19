@@ -1619,6 +1619,17 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: mamba_mixer
+  description: Triton implementation of the Mamba mixer operator for vLLM inference.
+  for:
+  - mamba_mixer
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: megamoe_int8
   description: 'Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
 
