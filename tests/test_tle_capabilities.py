@@ -153,7 +153,7 @@ def test_attn_res_missing_tle_load_uses_non_tle_cache_key(monkeypatch):
 
     assert module._HAS_TLE_LOAD is False
     assert module.tle is None
-    assert module._attn_res_post_kernel.cache_key
+    assert module._attn_res_post_kernel.jit_function.cache_key
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
