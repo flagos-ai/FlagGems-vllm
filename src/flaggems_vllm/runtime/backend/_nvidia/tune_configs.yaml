@@ -870,7 +870,6 @@ fp8_fp4_mqa_logits:
     num_stages: 2
 
 # W8A16 candidates use default register limits for a uniform library SQL schema.
-# Two-stage FP8 gate/up also fails on Hopper with FlagTree 0.7.0.
 fused_marlin_moe_w8a16_fp8_gateup_silu:
   - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
     num_warps: 4
@@ -887,6 +886,21 @@ fused_marlin_moe_w8a16_fp8_gateup_silu:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 2
 
 fused_marlin_moe_w8a16_int8_gateup_silu_large:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
@@ -908,7 +922,6 @@ fused_marlin_moe_w8a16_int8_gateup_silu_large:
     num_warps: 8
     num_stages: 1
 
-# FlagTree 0.7.0 also fails on Hopper for the three-stage FP8 down kernel.
 fused_marlin_moe_w8a16_fp8_down:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
     num_warps: 4
@@ -922,8 +935,19 @@ fused_marlin_moe_w8a16_fp8_down:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
 
-# FlagTree 0.7.0 generates invalid Hopper code for three-stage INT8 unified decode.
 fused_marlin_moe_w8a16_int8_unified:
   - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
     num_warps: 4
@@ -943,8 +967,25 @@ fused_marlin_moe_w8a16_int8_unified:
   - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 64, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 128, BLOCK_K_H: 128}
+    num_warps: 8
+    num_stages: 3
 
-# FlagTree 0.7.0 also fails on Hopper for this three-stage FP8 decode path.
 fused_marlin_moe_w8a16_fp8_unified:
   - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
     num_warps: 4
@@ -955,6 +996,15 @@ fused_marlin_moe_w8a16_fp8_unified:
   - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
     num_warps: 4
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_I_TILE: 32, BLOCK_K_H: 128}
+    num_warps: 4
+    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_gateup:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
@@ -980,8 +1030,6 @@ fused_marlin_moe_w8a16_int8_gateup:
     n: [64, 128]
     warps: [4, 8]
 
-# FlagTree 0.7.0 emits an illegal instruction on Hopper for short-M INT8
-# fused gate/up tiles when the pipeline uses three stages.
 fused_marlin_moe_w8a16_int8_gateup_silu:
   - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
     num_warps: 4
@@ -1016,6 +1064,39 @@ fused_marlin_moe_w8a16_int8_gateup_silu:
   - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
     num_warps: 8
     num_stages: 1
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 32, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 64}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 128}
+    num_warps: 8
+    num_stages: 3
 
 fused_marlin_moe_w8a16_int8_down:
   - META: {BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64}
@@ -1373,18 +1454,6 @@ kda_safe_gate_cumsum:
   - META: {BD: 64}
     num_warps: 8
 
-# Sparse top-k overwrites only its output and private scratch on each launch.
-top_k_per_row_standard:
-  - META: {}
-    num_warps: 4
-    num_stages: 3
-  - META: {}
-    num_warps: 8
-    num_stages: 3
-  - META: {}
-    num_warps: 16
-    num_stages: 3
-
 concat_mla_q:
   - META: {BLOCK: 128}
     num_warps: 4
@@ -1397,6 +1466,21 @@ concat_mla_q:
     num_stages: 1
   - META: {BLOCK: 1024}
     num_warps: 8
+    num_stages: 1
+
+# Bad-words keeps semantic tile selection in its host dispatch.  These
+# candidates are reserved for the libtuner integration and only vary launch
+# resources, so autotuning cannot select a tile that changes the dispatch
+# contract.
+apply_bad_words:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
     num_stages: 1
 
 triton_reshape_and_cache_flash:
@@ -1580,6 +1664,34 @@ chunk_kda_fwd_intra_token_parallel:
     stages:
       - 1
 
+hc_down_silu_gemv:
+  - META: {BLOCK_N: 1, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 2, BLOCK_K: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 4, BLOCK_K: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_N: 4, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+
+hc_down_silu_gemm:
+  - META: {BLOCK_M: 16, BLOCK_N: 32, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 32, BLOCK_K: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 16, BLOCK_N: 64, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_N: 32, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 2
+
 hc_combine:
   - META: {BLOCK_D: 128, LOOP: false}
     num_warps: 4
@@ -1599,6 +1711,41 @@ hc_combine:
   - META: {BLOCK_D: 1024, LOOP: true}
     num_warps: 4
     num_stages: 1
+
+logprob_tle_log_softmax:
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 8
+    num_stages: 3
+
+logprob_tle_logits_ranks:
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 8
+    num_stages: 3
+
+logprob_triton_scores_ranks:
+  - META: {BLOCK_SIZE: 512}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_SIZE: 2048}
+    num_warps: 8
+    num_stages: 3
+
+logprob_fill_ids:
+  - META: {}
+    num_warps: 4
+    num_stages: 3
+  - META: {}
+    num_warps: 8
+    num_stages: 3
 
 fused_kimi_k3_mla_kv_concat:
   - META: {BLOCK: 256, ROW_LAYOUT: false}
@@ -1821,6 +1968,46 @@ cast_sigmoid:
   - META: {BLOCK_SIZE: 8192}
     num_warps: 8
     num_stages: 1
+
+gumbel_sample:
+  # BLOCK_SIZE stays 1024 so every trial shares the same workspace shape.
+  # Cache calls use the first configuration directly, without live-state tuning.
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+# Short generic routing: narrow register pairs after same-dtype preprocessing.
+grouped_topk_fused_select:
+  - META: {USE_SORT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {USE_SORT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {USE_SORT: true}
+    num_warps: 1
+    num_stages: 1
+  - META: {USE_SORT: false}
+    num_warps: 1
+    num_stages: 1
+
+# Exact FP32 ordering: compact candidates are always refined or retried at full width.
+grouped_topk_register_select:
+  - META: {COMPACT: false}
+    num_warps: 1
+    num_stages: 1
+  - META: {COMPACT: true}
+    num_warps: 1
+    num_stages: 1
+
+# Preserve the latency-oriented single-warp path for short batches.
+grouped_topk_single_register:
+  - META: {}
+    num_warps: 1
+    num_stages: 3
 
 # BK=64 / BH=64 / 8 warps is the optimum of this space on sm_90a: BK=128 needs
 # 144 KB of KV tiles and spills 242 regs, while BK=32 loses MMA efficiency

@@ -18,6 +18,26 @@ pytestmark = pytest.mark.ple_fusion
 _KERNEL_STATE_BLOCKS = 64
 
 
+def _assert_within_ulps(actual, expected, ulps=2):
+    """Allow a couple of units in the last place.
+
+    MetaX libdevice SiLU, and the fp32 outer-residual add, can land one or
+    two bf16/fp16 values away from the eager reference. The cache update is
+    still compared exactly.
+    """
+    a = actual.float()
+    e = expected.float()
+    mag = torch.maximum(a.abs(), e.abs()).clamp(min=torch.finfo(actual.dtype).tiny)
+    bits = {torch.bfloat16: 7, torch.float16: 10}.get(actual.dtype, 23)
+    unit = torch.pow(2.0, torch.floor(torch.log2(mag)) - bits)
+    mismatch = (a - e).abs() > (ulps * unit + 1e-12)
+    if mismatch.any():
+        worst = ((a - e).abs() / unit).max().item()
+        raise AssertionError(
+            f"{int(mismatch.sum())} values differ, worst {worst:.2f} ulps"
+        )
+
+
 def _short_conv_dilated_decode_pytorch(
     x_d: torch.Tensor,
     conv_state: torch.Tensor,
@@ -792,13 +812,13 @@ def test_ple_conv_matches_eager(case, state_layout, fuse_residual):
     if fuse_residual:
         residual_reference = outer_residual + residual_reference
 
-    assert torch.equal(
+    _assert_within_ulps(
         residual_kernel[:num_real_tokens], residual_reference[:num_real_tokens]
     )
     assert torch.equal(conv_state, state_reference)
     assert torch.equal(conv_state[NULL_BLOCK_ID], null_state)
     if case.graph_padding:
-        assert torch.equal(
+        _assert_within_ulps(
             residual_kernel[num_real_tokens:],
             residual_reference[num_real_tokens:],
         )
