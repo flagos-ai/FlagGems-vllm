@@ -18,8 +18,12 @@ from flaggems_vllm.runtime.backend._ascend.a5.ops.causal_conv1d_fn import (
 from flaggems_vllm.runtime.backend._ascend.a5.ops.causal_conv1d_update import (
     causal_conv1d_update,
 )
+from flaggems_vllm.runtime.backend._ascend.a5.ops.topk_softplus_sqrt import (
+    topk_softplus_sqrt,
+)
 
 __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
+    "topk_softplus_sqrt",
 ]
