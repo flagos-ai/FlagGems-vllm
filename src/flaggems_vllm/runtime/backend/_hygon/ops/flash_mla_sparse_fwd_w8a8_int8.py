@@ -348,22 +348,55 @@ def _v32_prefill_weights(
 
 
 @triton.jit
-def _v32_prefill_values(
-    KV,
-    Indices,
-    Length,
-    Sink,
-    Weights,
+def _v32_normalize_tile_stats(
     TileStats,
-    Output,
+    Sink,
     LSE,
     RowOffset,
     H: tl.constexpr,
     K: tl.constexpr,
     SQ: tl.constexpr,
+    HasSink: tl.constexpr,
+):
+    head_tile, local_row = tl.program_id(0), tl.program_id(1)
+    row = RowOffset + local_row
+    heads = head_tile * 32 + tl.arange(0, 32)
+    tiles = tl.arange(0, K // 256)
+    stats_offsets = (local_row * (K // 256) + tiles[:, None]) * 3 * H + heads[None, :]
+    tile_maxima = tl.load(TileStats + stats_offsets)
+    tile_masses = tl.load(TileStats + stats_offsets + H)
+    quantum = tl.load(TileStats + stats_offsets + 2 * H)
+    maximum = tl.max(tile_maxima, 0)
+    safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+    retain = tl.exp2(tile_maxima - safe_maximum[None, :])
+    denominator = tl.sum(tile_masses * retain, 0)
+    lse = tl.where(
+        denominator > 0.0,
+        maximum * 0.6931471805599453 + tl.log(denominator),
+        float("inf"),
+    )
+    inverse = 1.0 / tl.where(denominator > 0.0, denominator, 1.0)
+    if HasSink:
+        sink = tl.load(Sink + heads)
+        inverse *= tl.where(denominator > 0.0, 1.0 / (1.0 + tl.exp(sink - lse)), 0.0)
+    # Reuse the quantum slots for factors shared by all four value blocks.
+    tl.store(TileStats + stats_offsets + 2 * H, quantum * retain * inverse[None, :])
+    tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, lse)
+
+
+@triton.jit
+def _v32_prefill_values(
+    KV,
+    Indices,
+    Length,
+    Weights,
+    TileStats,
+    Output,
+    RowOffset,
+    H: tl.constexpr,
+    K: tl.constexpr,
     Tokens: tl.constexpr,
     HasLength: tl.constexpr,
-    HasSink: tl.constexpr,
 ):
     value_tile, head_tile, local_row = (
         tl.program_id(0),
@@ -375,18 +408,9 @@ def _v32_prefill_values(
     channels = value_tile * 128 + tl.arange(0, 128)
     lanes = tl.arange(0, 128)
     length = tl.minimum(K, tl.load(Length + row)) if HasLength else K
-    # Every value block shares one denominator and one reference maximum.
-    tiles = tl.arange(0, K // 256)
-    stats_offsets = (local_row * (K // 256) + tiles[None, :]) * 3 * H + heads[:, None]
-    tile_maxima = tl.load(TileStats + stats_offsets)
-    tile_masses = tl.load(TileStats + stats_offsets + H)
-    maximum = tl.max(tile_maxima, 1)
-    safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
-    denominator = tl.sum(tile_masses * tl.exp2(tile_maxima - safe_maximum[:, None]), 1)
     output = tl.full((64, 128), 0.0, tl.float32)
-    for tile in range(K // 256):
-        high_sum = tl.full((64, 128), 0, tl.int32)
-        low_sum = tl.full((64, 128), 0, tl.int32)
+    for tile in tl.range(0, K // 256, loop_unroll_factor=1):
+        numerator = tl.full((64, 128), 0, tl.int32)
         for half in tl.static_range(2):
             offsets = tile * 256 + half * 128 + lanes
             token = tl.load(Indices + row * K + offsets, offsets < length, -1)
@@ -399,30 +423,16 @@ def _v32_prefill_values(
             operands = tl.load(Weights + weight_offsets)
             high = (operands >> 8).to(tl.int8)
             low = operands.to(tl.int8)
-            high_sum = tl.dot(high, values, high_sum, out_dtype=tl.int32)
-            low_sum = tl.dot(low, values, low_sum, out_dtype=tl.int32)
+            high_sum = tl.dot(high, values, out_dtype=tl.int32)
+            # 256 signed P14-by-INT8 products fit in INT32.
+            numerator = tl.dot(
+                low, values, numerator + high_sum * 128, out_dtype=tl.int32
+            )
 
         stats = (local_row * (K // 256) + tile) * 3 * H + heads
-        include = tl.exp2(tl.load(TileStats + stats) - safe_maximum)
-        scale = tl.load(TileStats + stats + 2 * H) * include
-        contribution = high_sum.to(tl.float32) * 128.0 + low_sum.to(tl.float32)
-        output += contribution * scale[:, None]
-
-    lse = tl.where(
-        denominator > 0.0,
-        maximum * 0.6931471805599453 + tl.log(denominator),
-        float("inf"),
-    )
-    inverse = 1.0 / tl.where(denominator > 0.0, denominator, 1.0)
-    if HasSink:
-        sink = tl.load(Sink + heads)
-        inverse *= tl.where(denominator > 0.0, 1.0 / (1.0 + tl.exp(sink - lse)), 0.0)
-    tl.store(
-        Output + (row * H + heads[:, None]) * 512 + channels[None, :],
-        output * inverse[:, None],
-    )
-    if value_tile == 0:
-        tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, lse)
+        scale = tl.load(TileStats + stats + 2 * H)
+        output += numerator.to(tl.float32) * scale[:, None]
+    tl.store(Output + (row * H + heads[:, None]) * 512 + channels[None, :], output)
 
 
 def _prepare_v32_prefill(
@@ -473,22 +483,29 @@ def _prepare_v32_prefill(
                 num_warps=4,
                 num_stages=1,
             )
-            _v32_prefill_values[(4, heads // 64, count)](
-                k_cache_lora,
-                indices,
-                topk_length,
-                attn_sink,
-                weights,
+            _v32_normalize_tile_stats[(heads // 32, count)](
                 stats,
-                output,
+                attn_sink,
                 lse,
                 base,
                 heads,
                 topk,
                 sq,
+                attn_sink is not None,
+                num_warps=4,
+            )
+            _v32_prefill_values[(4, heads // 64, count)](
+                k_cache_lora,
+                indices,
+                topk_length,
+                weights,
+                stats,
+                output,
+                base,
+                heads,
+                topk,
                 tokens,
                 topk_length is not None,
-                attn_sink is not None,
                 num_warps=4,
                 num_stages=1,
             )
