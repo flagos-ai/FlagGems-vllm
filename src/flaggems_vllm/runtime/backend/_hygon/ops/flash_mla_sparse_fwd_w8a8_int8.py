@@ -272,6 +272,230 @@ def merge_sparse_int8_attention(
         tl.store(LSE + (row // SQ * H + head) * SQ + row % SQ, logsum)
 
 
+@triton.jit
+def _v32_prefill_weights(
+    Q,
+    QRope,
+    KV,
+    KRope,
+    QScale,
+    KScale,
+    Indices,
+    Length,
+    High,
+    Low,
+    TileStats,
+    RowOffset,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    Tokens: tl.constexpr,
+    Scale: tl.constexpr,
+    HasLength: tl.constexpr,
+):
+    tile, head_tile, local_row = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    row = RowOffset + local_row
+    heads = head_tile * 64 + tl.arange(0, 64)
+    offsets = tile * 256 + tl.arange(0, 256)
+    length = tl.minimum(K, tl.load(Length + row)) if HasLength else K
+    token = tl.load(Indices + row * K + offsets, offsets < length, -1)
+    valid = (token >= 0) & (token < Tokens)
+    token = tl.where(valid, token, 0)
+    query_row = row * H + heads
+    channels = tl.arange(0, 128)
+    query_base = Q + query_row[:, None] * 512 + channels[None, :]
+    key_base = KV + token[None, :].to(tl.int64) * 512 + channels[:, None]
+    content = tl.full((64, 256), 0, tl.int32)
+    for panel in range(4):
+        query = tl.load(query_base + panel * 128)
+        key = tl.load(key_base + panel * 128, valid[None, :], 0)
+        content = tl.dot(query, key, content, out_dtype=tl.int32)
+
+    rope_channels = tl.arange(0, 64)
+    qr = tl.load(QRope + query_row[:, None] * 64 + rope_channels[None, :])
+    kr = tl.load(
+        KRope + token[None, :].to(tl.int64) * 64 + rope_channels[:, None],
+        valid[None, :],
+        0,
+    )
+    rope = tl.dot(qr, kr, out_dtype=tl.float32)
+    qs = tl.load(QScale + query_row) * (Scale * 1.4426950408889634)
+    ks = tl.load(KScale + token, valid, 0.0)
+    score = (content.to(tl.float32) + rope) * (qs[:, None] * ks[None, :])
+    score = tl.where(valid[None, :], score, -float("inf"))
+    maximum = tl.max(score, 1)
+    safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+    probability = tl.exp2(score - safe_maximum[:, None])
+    weight = probability * ks[None, :]
+    # Represent each weight in units of 1/128 of the signed INT8 range.
+    quantum = tl.maximum(tl.max(tl.abs(weight), 1) * (1.0 / (127 * 128)), 1.0e-30)
+    scaled = weight * (1.0 / quantum[:, None])
+    quant = (scaled + tl.where(scaled >= 0.0, 0.5, -0.5)).to(tl.int32)
+    high = (quant + 64) >> 7
+    low = quant - (high << 7)
+    packed = (local_row * H + heads[:, None]) * K + offsets[None, :]
+    tl.store(High + packed, high.to(tl.int8))
+    tl.store(Low + packed, low.to(tl.int8))
+    stats = ((local_row * H + heads) * (K // 256) + tile) * 3
+    tl.store(TileStats + stats, maximum)
+    tl.store(TileStats + stats + 1, tl.sum(probability, 1))
+    tl.store(TileStats + stats + 2, quantum)
+
+
+@triton.jit
+def _v32_prefill_values(
+    KV,
+    Indices,
+    Length,
+    Sink,
+    High,
+    Low,
+    TileStats,
+    Output,
+    LSE,
+    RowOffset,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    SQ: tl.constexpr,
+    Tokens: tl.constexpr,
+    HasLength: tl.constexpr,
+    HasSink: tl.constexpr,
+):
+    value_tile, head_tile, local_row = (
+        tl.program_id(0),
+        tl.program_id(1),
+        tl.program_id(2),
+    )
+    row = RowOffset + local_row
+    heads = head_tile * 64 + tl.arange(0, 64)
+    channels = value_tile * 128 + tl.arange(0, 128)
+    lanes = tl.arange(0, 128)
+    length = tl.minimum(K, tl.load(Length + row)) if HasLength else K
+    maximum = tl.full((64,), -float("inf"), tl.float32)
+    denominator = tl.full((64,), 0.0, tl.float32)
+    output = tl.full((64, 128), 0.0, tl.float32)
+    for tile in range(K // 256):
+        high_sum = tl.full((64, 128), 0, tl.int32)
+        low_sum = tl.full((64, 128), 0, tl.int32)
+        for half in tl.static_range(2):
+            offsets = tile * 256 + half * 128 + lanes
+            token = tl.load(Indices + row * K + offsets, offsets < length, -1)
+            valid = (token >= 0) & (token < Tokens)
+            token = tl.where(valid, token, 0).to(tl.int64)
+            values = tl.load(
+                KV + token[:, None] * 512 + channels[None, :], valid[:, None], 0
+            )
+            packed = (local_row * H + heads[:, None]) * K + offsets[None, :]
+            high_sum = tl.dot(
+                tl.load(High + packed), values, high_sum, out_dtype=tl.int32
+            )
+            low_sum = tl.dot(tl.load(Low + packed), values, low_sum, out_dtype=tl.int32)
+
+        stats = ((local_row * H + heads) * (K // 256) + tile) * 3
+        tile_maximum = tl.load(TileStats + stats)
+        next_maximum = tl.maximum(maximum, tile_maximum)
+        safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
+        retain = tl.exp2(maximum - safe_maximum)
+        include = tl.exp2(tile_maximum - safe_maximum)
+        denominator = denominator * retain + tl.load(TileStats + stats + 1) * include
+        contribution = high_sum.to(tl.float32) * 128.0 + low_sum.to(tl.float32)
+        output = (
+            output * retain[:, None]
+            + contribution * (tl.load(TileStats + stats + 2) * include)[:, None]
+        )
+        maximum = next_maximum
+
+    lse = tl.where(
+        denominator > 0.0,
+        maximum * 0.6931471805599453 + tl.log(denominator),
+        float("inf"),
+    )
+    inverse = 1.0 / tl.where(denominator > 0.0, denominator, 1.0)
+    if HasSink:
+        sink = tl.load(Sink + heads)
+        inverse *= tl.where(denominator > 0.0, 1.0 / (1.0 + tl.exp(sink - lse)), 0.0)
+    tl.store(
+        Output + (row * H + heads[:, None]) * 512 + channels[None, :],
+        output * inverse[:, None],
+    )
+    if value_tile == 0:
+        tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, lse)
+
+
+def _prepare_v32_prefill(
+    q_nope,
+    q_rope,
+    k_cache_lora,
+    k_cache_rope,
+    q_scale,
+    k_scale,
+    indices,
+    topk_length,
+    attn_sink,
+    output,
+    lse,
+    scale,
+):
+    batch, sq, heads, _ = q_nope.shape
+    rows = batch * sq
+    topk = indices.shape[-1]
+    tokens = k_cache_lora.shape[0] * 64
+    # Process row chunks so the P14 workspace does not grow with the batch.
+    chunk = min(rows, 512)
+    high = torch.empty((chunk, heads, topk), device=q_nope.device, dtype=torch.int8)
+    low = torch.empty_like(high)
+    stats = torch.empty(
+        (chunk, heads, topk // 256, 3), device=q_nope.device, dtype=torch.float32
+    )
+
+    def run():
+        for base in range(0, rows, chunk):
+            count = min(chunk, rows - base)
+            _v32_prefill_weights[(topk // 256, heads // 64, count)](
+                q_nope,
+                q_rope,
+                k_cache_lora,
+                k_cache_rope,
+                q_scale,
+                k_scale,
+                indices,
+                topk_length,
+                high,
+                low,
+                stats,
+                base,
+                heads,
+                topk,
+                tokens,
+                scale,
+                topk_length is not None,
+                num_warps=4,
+                num_stages=1,
+            )
+            _v32_prefill_values[(4, heads // 64, count)](
+                k_cache_lora,
+                indices,
+                topk_length,
+                attn_sink,
+                high,
+                low,
+                stats,
+                output,
+                lse,
+                base,
+                heads,
+                topk,
+                sq,
+                tokens,
+                topk_length is not None,
+                attn_sink is not None,
+                num_warps=4,
+                num_stages=1,
+            )
+        return output, lse
+
+    return run
+
+
 def prepare_flash_mla_sparse_fwd_w8a8_int8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -347,6 +571,21 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
     lse = torch.empty((batch, heads, sq), dtype=torch.float32, device=device)
     if rows == 0:
         return lambda: (output, lse)
+    if rope == 64 and rows >= 4096 and heads >= 64 and topk == 2048:
+        return _prepare_v32_prefill(
+            q_nope,
+            q_rope,
+            k_cache_lora,
+            k_cache_rope,
+            q_scale,
+            k_scale,
+            indices,
+            topk_length,
+            attn_sink,
+            output,
+            lse,
+            scale,
+        )
 
     bh = min(heads, 32)
     v_slice = 512
