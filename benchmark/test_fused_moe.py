@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark FlagGems fused_experts_impl against each platform production MoE entry."""
+"""Benchmark FlagGems fused_experts_impl against each platform MoE baseline.
+
+Production entries are used where they are wired up. NVIDIA currently uses the
+functional vLLM fused_experts_impl as its reference until the production modular
+baseline is agreed with the platform partner.
+"""
 
 import gc
 import inspect
@@ -29,10 +34,11 @@ from . import base
 
 VENDOR = flaggems_vllm.vendor_name
 
-# Vendors whose vLLM build ships the Triton fused_experts_impl.
-VLLM_NATIVE_VENDORS = {"nvidia", "metax"}
+# Vendors whose benchmark baseline is the functional vLLM fused_experts_impl.
+# MetaX is not listed here: its production entry is selected below.
+VLLM_FUNCTIONAL_VENDORS = {"nvidia"}
 
-if VENDOR in VLLM_NATIVE_VENDORS:
+if VENDOR in VLLM_FUNCTIONAL_VENDORS:
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         fused_experts_impl as vllm_fused_experts_impl,
     )
@@ -98,7 +104,7 @@ def _input_fn(shape, dtype, device):
     yield hidden_states, w1, w2, topk_weights, topk_ids
 
 
-def _vllm_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
+def _vllm_functional_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
     return vllm_fused_experts_impl(
         hidden_states,
         w1,
@@ -203,12 +209,12 @@ def thead_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
 
 def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
     """Run vLLM-MetaX's production unquantized MoE method."""
-    assert topk_weights.dtype == torch.float32, (
-        "MetaX mctlass baseline expects float32 topk_weights"
-    )
-    assert topk_ids.dtype == torch.int32, (
-        "MetaX mctlass baseline expects int32 topk_ids"
-    )
+    assert (
+        topk_weights.dtype == torch.float32
+    ), "MetaX mctlass baseline expects float32 topk_weights"
+    assert (
+        topk_ids.dtype == torch.int32
+    ), "MetaX mctlass baseline expects int32 topk_ids"
     import vllm_metax
     from vllm.config import set_current_vllm_config
     from vllm.forward_context import set_forward_context
@@ -573,8 +579,8 @@ _PRODUCTION_BASELINE_VENDORS = {"thead", "metax", "mthreads", "hygon"}
 def _get_baseline_op():
     if VENDOR in _PRODUCTION_BASELINE_VENDORS:
         return production_moe_op(VENDOR)
-    if VENDOR in VLLM_NATIVE_VENDORS:
-        return _vllm_fused_moe_op
+    if VENDOR in VLLM_FUNCTIONAL_VENDORS:
+        return _vllm_functional_fused_moe_op
     return None
 
 
