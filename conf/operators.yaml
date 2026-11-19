@@ -48,6 +48,19 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.5'
+- id: apply_logit_bias
+  description: |
+    Apply allowed-token filtering, per-token logit biases, and minimum-length
+    stop-token masking to vLLM sampling logits in place.
+  for:
+    - apply_logit_bias
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - NeuralNetwork
+  stages:
+    - alpha: '5.4'
 - id: apply_min_p
   description: Filter logits in place using per-request minimum probability ratios.
   for:
