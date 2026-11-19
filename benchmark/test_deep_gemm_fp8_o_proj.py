@@ -123,6 +123,22 @@ def _is_ascend():
     return flaggems_vllm.vendor_name == "ascend"
 
 
+def _scaling_compute_dtype():
+    """Precision this implementation actually computes in.
+
+    The "vs Base" divisor describes the local implementation's hardware
+    potential, so tensor-bound points must use the compute precision, not the
+    bf16 io dtype: MetaX/Hygon/PPU transport the FP8 values as INT8, Ascend
+    uses FP16. NVIDIA returns None so the io dtype keeps the baseline chip's
+    factor at 1.0.
+    """
+    if _is_int8_transport_vendor():
+        return torch.int8
+    if _is_ascend():
+        return torch.float16
+    return None
+
+
 def _sync():
     flaggems_vllm.runtime.torch_device_fn.synchronize()
 
@@ -280,6 +296,13 @@ class DeepGemmFP8OProjBenchmark(base.Benchmark):
     DEFAULT_METRICS = base.consts.DEFAULT_METRICS[:] + ["tflops"]
     DEFAULT_SHAPE_DESC = "tokens, n_groups, group_dim, o_lora_rank"
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Tensor-bound shapes are normalized by the peak of the precision the
+        # backend kernels run in (INT8 / FP16), while the mem-bound shapes keep
+        # using the dtype-independent bandwidth ratio.
+        self.scaling_dtype = _scaling_compute_dtype()
+
     def set_more_shapes(self):
         # Decode / DSpark verify / C32 / prefill points for both DGX SKUs.
         tokens = (1, 4, 16, 64, 128, 512, 2048, 8192)
@@ -382,7 +405,9 @@ def test_perf_deep_gemm_fp8_o_proj_int8_vs_h100():
     timing method. The harness prints
     ``vs Base = (base_ms / latency) / factor``, where ``factor`` is the
     PPU/MetaX/Hygon-vs-H100 peak ratio of the record's bottleneck resource from
-    ``_scaling_factors`` -- the 折算 the acceptance doc prescribes.
+    ``_scaling_factors`` (mem -> bandwidth, tensor -> INT8 peak, since these
+    backends transport the FP8 values as INT8) -- the 折算 the acceptance doc
+    prescribes.
     """
     _run_h100_baseline_comparison()
 
@@ -396,6 +421,6 @@ def test_perf_deep_gemm_fp8_o_proj_ascend_vs_h100():
 
     The reference is the same H100 record used for MetaX/Hygon; ``factor`` is
     the Ascend910B4/H100 peak ratio of the record's bottleneck resource from
-    ``_scaling_factors`` (mem -> bandwidth, tensor -> bf16).
+    ``_scaling_factors`` (mem -> bandwidth, tensor -> FP16 peak).
     """
     _run_h100_baseline_comparison()
