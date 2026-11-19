@@ -167,9 +167,13 @@ def test_mega_mhc_projection_cancellation(tokens, hidden, implementation):
 @pytest.mark.parametrize(
     "hidden,streams,unaligned",
     [
+        (256, 2, False),
+        (256, 4, False),
         (512, 2, False),
         (512, 4, False),
         (512, 4, True),
+        (768, 2, False),
+        (768, 4, False),
         (521, 4, False),
         (259, 2, False),
     ],

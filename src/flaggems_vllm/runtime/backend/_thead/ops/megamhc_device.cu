@@ -98,13 +98,14 @@ __device__ __forceinline__ int post(
   float sum[kValues] = {};
   unsigned current = 0;
   prefetch(0, current);
+  if (hidden > kColumns)
+    prefetch(kColumns, 1);
   for (unsigned column = 0; column < hidden; column += kColumns) {
-    asm volatile("cp.async.wait_group 0;" : : : "memory");
-    // The next tile occupies the other slot and can load while this tile
-    // computes and publishes its residual. Each lane reads the bytes it copied.
-    if (column + kColumns < hidden) {
-      prefetch(column + kColumns, current ^ 1);
-    }
+    // Keep the next tile in flight; the final tile drains the remaining group.
+    if (hidden - column > kColumns)
+      asm volatile("cp.async.wait_group 1;" : : : "memory");
+    else
+      asm volatile("cp.async.wait_group 0;" : : : "memory");
     const unsigned base = smem_lane + current * slot_size;
     const Bf16x8 xv = read_tile(base);
     Bf16x8 residuals[R];
@@ -112,6 +113,9 @@ __device__ __forceinline__ int post(
     for (unsigned src = 0; src < R; ++src) {
       residuals[src] = read_tile(base + (src + 1) * slot_plane);
     }
+    // Each lane has read its own slot into registers. Refill it two tiles ahead.
+    if (hidden - column > 2 * kColumns)
+      prefetch(column + 2 * kColumns, current);
 #pragma unroll
     for (unsigned dst = 0; dst < R; ++dst) {
       Bf16x8 rounded;
