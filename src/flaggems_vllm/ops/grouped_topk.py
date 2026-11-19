@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
-from flaggems_vllm.utils import tl_extra_shim
+from flaggems_vllm.utils import libtuner, tl_extra_shim
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 
@@ -55,6 +55,7 @@ def topk_with_k2_triton(
     num_experts_per_group,
     n_group,
     stride_scores_token,
+    stride_scores_expert,
     stride_group_scores_token,
     BLOCK_SIZE: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
@@ -74,11 +75,14 @@ def topk_with_k2_triton(
     lane = tl.arange(0, BLOCK_SIZE)
     mask = lane < num_experts_per_group
 
-    scores_offset = token_id * stride_scores_token + group_id * num_experts_per_group
+    scores_offset = (
+        token_id * stride_scores_token
+        + group_id * num_experts_per_group * stride_scores_expert
+    )
     bias_offset = group_id * num_experts_per_group
 
     x = tl.load(
-        scores_ptr + scores_offset + lane,
+        scores_ptr + scores_offset + lane * stride_scores_expert,
         mask=mask,
         other=-float("inf"),
     )
@@ -130,6 +134,7 @@ def group_idx_and_topk_triton(
     num_experts_per_group,
     routed_scaling_factor,
     stride_scores_token,
+    stride_scores_expert,
     stride_group_scores_token,
     stride_out_token,
     N_GROUP: tl.constexpr,
@@ -218,7 +223,7 @@ def group_idx_and_topk_triton(
     ) & valid_expert
 
     scored = tl.load(
-        scores_ptr + pid * stride_scores_token + expert_offsets,
+        scores_ptr + pid * stride_scores_token + expert_offsets * stride_scores_expert,
         mask=expert_selected,
         other=neg_inf,
     )
@@ -252,7 +257,9 @@ def group_idx_and_topk_triton(
         selected_idx = tl.min(candidate_idx, axis=0)
 
         selected_score = tl.load(
-            scores_ptr + pid * stride_scores_token + selected_idx,
+            scores_ptr
+            + pid * stride_scores_token
+            + selected_idx * stride_scores_expert,
             mask=selected_idx < num_experts,
             other=neg_inf,
         )
@@ -320,17 +327,6 @@ def _unpack_val_idx_fp32(pair):
     return val, idx
 
 
-@triton.jit
-def _packed_max_uint32(values, axis: tl.constexpr):
-    # Preserve all FP32 bits and the index tie-break while allowing the
-    # NVIDIA backend to use native warp reductions instead of uint64 shuffles.
-    high = (values >> 32).to(tl.uint32)
-    low = values.to(tl.uint32)
-    high_max = tl.max(high, axis)
-    low_max = tl.max(tl.where(high == tl.expand_dims(high_max, axis), low, 0), axis)
-    return (high_max.to(tl.uint64) << 32) | low_max.to(tl.uint64)
-
-
 # Adapted from vLLM:
 #   ./vllm/csrc/moe/grouped_topk_kernels.cu
 #   ./vllm/csrc/moe/moeTopKFuncs.cuh
@@ -396,7 +392,7 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
         s_score_bias_ptr = tle.gpu.local_ptr(s_score_bias, (0, 0))
     else:
         # Masked scores may have a padded row stride, but this scratch is dense.
-        scratch_stride = num_experts if HAS_PADDING else scores_stride0
+        scratch_stride = num_experts
         s_score_sigmoid_ptr = g_score_sigmoid_ptr + token_id * scratch_stride
         s_score_bias_ptr = g_score_bias_ptr + token_id * scratch_stride
 
@@ -799,7 +795,86 @@ def triton_grouped_topk_fused_small_expert_count_kernel(
 
 
 @triton.jit
-def _load_packed_expert(scores, bias, offsets, experts, SCORING_FUNC: tl.constexpr):
+def _legacy_sigmoid(x, dtype: tl.constexpr):
+    # Match the legacy grouped path: separate same-dtype half/tanh/half/add.
+    half = (x.to(tl.float32) * 0.5).to(dtype)
+    t = tl_extra_shim.tanh(half.to(tl.float32)).to(dtype)
+    half_t = (t.to(tl.float32) * 0.5).to(dtype)
+    return (half_t.to(tl.float32) + 0.5).to(dtype)
+
+
+@triton.jit
+def _write_padding(weights, ids, token, topk: tl.constexpr, block: tl.constexpr):
+    slot = tl.arange(0, block)
+    tl.store(weights + token * topk + slot, 0.0, slot < topk)
+    tl.store(ids + token * topk + slot, -1, slot < topk)
+
+
+@triton.jit
+def _masked_single_group_kernel(
+    scores,
+    bias,
+    padding,
+    out_weights,
+    out_ids,
+    num_tokens,
+    num_experts: tl.constexpr,
+    topk: tl.constexpr,
+    stride_score,
+    routed_scaling_factor,
+    RENORMALIZE: tl.constexpr,
+    SCORING_FUNC: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
+    USE_FAST_SIGMOID: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if HAS_PADDING:
+        if tl.load(padding + row):
+            _write_padding(out_weights, out_ids, row, topk, BLOCK_TOPK)
+            return
+    expert = tl.arange(0, BLOCK_EXPERTS)
+    unb = tl.load(scores + row * stride_score + expert, expert < num_experts, 0.0)
+    if SCORING_FUNC == 1:
+        if USE_FAST_SIGMOID:
+            unb = _sigmoid(unb.to(tl.float32)).to(INPUT_DTYPE)
+        else:
+            unb = _legacy_sigmoid(unb, INPUT_DTYPE)
+    b = tl.load(bias + expert, expert < num_experts, 0.0).to(INPUT_DTYPE)
+    s = (unb + b).to(tl.float32)
+    s = tl.where(s == 0.0, 0.0, s)  # Signed zeros compare equal on the legacy path.
+    # Zero key for invalid lanes sorts behind every valid expert including -inf.
+    keys = tl.where(expert < num_experts, _pack_val_idx_fp32(s, expert), 0)
+    winners = tl.topk(keys, BLOCK_TOPK)
+    chosen, ids = _unpack_val_idx_fp32(winners)
+    slot = tl.arange(0, BLOCK_TOPK)
+    vals = tl.load(scores + row * stride_score + ids, slot < topk, 0.0)
+    if SCORING_FUNC == 1:
+        if USE_FAST_SIGMOID:
+            vals = _sigmoid(vals.to(tl.float32)).to(INPUT_DTYPE)
+        else:
+            vals = _legacy_sigmoid(vals, INPUT_DTYPE)
+    vals = tl.where(slot < topk, vals.to(tl.float32), 0.0)
+    scale = routed_scaling_factor
+    if RENORMALIZE:
+        scale = scale / (tl.sum(vals) + 1e-20)
+    # Old generic routing emits uniform weights when the single group is invalid.
+    group_score = tl.sum(tl.where(slot < 2, chosen, 0.0)).to(INPUT_DTYPE).to(tl.float32)
+    valid = (group_score > -float("inf")) & (group_score < float("inf"))
+    tl.store(
+        out_weights + row * topk + slot,
+        tl.where(valid, vals * scale, 1.0 / topk),
+        slot < topk,
+    )
+    tl.store(out_ids + row * topk + slot, tl.where(valid, ids, slot), slot < topk)
+
+
+@triton.jit
+def _load_packed_contiguous_expert(
+    scores, bias, offsets, experts, SCORING_FUNC: tl.constexpr
+):
     valid = offsets < experts
     raw = tl.load(scores + offsets, valid, -float("inf")).to(tl.float32)
     if SCORING_FUNC == 1:
@@ -809,8 +884,11 @@ def _load_packed_expert(scores, bias, offsets, experts, SCORING_FUNC: tl.constex
     return _pack_val_idx_fp32(ranked, offsets)
 
 
-# A single warp owns all candidates for one token. Keep the measured layout
-# fixed; multi-token CTA alternatives were slower on the target workloads.
+@libtuner(
+    configs=runtime.get_tuned_config("grouped_topk_single_register"),
+    key=["tokens", "experts", "topk", "SCORING_FUNC", "RENORMALIZE"],
+    strategy=["log", "default", "default", "default", "default"],
+)
 @triton.jit
 def _grouped_topk_single_register_kernel(
     scores,
@@ -838,28 +916,28 @@ def _grouped_topk_single_register_kernel(
     lane = tl.arange(0, 32)
     # Each lane owns eight candidates. Sort locally before extracting K winners.
     expert_idx_group7 = lane + 224
-    comp_val_idx20 = _load_packed_expert(
+    comp_val_idx20 = _load_packed_contiguous_expert(
         scores + row * stride, bias, lane + 0, experts, SCORING_FUNC
     )
-    comp_val_idx21 = _load_packed_expert(
+    comp_val_idx21 = _load_packed_contiguous_expert(
         scores + row * stride, bias, lane + 32, experts, SCORING_FUNC
     )
-    comp_val_idx22 = _load_packed_expert(
+    comp_val_idx22 = _load_packed_contiguous_expert(
         scores + row * stride, bias, lane + 64, experts, SCORING_FUNC
     )
-    comp_val_idx23 = _load_packed_expert(
+    comp_val_idx23 = _load_packed_contiguous_expert(
         scores + row * stride, bias, lane + 96, experts, SCORING_FUNC
     )
-    comp_val_idx24 = _load_packed_expert(
+    comp_val_idx24 = _load_packed_contiguous_expert(
         scores + row * stride, bias, lane + 128, experts, SCORING_FUNC
     )
-    comp_val_idx25 = _load_packed_expert(
+    comp_val_idx25 = _load_packed_contiguous_expert(
         scores + row * stride, bias, lane + 160, experts, SCORING_FUNC
     )
-    comp_val_idx26 = _load_packed_expert(
+    comp_val_idx26 = _load_packed_contiguous_expert(
         scores + row * stride, bias, lane + 192, experts, SCORING_FUNC
     )
-    comp_val_idx27 = _load_packed_expert(
+    comp_val_idx27 = _load_packed_contiguous_expert(
         scores + row * stride, bias, lane + 224, experts, SCORING_FUNC
     )
     # descending bitonic sort
@@ -1004,80 +1082,557 @@ def _grouped_topk_single_register_kernel(
 
 
 @triton.jit
-def _legacy_sigmoid(x, dtype: tl.constexpr):
-    # Match the legacy grouped path: separate same-dtype half/tanh/half/add.
-    half = (x.to(tl.float32) * 0.5).to(dtype)
-    t = tl_extra_shim.tanh(half.to(tl.float32)).to(dtype)
-    half_t = (t.to(tl.float32) * 0.5).to(dtype)
-    return (half_t.to(tl.float32) + 0.5).to(dtype)
+def _ordered_fp32_key(x):
+    bits = x.to(tl.uint32, bitcast=True)
+    return tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
 
 
 @triton.jit
-def _write_padding(weights, ids, token, topk: tl.constexpr, block: tl.constexpr):
-    slot = tl.arange(0, block)
-    tl.store(weights + token * topk + slot, 0.0, slot < topk)
-    tl.store(ids + token * topk + slot, -1, slot < topk)
-
-
-@triton.jit
-def _masked_single_group_kernel(
+def _load_packed_expert(
     scores,
     bias,
-    padding,
-    out_weights,
-    out_ids,
-    num_tokens,
-    num_experts: tl.constexpr,
-    topk: tl.constexpr,
-    stride_score,
-    routed_scaling_factor,
-    RENORMALIZE: tl.constexpr,
+    offsets,
+    experts,
     SCORING_FUNC: tl.constexpr,
+    stride_expert,
+    stride_bias,
+):
+    valid = offsets < experts
+    raw = tl.load(scores + offsets * stride_expert, valid, -float("inf")).to(tl.float32)
+    if SCORING_FUNC == 1:
+        raw = _sigmoid(raw)
+    correction = tl.load(bias + offsets * stride_bias, valid, 0.0).to(tl.float32)
+    ranked = tl.where(valid, raw + correction, -float("inf"))
+    return _pack_val_idx_fp32(ranked, offsets)
+
+
+@triton.jit
+def _packed_max_uint32(values, axis: tl.constexpr):
+    high = (values >> 32).to(tl.uint32)
+    low = values.to(tl.uint32)
+    high_max = tl.max(high, axis)
+    low_max = tl.max(tl.where(high == tl.expand_dims(high_max, axis), low, 0), axis)
+    return (high_max.to(tl.uint64) << 32) | low_max.to(tl.uint64)
+
+
+@triton.jit
+def _load_compact_expert(
+    scores, bias, offsets, experts, SF: tl.constexpr, stride_expert, stride_bias
+):
+    v = tl.load(scores + offsets * stride_expert, offsets < experts, 0.0).to(tl.float32)
+    if SF:
+        v = _sigmoid(v)
+    b = tl.load(bias + offsets * stride_bias, offsets < experts, 0.0).to(tl.float32)
+    return tl.where(
+        offsets < experts,
+        (_ordered_fp32_key(v + b) & 0xFFFFFF00) | (255 - offsets).to(tl.uint32),
+        0,
+    )
+
+
+@triton.jit
+def _select_register(
+    scores,
+    bias,
+    tokens,
+    experts: tl.constexpr,
+    topk: tl.constexpr,
+    stride,
+    stride_expert,
+    stride_bias,
+    SCORING_FUNC: tl.constexpr,
+    COMPACT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    WARP_SIZE: tl.constexpr = 32
+    MAX_IDX: tl.constexpr = 65535
+    neg_inf: tl.constexpr = -float("inf")
+    lane = tl.arange(0, 32)
+    # Each lane owns eight candidates. Sort locally before extracting K winners.
+    expert_idx_group7 = lane + 224
+    load_fn: tl.constexpr = _load_compact_expert if COMPACT else _load_packed_expert
+    comp_val_idx20 = load_fn(
+        scores + row * stride,
+        bias,
+        lane + 0,
+        experts,
+        SCORING_FUNC,
+        stride_expert,
+        stride_bias,
+    )
+    comp_val_idx21 = load_fn(
+        scores + row * stride,
+        bias,
+        lane + 32,
+        experts,
+        SCORING_FUNC,
+        stride_expert,
+        stride_bias,
+    )
+    comp_val_idx22 = load_fn(
+        scores + row * stride,
+        bias,
+        lane + 64,
+        experts,
+        SCORING_FUNC,
+        stride_expert,
+        stride_bias,
+    )
+    comp_val_idx23 = load_fn(
+        scores + row * stride,
+        bias,
+        lane + 96,
+        experts,
+        SCORING_FUNC,
+        stride_expert,
+        stride_bias,
+    )
+    comp_val_idx24 = load_fn(
+        scores + row * stride,
+        bias,
+        lane + 128,
+        experts,
+        SCORING_FUNC,
+        stride_expert,
+        stride_bias,
+    )
+    comp_val_idx25 = load_fn(
+        scores + row * stride,
+        bias,
+        lane + 160,
+        experts,
+        SCORING_FUNC,
+        stride_expert,
+        stride_bias,
+    )
+    comp_val_idx26 = load_fn(
+        scores + row * stride,
+        bias,
+        lane + 192,
+        experts,
+        SCORING_FUNC,
+        stride_expert,
+        stride_bias,
+    )
+    comp_val_idx27 = load_fn(
+        scores + row * stride,
+        bias,
+        lane + 224,
+        experts,
+        SCORING_FUNC,
+        stride_expert,
+        stride_bias,
+    )
+    orig0 = comp_val_idx20
+    orig1 = comp_val_idx21
+    orig2 = comp_val_idx22
+    orig3 = comp_val_idx23
+    orig4 = comp_val_idx24
+    orig5 = comp_val_idx25
+    orig6 = comp_val_idx26
+    orig7 = comp_val_idx27
+    # descending bitonic sort
+    # k = 2, j = 1
+    comp_val_idx20, comp_val_idx21 = max(comp_val_idx20, comp_val_idx21), min(
+        comp_val_idx20, comp_val_idx21
+    )
+    comp_val_idx22, comp_val_idx23 = min(comp_val_idx22, comp_val_idx23), max(
+        comp_val_idx22, comp_val_idx23
+    )
+    comp_val_idx24, comp_val_idx25 = max(comp_val_idx24, comp_val_idx25), min(
+        comp_val_idx24, comp_val_idx25
+    )
+    comp_val_idx26, comp_val_idx27 = min(comp_val_idx26, comp_val_idx27), max(
+        comp_val_idx26, comp_val_idx27
+    )
+    # k = 4, j = 2
+    comp_val_idx20, comp_val_idx22 = max(comp_val_idx20, comp_val_idx22), min(
+        comp_val_idx20, comp_val_idx22
+    )
+    comp_val_idx21, comp_val_idx23 = max(comp_val_idx21, comp_val_idx23), min(
+        comp_val_idx21, comp_val_idx23
+    )
+    comp_val_idx24, comp_val_idx26 = min(comp_val_idx24, comp_val_idx26), max(
+        comp_val_idx24, comp_val_idx26
+    )
+    comp_val_idx25, comp_val_idx27 = min(comp_val_idx25, comp_val_idx27), max(
+        comp_val_idx25, comp_val_idx27
+    )
+    # k = 4, j = 1
+    comp_val_idx20, comp_val_idx21 = max(comp_val_idx20, comp_val_idx21), min(
+        comp_val_idx20, comp_val_idx21
+    )
+    comp_val_idx22, comp_val_idx23 = max(comp_val_idx22, comp_val_idx23), min(
+        comp_val_idx22, comp_val_idx23
+    )
+    comp_val_idx24, comp_val_idx25 = min(comp_val_idx24, comp_val_idx25), max(
+        comp_val_idx24, comp_val_idx25
+    )
+    comp_val_idx26, comp_val_idx27 = min(comp_val_idx26, comp_val_idx27), max(
+        comp_val_idx26, comp_val_idx27
+    )
+    # k = 8, j = 4
+    comp_val_idx20, comp_val_idx24 = max(comp_val_idx20, comp_val_idx24), min(
+        comp_val_idx20, comp_val_idx24
+    )
+    comp_val_idx21, comp_val_idx25 = max(comp_val_idx21, comp_val_idx25), min(
+        comp_val_idx21, comp_val_idx25
+    )
+    comp_val_idx22, comp_val_idx26 = max(comp_val_idx22, comp_val_idx26), min(
+        comp_val_idx22, comp_val_idx26
+    )
+    comp_val_idx23, comp_val_idx27 = max(comp_val_idx23, comp_val_idx27), min(
+        comp_val_idx23, comp_val_idx27
+    )
+    # k = 8, j = 2
+    comp_val_idx20, comp_val_idx22 = max(comp_val_idx20, comp_val_idx22), min(
+        comp_val_idx20, comp_val_idx22
+    )
+    comp_val_idx21, comp_val_idx23 = max(comp_val_idx21, comp_val_idx23), min(
+        comp_val_idx21, comp_val_idx23
+    )
+    comp_val_idx24, comp_val_idx26 = max(comp_val_idx24, comp_val_idx26), min(
+        comp_val_idx24, comp_val_idx26
+    )
+    comp_val_idx25, comp_val_idx27 = max(comp_val_idx25, comp_val_idx27), min(
+        comp_val_idx25, comp_val_idx27
+    )
+    # k = 8, j = 1
+    comp_val_idx20, comp_val_idx21 = max(comp_val_idx20, comp_val_idx21), min(
+        comp_val_idx20, comp_val_idx21
+    )
+    comp_val_idx22, comp_val_idx23 = max(comp_val_idx22, comp_val_idx23), min(
+        comp_val_idx22, comp_val_idx23
+    )
+    comp_val_idx24, comp_val_idx25 = max(comp_val_idx24, comp_val_idx25), min(
+        comp_val_idx24, comp_val_idx25
+    )
+    comp_val_idx26, comp_val_idx27 = max(comp_val_idx26, comp_val_idx27), min(
+        comp_val_idx26, comp_val_idx27
+    )
+
+    min_val2 = tl.full((WARP_SIZE,), neg_inf, dtype=tl.float32)
+    top_experts = tl.full((WARP_SIZE,), MAX_IDX, dtype=tl.uint32)
+    packed_max20 = tl.full((), 0, dtype=tl.uint32 if COMPACT else tl.uint64)
+    for kk in tl.static_range(0, topk):
+        update = (kk > 0) & (comp_val_idx20 == packed_max20)
+        comp_val_idx20 = tl.where(
+            update,
+            comp_val_idx21,
+            comp_val_idx20,
+        )
+        comp_val_idx21 = tl.where(
+            update,
+            comp_val_idx22,
+            comp_val_idx21,
+        )
+        comp_val_idx22 = tl.where(
+            update,
+            comp_val_idx23,
+            comp_val_idx22,
+        )
+        comp_val_idx23 = tl.where(
+            update,
+            comp_val_idx24,
+            comp_val_idx23,
+        )
+        comp_val_idx24 = tl.where(
+            update,
+            comp_val_idx25,
+            comp_val_idx24,
+        )
+        comp_val_idx25 = tl.where(
+            update,
+            comp_val_idx26,
+            comp_val_idx25,
+        )
+        comp_val_idx26 = tl.where(
+            update,
+            comp_val_idx27,
+            comp_val_idx26,
+        )
+        comp_val_idx27 = tl.where(
+            update,
+            0 if COMPACT else _pack_val_idx_fp32(min_val2, expert_idx_group7),
+            comp_val_idx27,
+        )
+        if COMPACT:
+            packed_max20 = tl.max(comp_val_idx20, 0)
+        else:
+            packed_max20 = _packed_max_uint32(comp_val_idx20, 0)
+        if COMPACT:
+            out_idx = 255 - (packed_max20 & 255).to(tl.int32)
+        else:
+            _3, out_idx = _unpack_val_idx_fp32(packed_max20)
+        top_experts = tl.where(lane == kk, out_idx, top_experts)
+
+    if COMPACT:
+        threshold = packed_max20 >> 8
+        count = (
+            ((orig0 >> 8) >= threshold).to(tl.int32)
+            + ((orig1 >> 8) >= threshold).to(tl.int32)
+            + ((orig2 >> 8) >= threshold).to(tl.int32)
+            + ((orig3 >> 8) >= threshold).to(tl.int32)
+            + ((orig4 >> 8) >= threshold).to(tl.int32)
+            + ((orig5 >> 8) >= threshold).to(tl.int32)
+            + ((orig6 >> 8) >= threshold).to(tl.int32)
+            + ((orig7 >> 8) >= threshold).to(tl.int32)
+        )
+        ambig = tl.sum(count) > topk
+    else:
+        ambig = False
+    return top_experts, ambig
+
+
+@libtuner(
+    configs=runtime.get_tuned_config("grouped_topk_register_select"),
+    use_cuda_graph=True,
+    key=["tokens", "experts", "topk", "SCORING_FUNC", "RENORMALIZE", "HAS_PADDING"],
+    strategy=["log", "default", "default", "default", "default", "default"],
+)
+@triton.jit
+def _grouped_topk_register_select_kernel(
+    scores,
+    bias,
+    weights,
+    ids,
+    padding,
+    tokens,
+    experts: tl.constexpr,
+    topk: tl.constexpr,
+    stride,
+    stride_expert,
+    stride_bias,
+    scale,
+    SCORING_FUNC: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
     HAS_PADDING: tl.constexpr,
-    USE_FAST_SIGMOID: tl.constexpr,
-    INPUT_DTYPE: tl.constexpr,
-    BLOCK_EXPERTS: tl.constexpr,
-    BLOCK_TOPK: tl.constexpr,
+    COMPACT: tl.constexpr,
+):
+    if HAS_PADDING:
+        if tl.load(padding + tl.program_id(0)):
+            _write_padding(weights, ids, tl.program_id(0), topk, 32)
+            return
+    # The compact key carries 24 order bits plus an 8-bit expert index.
+    # It only constructs a candidate set; full FP32 keys determine the result.
+    top_experts, ambig = _select_register(
+        scores,
+        bias,
+        tokens,
+        experts,
+        topk,
+        stride,
+        stride_expert,
+        stride_bias,
+        SCORING_FUNC,
+        COMPACT,
+    )
+    row = tl.program_id(0)
+    lane = tl.arange(0, 32)
+    # More than K experts in the cutoff prefix can hide a true winner.
+    # Retry the row with full-width pairs instead of dropping any FP32 bits.
+    if COMPACT and ambig:
+        top_experts, unused_ambig = _select_register(
+            scores,
+            bias,
+            tokens,
+            experts,
+            topk,
+            stride,
+            stride_expert,
+            stride_bias,
+            SCORING_FUNC,
+            False,
+        )
+    elif COMPACT:
+        # Every possible winner is present, but their coarse order may differ.
+        kk = tl.arange(0, triton.next_power_of_2(topk))
+        small = tl.gather(top_experts, kk, 0)
+        v = tl.load(
+            scores + row * stride + small * stride_expert,
+            kk < topk,
+            0.0,
+        ).to(tl.float32)
+        if SCORING_FUNC:
+            v = _sigmoid(v)
+        b = tl.load(bias + small * stride_bias, kk < topk, 0.0).to(tl.float32)
+        pp = tl.where(kk < topk, _pack_val_idx_fp32(v + b, small), 0)
+        ordered = tl.sort(pp, dim=0, descending=True)
+        sorted_values, sids = _unpack_val_idx_fp32(ordered)
+        top_experts = tl.gather(sids, tl.minimum(lane, topk - 1), 0)
+    chosen = tl.load(
+        scores + row * stride + top_experts * stride_expert,
+        lane < topk,
+        0.0,
+    ).to(tl.float32)
+    if SCORING_FUNC:
+        chosen = _sigmoid(chosen)
+    chosen = tl.where(lane < topk, chosen, 0.0)
+    if RENORMALIZE:
+        scale = scale / (tl.sum(chosen) + 1e-20)
+    tl.store(weights + row * topk + lane, chosen * scale, lane < topk)
+    tl.store(ids + row * topk + lane, top_experts, lane < topk)
+
+
+def _prune_fused_select_configs(configs, named_args, **kwargs):
+    # Large batches are throughput-bound. Cross-warp sorting costs more than
+    # the single-warp reduction; retaining it in an event-based tuning trial
+    # can also select an unstable result for these short kernels.
+    if named_args["TOKENS"] > 512:
+        return [c for c in configs if c.num_warps == 1 and not c.kwargs["USE_SORT"]]
+    return [c for c in configs if c.num_warps == 4]
+
+
+@libtuner(
+    configs=runtime.get_tuned_config("grouped_topk_fused_select"),
+    prune_configs_by={"early_config_prune": _prune_fused_select_configs},
+    use_cuda_graph=True,
+    key=[
+        "TOKENS",
+        "EXPERTS",
+        "GROUPS",
+        "KEEP",
+        "TOPK",
+        "SCORING_FUNC",
+        "RENORMALIZE",
+        "HAS_PADDING",
+    ],
+    strategy=[
+        "log",
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+        "default",
+    ],
+)
+@triton.jit
+def _grouped_topk_fused_select_kernel(
+    scores,
+    bias,
+    weights,
+    indices,
+    padding,
+    TOKENS: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    GROUPS: tl.constexpr,
+    KEEP: tl.constexpr,
+    TOPK: tl.constexpr,
+    stride_row,
+    stride_expert,
+    stride_bias,
+    scale,
+    SCORING_FUNC: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
+    USE_SORT: tl.constexpr,
+    FAST_RANK: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     if HAS_PADDING:
         if tl.load(padding + row):
-            _write_padding(out_weights, out_ids, row, topk, BLOCK_TOPK)
+            _write_padding(weights, indices, row, TOPK, triton.next_power_of_2(TOPK))
             return
-    expert = tl.arange(0, BLOCK_EXPERTS)
-    unb = tl.load(scores + row * stride_score + expert, expert < num_experts, 0.0)
-    if SCORING_FUNC == 1:
-        if USE_FAST_SIGMOID:
-            unb = _sigmoid(unb.to(tl.float32)).to(INPUT_DTYPE)
-        else:
-            unb = _legacy_sigmoid(unb, INPUT_DTYPE)
-    b = tl.load(bias + expert, expert < num_experts, 0.0).to(INPUT_DTYPE)
-    s = (unb + b).to(tl.float32)
-    s = tl.where(s == 0.0, 0.0, s)  # Signed zeros compare equal on the legacy path.
-    # Zero key for invalid lanes sorts behind every valid expert including -inf.
-    keys = tl.where(expert < num_experts, _pack_val_idx_fp32(s, expert), 0)
-    winners = tl.topk(keys, BLOCK_TOPK)
-    chosen, ids = _unpack_val_idx_fp32(winners)
-    slot = tl.arange(0, BLOCK_TOPK)
-    vals = tl.load(scores + row * stride_score + ids, slot < topk, 0.0)
-    if SCORING_FUNC == 1:
-        if USE_FAST_SIGMOID:
-            vals = _sigmoid(vals.to(tl.float32)).to(INPUT_DTYPE)
-        else:
-            vals = _legacy_sigmoid(vals, INPUT_DTYPE)
-    vals = tl.where(slot < topk, vals.to(tl.float32), 0.0)
-    scale = routed_scaling_factor
-    if RENORMALIZE:
-        scale = scale / (tl.sum(vals) + 1e-20)
-    # Old generic routing emits uniform weights when the single group is invalid.
-    group_score = tl.sum(tl.where(slot < 2, chosen, 0.0)).to(INPUT_DTYPE).to(tl.float32)
-    valid = (group_score > -float("inf")) & (group_score < float("inf"))
-    tl.store(
-        out_weights + row * topk + slot,
-        tl.where(valid, vals * scale, 1.0 / topk),
-        slot < topk,
+    GP: tl.constexpr = triton.next_power_of_2(GROUPS)
+    EP: tl.constexpr = triton.next_power_of_2(EXPERTS // GROUPS)
+    KP: tl.constexpr = triton.next_power_of_2(TOPK)
+    DT: tl.constexpr = scores.dtype.element_ty
+    group = tl.arange(0, GP)
+    lane = tl.arange(0, EP)
+    expert = group[:, None] * (EXPERTS // GROUPS) + lane[None, :]
+    valid = (group[:, None] < GROUPS) & (lane[None, :] < EXPERTS // GROUPS)
+    unbiased = tl.load(scores + row * stride_row + expert * stride_expert, valid, 0.0)
+    if FAST_RANK:
+        unbiased = unbiased.to(tl.float32)
+        if SCORING_FUNC == 1:
+            unbiased = _sigmoid(unbiased)
+        correction = tl.load(bias + expert * stride_bias, valid, 0.0).to(tl.float32)
+        ranked = unbiased + correction
+    else:
+        if SCORING_FUNC == 1:
+            unbiased = _legacy_sigmoid(unbiased, DT)
+        correction = tl.load(bias + expert * stride_bias, valid, 0.0).to(DT)
+        ranked = (unbiased + correction).to(DT).to(tl.float32)
+    ranked = tl.where(valid, ranked, -float("inf"))
+    if not FAST_RANK:
+        # tl.max on the original generic route ignores NaNs. Packed integer
+        # keys must exclude them explicitly before ranking.
+        ranked = tl.where(ranked == ranked, ranked, -float("inf"))
+
+    # Two reductions over values plus the deterministic removal of one maximum.
+    # There is no global group-score or expert-score workspace.
+    maximum = tl.max(ranked, 1)
+    first = tl.min(tl.where(ranked == maximum[:, None], lane[None, :], 0x7FFFFFFF), 1)
+    second = tl.max(tl.where(lane[None, :] == first[:, None], -float("inf"), ranked), 1)
+    group_scores = maximum + second
+    if not FAST_RANK:
+        group_scores = group_scores.to(DT).to(tl.float32)
+    if not FAST_RANK:
+        group_scores = tl.where(
+            (group_scores == group_scores) & (group_scores != float("inf")),
+            group_scores,
+            -float("inf"),
+        )
+    proceed = tl.max(group_scores) != -float("inf")
+    if not FAST_RANK:
+        group_scores = tl.where(group_scores == 0.0, 0.0, group_scores)
+    group_keys = tl.where(group < GROUPS, _pack_val_idx_fp32(group_scores, group), 0)
+    if triton.next_power_of_2(KEEP) == KEEP:
+        threshold = tl.min(tl.topk(group_keys, KEEP))
+    else:
+        remaining = group_keys
+        for _ in tl.static_range(KEEP):
+            threshold = tl.max(remaining)
+            remaining = tl.where(remaining == threshold, 0, remaining)
+    enabled = (group_keys >= threshold) & (group < GROUPS)
+    ranked = tl.where(enabled[:, None], ranked, -float("inf"))
+    # The generic route compares signed zeros as equal, then uses the index.
+    if not FAST_RANK:
+        ranked = tl.where(ranked == 0.0, 0.0, ranked)
+
+    if DT == tl.float32 or FAST_RANK:
+        candidates = _pack_val_idx_fp32(ranked, expert)
+    else:
+        # DeepSelect's narrow pair format is exact here: ranking was rounded
+        # to the input dtype before selection. FP32 bias is never narrowed on
+        # the separate fast routing path.
+        bits = ranked.to(DT).to(tl.uint16, bitcast=True).to(tl.uint32)
+        ordered = bits ^ tl.where((bits & 0x8000) != 0, 0xFFFF, 0x8000)
+        candidates = (ordered << 16) | (0xFFFF - expert).to(tl.uint32)
+    candidates = tl.reshape(tl.where(valid, candidates, 0), (GP * EP,))
+    slot = tl.arange(0, KP)
+    if USE_SORT:
+        winners = tl.topk(candidates, KP)
+    else:
+        winners = tl.full((KP,), 0, candidates.dtype)
+        for k in tl.static_range(TOPK):
+            best = tl.max(candidates)
+            winners = tl.where(slot == k, best, winners)
+            candidates = tl.where(candidates == best, 0, candidates)
+    selected = (0xFFFF - (winners & 0xFFFF)).to(tl.int32)
+    values = tl.load(
+        scores + row * stride_row + selected * stride_expert, slot < TOPK, 0.0
     )
-    tl.store(out_ids + row * topk + slot, tl.where(valid, ids, slot), slot < topk)
+    if SCORING_FUNC == 1:
+        if FAST_RANK:
+            values = _sigmoid(values.to(tl.float32))
+        else:
+            values = _legacy_sigmoid(values, DT)
+    values = tl.where(slot < TOPK, values.to(tl.float32), 0.0)
+    if RENORMALIZE:
+        scale = scale / (tl.sum(values) + 1e-20)
+    if FAST_RANK:
+        proceed = True
+    tl.store(
+        weights + row * TOPK + slot,
+        tl.where(proceed, values * scale, 1.0 / TOPK),
+        slot < TOPK,
+    )
+    tl.store(
+        indices + row * TOPK + slot, tl.where(proceed, selected, slot), slot < TOPK
+    )
 
 
 def _validate_padding(scores, bias, is_padding, n_group, topk_group, topk):
@@ -1176,6 +1731,48 @@ def grouped_topk(
         & (topk <= 8)
         & (topk_group <= 4)
     )
+    if num_tokens == 0:
+        shape = (0, topk)
+        return (
+            torch.empty(shape, device=scores.device, dtype=torch.float32),
+            torch.empty(shape, device=scores.device, dtype=torch.int32),
+        )
+    if (
+        runtime.device.vendor_name == "nvidia"
+        and (
+            not (is_single_group or is_multi_group)
+            or (is_multi_group and (scores.stride(1) != 1 or bias.stride(0) != 1))
+        )
+        and 2 <= num_experts_per_group
+        and num_experts <= 1024
+        and 1 <= topk_group <= n_group
+        and 1 <= topk <= min(32, num_experts_per_group * topk_group)
+    ):
+        shape = (num_tokens, topk)
+        values = torch.empty(shape, device=scores.device, dtype=torch.float32)
+        indices = torch.empty(shape, device=scores.device, dtype=torch.int32)
+        _grouped_topk_fused_select_kernel[(num_tokens,)](
+            scores,
+            bias,
+            values,
+            indices,
+            is_padding,
+            num_tokens,
+            num_experts,
+            n_group,
+            topk_group,
+            topk,
+            scores.stride(0),
+            scores.stride(1),
+            bias.stride(0),
+            routed_scaling_factor,
+            SCORING_FUNC=scoring_func,
+            RENORMALIZE=renormalize,
+            HAS_PADDING=has_padding,
+            FAST_RANK=is_single_group or is_multi_group,
+        )
+        return values, indices
+
     if has_padding and (num_tokens == 0 or (n_group == 1 and not is_single_group)):
         shape = (num_tokens, topk)
         topk_values = torch.empty(shape, device=scores.device, dtype=torch.float32)
@@ -1205,18 +1802,15 @@ def grouped_topk(
         return topk_values, topk_indices
 
     if is_single_group and runtime.device.vendor_name == "nvidia":
-        topk_values = torch.empty(
-            (num_tokens, topk), device=scores.device, dtype=torch.float32
-        )
-        topk_indices = torch.empty(
-            (num_tokens, topk), device=scores.device, dtype=torch.int32
-        )
-        if num_tokens:
+        shape = (num_tokens, topk)
+        values = torch.empty(shape, device=scores.device, dtype=torch.float32)
+        indices = torch.empty(shape, device=scores.device, dtype=torch.int32)
+        if num_tokens < 1024 and scores.stride(1) == 1 and bias.stride(0) == 1:
             _grouped_topk_single_register_kernel[(num_tokens,)](
                 scores,
                 bias,
-                topk_values,
-                topk_indices,
+                values,
+                indices,
                 num_tokens,
                 num_experts,
                 topk,
@@ -1226,10 +1820,26 @@ def grouped_topk(
                 RENORMALIZE=renormalize,
                 padding=is_padding,
                 HAS_PADDING=has_padding,
-                num_warps=1,
-                num_stages=3,
             )
-        return topk_values, topk_indices
+        else:
+            _grouped_topk_register_select_kernel[(num_tokens,)](
+                scores,
+                bias,
+                values,
+                indices,
+                is_padding,
+                num_tokens,
+                num_experts,
+                topk,
+                scores.stride(0),
+                scores.stride(1),
+                bias.stride(0),
+                routed_scaling_factor,
+                SCORING_FUNC=scoring_func,
+                RENORMALIZE=renormalize,
+                HAS_PADDING=has_padding,
+            )
+        return values, indices
 
     if is_single_group | is_multi_group:
         topk_values = torch.empty(
@@ -1290,8 +1900,6 @@ def grouped_topk(
 
         return topk_values, topk_indices
 
-    # Fuse the legacy same-dtype sigmoid into the two routing kernels instead
-    # of materializing four eager pointwise results for the entire score matrix.
     scores_processed = scores
 
     group_scores = torch.empty(
@@ -1322,6 +1930,7 @@ def grouped_topk(
         num_experts_per_group,
         n_group,
         scores_processed.stride(0),
+        scores_processed.stride(1),
         group_scores.stride(0),
         BLOCK_SIZE=BLOCK1,
         INPUT_DTYPE=INPUT_DTYPE,
@@ -1348,6 +1957,7 @@ def grouped_topk(
         num_experts_per_group,
         routed_scaling_factor,
         scores_processed.stride(0),
+        scores_processed.stride(1),
         group_scores.stride(0),
         topk_values.stride(0),
         N_GROUP=n_group,
