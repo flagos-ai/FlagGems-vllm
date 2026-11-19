@@ -66,13 +66,19 @@ def sparse_int8_attention(
     BN: tl.constexpr,
     BK: tl.constexpr,
     HeadMajor: tl.constexpr,
+    VSlice: tl.constexpr,
 ):
     head_tile, row, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    tl.static_assert(not HeadMajor or not Rope)
+    if VSlice == 256:
+        tl.static_assert(Splits == 1)
+        value_offset = split * 256
+        split = 0
+    else:
+        value_offset = 0
     heads = head_tile * BH + tl.arange(0, BH)
     lanes = tl.arange(0, BN)
     dims = tl.arange(0, BK)
-    vd = tl.arange(0, 128)
+    vd = value_offset + tl.arange(0, 128)
     query_row = row * H + heads
     query_scale = tl.load(QScale + query_row) * (Scale * 1.4426950408889634)
     if Rope:
@@ -86,8 +92,9 @@ def sparse_int8_attention(
     TokenAxis: tl.constexpr = 1 if HeadMajor else 0
     acc0 = tl.full(AccShape, 0.0, tl.float32)
     acc1 = tl.full(AccShape, 0.0, tl.float32)
-    acc2 = tl.full(AccShape, 0.0, tl.float32)
-    acc3 = tl.full(AccShape, 0.0, tl.float32)
+    if VSlice == 512:
+        acc2 = tl.full(AccShape, 0.0, tl.float32)
+        acc3 = tl.full(AccShape, 0.0, tl.float32)
     begin = split * SplitTiles * BN
     end = tl.minimum(begin + SplitTiles * BN, length)
     for start in range(begin, end, BN):
@@ -115,7 +122,10 @@ def sparse_int8_attention(
                 valid[:, None],
                 0,
             )
-            score += tl.dot(kr, tl.trans(qr), out_dtype=tl.float32)
+            if HeadMajor:
+                score += tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
+            else:
+                score += tl.dot(kr, tl.trans(qr), out_dtype=tl.float32)
         ks = tl.load(KScale + token, valid, 0.0)
         if HeadMajor:
             score *= ks[None, :] * query_scale[:, None]
@@ -144,18 +154,36 @@ def sparse_int8_attention(
         high_raw = (quant + 64) >> 7
         high = high_raw.to(tl.int8)
         low = (quant - (high_raw << 7)).to(tl.int8)
+        value_base = kv_base + value_offset
         acc0 = sparse_int8_pv(
-            kv_base, valid, high, low, correction, weight_scale, acc0, 0, HeadMajor
+            value_base, valid, high, low, correction, weight_scale, acc0, 0, HeadMajor
         )
         acc1 = sparse_int8_pv(
-            kv_base, valid, high, low, correction, weight_scale, acc1, 128, HeadMajor
+            value_base, valid, high, low, correction, weight_scale, acc1, 128, HeadMajor
         )
-        acc2 = sparse_int8_pv(
-            kv_base, valid, high, low, correction, weight_scale, acc2, 256, HeadMajor
-        )
-        acc3 = sparse_int8_pv(
-            kv_base, valid, high, low, correction, weight_scale, acc3, 384, HeadMajor
-        )
+        if VSlice == 512:
+            acc2 = sparse_int8_pv(
+                value_base,
+                valid,
+                high,
+                low,
+                correction,
+                weight_scale,
+                acc2,
+                256,
+                HeadMajor,
+            )
+            acc3 = sparse_int8_pv(
+                value_base,
+                valid,
+                high,
+                low,
+                correction,
+                weight_scale,
+                acc3,
+                384,
+                HeadMajor,
+            )
         maximum = next_maximum
 
     maximum *= 0.6931471805599453
@@ -173,9 +201,11 @@ def sparse_int8_attention(
             inv = inv[None, :]
         tl.store(ptr, acc0 * inv)
         tl.store(ptr + 128, acc1 * inv)
-        tl.store(ptr + 256, acc2 * inv)
-        tl.store(ptr + 384, acc3 * inv)
-        tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, logsum)
+        if VSlice == 512:
+            tl.store(ptr + 256, acc2 * inv)
+            tl.store(ptr + 384, acc3 * inv)
+        if value_offset == 0:
+            tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, logsum)
     else:
         partial_row = (row * Splits + split) * H + heads
         if HeadMajor:
@@ -307,9 +337,16 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
         return lambda: (output, lse)
 
     bh = min(heads, 32)
+    v_slice = 512
     small_decode = rows <= 32 and heads == 64 and not rope and topk > 128
     head_major = heads == 64 and not rope and (small_decode or rows > 256)
-    if small_decode:
+    if rope and rows >= 1024 and heads >= 64 and topk == 2048:
+        # Recompute QK per value slice and share each gathered key across
+        # 64 heads. Large prefill batches have enough CTAs without TopK splits.
+        bh, bn, bk, warps = 64, 64, 256, 4
+        head_major = True
+        v_slice = 256
+    elif small_decode:
         bn, bk, warps = 64, 256 if topk <= 1024 else 128, 4
     elif head_major and topk > 1024:
         # Large batches have enough CTAs without splitting. Wider KV tiles
@@ -340,7 +377,7 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
 
     # Keep head tiles for the same sparse indices adjacent in the grid.
     run_attention = partial(
-        sparse_int8_attention[(heads // bh, rows, splits)],
+        sparse_int8_attention[(heads // bh, rows, splits * (512 // v_slice))],
         q_nope,
         q_rope,
         k_cache_lora,
@@ -368,6 +405,7 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
         bn,
         bk,
         head_major,
+        v_slice,
         num_warps=warps,
         num_stages=1,
     )
