@@ -18,18 +18,15 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
-from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
 
-try:
+_USE_TLE_LOAD = (
+    runtime.device.vendor_name == "nvidia"
+    and has_triton_tle_attrs(("load",), 3, 6, 0)
+)
+if _USE_TLE_LOAD:
     import triton.experimental.tle.language as tle
 
-    HAS_TLE = hasattr(tle, "load")
-except ImportError:  # pragma: no cover - depends on the Triton distribution
-    tle = None
-    HAS_TLE = False
-
-
-if HAS_TLE:
 
     @triton.jit
     def _bad_words_load(ptr, mask=None, other=None):
