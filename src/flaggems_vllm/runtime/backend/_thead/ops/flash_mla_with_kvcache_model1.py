@@ -14,12 +14,12 @@
 
 """MODEL1 sparse decode with an FP8 KV cache for T-Head PPU (FlagTree TLE).
 
-Three kernels: ``_schedule`` lays every request's 64-token tiles (main topk
-tiles, then extra tiles) end to end and splits them over PARTS partitions;
-``_attention`` runs one partition per program, keeping an online softmax over
-the 64 heads; ``_combine`` merges requests that span several partitions and
-applies the attention sink. The schedule is computed on the first call with a
-given FlashMLASchedMeta and reused by later calls with the same object.
+Two kernels, over the shared ``combine``: ``_schedule`` lays every request's
+64-token tiles (main topk tiles, then extra tiles) end to end and splits them
+over PARTS partitions, and ``_attention`` runs one partition per program,
+keeping an online softmax over the 64 heads. The schedule is computed on the
+first call with a given FlashMLASchedMeta and reused by later calls with the
+same object, which holds the lengths in topk_length fixed (see the host code).
 
 KV cache layout (MODEL1 FP8): per page, ``page_size`` tokens of 576 bytes
 (448 e4m3 NoPE values, then 64 BF16 RoPE values), followed by 8 bytes per
@@ -30,24 +30,25 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-HEADS = tl.constexpr(64)
-HEAD_DIM = tl.constexpr(512)
+from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_common import (
+    BLOCK_N,
+    COMBINE_HEADS,
+    COMBINE_WARPS,
+    HEAD_DIM,
+    HEADS,
+    LN2,
+    LOG2E,
+    PARTS,
+    combine,
+    sink_factor,
+)
+
 NOPE_DIM = tl.constexpr(448)
 TOKEN_BYTES = tl.constexpr(576)
 SCALE_BYTES = tl.constexpr(8)
-BLOCK_N = tl.constexpr(64)
-LN2 = tl.constexpr(0.6931471805599453)
-LOG2E = 1.4426950408889634
-# Partitions (one program each). On the 810E, a sweep over 16..128 puts the
-# best at 20 (or 40).
-PARTS = 20
 # Cost of starting a request, in tiles, when balancing partitions: a partition
 # that also starts a request (Q load, first tile, final write) gets fewer tiles.
 SCHEDULE_OVERHEAD = 5
-# _combine: heads per program and warps; one head per program parallelizes
-# best when a few long requests are spread over all partitions.
-COMBINE_HEADS = 1
-COMBINE_WARPS = 4
 
 
 @triton.jit
@@ -253,15 +254,6 @@ def _dequant(raw, rope, scales):
 
 
 @triton.jit
-def _sink_factor(sink, h, lse):
-    """exp(lse) / (exp(lse) + exp(sink)), including sink = +-inf and lse = +inf."""
-    sink_value = tl.load(sink + h)
-    return tl.where(
-        sink_value == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink_value - lse))
-    )
-
-
-@triton.jit
 def _attention(
     q,
     cache,
@@ -427,67 +419,13 @@ def _attention(
             # The whole request is here: write the final output.
             natural = tl.where(nonempty, log2_sum * LN2, float("inf"))
             if HAS_SINK:
-                result *= _sink_factor(sink, h, natural)[:, None]
+                result *= sink_factor(sink, h, natural)[:, None]
             tl.store(out + b * HEADS * HEAD_DIM + rows, result.to(tl.bfloat16))
             tl.store(lse + b * HEADS + h, natural)
         else:
             split = tl.load(split_prefix + b) + tl.where(b == first, first_split, 0)
             tl.store(partial + split * HEADS * HEAD_DIM + rows, result)
             tl.store(partial_lse + split * HEADS + h, log2_sum)
-
-
-@triton.jit
-def _combine(
-    partial,
-    partial_lse,
-    split_prefix,
-    sink,
-    out,
-    lse,
-    HAS_SINK: tl.constexpr,
-    GROUP: tl.constexpr,
-):
-    """Merge a request's splits (GROUP heads per program), then apply the sink."""
-    b = tl.program_id(0)
-    first = tl.load(split_prefix + b)
-    end = tl.load(split_prefix + b + 1)
-    if end - first > 1:
-        h = tl.program_id(1) * GROUP + tl.arange(0, GROUP)
-        rows = h[:, None] * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
-        maximum = tl.full((GROUP,), float("-inf"), tl.float32)
-        denominator = tl.zeros((GROUP,), tl.float32)
-        result = tl.zeros((GROUP, HEAD_DIM), tl.float32)
-        for split in range(first, end):
-            value = tl.load(partial_lse + split * HEADS + h)
-            new_maximum = tl.maximum(maximum, value)
-            safe = tl.where(new_maximum == float("-inf"), 0.0, new_maximum)
-            alpha = tl.exp2(maximum - safe)
-            weight = tl.exp2(value - safe)
-            result = (
-                result * alpha[:, None]
-                + tl.load(partial + split * HEADS * HEAD_DIM + rows) * weight[:, None]
-            )
-            denominator = denominator * alpha + weight
-            maximum = new_maximum
-        valid = denominator > 0
-        natural = tl.where(valid, (tl.log2(denominator) + maximum) * LN2, float("inf"))
-        factor = tl.where(valid, 1.0 / denominator, 0.0)
-        if HAS_SINK:
-            factor *= _sink_factor(sink, h, natural)
-        tl.store(
-            out + b * HEADS * HEAD_DIM + rows,
-            (result * factor[:, None]).to(tl.bfloat16),
-        )
-        tl.store(lse + b * HEADS + h, natural)
-
-
-def _is_thead_device():
-    try:
-        from flaggems_vllm import runtime
-
-        return runtime.device.vendor_name == "thead"
-    except Exception:
-        return False
 
 
 def _cache_supported(cache):
@@ -513,9 +451,8 @@ def can_use_model1_thead(
     topk_length=None,
     extra_topk_length=None,
 ):
-    """Whether this path can serve the call; callers fall back if not."""
-    if not _is_thead_device():
-        return False
+    """Whether this path can serve the call, the device aside (the dispatcher
+    in flash_mla_with_kvcache.py checks that); callers fall back if not."""
     if (
         q.dtype != torch.bfloat16
         or q.ndim != 4
@@ -531,11 +468,15 @@ def can_use_model1_thead(
         return False
     if topk_length is None or not _cache_supported(kv):
         return False
-    if out is not None and (
-        out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous()
+    # Both are written by the kernel, so neither may be missing.
+    if (
+        out is None
+        or out.shape != q.shape
+        or out.dtype != q.dtype
+        or not out.is_contiguous()
     ):
         return False
-    if lse is not None and (lse.dtype != torch.float32 or not lse.is_contiguous()):
+    if lse is None or lse.dtype != torch.float32 or not lse.is_contiguous():
         return False
     if extra_kv is not None:
         if (
@@ -567,13 +508,23 @@ def sparse_decode_model1_thead(
     sched_meta=None,
 ):
     """Writes out [B, 1, 64, 512] and lse [B, 64, 1]. The tile schedule is kept
-    in sched_meta.tile_scheduler_metadata / num_splits and reused while set."""
+    in sched_meta.tile_scheduler_metadata / num_splits and reused while set,
+    which assumes the lengths in topk_length have not changed since."""
     batch = q.shape[0]
     has_extra = extra_kv is not None
     kv = kv.view(torch.uint8)
     extra_cache = extra_kv.view(torch.uint8) if has_extra else kv
     extra_indices = extra_indices if has_extra else indices
     extra_lengths = extra_topk_length if has_extra else topk_length
+    # The schedule balances tiles over partitions by the lengths in
+    # topk_length, so it holds for exactly the lengths it was computed from. It
+    # is computed on the first call with a given sched_meta and reused after
+    # that, which is the interface's own contract: the vendor API computes this
+    # metadata from cache_seqlens in get_mla_metadata, and vLLM calls that once
+    # per forward step and passes the result to every layer. Reusing one
+    # sched_meta across steps whose lengths changed is a caller error here as
+    # it is there -- a single-program scan over the batch, it costs 6 us at
+    # batch 1 and 87 us at batch 512 to redo, so it is not redone defensively.
     if sched_meta is not None and sched_meta.tile_scheduler_metadata is not None:
         metadata, split_prefix = (
             sched_meta.tile_scheduler_metadata,
@@ -631,7 +582,7 @@ def sparse_decode_model1_thead(
         attn_sink is not None,
         num_warps=16,
     )
-    _combine[(batch, 64 // COMBINE_HEADS)](
+    combine[(batch, 64 // COMBINE_HEADS)](
         partial,
         partial_lse,
         split_prefix,

@@ -14,12 +14,11 @@
 
 """V32 sparse decode with an FP8 KV cache for T-Head PPU (FlagTree TLE).
 
-Three kernels: ``_schedule`` lays every request's 64-token tiles end to end and
-splits them over PARTS partitions; ``_attention`` runs one partition per
-program, keeping an online softmax over the 64 heads; ``_combine`` merges
-requests that span several partitions and applies the attention sink. The
-schedule is computed on the first call with a given FlashMLASchedMeta and
-reused by later calls with the same object.
+Two kernels, over the shared ``combine``: ``_schedule`` lays every request's
+64-token tiles end to end and splits them over PARTS partitions, and
+``_attention`` runs one partition per program, keeping an online softmax over
+the 64 heads. The schedule is computed on the first call with a given
+FlashMLASchedMeta and reused by later calls with the same object.
 
 KV cache layout (V32 FP8), per token 656 bytes:
 
@@ -36,7 +35,18 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-HEADS = tl.constexpr(64)
+from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_common import (
+    BLOCK_N,
+    COMBINE_HEADS,
+    COMBINE_WARPS,
+    HEADS,
+    LN2,
+    LOG2E,
+    PARTS,
+    combine,
+    sink_factor,
+)
+
 NOPE_DIM = tl.constexpr(512)  # d_v as well: V is the NoPE block
 ROPE_DIM = tl.constexpr(64)
 TOKEN_BYTES = tl.constexpr(656)
@@ -44,20 +54,6 @@ SCALE_OFFSET = tl.constexpr(512)
 SCALE_TILES = tl.constexpr(4)  # one float32 scale per 128 NoPE dims
 SCALE_TILE = tl.constexpr(128)
 ROPE_OFFSET = tl.constexpr(528)
-# KV tokens per tile. A 128-token tile halves the per-tile fixed costs but only
-# fits with Q in registers instead of a shared tile, and measures slower both
-# ways; 32 needs twice the tiles for the same work and measures twice as slow.
-BLOCK_N = tl.constexpr(64)
-LN2 = tl.constexpr(0.6931471805599453)
-LOG2E = 1.4426950408889634
-# Partitions (one program each). On the 810E this dominates every other tuning
-# knob: a sweep of 8..128 is good at 20, 40 and 80 and markedly worse at 16,
-# 24, 32 and 64, with 20 the best at every batch; below 20 the time scales as
-# 1/PARTS. A high-water counter added to _attention for the measurement showed
-# the device keeping exactly 20 of its programs resident, and the same 20
-# whatever PARTS, the warp count and the shared-memory footprint were.
-# Re-measure it if the schedule, the tile size or that footprint changes.
-PARTS = 20
 # Cost of starting a request, in tiles, when balancing partitions: a partition
 # that also starts a request (Q load, first tile, final write) gets fewer
 # tiles. One tile measures best at every batch; with 20 partitions each
@@ -65,10 +61,6 @@ PARTS = 20
 # correct. It has to stay at least 1 for the no-split argument in
 # sparse_decode_v32_thead to hold.
 SCHEDULE_OVERHEAD = 1
-# _combine: heads per program and warps; one head per program parallelizes
-# best when a few long requests are spread over all partitions.
-COMBINE_HEADS = 1
-COMBINE_WARPS = 4
 
 
 @triton.jit
@@ -159,43 +151,50 @@ def _tile_bytes(token, valid, cache, page_stride, PAGE_SHIFT: tl.constexpr):
 
 
 @triton.jit
+def _spread(value):
+    """One value per 128-wide scale group to one per NoPE column, as BF16."""
+    return tl.reshape(
+        tl.broadcast_to(
+            value.to(tl.bfloat16)[:, :, None], (BLOCK_N, SCALE_TILES, SCALE_TILE)
+        ),
+        (BLOCK_N, NOPE_DIM),
+    )
+
+
+@triton.jit
 def _dequant(raw, scales):
     """[64, 512] BF16 NoPE tile: e4m3 values times their 128-wide group's scale.
 
-    The producer rounds every scale to a power of two (ue8m0), so BF16 holds it
-    exactly and the exponent arithmetic below is lossless.
+    Each scale is split into its power of two, which the exponent arithmetic
+    below carries for nothing, and its significand in [1, 2), which needs a
+    real multiply, which a ue8m0 scale -- rounded to a power of two, what
+    indexer_k_quant_and_cache writes with scale_fmt="ue8m0" -- leaves at 1 but
+    still pays for. Skipping it on a data-dependent branch does not compile
+    (make_ttgir rejects the loop), and the interface says nothing about the
+    format, so every tile pays: 3.5% of the call.
     """
+    bits = scales.to(tl.uint32, bitcast=True)
+    pow2 = (bits & 0xFF800000).to(tl.float32, bitcast=True)
+    significand = ((bits & 0x007FFFFF) | 0x3F800000).to(tl.float32, bitcast=True)
     # An e4m3 byte is s.eeee.mmm, and BF16 wants the exponent at bits 14..7 and
     # the mantissa at 6..0, so *both* fields move left by exactly 4: masking
     # bits 6..0 and shifting once places them together. Adding the BF16 pattern
-    # of the scale then raises the exponent by (scale's exponent + 120), which
-    # is the 120 bias e4m3 needs and the multiplication by the scale at once --
-    # hence scale * 2**-7 below, 127 - 7 being the bias difference.
-    biased = tl.reshape(
-        tl.broadcast_to(
-            (scales * 0.0078125).to(tl.bfloat16)[:, :, None],
-            (BLOCK_N, SCALE_TILES, SCALE_TILE),
-        ),
-        (BLOCK_N, NOPE_DIM),
-    )
+    # of the power of two then raises the exponent by (its exponent + 120),
+    # which is the 120 bias e4m3 needs and the scaling by it at once -- hence
+    # pow2 * 2**-7 below, 127 - 7 being the bias difference.
+    biased = _spread(pow2 * 0.0078125)
     # A subnormal comes out of that as 2**-7 * (1 + m/8) where it should be
     # 2**-6 * m/8, and the second is exactly twice the first less 2**-6, so
     # min(2x - 2**-6, x) picks the right one either way: for a normal value
-    # 2x - 2**-6 is above x, for a subnormal below it. The bound is scaled the
-    # same way as the values.
-    epsilon = tl.reshape(
-        tl.broadcast_to(
-            (scales * -0.015625).to(tl.bfloat16)[:, :, None],
-            (BLOCK_N, SCALE_TILES, SCALE_TILE),
-        ),
-        (BLOCK_N, NOPE_DIM),
-    )
+    # 2x - 2**-6 is above x, for a subnormal below it. The bound is scaled like
+    # the values.
+    epsilon = _spread(pow2 * -0.015625)
     # The backend's own e4m3 conversion is a long software sequence on this
     # target (capability 8.0), and the e4m3x2 cvt instruction is rejected on
     # ppu1.0. All four values of a pack share one scale, so $3 and $5 serve
     # both halves. x ends up holding the pack's bytes 0 and 2 and y bytes 1 and
     # 3, so the two permutes at the end restore the column order.
-    return tl.inline_asm_elementwise(
+    tile = tl.inline_asm_elementwise(
         """{
         .reg .b32 t0, t1, x, y, s0, s1, two, t;
         ppu.mov.b32 two, 0x40004000;
@@ -223,15 +222,7 @@ def _dequant(raw, scales):
         is_pure=True,
         pack=4,
     )
-
-
-@triton.jit
-def _sink_factor(sink, h, lse):
-    """exp(lse) / (exp(lse) + exp(sink)), including sink = +-inf and lse = +inf."""
-    sink_value = tl.load(sink + h)
-    return tl.where(
-        sink_value == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink_value - lse))
-    )
+    return tile * _spread(significand)
 
 
 @triton.jit
@@ -413,7 +404,7 @@ def _attention(
             # 4% less than staging it through the KV tile by hand.
             natural = tl.where(nonempty, log2_sum * LN2, float("inf"))
             if HAS_SINK:
-                result *= _sink_factor(sink, h, natural)[:, None]
+                result *= sink_factor(sink, h, natural)[:, None]
             tl.store(out + b * HEADS * NOPE_DIM + rows, result.to(tl.bfloat16))
             tl.store(lse + b * HEADS + h, natural)
         elif not WHOLE_REQUESTS:
@@ -422,64 +413,9 @@ def _attention(
             tl.store(partial_lse + split * HEADS + h, log2_sum)
 
 
-@triton.jit
-def _combine(
-    partial,
-    partial_lse,
-    split_prefix,
-    sink,
-    out,
-    lse,
-    HAS_SINK: tl.constexpr,
-    GROUP: tl.constexpr,
-):
-    """Merge a request's splits (GROUP heads per program), then apply the sink."""
-    b = tl.program_id(0)
-    first = tl.load(split_prefix + b)
-    end = tl.load(split_prefix + b + 1)
-    if end - first > 1:
-        h = tl.program_id(1) * GROUP + tl.arange(0, GROUP)
-        rows = h[:, None] * NOPE_DIM + tl.arange(0, NOPE_DIM)[None, :]
-        maximum = tl.full((GROUP,), float("-inf"), tl.float32)
-        denominator = tl.zeros((GROUP,), tl.float32)
-        result = tl.zeros((GROUP, NOPE_DIM), tl.float32)
-        for split in range(first, end):
-            value = tl.load(partial_lse + split * HEADS + h)
-            new_maximum = tl.maximum(maximum, value)
-            safe = tl.where(new_maximum == float("-inf"), 0.0, new_maximum)
-            alpha = tl.exp2(maximum - safe)
-            weight = tl.exp2(value - safe)
-            result = (
-                result * alpha[:, None]
-                + tl.load(partial + split * HEADS * NOPE_DIM + rows) * weight[:, None]
-            )
-            denominator = denominator * alpha + weight
-            maximum = new_maximum
-        valid = denominator > 0
-        natural = tl.where(valid, (tl.log2(denominator) + maximum) * LN2, float("inf"))
-        factor = tl.where(valid, 1.0 / denominator, 0.0)
-        if HAS_SINK:
-            factor *= _sink_factor(sink, h, natural)
-        tl.store(
-            out + b * HEADS * NOPE_DIM + rows,
-            (result * factor[:, None]).to(tl.bfloat16),
-        )
-        tl.store(lse + b * HEADS + h, natural)
-
-
-def _is_thead_device():
-    try:
-        from flaggems_vllm import runtime
-
-        return runtime.device.vendor_name == "thead"
-    except Exception:
-        return False
-
-
 def can_use_v32_thead(q, kv, indices, out, lse, topk_length=None):
-    """Whether this path can serve the call; callers fall back if not."""
-    if not _is_thead_device():
-        return False
+    """Whether this path can serve the call, the device aside (the dispatcher
+    in flash_mla_with_kvcache.py checks that); callers fall back if not."""
     if (
         q.dtype != torch.bfloat16
         or q.ndim != 4
@@ -505,13 +441,16 @@ def can_use_v32_thead(q, kv, indices, out, lse, topk_length=None):
         or kv.stride(1) != 656
     ):
         return False
-    if out is not None and (
-        out.shape != q.shape[:-1] + (NOPE_DIM.value,)
+    # Both are written by the kernel, and the no-split path uses lse for the
+    # partial buffers it does not allocate, so neither may be missing.
+    if (
+        out is None
+        or out.shape != q.shape[:-1] + (NOPE_DIM.value,)
         or out.dtype != q.dtype
         or not out.is_contiguous()
     ):
         return False
-    if lse is not None and (lse.dtype != torch.float32 or not lse.is_contiguous()):
+    if lse is None or lse.dtype != torch.float32 or not lse.is_contiguous():
         return False
     return True
 
@@ -519,8 +458,13 @@ def can_use_v32_thead(q, kv, indices, out, lse, topk_length=None):
 def sparse_decode_v32_thead(
     q, kv, indices, *, attn_sink, out, lse, sm_scale, sched_meta=None
 ):
-    """Writes out [B, 1, 64, 512] and lse [B, 64, 1]. The tile schedule is kept
-    in sched_meta.tile_scheduler_metadata / num_splits and reused while set."""
+    """Writes out [B, 1, 64, 512] and lse [B, 64, 1].
+
+    The tile schedule is kept in sched_meta.tile_scheduler_metadata /
+    num_splits and reused while set, which is sound here because without
+    topk_length it is a function of the batch size and topk alone -- both of
+    them pinned for the life of a sched_meta by its Config.
+    """
     batch = q.shape[0]
     topk = indices.shape[-1]
     tiles = topk // BLOCK_N.value
@@ -553,14 +497,22 @@ def sparse_decode_v32_thead(
     # divides batch that is exactly batch / PARTS whole requests with OVERHEAD
     # units to spare, and starting one more needs OVERHEAD + 1, so no request
     # is ever split. Worth telling the kernel: the partial write-back and its
-    # split_prefix load compile away, and _combine, whose programs would each
+    # split_prefix load compile away, and combine, whose programs would each
     # load a split count and return, need not be launched at all.
     whole_requests = batch % PARTS == 0
-    # Every partition adds at most one split beyond one per request.
-    partial = torch.empty(
-        (batch + PARTS, 64, 512), dtype=torch.float32, device=q.device
-    )
-    partial_lse = torch.empty((batch + PARTS, 64), dtype=torch.float32, device=q.device)
+    if whole_requests:
+        # Nothing is written to the partial buffers and nothing reads them, so
+        # they are not allocated at all; the kernel still needs two float32
+        # pointers for the arguments it compiles away, and lse serves as both.
+        partial = partial_lse = lse
+    else:
+        # Every partition adds at most one split beyond one per request.
+        partial = torch.empty(
+            (batch + PARTS, 64, 512), dtype=torch.float32, device=q.device
+        )
+        partial_lse = torch.empty(
+            (batch + PARTS, 64), dtype=torch.float32, device=q.device
+        )
     sink = attn_sink if attn_sink is not None else lse
     _attention[(PARTS,)](
         q,
@@ -584,7 +536,7 @@ def sparse_decode_v32_thead(
         num_warps=16,
     )
     if not whole_requests:
-        _combine[(batch, 64 // COMBINE_HEADS)](
+        combine[(batch, 64 // COMBINE_HEADS)](
             partial,
             partial_lse,
             split_prefix,

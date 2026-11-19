@@ -50,28 +50,19 @@ if HAS_TLE:
         HAS_TLE_MODEL1 = True
     except ImportError:
         HAS_TLE_MODEL1 = False
-    try:
-        from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_model1 import (
-            can_use_model1_thead,
-            sparse_decode_model1_thead,
-        )
-
-        HAS_TLE_MODEL1_THEAD = True
-    except ImportError:
-        HAS_TLE_MODEL1_THEAD = False
-    try:
-        from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_v32 import (
-            can_use_v32_thead,
-            sparse_decode_v32_thead,
-        )
-
-        HAS_TLE_V32_THEAD = True
-    except ImportError:
-        HAS_TLE_V32_THEAD = False
 else:
     HAS_TLE_MODEL1 = False
-    HAS_TLE_MODEL1_THEAD = False
-    HAS_TLE_V32_THEAD = False
+
+# Its own entry asks TLE whether this backend has the primitives it uses, so it
+# is not gated on the barriers the warp-specialized path above needs.
+try:
+    from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache import (
+        sparse_decode_thead,
+    )
+
+    HAS_TLE_THEAD = True
+except ImportError:
+    HAS_TLE_THEAD = False
 
 
 # TLE constants for decode
@@ -88,13 +79,24 @@ TLE_DECODE_WORKER_NUM_WARPS = 4
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
-    """Stores tile scheduler metadata for FlashMLA."""
+    """Stores tile scheduler metadata for FlashMLA.
+
+    One object serves repeated calls that agree on everything in Config, which
+    every call after the first asserts, and a backend may keep a tile schedule
+    in tile_scheduler_metadata / num_splits across them. What Config cannot
+    assert is the dynamic lengths in topk_length and extra_topk_length, which a
+    schedule may also depend on, so an object belongs to one set of inputs: get
+    a fresh one from get_mla_metadata when the lengths change, exactly as the
+    CUDA interface takes cache_seqlens there and vLLM calls it once per forward
+    step before handing the result to every layer.
+    """
 
     @dataclasses.dataclass
     class Config:
         b: int
         s_q: int
         h_q: int
+        head_dim_k: int
         page_block_size: int
         h_k: int
         causal: bool
@@ -923,6 +925,7 @@ def flash_mla_with_kvcache(
             q.shape[0],
             q.shape[1],
             q.shape[2],
+            q.shape[3],
             k_cache.shape[1],
             k_cache.shape[2],
             causal,
@@ -946,6 +949,9 @@ def flash_mla_with_kvcache(
         )
         assert sched_meta.config.h_q == q.shape[2], (
             "sched_meta.config.h_q must be equal to num_heads_q." + helper_msg
+        )
+        assert sched_meta.config.head_dim_k == q.shape[3], (
+            "sched_meta.config.head_dim_k must be equal to head_dim_k." + helper_msg
         )
         assert sched_meta.config.page_block_size == k_cache.shape[1], (
             "sched_meta.config.page_block_size must be equal to page_block_size."
@@ -1173,36 +1179,26 @@ def _sparse_decode_dispatch(
 
     skv = kv.shape[0] * page_block_size
 
-    if head_dim_k == 512:
-        # MODEL1 fast path for T-Head PPU (FlagTree TLE). It keeps its tile
-        # schedule in sched_meta and reuses it on later calls.
-        if HAS_TLE_MODEL1_THEAD and can_use_model1_thead(
-            q,
-            kv,
-            indices,
-            out,
-            lse,
-            extra_kv,
-            extra_indices,
-            topk_length,
-            extra_topk_length,
-        ):
-            sparse_decode_model1_thead(
-                q,
-                kv,
-                indices,
-                attn_sink=attn_sink,
-                topk_length=topk_length,
-                extra_kv=extra_kv,
-                extra_indices=extra_indices,
-                extra_topk_length=extra_topk_length,
-                out=out,
-                lse=lse,
-                sm_scale=softmax_scale,
-                sched_meta=sched_meta,
-            )
-            return
+    # T-Head PPU fast paths (FlagTree TLE), one entry for both FP8 layouts; it
+    # returns False without writing anything when it cannot serve the call. The
+    # tile schedule is kept in sched_meta and reused on later calls.
+    if HAS_TLE_THEAD and sparse_decode_thead(
+        q,
+        kv,
+        indices,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        extra_kv=extra_kv,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
+        out=out,
+        lse=lse,
+        sm_scale=softmax_scale,
+        sched_meta=sched_meta,
+    ):
+        return
 
+    if head_dim_k == 512:
         # Warp-specialized MODEL1 fast path (FlagTree TLE, sm90). Falls back
         # to the portable kernel below when the layout is unsupported.
         if HAS_TLE_MODEL1 and can_use_model1_tle(
@@ -1266,25 +1262,6 @@ def _sparse_decode_dispatch(
             topk_length is not None,
             extra_kv is not None,
             extra_topk_length is not None,
-        )
-        return
-
-    # V32 fast path for T-Head PPU (FlagTree TLE). It keeps its tile schedule
-    # in sched_meta and reuses it on later calls.
-    if (
-        is_fp8_kvcache
-        and HAS_TLE_V32_THEAD
-        and can_use_v32_thead(q, kv, indices, out, lse, topk_length)
-    ):
-        sparse_decode_v32_thead(
-            q,
-            kv,
-            indices,
-            attn_sink=attn_sink,
-            out=out,
-            lse=lse,
-            sm_scale=softmax_scale,
-            sched_meta=sched_meta,
         )
         return
 
