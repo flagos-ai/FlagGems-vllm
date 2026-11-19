@@ -21,11 +21,6 @@ benchmark suite.
 
 import torch
 
-try:
-    from vllm.models.deepseek_v41.nvidia.ops.mhc import hc_expand as native
-except (ImportError, OSError, RuntimeError):
-    native = None
-
 OP_NAME = "hc_expand"
 DTYPES = [torch.bfloat16, torch.float32]
 IS_INPLACE = False
@@ -67,6 +62,18 @@ FUNCTIONAL_SHAPES = [
     (1025, 5120, 6),
     (8193, 5120, 7),
 ]
+
+
+def native():
+    """Return vLLM's NVIDIA Triton implementation, or None if unavailable."""
+    global NATIVE_UNAVAILABLE_REASON
+    try:
+        from vllm.models.deepseek_v41.nvidia.ops.mhc import hc_expand
+    except (ImportError, AttributeError, OSError, RuntimeError) as exc:
+        NATIVE_UNAVAILABLE_REASON = repr(exc)
+        return None
+    return hc_expand if callable(hc_expand) else None
+
 
 def torch_reference(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     """PyTorch reference copied from vllm/model_executor/layers/mhc.py."""

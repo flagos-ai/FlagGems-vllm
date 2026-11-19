@@ -25,9 +25,6 @@ from baseline.hc_expand import (
 )
 from vllm.utils.torch_utils import set_random_seed
 
-TORCH_REFERENCE = torch_reference
-
-
 def _assert_bits_equal(actual, expected):
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype
@@ -72,7 +69,7 @@ def test_hc_expand_preserves_bits_in_eager(
     x_before = x.clone()
 
     def check(actual):
-        expected = TORCH_REFERENCE(x, hc_mult)
+        expected = torch_reference(x, hc_mult)
         assert actual.shape == expected.shape and actual.dtype == x.dtype
         assert actual.is_contiguous()
         _assert_bits_equal(actual, expected)
