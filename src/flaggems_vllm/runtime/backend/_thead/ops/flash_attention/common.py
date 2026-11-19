@@ -1,5 +1,50 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+#
+# The PPU helper portions identified below are adapted from public T-Head
+# sources under BSD-3-Clause. FlagOS contributions are under Apache-2.0.
+#
+# Public assembly sources, pinned to the referenced revisions:
+# - issue_copy and tsm_fragment (AIU copy and shared-memory matrix loads):
+#   https://github.com/t-head/actlize/blob/9771215b2119d19464c0663299885699d74985a8/include/cute/arch/copy_ppu0010_aiu.hpp
+# - commit_copies and wait_copies (asynchronous copy commit and wait):
+#   https://github.com/t-head/actlize/blob/9771215b2119d19464c0663299885699d74985a8/include/cute/arch/copy_ppu.hpp
+# - mma_packed (FP16/BF16 matrix multiply with FP32 accumulation):
+#   https://github.com/t-head/actlize/blob/9771215b2119d19464c0663299885699d74985a8/include/cute/arch/mma_ppu0010.hpp
+# - mma_reorder (register-fragment conversion using low-precision MMA):
+#   https://github.com/t-head/flash-attention-for-sail/blob/5341d08f3e689becc0a7e73ecdc40ec1ef3e7d33/hopper/acc_vreg_fraga.h
+# Public PTX syntax for mov.u32, setp.eq.u32 and bar.sync:
+#   https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+#
+# The adapted PPU helper portions retain the following BSD-3-Clause notice:
+# Copyright (c) 2022-2026 T-Head (Shanghai) Semiconductor Co., Ltd.
+# Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import torch
 import triton
