@@ -133,11 +133,7 @@ def test_per_token_group_quant_fp8(
     x = torch.rand(num_tokens, d, dtype=dtype, device=flaggems_vllm.device)
     ref_x = utils.to_reference(x)
 
-    if (
-        _HAS_VLLM_FP8_REF
-        and not column_major_scales
-        and ref_x.device.type != "cpu"
-    ):
+    if _HAS_VLLM_FP8_REF and not column_major_scales and ref_x.device.type != "cpu":
         # vLLM's generic Triton fallback does not support every vendor's FP8 conversion.
         # column_major_scales is FlagGems-only; use the torch reference for that path.
         if _VLLM_FP8_HAS_UE8M0:
