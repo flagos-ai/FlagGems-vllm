@@ -328,7 +328,11 @@ def _v32_prefill_weights(
     # Represent each weight in units of 1/128 of the signed INT8 range.
     quantum = tl.maximum(tl.max(tl.abs(weight), 1) * (1.0 / (127 * 128)), 1.0e-30)
     scaled = weight * (1.0 / quantum[:, None])
-    quant = (scaled + tl.where(scaled >= 0.0, 0.5, -0.5)).to(tl.int32)
+    if H > 64 or Tokens <= 16384:
+        # The signed P14 range fits in the FP32 unit-ULP bin around this bias.
+        quant = (scaled + 12582912.0).to(tl.int32, bitcast=True) - 0x4B400000
+    else:
+        quant = (scaled + tl.where(scaled >= 0.0, 0.5, -0.5)).to(tl.int32)
     high = (quant + 64) >> 7
     low = quant - (high << 7)
     operands = ((high << 8) | (low & 255)).to(tl.int16)
@@ -368,8 +372,14 @@ def _v32_prefill_values(
     channels = value_tile * 128 + tl.arange(0, 128)
     lanes = tl.arange(0, 128)
     length = tl.minimum(K, tl.load(Length + row)) if HasLength else K
-    maximum = tl.full((64,), -float("inf"), tl.float32)
-    denominator = tl.full((64,), 0.0, tl.float32)
+    # Every value block shares one denominator and one reference maximum.
+    tiles = tl.arange(0, K // 256)
+    stats_offsets = (local_row * (K // 256) + tiles[None, :]) * 3 * H + heads[:, None]
+    tile_maxima = tl.load(TileStats + stats_offsets)
+    tile_masses = tl.load(TileStats + stats_offsets + H)
+    maximum = tl.max(tile_maxima, 1)
+    safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+    denominator = tl.sum(tile_masses * tl.exp2(tile_maxima - safe_maximum[:, None]), 1)
     output = tl.full((64, 128), 0.0, tl.float32)
     for tile in range(K // 256):
         high_sum = tl.full((64, 128), 0, tl.int32)
@@ -390,18 +400,10 @@ def _v32_prefill_values(
             low_sum = tl.dot(low, values, low_sum, out_dtype=tl.int32)
 
         stats = (local_row * (K // 256) + tile) * 3 * H + heads
-        tile_maximum = tl.load(TileStats + stats)
-        next_maximum = tl.maximum(maximum, tile_maximum)
-        safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
-        retain = tl.exp2(maximum - safe_maximum)
-        include = tl.exp2(tile_maximum - safe_maximum)
-        denominator = denominator * retain + tl.load(TileStats + stats + H) * include
+        include = tl.exp2(tl.load(TileStats + stats) - safe_maximum)
+        scale = tl.load(TileStats + stats + 2 * H) * include
         contribution = high_sum.to(tl.float32) * 128.0 + low_sum.to(tl.float32)
-        output = (
-            output * retain[:, None]
-            + contribution * (tl.load(TileStats + stats + 2 * H) * include)[:, None]
-        )
-        maximum = next_maximum
+        output += contribution * scale[:, None]
 
     lse = tl.where(
         denominator > 0.0,
