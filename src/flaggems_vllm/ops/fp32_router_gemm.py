@@ -157,6 +157,127 @@ def _launch_matrix(x, weight):
     return out
 
 
+@triton.jit
+def _router_tile(
+    X,
+    W,
+    Y,
+    M,
+    XS_M,
+    XS_K,
+    WS_N,
+    WS_K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    SPLIT: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    n_tiles: tl.constexpr = 512 // BN
+    m_tiles = tl.cdiv(M, BM)
+    first_m = (pid // (n_tiles * GROUP)) * GROUP
+    group_m = tl.minimum(m_tiles - first_m, GROUP)
+    within = pid % (n_tiles * GROUP)
+    row = (first_m + within % group_m) * BM + tl.arange(0, BM)
+    col = (within // group_m) * BN + tl.arange(0, BN)
+    s = tl.program_id(1)
+    start = s * (3072 // SPLIT)
+    k = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for ks in range(3072 // (BK * SPLIT)):
+        kk = start + ks * BK + k
+        x = tl.load(X + row[:, None] * XS_M + kk[None, :] * XS_K, row[:, None] < M, 0)
+        w = tl.load(W + kk[:, None] * WS_K + col[None, :] * WS_N)
+        acc = tl.dot(x.to(tl.float32), w, acc, input_precision="tf32x3")
+    tl.store(Y + (s * M + row[:, None]) * 512 + col[None, :], acc, row[:, None] < M)
+
+
+@triton.jit
+def _router_reduce(P, Out, ELEMENTS, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+    ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    parts = tl.arange(0, SPLIT)
+    x = tl.load(
+        P + parts[:, None] * ELEMENTS + ids[None, :], ids[None, :] < ELEMENTS, 0.0
+    )
+    tl.store(Out + ids, tl.sum(x, axis=0), ids < ELEMENTS)
+
+
+_HOPPER_SMALL = {
+    (True, 1): (1, 1, 512, 1, 1, 4, 1),
+    (True, 8): (8, 1, 512, 1, 1, 4, 1),
+    (True, 16): (8, 1, 256, 1, 1, 2, 1),
+    (False, 1): (1, 1, 128, 1, 1, 1, 1),
+    (False, 8): (8, 1, 256, 1, 1, 4, 1),
+    (False, 16): (16, 1, 128, 1, 1, 8, 1),
+}
+
+
+def _launch_hopper_router(input, weight):
+    m = input.shape[0]
+    if m in (1, 8, 16):
+        bm, _, bk, _, _, warps, _ = _HOPPER_SMALL[(input.dtype == torch.bfloat16, m)]
+        out = torch.empty((m, 512), dtype=torch.float32, device=input.device)
+        _router_kernel.fn[(512, triton.cdiv(m, bm))](
+            input,
+            weight,
+            out,
+            m,
+            512,
+            3072,
+            *input.stride(),
+            *weight.stride(),
+            bm,
+            bk,
+            num_warps=warps,
+            num_stages=1,
+        )
+        return out
+    if m in (32, 48, 64):
+        bm, bn, bk, split, group, warps, stages = 16, 32, 64, 8, 1, 2, 2
+    elif m in (1024, 2048):
+        bm, bn, bk, split, group, warps, stages = 64, 64, 64, 1, 4, 4, 3
+    elif m in (4096, 8192):
+        bm, bn, bk, split, group, warps, stages = 128, 128, 32, 1, 4, 8, 3
+    else:
+        return None
+    out = torch.empty((m, 512), dtype=torch.float32, device=input.device)
+    partial = (
+        out
+        if split == 1
+        else torch.empty(
+            (split, m, 512),
+            dtype=torch.float32,
+            device=input.device,
+        )
+    )
+    _router_tile[(triton.cdiv(m, bm) * (512 // bn), split)](
+        input,
+        weight,
+        partial,
+        m,
+        *input.stride(),
+        *weight.stride(),
+        bm,
+        bn,
+        bk,
+        split,
+        group,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    if split > 1:
+        _router_reduce[(triton.cdiv(m * 512, 256),)](
+            partial,
+            out,
+            m * 512,
+            split,
+            256,
+            num_warps=4,
+        )
+    return out
+
+
 @torch.library.custom_op("flaggems_vllm::fp32_router_gemm", mutates_args=())
 def _fp32_router_gemm_op(
     input: torch.Tensor, router_weight: torch.Tensor
@@ -166,6 +287,16 @@ def _fp32_router_gemm_op(
         return torch.empty(
             (0, router_weight.shape[0]), dtype=torch.float32, device=input.device
         )
+    # Offline-selected launch parameters keep first use graph-safe.
+    if (
+        input.shape[1] == 3072
+        and torch.version.cuda
+        and torch.cuda.get_device_capability(input.device) == (9, 0)
+    ):
+        with torch_device_fn.device(input.device):
+            tuned = _launch_hopper_router(input, router_weight)
+        if tuned is not None:
+            return tuned
     # Fixed launch metadata; no runtime tuning or unordered atomic reductions.
     m = input.shape[0]
     if (
