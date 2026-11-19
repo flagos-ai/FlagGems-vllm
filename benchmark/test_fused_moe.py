@@ -116,10 +116,20 @@ _CACHE = {"key": None, "layer": None, "workspace_ready": False}
 
 def _build_layer(num_experts, hidden_size, intermediate_size, topk, dtype):
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-    from vllm.v1.worker.workspace import init_workspace_manager
 
-    if not _CACHE["workspace_ready"]:
+    # vLLM 0.32 replaced the FusedMoE constructor with FusedMoEFactory.
+    try:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE as _moectl
+    except ImportError:
+        from vllm.model_executor.layers.fused_moe.layer import (
+            FusedMoEFactory as _moectl,
+        )
+    try:
+        from vllm.v1.worker.workspace import init_workspace_manager
+    except ImportError:  # vLLM 0.32 dropped this helper
+        init_workspace_manager = None
+
+    if init_workspace_manager is not None and not _CACHE["workspace_ready"]:
         init_workspace_manager(torch.device("cuda"))
         _CACHE["workspace_ready"] = True
     ctx = VllmConfig()
@@ -127,7 +137,7 @@ def _build_layer(num_experts, hidden_size, intermediate_size, topk, dtype):
     torch.set_default_device("cuda")
     try:
         with set_current_vllm_config(ctx):
-            layer = FusedMoE(
+            layer = _moectl(
                 num_experts,
                 topk,
                 hidden_size,
