@@ -53,7 +53,7 @@ def _thead_moe_sum_pair_kernel(
     BLOCK_SIZE: tl.constexpr,
     ELEM_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
     hidden_start = block_idx * BLOCK_SIZE
     hidden_offsets = hidden_start + tl.arange(0, BLOCK_SIZE)
@@ -73,7 +73,11 @@ def _thead_moe_sum_pair_kernel(
             input_ptrs0 = input_base + expert_idx * input_stride_topk + hidden_offsets
         else:
             source_row0 = tl.load(src2dst_ptr + expert_idx * num_tokens + token_idx)
-            input_ptrs0 = input_ptr + source_row0 * input_stride_topk + hidden_offsets
+            input_ptrs0 = (
+                input_ptr
+                + source_row0.to(tl.int64) * input_stride_topk
+                + hidden_offsets
+            )
         expert_data0 = tl.load(input_ptrs0, mask=hidden_mask, other=0.0).to(tl.float32)
         if HAS_BIAS:
             expert_id0 = tl.load(expert_ptr + token_idx * topk + expert_idx)
@@ -96,7 +100,9 @@ def _thead_moe_sum_pair_kernel(
                     src2dst_ptr + (expert_idx + 1) * num_tokens + token_idx
                 )
                 input_ptrs1 = (
-                    input_ptr + source_row1 * input_stride_topk + hidden_offsets
+                    input_ptr
+                    + source_row1.to(tl.int64) * input_stride_topk
+                    + hidden_offsets
                 )
             expert_data1 = tl.load(input_ptrs1, mask=hidden_mask, other=0.0).to(
                 tl.float32
@@ -166,7 +172,7 @@ def _thead_moe_sum_mt_kernel(
     block_idx = tl.program_id(0)
     token_pid = tl.program_id(1)
 
-    token_offsets = token_pid * TOKENS + tl.arange(0, TOKENS)
+    token_offsets = (token_pid * TOKENS + tl.arange(0, TOKENS)).to(tl.int64)
     hidden_offsets = block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
     hidden_offsets = tl.max_contiguous(tl.multiple_of(hidden_offsets, BLOCK_H), BLOCK_H)
 
@@ -195,7 +201,7 @@ def _thead_moe_sum_mt_kernel(
             )
             input_ptrs = (
                 input_ptr
-                + source_row[:, None] * input_stride_topk
+                + source_row[:, None].to(tl.int64) * input_stride_topk
                 + hidden_offsets[None, :]
             )
         expert_data = tl.load(input_ptrs, mask=mask, other=0.0).to(tl.float32)
@@ -273,7 +279,7 @@ def _thead_moe_sum_general_kernel(
     BLOCK_SIZE: tl.constexpr,
     ELEM_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
     hidden_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     hidden_mask = hidden_offsets < hidden_size
@@ -293,7 +299,7 @@ def _thead_moe_sum_general_kernel(
             source_row = tl.load(src2dst_ptr + expert_idx * num_tokens + token_idx)
             input_ptrs = (
                 input_ptr
-                + source_row * input_stride_topk
+                + source_row.to(tl.int64) * input_stride_topk
                 + hidden_offsets * input_stride_hidden
             )
         expert_data = tl.load(input_ptrs, mask=hidden_mask, other=0.0).to(tl.float32)

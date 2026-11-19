@@ -30,6 +30,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
     compressor_prepared,
     prepare_compressor_workspace,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import cooperative_topk
+from flaggems_vllm.runtime.backend._ascend.ops.cp_gather_indexer_k_quant_cache import (
+    cp_gather_indexer_k_quant_cache,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
@@ -53,6 +57,11 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.gdn_w8a16_int8 import (
+    chunk_gated_delta_rule_w8a16_int8,
+    gdn_w8a16_int8,
+    quantize_gdn_state_int8,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
     group_list_cumsum,
@@ -62,6 +71,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.ihc_pre import ihc_pre, triton_ihc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
     indexer_gemm_score,
@@ -89,7 +99,8 @@ from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre
+from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
+from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre_clamp_sinkhorn
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
@@ -113,6 +124,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
 from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention import (
+    sparse_flash_attention,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
     top_k_per_row_decode,
@@ -132,10 +146,13 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule_fwd",
+    "chunk_gated_delta_rule_w8a16_int8",
     "combine_topk_swa_indices",
     "compressor",
     "compressor_prepared",
     "compute_slot_mapping_parallel",
+    "cooperative_topk",
+    "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",
@@ -144,10 +161,12 @@ __all__ = [
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
     "gather_kda_state",
+    "gdn_w8a16_int8",
     "gemma_rms_norm",
     "group_list_cumsum",
     "grouped_topk",
     "hc_combine",
+    "ihc_pre",
     "indexer_epilogue",
     "indexer_gemm_score",
     "indexer_k_quant_and_cache",
@@ -156,7 +175,8 @@ __all__ = [
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",
-    "npu_mhc_pre",
+    "mhc_post",
+    "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
     "pack_seq_triton",
     "paged_scatter_triton",
@@ -164,6 +184,7 @@ __all__ = [
     "persistent_topk",
     "ple_state_scatter_",
     "prepare_compressor_workspace",
+    "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
@@ -174,11 +195,13 @@ __all__ = [
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
     "sparse_attn_sharedkv",
+    "sparse_flash_attention",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
     "top_k_top_p",
     "topk_softplus_sqrt",
+    "triton_ihc_pre",
     "unpack_seq_triton",
 ]
