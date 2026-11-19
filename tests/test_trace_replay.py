@@ -21,7 +21,6 @@ import torch
 import flaggems_vllm
 from flaggems_vllm import apply_trace_tokens as flaggems_apply_trace_tokens
 
-
 try:
     from vllm.v1.worker.gpu.sample.trace_replay import (
         apply_trace_tokens as vllm_reference,
@@ -71,9 +70,7 @@ def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected=No
     cpu_expected = _cpu_reference(sampled, mapping, traces, lengths, total, prompt)
     if expected is not None:
         assert cpu_expected == expected
-    reference_sampled = (
-        sampled.clone() if vllm_reference is not None else None
-    )
+    reference_sampled = sampled.clone() if vllm_reference is not None else None
     pointer = sampled.data_ptr()
     assert (
         flaggems_apply_trace_tokens(sampled, mapping, traces, lengths, total, prompt)
@@ -84,9 +81,7 @@ def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected=No
 
     if reference_sampled is not None:
         assert (
-            vllm_reference(
-                reference_sampled, mapping, traces, lengths, total, prompt
-            )
+            vllm_reference(reference_sampled, mapping, traces, lengths, total, prompt)
             is None
         )
         assert reference_sampled.cpu().tolist() == cpu_expected

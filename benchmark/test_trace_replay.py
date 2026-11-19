@@ -29,7 +29,6 @@ except (ImportError, OSError):
     vllm_reference = None
 
 
-
 class TraceReplayBenchmark(base.Benchmark):
     DEFAULT_SHAPES = [
         (n, 2048) for n in (1, 2, 3, 5, 32, 33, 127, 128, 129, 256, 257, 4096)
@@ -66,8 +65,7 @@ class TraceReplayBenchmark(base.Benchmark):
                 candidate_sampled = sampled.clone()
                 reference_sampled = sampled.clone()
                 assert (
-                    flaggems_apply_trace_tokens(candidate_sampled, *arguments)
-                    is None
+                    flaggems_apply_trace_tokens(candidate_sampled, *arguments) is None
                 )
                 assert vllm_reference(reference_sampled, *arguments) is None
                 torch.testing.assert_close(
