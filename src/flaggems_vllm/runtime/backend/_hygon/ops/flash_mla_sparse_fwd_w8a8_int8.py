@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+_V32_ORDER_MIN_TOKENS = 65536
+
 
 @triton.jit
 def sparse_int8_pv(
@@ -503,7 +505,7 @@ def _prepare_v32_prefill(
         (chunk, tiles, 3, heads), device=q_nope.device, dtype=torch.float32
     )
     order = None
-    if heads == 64 and tokens >= 65536:
+    if heads == 64 and tokens >= _V32_ORDER_MIN_TOKENS:
         chunks = triton.cdiv(rows, chunk)
         order_block = triton.next_power_of_2(chunk * tiles)
         # Reserve bits for the task ID and leave the largest key for padding.
@@ -661,8 +663,12 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
     lse = torch.empty((batch, heads, sq), dtype=torch.float32, device=device)
     if rows == 0:
         return lambda: (output, lse)
-    # Staging exposes parallel KV tiles for batched H128 decode as well as prefill.
-    use_staged_v32 = (heads == 128 and rows >= 32) or (heads == 64 and rows >= 4096)
+    # With a large H64 cache, ordering the parallel QK tiles by KV location
+    # also pays off for shorter batches.
+    h64_min_rows = 64 if pages * 64 >= _V32_ORDER_MIN_TOKENS else 4096
+    use_staged_v32 = (heads == 128 and rows >= 32) or (
+        heads == 64 and rows >= h64_min_rows
+    )
     if rope == 64 and topk == 2048 and use_staged_v32:
         return _prepare_v32_prefill(
             q_nope,
