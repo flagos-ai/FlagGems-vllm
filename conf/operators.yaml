@@ -2115,6 +2115,17 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.5'
+- id: recurrent_gated_delta_rule
+  description: Single-token FLA gated delta-rule decode updating a strided FP32 state pool on Atlas A5.
+  for:
+  - recurrent_gated_delta_rule
+  labels:
+  - non-aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: reglu
   description: 'Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead
     of the sigmoid function for gating.
