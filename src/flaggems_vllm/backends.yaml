@@ -238,7 +238,7 @@ backends:
     vendor: metax
     python: "3.12"
     triton: triton==3.0.0+metax3.7.2.0
-    flagtree: flagtree==3.1.0+metax3.7.2.0
+    flagtree: flagtree==0.7.0+metax3.6
     vllm_note: >-
       No vLLM package is published for MACA 3.7.2. Install the vendor vLLM
       build first and use `--no-venv`, or set VLLM_PACKAGE.
