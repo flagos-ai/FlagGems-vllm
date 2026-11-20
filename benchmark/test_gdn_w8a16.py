@@ -15,6 +15,7 @@ import os
 import statistics
 import subprocess
 import sys
+import tempfile
 from functools import lru_cache, partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,10 +39,11 @@ from benchmark.conftest import Config  # noqa: E402
 from benchmark.consts import BenchLevel, BenchMode  # noqa: E402
 from flaggems_vllm.ops.gdn_w8a16 import quantize_gdn_state_fp8  # noqa: E402
 from flaggems_vllm.runtime import torch_device_fn  # noqa: E402
-from tests.test_gdn_w8a16 import (  # noqa: E402
+from tests.test_gdn_w8a16 import (
     build_int8_gdn_decode_inputs,
     build_int8_gdn_prefill_inputs,
 )
+from tests.test_gdn_w8a16 import make_inputs as make_fp8_gdn_inputs  # noqa: E402
 
 
 def _vllm_bf16(q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t):
@@ -120,28 +122,33 @@ class GdnW8A16Benchmark(Benchmark):
                 raise ValueError("This benchmark covers K=V=128")
             torch.manual_seed(42)
             device = flaggems_vllm.device
-            q = torch.randn(1, n * t, h, key_dim, device=device, dtype=cur_dtype)
-            k = torch.randn_like(q)
-            v = 0.125 * torch.randn(
-                1, n * t, hv, value_dim, device=device, dtype=cur_dtype
-            )
-            g = torch.empty(1, n * t, hv, device=device, dtype=cur_dtype).uniform_(
-                math.log(0.98), math.log(0.995)
-            )
-            beta = torch.rand(1, n * t, hv, device=device, dtype=cur_dtype)
+            q, k, v, g, beta, cu, _ = make_fp8_gdn_inputs(n, t, h, hv, cur_dtype)
             state = torch.zeros(
-                n + 1, hv, key_dim, value_dim, device=device, dtype=cur_dtype
+                n + 1,
+                hv,
+                key_dim,
+                value_dim,
+                device=device,
+                dtype=(
+                    torch.float32
+                    if flaggems_vllm.vendor_name == "mthreads"
+                    else cur_dtype
+                ),
             )
-            state_fp8, state_scale = quantize_gdn_state_fp8(state)
-            cu = torch.arange(0, n * t + 1, t, device=device, dtype=torch.int32)
+            if flaggems_vllm.vendor_name == "mthreads":
+                state = state.transpose(-1, -2)
+            state_fp8, state_scale = quantize_gdn_state_fp8(state.contiguous())
             indices = (
                 torch.arange(1, n + 1, device=device, dtype=torch.int64)[:, None]
                 .expand(n, t)
                 .contiguous()
             )
             inputs = q, k, v, g, beta, state, state_fp8, state_scale, cu, indices, t
-            baseline, _ = _vllm_bf16(*inputs)
-            torch.cuda.synchronize()
+            query_initial, key_initial = q.clone(), k.clone()
+            baseline, _ = self.torch_op(*inputs)
+            torch_device_fn.synchronize()
+            q.copy_(query_initial)
+            k.copy_(key_initial)
             # A zero initial state gives a closed-form first-token output.
             query = q.reshape(n, t, h, key_dim)[:, 0].float()
             key = k.reshape(n, t, h, key_dim)[:, 0].float()
@@ -162,15 +169,140 @@ class GdnW8A16Benchmark(Benchmark):
             yield inputs
 
 
+def _mthreads_bf16(
+    q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t
+):
+    from mate.gdn_prefill import chunk_gated_delta_rule
+
+    # The shared FP8 benchmark supplies precomputed gates and KV state;
+    # MATE's precomputed-gate interface takes unbatched QKV and VK state.
+    state = state_bf16.transpose(-1, -2)
+    out, final = chunk_gated_delta_rule(
+        q[0],
+        k[0],
+        v[0],
+        g=g[0],
+        beta=beta[0],
+        initial_state=state,
+        output_state=state,
+        output_final_state=True,
+        cu_seqlens=cu,
+        state_indices=indices[:, 0],
+        use_qk_l2norm_in_kernel=True,
+        is_log_space=True,
+    )
+    return out.unsqueeze(0), final
+
+
+class MthreadsGdnW8A16Benchmark(GdnW8A16Benchmark):
+    def get_latency(self, op, *args, **kwargs):
+        if Config.mode != BenchMode.KERNEL:
+            return super().get_latency(op, *args, **kwargs)
+        synchronize = torch_device_fn.synchronize
+        q, k, _, _, _, state, state_fp8, state_scale, _, _, _ = args
+        buffers = (q, k, state, state_fp8, state_scale)
+        saved = tuple(tensor.clone() for tensor in buffers)
+        samples = max(5, min(30, int(Config.repetition)))
+        warmups = max(1, min(5, int(Config.warm_up)))
+
+        def restore_state():
+            for tensor, original in zip(buffers, saved):
+                tensor.copy_(original)
+            synchronize()
+
+        for _ in range(warmups):
+            restore_state()
+            op(*args, **kwargs)
+        synchronize()
+        activities = torch.profiler.supported_activities()
+        if len(activities) < 2:
+            raise RuntimeError("MUSA GPU profiling is required for GDN kernel timing")
+        cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+        timings = []
+        # MUSA events include Python/graph submission gaps. Profile hardware
+        # activities instead; restore mutable inputs and clear L2 before collection.
+        with tempfile.TemporaryDirectory(prefix="gdn-musa-profile-") as directory:
+            trace_path = Path(directory) / "trace.json"
+            # Arm MUPTI once, then collect marked samples in the same session.
+            with torch.profiler.profile(activities=list(activities)) as profile:
+                restore_state()
+                op(*args, **kwargs)
+                synchronize()
+                for sample in range(samples):
+                    restore_state()
+                    cache.zero_()
+                    synchronize()
+                    with torch.profiler.record_function(f"gdn_sample_{sample}"):
+                        op(*args, **kwargs)
+                        synchronize()
+                # Drain the final target activity before stopping MUPTI.
+                cache.zero_()
+                synchronize()
+            profile.export_chrome_trace(str(trace_path))
+            events = json.loads(trace_path.read_text())["traceEvents"]
+            hardware = [
+                event
+                for event in events
+                if event.get("ph") == "X"
+                and event.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")
+            ]
+            activity_count = None
+            for sample in range(samples):
+                ranges = [
+                    (float(event["ts"]), float(event["ts"]) + float(event["dur"]))
+                    for event in events
+                    if event.get("ph") == "X"
+                    and event.get("cat") == "gpu_user_annotation"
+                    and event.get("name") == f"gdn_sample_{sample}"
+                ]
+                intervals = sorted(
+                    (float(event["ts"]), float(event["ts"]) + float(event["dur"]))
+                    for event in hardware
+                    if any(
+                        float(event["ts"]) >= left - 0.01
+                        and float(event["ts"]) + float(event["dur"]) <= right + 0.01
+                        for left, right in ranges
+                    )
+                )
+                if not intervals:
+                    raise RuntimeError("MUSA profiler returned no GPU activities")
+                if activity_count is None:
+                    activity_count = len(intervals)
+                elif activity_count != len(intervals):
+                    raise RuntimeError("MUSA profiler returned incomplete GPU samples")
+                # Union intervals so overlapping streams are not counted twice.
+                begin, end = intervals[0]
+                elapsed = 0.0
+                for left, right in intervals[1:]:
+                    if left > end:
+                        elapsed += end - begin
+                        begin, end = left, right
+                    else:
+                        end = max(end, right)
+                elapsed += end - begin
+                timings.append(elapsed / 1000.0)
+        restore_state()
+        return statistics.median(timings)
+
+
 @pytest.mark.gdn_w8a16
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "nvidia"
-    or not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] < 9,
-    reason="FP8 GDN requires NVIDIA SM90 or newer",
-)
-def test_gdn_w8a16():
-    bench = GdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_vllm_bf16)
+def test_gdn_w8a16(tmp_path):
+    if flaggems_vllm.vendor_name == "mthreads":
+        bench = MthreadsGdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_mthreads_bf16)
+    elif flaggems_vllm.vendor_name == "metax":
+        run_perf_gdn_w8a16_metax(tmp_path)
+        return
+    elif "gdn_w8a16_int8" in vars(flaggems_vllm):
+        run_perf_gdn_w8a16_int8()
+        return
+    elif (
+        flaggems_vllm.vendor_name == "nvidia"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 9
+    ):
+        bench = GdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_vllm_bf16)
+    else:
+        pytest.skip("GDN is unsupported on this backend")
     bench.set_gems(_fp8)
     bench.run()
 
@@ -659,12 +791,7 @@ def prepare_ascend_gdn_prefill_baseline(reference):
     return _run, (state,)
 
 
-@pytest.mark.gdn_w8a16
-@pytest.mark.skipif(
-    "gdn_w8a16_int8" not in vars(flaggems_vllm),
-    reason="backend does not export INT8-state GDN",
-)
-def test_perf_gdn_w8a16_int8():
+def run_perf_gdn_w8a16_int8():
     bench = Int8StateGdnBenchmark(
         op_name="gdn_w8a16", torch_op=native_int8_state_gdn_baseline
     )
@@ -1166,8 +1293,7 @@ def _metax_shape_row(shape):
     return {"op": op, "shape": list(shape), "count": 1}
 
 
-@pytest.mark.gdn_w8a16
-def test_perf_gdn_w8a16_metax(tmp_path):
+def run_perf_gdn_w8a16_metax(tmp_path):
     """Use shared shapes with the paired CUDA Graph benchmark and FP32 state."""
     from flaggems_vllm import vendor_name
 
