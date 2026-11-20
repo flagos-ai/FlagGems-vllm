@@ -26,10 +26,24 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_flash_mla_with_kvcache_w8a8 import SUPPORTED as HAS_FP8_MLA
+from tests.test_flash_mla_with_kvcache_w8a8 import SUPPORTED as HAS_CUDA_FP8_MLA
 from tests.test_flash_mla_with_kvcache_w8a8 import quantize_dense_fp8
 
+from . import conftest as cfg
 from .accuracy_utils import gems_assert_close, gems_assert_equal, to_cpu, to_reference
+
+MTHREADS_FP8_MLA = flaggems_vllm.vendor_name == "mthreads" and (
+    "flash_mla_sparse_fwd_w8a8"
+    in dict(flaggems_vllm.runtime.backend.get_customized_ops())
+)
+HAS_FP8_MLA = HAS_CUDA_FP8_MLA or MTHREADS_FP8_MLA
+
+if MTHREADS_FP8_MLA:
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_sparse_fwd_w8a8 import (
+        prepare_flash_mla_sparse_fwd_w8a8,
+    )
+else:
+    prepare_flash_mla_sparse_fwd_w8a8 = None
 
 
 @lru_cache(maxsize=1)
@@ -103,7 +117,7 @@ def make_sparse_inputs(shape, dtype=torch.bfloat16):
     # Coprime strides select unique tokens without allocating an SQ-by-SKV matrix.
     positions = torch.arange(min(s_kv, topk), dtype=torch.int64)
     indices = torch.full((s_q, topk), -1, dtype=torch.int32)
-    for row in range(s_q):
+    for row in range(s_q if s_kv else 0):
         offset = random.randrange(s_kv)
         step = random.randrange(1, s_kv) if s_kv > 1 else 1
         while math.gcd(step, s_kv) != 1:
@@ -129,23 +143,28 @@ def make_sparse_inputs(shape, dtype=torch.bfloat16):
     return q, kv, indices, 0.5, d_v, attn_sink, topk_length
 
 
+def _pack_sparse_qkv(q, kv, *, power_of_two=False):
+    pages = math.ceil(kv.shape[0] / 64)
+    if kv.shape[0] % 64:
+        cache = kv.new_zeros((pages * 64, *kv.shape[1:]))
+        cache[: kv.shape[0]].copy_(kv)
+        kv = cache
+    q_nope, q_rope, q_scale, _ = quantize_dense_fp8(
+        q[:, None], dequantize=False, power_of_two=power_of_two
+    )
+    k_nope, k_rope, k_scale, _ = quantize_dense_fp8(
+        kv.view(pages, 64, *kv.shape[1:]), dequantize=False, power_of_two=power_of_two
+    )
+    return q_nope, q_rope, k_nope, k_rope, q_scale, k_scale
+
+
 def quantize_sparse_fp8_fixture(
     q, kv, indices, sm_scale, value_dim, attn_sink=None, topk_length=None
 ):
     if value_dim != 512:
         raise ValueError("FP8 sparse MLA requires value_dim=512")
-    q_nope, q_rope, q_scale, _ = quantize_dense_fp8(q, dequantize=False)
-    pages = math.ceil(kv.shape[0] / 64)
-    cache = torch.zeros((pages * 64, kv.shape[-1]), dtype=kv.dtype, device=kv.device)
-    cache[: kv.shape[0]].copy_(kv[:, 0])
-    k_nope, k_rope, k_scale, _ = quantize_dense_fp8(cache, dequantize=False)
     return (
-        q_nope[:, None],
-        q_rope[:, None],
-        k_nope.view(pages, 64, 512),
-        k_rope.view(pages, 64, q_rope.shape[-1]),
-        q_scale[:, None],
-        k_scale.view(pages, 64, 1),
+        *_pack_sparse_qkv(q, kv[:, 0]),
         torch.where((indices >= 0) & (indices < kv.shape[0]), indices, -1),
         sm_scale,
         attn_sink,
@@ -173,8 +192,123 @@ def assert_sparse_fixture_close(output, lse, reference, reference_lse):
     )
 
 
+def dequantize_sparse_rows(content, rope, scale):
+    values = content.float()
+    if rope.shape[-1]:
+        values = torch.cat((values, rope.float()), -1)
+    return values * scale
+
+
+def make_mthreads_sparse_inputs(batch, heads, topk, tokens, dtype, rope_dim, seed):
+    shape = (batch, heads, 576, tokens, 1, topk, 512, False, False, seed)
+    query, cache, indices, *_ = make_sparse_inputs(shape)
+    width = 512 + rope_dim
+    q, qr, kv, kr, qs, ks = _pack_sparse_qkv(
+        query[..., :width], cache[..., :width], power_of_two=True
+    )
+    native_q = torch.empty(
+        (*q.shape[:-1], width), dtype=torch.bfloat16, device=q.device
+    )
+    # Keep FP8 casts within the muDNN unary datacast launch limit.
+    chunk = max(1, (1 << 23) // max(1, heads * 512))
+    for first in range(0, batch, chunk):
+        rows = slice(first, first + chunk)
+        native_q[rows] = dequantize_sparse_rows(q[rows], qr[rows], qs[rows])
+    return [q, qr.to(dtype), kv, kr.to(dtype), qs, ks, indices], native_q
+
+
+def mthreads_sparse_reference(
+    inputs,
+    *,
+    attn_sink=None,
+    topk_length=None,
+    softmax_scale=None,
+    reference_device=None,
+    chunk_rows=16,
+):
+    if reference_device is None:
+        reference_device = "cpu" if cfg.TO_CPU else inputs[0].device
+    q, qr, kv, kr, qs, ks, indices = (tensor.to(reference_device) for tensor in inputs)
+    attn_sink = None if attn_sink is None else attn_sink.to(reference_device)
+    topk_length = (
+        None if topk_length is None else topk_length.to(reference_device).flatten()
+    )
+    batch, queries, heads, _ = q.shape
+    dims = 512 + qr.shape[-1]
+    rows = batch * queries
+    q = q.view(rows, heads, 512)
+    qr = qr.view(rows, heads, qr.shape[-1])
+    qs = qs.view(rows, heads, 1)
+    tokens = kv.shape[0] * 64
+    kv = kv.view(tokens, 1, 512)
+    kr = kr.view(tokens, 1, kr.shape[-1])
+    ks = ks.view(tokens, 1, 1)
+    # Invalid indices must contribute zero even when token zero contains NaNs.
+    cache = torch.empty(
+        (tokens + 1, 1, dims), dtype=torch.float32, device=reference_device
+    )
+    cache[tokens].zero_()
+    # Keep FP8 casts bounded: large unary datacast launches fail in muDNN.
+    for first in range(0, tokens, 16384):
+        last = min(first + 16384, tokens)
+        cache[first:last] = dequantize_sparse_rows(
+            kv[first:last], kr[first:last], ks[first:last]
+        )
+    selected = indices.view(rows, indices.shape[-1])
+    scale = dims**-0.5 if softmax_scale is None else softmax_scale
+    output = torch.empty(
+        (rows, heads, 512), dtype=torch.float32, device=reference_device
+    )
+    lse = torch.empty((rows, heads), dtype=torch.float32, device=reference_device)
+    if topk_length is not None:
+        positions = torch.arange(selected.shape[-1], device=reference_device)
+    for begin in range(0, rows, chunk_rows):
+        end = min(begin + chunk_rows, rows)
+        query = dequantize_sparse_rows(q[begin:end], qr[begin:end], qs[begin:end])
+        ids = selected[begin:end]
+        valid = (ids >= 0) & (ids < tokens)
+        if topk_length is not None:
+            valid &= positions < topk_length[begin:end, None]
+        keys = cache.index_select(0, ids.masked_fill(~valid, tokens).flatten()).view(
+            end - begin, selected.shape[-1], dims
+        )
+        scores = (query @ keys.transpose(1, 2)) * scale
+        scores = scores.masked_fill(~valid[:, None, :], -torch.inf)
+        empty = ~valid.any(dim=-1, keepdim=True)
+        # muDNN logsumexp can produce NaN on rows filled with -inf.
+        logsum = torch.logsumexp(scores.masked_fill(empty[..., None], 0.0), dim=-1)
+        logsum = logsum.masked_fill(empty, -torch.inf)
+        normalizer = logsum
+        if attn_sink is not None:
+            sink = attn_sink.expand_as(logsum)
+            normalizer = torch.logsumexp(torch.stack((logsum, sink)), dim=0)
+            normalizer = torch.where(torch.isneginf(sink), logsum, normalizer)
+            normalizer = normalizer.masked_fill(torch.isposinf(sink), torch.inf)
+        normalizer = normalizer.masked_fill(empty, torch.inf)
+        output[begin:end] = torch.exp(scores - normalizer[..., None]) @ keys[..., :512]
+        lse[begin:end] = logsum.masked_fill(empty, torch.inf)
+    return output.view(batch, queries, heads, 512), lse.view(
+        batch, queries, heads
+    ).transpose(1, 2)
+
+
+def assert_mthreads_sparse_accuracy(actual, expected, *, output_atol=4e-3):
+    ref_output, ref_lse = expected
+    output, lse = actual
+    assert output.shape == ref_output.shape and lse.shape == ref_lse.shape
+    # Compare every row while bounding casts and copies to the same small size.
+    for first in range(0, output.shape[0], 16):
+        last = min(first + 16, output.shape[0])
+        value = output[first:last].to(ref_output.device)
+        logsum = lse[first:last].to(ref_lse.device)
+        reference_value = ref_output[first:last]
+        reference_logsum = ref_lse[first:last]
+        gems_assert_close(value, reference_value, output.dtype, atol=output_atol)
+        gems_assert_close(logsum, reference_logsum, torch.float32, atol=2e-4)
+
+
 @pytest.mark.flash_mla_sparse_fwd_w8a8
-@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+@pytest.mark.skipif(not HAS_FP8_MLA, reason="Sparse FP8 MLA backend is unavailable")
 @pytest.mark.parametrize(
     "shape",
     [
@@ -190,8 +324,129 @@ def assert_sparse_fixture_close(output, lse, reference, reference_lse):
 def test_flash_mla_sparse_flashmla(shape):
     inputs = make_sparse_inputs(shape)
     inputs[2][0].fill_(-1)
+    packed = quantize_sparse_fp8_fixture(*inputs)
+    if MTHREADS_FP8_MLA:
+        expected = mthreads_sparse_reference(
+            packed[:7],
+            softmax_scale=packed[7],
+            attn_sink=packed[8],
+            topk_length=packed[9],
+        )
+        assert_mthreads_sparse_accuracy(
+            flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed), expected
+        )
+        return
     reference, _, reference_lse = flashmla_reference().flash_mla_sparse_fwd(*inputs)
-    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(
-        *quantize_sparse_fp8_fixture(*inputs)
-    )
+    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed)
     assert_sparse_fixture_close(output[:, 0], lse[:, :, 0], reference, reference_lse)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
+@pytest.mark.parametrize("tokens, topk", [(0, 128), (64, 0)])
+def test_mthreads_empty_attention(tokens, topk):
+    packed, _ = make_mthreads_sparse_inputs(
+        4, 64, topk, tokens, torch.bfloat16, 0, seed=42
+    )
+    run, (output, lse) = prepare_flash_mla_sparse_fwd_w8a8(*packed)
+    output.fill_(1)
+    lse.zero_()
+    expected = mthreads_sparse_reference(packed)
+    assert_mthreads_sparse_accuracy(run(), expected)
+    assert torch.all(output == 0)
+    assert torch.all(torch.isposinf(lse))
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mthreads_k128_prepared_row_update(dtype):
+    packed, _ = make_mthreads_sparse_inputs(129, 64, 128, 4096, dtype, 0, seed=42)
+    run, _ = prepare_flash_mla_sparse_fwd_w8a8(*packed)
+    # One CTA can own both rejected and accepted queries in the same call.
+    packed[6][0].fill_(-1)
+    packed[4][1].mul_(256)
+    expected = mthreads_sparse_reference(packed)
+    assert_mthreads_sparse_accuracy(run(), expected, output_atol=2e-3)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mthreads_v32_prepared_scale_update(dtype):
+    packed, _ = make_mthreads_sparse_inputs(4, 64, 2048, 4096, dtype, 64, seed=42)
+    packed[6][0].fill_(-1)
+    run, actual = prepare_flash_mla_sparse_fwd_w8a8(*packed)
+    expected = mthreads_sparse_reference(packed)
+    assert_mthreads_sparse_accuracy(actual, expected, output_atol=2e-3)
+
+    # A larger, non-power-of-two scale exercises the IEEE FP32 recomputation.
+    packed[4][1::2].mul_(4.03125)
+    packed[5].mul_(4.03125)
+    expected = mthreads_sparse_reference(packed)
+    assert_mthreads_sparse_accuracy(run(), expected, output_atol=2e-3)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
+@pytest.mark.parametrize("rows, first_row", ((64, 0), (132, 130), (193, 191), (512, 0)))
+def test_mthreads_v32_prepared_rope_update(rows, first_row):
+    packed, _ = make_mthreads_sparse_inputs(
+        rows, 64, 2048, 4096, torch.bfloat16, 64, seed=42
+    )
+    empty_row, updated_row = first_row, first_row + 1
+    packed[6][empty_row].fill_(-1)
+    packed[6][updated_row, 0].masked_fill_(packed[6][updated_row, 0] == 0, -1)
+    packed[6][updated_row, 0, 0] = 0
+    run, _ = prepare_flash_mla_sparse_fwd_w8a8(*packed)
+    affected_rows = slice(first_row, first_row + 2)
+    reference_inputs = [
+        tensor[affected_rows] if index in (0, 1, 4, 6) else tensor
+        for index, tensor in enumerate(packed)
+    ]
+
+    # The shape and address are fixed, but the error check must read the
+    # current selected key. Use the softmax reference for the two touched rows.
+    packed[3].view(-1, 64)[0].copy_(packed[1][updated_row, 0, 0].sign() * 32768.0)
+    expected = mthreads_sparse_reference(reference_inputs)
+    output, lse = run()
+    assert_mthreads_sparse_accuracy(
+        (output[affected_rows], lse[affected_rows]), expected, output_atol=2e-3
+    )
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
+@pytest.mark.parametrize(
+    "rows, cache_component",
+    (
+        pytest.param(576, 2, id="content"),
+        pytest.param(576, 3, id="rope"),
+        pytest.param(576, 5, id="scale"),
+        pytest.param(64, 2, id="split-content"),
+        pytest.param(64, 3, id="split-rope"),
+        pytest.param(64, 5, id="split-scale"),
+    ),
+)
+def test_mthreads_v32_nan_in_unselected_sentinel(rows, cache_component):
+    packed, _ = make_mthreads_sparse_inputs(
+        rows, 64, 2048, 4096, torch.bfloat16, 64, seed=42
+    )
+    indices = packed[-1]
+    indices.masked_fill_(indices == 0, 1)
+    indices[0].fill_(-1)
+    indices[1, 0, 0] = -1
+    indices[2].remainder_(4095).add_(1)
+    reference_inputs = [
+        data[:3] if i in (0, 1, 4, 6) else data for i, data in enumerate(packed)
+    ]
+    run, _ = prepare_flash_mla_sparse_fwd_w8a8(*packed)
+
+    # No query selects key zero. Invalid indices must not expose it to PV.
+    if cache_component == 2:
+        packed[2].view(torch.uint8).flatten()[0] = 0x7F
+    else:
+        packed[cache_component].flatten()[0] = float("nan")
+    expected = mthreads_sparse_reference(reference_inputs)
+    output, lse = run()
+    assert_mthreads_sparse_accuracy((output[:3], lse[:3]), expected, output_atol=2e-3)

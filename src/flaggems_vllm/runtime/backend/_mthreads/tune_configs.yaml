@@ -850,6 +850,37 @@ hc_combine:
     num_warps: 4
     num_stages: 1
 
+mthreads_sparse_fp8_mla:
+- META:
+    BH: 32
+    BN: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    BH: 32
+    BN: 64
+  num_warps: 8
+  num_stages: 1
+- META:
+    BH: 64
+    BN: 128
+  num_warps: 8
+  num_stages: 1
+- META:
+    BH: 64
+    BN: 128
+  num_warps: 16
+  num_stages: 1
+mthreads_sparse_fp8_combine:
+- META:
+    BV: 128
+  num_warps: 4
+  num_stages: 1
+- META:
+    BV: 256
+  num_warps: 4
+  num_stages: 1
+
 # mhc_shifted_post_pre (MUSA): the projection is a memory-bound skinny GEMM
 # over a packed (hc*H, 32) bf16 weight.  Split-K fills the 60 S5000 SMs; the
 # K loop pipelines, so num_stages 2/3 are safe (no fused reduction here).

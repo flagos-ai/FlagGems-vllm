@@ -285,7 +285,7 @@ def pytest_addoption(parser):
         default=0,
         help=(
             "Enable multi-GPU parallel benchmark execution across shapes. "
-            "Example: --parallel 8 means using GPU 0~7 in parallel. "
+            "Example: --parallel 8 uses the first eight visible GPUs. "
             "Default 0 means serial execution."
         ),
     )
