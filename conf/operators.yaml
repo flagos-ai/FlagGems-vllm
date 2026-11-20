@@ -1818,6 +1818,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: minimax_m3_decode_qk_score
+  description: Compute visible MiniMax-M3 index block scores for a paged BF16 index cache on Atlas A5.
+  for:
+  - minimax_m3_decode_qk_score
+  labels:
+  - non-aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: minimax_m3_sparse_attn
   description: 'MiniMax M3 block-sparse GQA prefill attention over packed paged KV
 
