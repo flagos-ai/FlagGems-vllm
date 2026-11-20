@@ -200,7 +200,9 @@ def moe_align_block_size_tle_atomic_fused_coop(
     for base in range(pid * BLOCK_TOKENS, numel, NUM_BLOCKS * BLOCK_TOKENS):
         offs = base + token_offsets
         mask = offs < numel
-        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=0).to(tl.int32)
+        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=0)
+        mask &= (expert_id >= 0) & (expert_id < num_experts)
+        expert_id = tl.where(mask, expert_id, 0).to(tl.int32)
         count_ptrs = tle.gpu.local_ptr(local_counts, (expert_id,))
         tl.atomic_add(count_ptrs, 1, mask=mask, sem="relaxed", scope="cta")
 
@@ -260,7 +262,9 @@ def moe_align_block_size_tle_atomic_fused_coop(
     for base in range(pid * BLOCK_TOKENS, numel, NUM_BLOCKS * BLOCK_TOKENS):
         offs = base + token_offsets
         mask = offs < numel
-        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=0).to(tl.int32)
+        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=0)
+        mask &= (expert_id >= 0) & (expert_id < num_experts)
+        expert_id = tl.where(mask, expert_id, 0).to(tl.int32)
         count_ptrs = tle.gpu.local_ptr(local_counts, (expert_id,))
         rank_with_prefix = tl.atomic_add(
             count_ptrs, 1, mask=mask, sem="relaxed", scope="cta"
@@ -340,7 +344,9 @@ def moe_align_block_size_tle_cluster_fused(
     for base in range(cluster_rank * BLOCK_TOKENS, numel, CLUSTER_SIZE * BLOCK_TOKENS):
         offs = base + init_offsets
         mask = offs < numel
-        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=0).to(tl.int32)
+        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=0)
+        mask &= (expert_id >= 0) & (expert_id < num_experts)
+        expert_id = tl.where(mask, expert_id, 0).to(tl.int32)
         count_ptrs = tle.gpu.local_ptr(local_counts, (expert_id,))
         tl.atomic_add(count_ptrs, 1, mask=mask, sem="relaxed", scope="cta")
 
@@ -400,7 +406,9 @@ def moe_align_block_size_tle_cluster_fused(
     for base in range(cluster_rank * BLOCK_TOKENS, numel, CLUSTER_SIZE * BLOCK_TOKENS):
         offs = base + init_offsets
         mask = offs < numel
-        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=0).to(tl.int32)
+        expert_id = tl.load(topk_ids_ptr + offs, mask=mask, other=0)
+        mask &= (expert_id >= 0) & (expert_id < num_experts)
+        expert_id = tl.where(mask, expert_id, 0).to(tl.int32)
         count_ptrs = tle.gpu.local_ptr(local_counts, (expert_id,))
         rank_with_prefix = tl.atomic_add(
             count_ptrs, 1, mask=mask, sem="relaxed", scope="cta"
@@ -424,6 +432,8 @@ def moe_align_block_size_stage1(
     numel_expert_ids: tl.constexpr,
     block_size_sorted: tl.constexpr,
     block_size_expert: tl.constexpr,
+    expert_map,
+    HAS_EXPERT_MAP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -442,6 +452,10 @@ def moe_align_block_size_stage1(
     offsets = start_idx + tl.arange(0, tokens_per_thread)
     mask = offsets < numel
     expert_id = tl.load(topk_ids_ptr + offsets, mask=mask, other=0)
+    mask &= (expert_id >= 0) & (expert_id < num_experts)
+    if HAS_EXPERT_MAP:
+        expert_id = tl.load(expert_map + expert_id, mask=mask, other=-1)
+        mask &= (expert_id >= 0) & (expert_id < num_experts)
     tl.atomic_add(tokens_cnts_ptr + off_c + expert_id, 1, mask=mask)
 
 
@@ -506,6 +520,10 @@ def moe_align_block_size_stage4(
     block_size: tl.constexpr,
     numel,
     tokens_per_thread: tl.constexpr,
+    expert_map,
+    scatter_idx,
+    HAS_EXPERT_MAP: tl.constexpr,
+    HAS_SCATTER: tl.constexpr,
 ):
     pid = tl.program_id(0)
     start_idx = tl.load(cumsum_ptr + pid)
@@ -518,8 +536,14 @@ def moe_align_block_size_stage4(
     off_t = pid * num_experts
 
     offset = tl.arange(0, tokens_per_thread) + start_idx
-    mask = offset < numel
-    expert_id = tl.load(topk_ids_ptr + offset, mask=mask)
+    in_range = offset < numel
+    expert_id = tl.load(topk_ids_ptr + offset, mask=in_range, other=-1)
+    mask = in_range & (expert_id >= 0) & (expert_id < num_experts)
+    if HAS_EXPERT_MAP:
+        expert_id = tl.load(expert_map + expert_id, mask=mask, other=-1)
+        mask &= (expert_id >= 0) & (expert_id < num_experts)
+    if HAS_SCATTER:
+        tl.store(scatter_idx + offset, tl.where(mask, offset, -1), mask=in_range)
     token_idx_in_expert = tl.atomic_add(
         tokens_cnts_ptr + off_t + expert_id, 1, mask=mask
     )
@@ -535,6 +559,9 @@ def _moe_align_block_size_triton_4stage(
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
     workspace=None,
+    *,
+    expert_map=None,
+    scatter_idx=None,
 ) -> None:
     """Non-TLE 4-stage pipeline.
 
@@ -578,6 +605,8 @@ def _moe_align_block_size_triton_4stage(
         numel_expert_ids,
         block_size_sorted,
         block_size_expert,
+        expert_map,
+        expert_map is not None,
     )
     if num_experts == num_experts_next_power_of_2:
         moe_align_block_size_stage2_vec[grid](tokens_cnts, num_experts)
@@ -601,6 +630,71 @@ def _moe_align_block_size_triton_4stage(
         block_size,
         numel,
         tokens_per_thread,
+        expert_map,
+        scatter_idx,
+        expert_map is not None,
+        scatter_idx is not None,
+    )
+
+
+def moe_align_block_size_ep(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    expert_map: Optional[torch.Tensor] = None,
+    scatter_idx: Optional[torch.Tensor] = None,
+) -> None:
+    """Align local routes in place using vLLM's padded route and scatter IDs.
+
+    The caller provides output capacity for each retained route padded to a
+    block boundary. The map is indexed by global expert ID and stores local
+    IDs or -1. Omit it to group routes by their original expert IDs.
+    """
+    if num_experts <= 0 or block_size <= 0:
+        raise ValueError("MoE alignment requires positive expert and block counts")
+    if topk_ids.ndim != 2 or topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("MoE alignment requires 2D int32/int64 route IDs")
+    if not topk_ids.is_contiguous():
+        raise ValueError("MoE alignment requires contiguous route IDs")
+    buffers = (
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map,
+        scatter_idx,
+    )
+    if any(
+        tensor is not None
+        and (
+            tensor.dtype != torch.int32
+            or tensor.device != topk_ids.device
+            or not tensor.is_contiguous()
+        )
+        for tensor in buffers
+    ):
+        raise ValueError(
+            "MoE alignment buffers must be contiguous int32 on the route device"
+        )
+    if expert_map is not None and expert_map.shape != (num_experts,):
+        raise ValueError("MoE alignment requires one local index per global expert")
+    if scatter_idx is not None and scatter_idx.numel() != topk_ids.numel():
+        raise ValueError("MoE alignment requires one scatter index per routed slot")
+    if num_tokens_post_pad.numel() != 1 or expert_ids.numel() < triton.cdiv(
+        sorted_token_ids.numel(), block_size
+    ):
+        raise ValueError("MoE alignment output buffers have incompatible sizes")
+    _moe_align_block_size_triton_4stage(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map=expert_map,
+        scatter_idx=scatter_idx,
     )
 
 
@@ -777,8 +871,8 @@ def _moe_align_block_size_small_grouped_kernel(
 
     for route_idx in tl.static_range(0, BLOCK_ROUTES):
         if route_idx < NUM_ROUTES:
-            expert_id = tl.load(topk_ids_ptr + route_idx).to(tl.int32)
-            counts += tl.where(expert_offsets == expert_id, 1, 0)
+            expert_id = tl.load(topk_ids_ptr + route_idx)
+            counts += tl.where(expert_mask & (expert_offsets == expert_id), 1, 0)
 
     aligned_counts = tl.cdiv(counts, BLOCK_SIZE_M) * BLOCK_SIZE_M
     starts = tl.cumsum(aligned_counts, 0) - aligned_counts
@@ -805,11 +899,15 @@ def _moe_align_block_size_small_grouped_kernel(
     ranks = tl.zeros((BLOCK_EXPERT,), dtype=tl.int32)
     for route_idx in tl.static_range(0, BLOCK_ROUTES):
         if route_idx < NUM_ROUTES:
-            expert_id = tl.load(topk_ids_ptr + route_idx).to(tl.int32)
-            is_expert = expert_offsets == expert_id
+            expert_id = tl.load(topk_ids_ptr + route_idx)
+            is_expert = expert_mask & (expert_offsets == expert_id)
             rank = tl.sum(tl.where(is_expert, ranks, 0), 0)
             start = tl.sum(tl.where(is_expert, starts, 0), 0)
-            tl.store(sorted_token_ids_ptr + start + rank, route_idx)
+            tl.store(
+                sorted_token_ids_ptr + start + rank,
+                route_idx,
+                mask=tl.sum(is_expert.to(tl.int32), 0) != 0,
+            )
             ranks += tl.where(is_expert, 1, 0)
 
 

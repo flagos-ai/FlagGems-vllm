@@ -183,6 +183,7 @@ from flaggems_vllm.ops.minimax_m3_sparse_attn import (
 )
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size,
+    moe_align_block_size_ep,
     moe_align_block_size_no_tle,
     moe_align_block_size_triton,
 )
@@ -413,6 +414,7 @@ __all__ = [
     "minimax_m3_sparse_attn_decode",
     "MixLayout",
     "moe_align_block_size",
+    "moe_align_block_size_ep",
     "moe_align_block_size_no_tle",
     "moe_align_block_size_triton",
     "moe_sum",

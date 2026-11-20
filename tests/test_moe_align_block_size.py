@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +27,87 @@ from flaggems_vllm.ops.moe_align_block_size import (
 )
 
 from . import accuracy_utils as utils
+
+
+@pytest.mark.moe_align_block_size_triton
+@pytest.mark.moe_align_block_size_ep
+@pytest.mark.parametrize("mapped", [False, True])
+def test_align_excludes_invalid_and_nonlocal_routes(mapped):
+    if flaggems_vllm.vendor_name != "nvidia":
+        pytest.skip("CUDA alignment test")
+    device = flaggems_vllm.device
+    experts, block = 8, 4
+    ids = torch.empty((2, 4), dtype=torch.int32, device=device)
+    sorted_ids = torch.empty(32, dtype=torch.int32, device=device)
+    block_ids = torch.empty(8, dtype=torch.int32, device=device)
+    count = torch.empty(1, dtype=torch.int32, device=device)
+    scatter = torch.empty_like(ids)
+    permutation = [2, -1, 0, 1, -1, -1, -1, -1]
+    expert_map = torch.tensor(permutation, dtype=torch.int32, device=device)
+    active_map = expert_map if mapped else None
+    mapping = permutation if mapped else list(range(experts))
+    states = [
+        [-1, 3, 2, 0, 8, 0, 1, -1],
+        [2, -1, -1, 8, 1, 1, 3, 2],
+    ]
+
+    def prepare(state):
+        flat = states[state]
+        ids.copy_(torch.tensor(flat, dtype=torch.int32, device=device).view_as(ids))
+        for buffer in (sorted_ids, block_ids, count, scatter):
+            buffer.fill_(999)
+        routes = [
+            (i, mapping[expert])
+            for i, expert in enumerate(flat)
+            if 0 <= expert < experts and mapping[expert] >= 0
+        ]
+        return routes
+
+    def check(routes, output, blocks, padded, scattered=None):
+        valid_by_expert = {expert: [] for _, expert in routes}
+        for index, expert in routes:
+            valid_by_expert[expert].append(index)
+        expected_count = sum(
+            ((len(group) + block - 1) // block) * block
+            for group in valid_by_expert.values()
+        )
+        assert padded.item() == expected_count
+        observed = []
+        for row, expert in zip(
+            output[:expected_count].reshape(-1, block).tolist(),
+            blocks[: expected_count // block].tolist(),
+        ):
+            observed.extend((i, expert) for i in row if i != ids.numel())
+        assert sorted(observed) == routes
+        assert torch.all(output[expected_count:] == ids.numel())
+        if scattered is not None:
+            expected_scatter = [-1] * ids.numel()
+            for index, _ in routes:
+                expected_scatter[index] = index
+            assert scattered.flatten().tolist() == expected_scatter
+
+    def launch():
+        flaggems_vllm.moe_align_block_size_ep(
+            ids, experts, block, sorted_ids, block_ids, count, active_map, scatter
+        )
+
+    routes = prepare(0)
+    if not mapped:
+        flaggems_vllm.moe_align_block_size_triton(
+            ids, experts, block, sorted_ids, block_ids, count
+        )
+        check(routes, sorted_ids, block_ids, count)
+        prepare(0)
+    launch()
+    check(routes, sorted_ids, block_ids, count, scatter)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for state in (0, 1, 0):
+        routes = prepare(state)
+        graph.replay()
+        check(routes, sorted_ids, block_ids, count, scatter)
 
 
 @pytest.mark.moe_align_block_size_triton
@@ -227,12 +309,13 @@ def test_moe_align_nonzero_launch_extents(
 ):
     """Empty compact buffers must not produce arange(0, 0) launch constants."""
     module = importlib.import_module("flaggems_vllm.ops.moe_align_block_size")
+    kernel_signature = inspect.signature(module.moe_align_block_size_stage1.fn)
     calls = []
 
     class Kernel:
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
-                calls.append(args)
+                calls.append((args, kwargs))
 
             return launch
 
@@ -248,7 +331,12 @@ def test_moe_align_nonzero_launch_extents(
         workspace=(None, None),
     )
     assert len(calls) == 4
-    extents = [calls[0][4], calls[0][-2], calls[0][-1]]
+    stage1_args, stage1_kwargs = calls[0]
+    launch = kernel_signature.bind(*stage1_args, **stage1_kwargs).arguments
+    extents = [
+        launch[field]
+        for field in ("tokens_per_thread", "block_size_sorted", "block_size_expert")
+    ]
     expected = [
         1 << (max(1, (n + num_experts - 1) // num_experts) - 1).bit_length()
         for n in [num_routes, num_sorted, num_blocks]
