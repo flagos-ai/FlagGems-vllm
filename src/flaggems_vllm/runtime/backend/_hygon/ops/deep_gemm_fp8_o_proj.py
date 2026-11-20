@@ -262,112 +262,113 @@ def _inv_rope_quant_int8_kernel(
     ROPE_START: tl.constexpr,
     HALF_ROPE: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    HEADS_PER_PROG: tl.constexpr = 1,
 ):
-    """One program covers ``BLOCK_T`` tokens of one (group, head) pair.
+    """One program covers ``BLOCK_T`` tokens of ``HEADS_PER_PROG`` heads.
 
     The layout follows the hygon ``fused_inv_rope_fp8_quant`` kernel: whole
     128-wide chunks are quantized from a compact tile, and only the trailing
     chunk runs the narrow rope rotation. The E4M3 grid values are rescaled onto
-    INT8, so the block scale is ``amax / 127``.
+    INT8, so the block scale is ``amax / 127``. Two heads per program halve the
+    per-program token-level loads (positions, cos/sin) and the launch overhead.
     """
     pid_gh = tl.program_id(0).to(tl.int64)
     pid_t = tl.program_id(1).to(tl.int64)
 
-    g = pid_gh // heads_per_group
-    head_in_group = pid_gh % heads_per_group
+    first_head = pid_gh * HEADS_PER_PROG
+    g = first_head // heads_per_group
+    head0 = first_head % heads_per_group
 
     rows = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     rows_valid = rows < num_tokens
     mask2d = rows_valid[:, None]
-    input_base = o_ptr + pid_gh * o_stride_head
     row_off = rows[:, None] * o_stride_token
     chunk_cols = tl.arange(0, QUANT_GROUP_SIZE)
-    out_base = (
-        out_ptr
-        + g * out_stride_group
-        + rows[:, None] * out_stride_token
-        + head_in_group * CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
+    out_row = (
+        out_ptr + g * out_stride_group + rows[:, None] * out_stride_token
     )
     scale_base = scale_ptr + g * scale_stride_group + rows * scale_stride_token
 
-    # Whole chunks without rope.
-    for ci in tl.static_range(CHUNKS_PER_HEAD - 1):
-        xi = tl.load(
-            input_base + row_off + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
-            mask=mask2d,
-            other=0.0,
-        ).to(tl.float32)
-        absmax_i = tl.maximum(tl.max(tl.abs(xi), axis=1), eps)
-        scale_i = absmax_i * (1.0 / int8_max)
-        rscale_i = fp8_max / absmax_i
-        qi = _round_to_e4m3_grid(xi * rscale_i[:, None]) * (int8_max / fp8_max)
-        qi = tl.where(qi >= 0, qi + 0.5, qi - 0.5).to(tl.int32).to(tl.int8)
-        tl.store(
-            scale_base + (head_in_group * CHUNKS_PER_HEAD + ci) * scale_stride_k,
-            scale_i,
-            mask=rows_valid,
-        )
-        tl.store(
-            out_base + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
-            qi,
-            mask=mask2d,
-        )
-
-    # Last chunk: first ROPE_START columns are pass-through, the trailing
-    # ROPE_WIDTH columns are inverse-rotated on a narrow tile.
-    ROPE_WIDTH: tl.constexpr = QUANT_GROUP_SIZE - ROPE_START
-    last_base = (CHUNKS_PER_HEAD - 1) * QUANT_GROUP_SIZE
-    lo_cols = tl.arange(0, ROPE_START)
-    hi_cols = tl.arange(0, ROPE_WIDTH)
-    lo = tl.load(
-        input_base + row_off + last_base + lo_cols[None, :], mask=mask2d, other=0.0
-    ).to(tl.float32)
+    # Token-level inputs are shared by every head this program handles; keeping
+    # them outside the head loop halves their traffic when two heads are fused.
     pos = tl.load(positions_ptr + rows, mask=rows_valid, other=0)
-    hi = tl.load(
-        input_base + row_off + last_base + ROPE_START + hi_cols[None, :],
-        mask=mask2d,
-        other=0.0,
-    ).to(tl.float32)
-    # The rope pairs are interleaved (even, odd): split them out of the tile
-    # instead of loading the partner element again (that re-read cost 1/8 of
-    # the row's bytes and showed up as ~10% of the pass at prefill sizes).
-    pairs = tl.reshape(hi, (BLOCK_T, HALF_ROPE, 2))
-    even, odd = tl.split(pairs)
     half_cols = tl.arange(0, HALF_ROPE)
     cache_off = pos[:, None] * cache_stride_pos + half_cols[None, :]
     cos_v = tl.load(cos_sin_cache_ptr + cache_off, mask=mask2d, other=1.0)
     sin_v = tl.load(cos_sin_cache_ptr + HALF_ROPE + cache_off, mask=mask2d, other=0.0)
-    hi_rot = tl.reshape(
-        tl.join(even * cos_v + odd * sin_v, odd * cos_v - even * sin_v),
-        (BLOCK_T, ROPE_WIDTH),
-    )
+    lo_cols = tl.arange(0, ROPE_START)
+    hi_cols = tl.arange(0, QUANT_GROUP_SIZE - ROPE_START)
+    last_base: tl.constexpr = (CHUNKS_PER_HEAD - 1) * QUANT_GROUP_SIZE
 
-    absmax_last = tl.maximum(
-        tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi_rot), axis=1)), eps
-    )
-    scale_last = absmax_last * (1.0 / int8_max)
-    rscale_last = fp8_max / absmax_last
-    tl.store(
-        scale_base
-        + (head_in_group * CHUNKS_PER_HEAD + CHUNKS_PER_HEAD - 1) * scale_stride_k,
-        scale_last,
-        mask=rows_valid,
-    )
+    for hp in tl.static_range(HEADS_PER_PROG):
+        head_in_group = head0 + hp
+        input_base = o_ptr + (first_head + hp) * o_stride_head
+        out_base = out_row + head_in_group * CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
+        scale_ofs = head_in_group * CHUNKS_PER_HEAD
 
-    q_lo = _round_to_e4m3_grid(lo * rscale_last[:, None]) * (int8_max / fp8_max)
-    q_lo = tl.where(q_lo >= 0, q_lo + 0.5, q_lo - 0.5).to(tl.int32).to(tl.int8)
-    q_hi = _round_to_e4m3_grid(hi_rot * rscale_last[:, None]) * (int8_max / fp8_max)
-    q_hi = tl.where(q_hi >= 0, q_hi + 0.5, q_hi - 0.5).to(tl.int32).to(tl.int8)
-    tl.store(
-        out_base + last_base + lo_cols[None, :],
-        q_lo,
-        mask=mask2d,
-    )
-    tl.store(
-        out_base + last_base + ROPE_START + hi_cols[None, :],
-        q_hi,
-        mask=mask2d,
-    )
+        # Whole chunks without rope.
+        for ci in tl.static_range(CHUNKS_PER_HEAD - 1):
+            xi = tl.load(
+                input_base + row_off + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
+                mask=mask2d,
+                other=0.0,
+            ).to(tl.float32)
+            absmax_i = tl.maximum(tl.max(tl.abs(xi), axis=1), eps)
+            scale_i = absmax_i * (1.0 / int8_max)
+            rscale_i = fp8_max / absmax_i
+            qi = _round_to_e4m3_grid(xi * rscale_i[:, None]) * (int8_max / fp8_max)
+            qi = tl.where(qi >= 0, qi + 0.5, qi - 0.5).to(tl.int32).to(tl.int8)
+            tl.store(
+                scale_base + (scale_ofs + ci) * scale_stride_k,
+                scale_i,
+                mask=rows_valid,
+            )
+            tl.store(
+                out_base + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
+                qi,
+                mask=mask2d,
+            )
+
+        # Last chunk: first ROPE_START columns are pass-through, the trailing
+        # ROPE_WIDTH columns are inverse-rotated in registers. The rope pairs
+        # are interleaved (even, odd); both halves come out of one load.
+        lo = tl.load(
+            input_base + row_off + last_base + lo_cols[None, :],
+            mask=mask2d,
+            other=0.0,
+        ).to(tl.float32)
+        hi = tl.load(
+            input_base + row_off + last_base + ROPE_START + hi_cols[None, :],
+            mask=mask2d,
+            other=0.0,
+        ).to(tl.float32)
+        pairs = tl.reshape(hi, (BLOCK_T, HALF_ROPE, 2))
+        even, odd = tl.split(pairs)
+        hi_rot = tl.reshape(
+            tl.join(even * cos_v + odd * sin_v, odd * cos_v - even * sin_v),
+            (BLOCK_T, QUANT_GROUP_SIZE - ROPE_START),
+        )
+
+        absmax_last = tl.maximum(
+            tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi_rot), axis=1)), eps
+        )
+        rscale_last = fp8_max / absmax_last
+        tl.store(
+            scale_base + (scale_ofs + CHUNKS_PER_HEAD - 1) * scale_stride_k,
+            absmax_last * (1.0 / int8_max),
+            mask=rows_valid,
+        )
+
+        q_lo = _round_to_e4m3_grid(lo * rscale_last[:, None]) * (int8_max / fp8_max)
+        q_lo = tl.where(q_lo >= 0, q_lo + 0.5, q_lo - 0.5).to(tl.int32).to(tl.int8)
+        q_hi = _round_to_e4m3_grid(hi_rot * rscale_last[:, None]) * (
+            int8_max / fp8_max
+        )
+        q_hi = tl.where(q_hi >= 0, q_hi + 0.5, q_hi - 0.5).to(tl.int32).to(tl.int8)
+        tl.store(out_base + last_base + lo_cols[None, :], q_lo, mask=mask2d)
+        tl.store(
+            out_base + last_base + ROPE_START + hi_cols[None, :], q_hi, mask=mask2d
+        )
 
 
 @triton.jit
@@ -567,8 +568,12 @@ def _launch_quant_int8(
 ) -> None:
     """Quantize ``o`` into the preallocated INT8 buffers."""
     num_tokens, _, head_dim = o.shape
+    # Two heads per program halves the token-level loads and the program count
+    # from 512 tokens up (-0.7% to -5%); smaller shapes lose parallelism and an
+    # odd heads_per_group always falls back to one head.
+    hpp = 2 if (heads_per_group % 2 == 0 and num_tokens >= 512) else 1
     grid = (
-        n_groups * heads_per_group,
+        n_groups * heads_per_group // hpp,
         triton.cdiv(max(num_tokens, 1), block_t),
     )
     args = (
@@ -595,10 +600,11 @@ def _launch_quant_int8(
         nope_dim % _QUANT_BLOCK,
         rope_dim // 2,
         block_t,
+        hpp,
     )
     key_extra = (
         tuple(_tensor_key(t) for t in (o, positions, cos_sin_cache, out, scale)),
-        args[6:23],
+        args[6:24],
         num_tokens == 1,
         num_tokens % 16 == 0,
     )
@@ -1026,12 +1032,12 @@ def deep_gemm_fp8_o_proj(
             act_i8, act_scale_i8 = _activation_to_int8(act, act_scale)
         else:
             act_i8, act_scale_i8 = _quant_buffers_cached(o, n_groups, heads_per_group)
-            # 8-token tiles keep the vector units busy up to 512 tokens (-2% to
-            # -15% vs 4); below 64 tokens there are not enough rows and the
-            # larger prefill shapes prefer 4.
+            # 8-token tiles keep the vector units busy up to 256 tokens (-2% to
+            # -15% vs 4); below 64 tokens there are not enough rows and from 512
+            # the 4-token tile is faster now that two heads share a program.
             if num_tokens < 64:
                 block_t = 2
-            elif num_tokens <= 512:
+            elif num_tokens <= 256:
                 block_t = 8
             else:
                 block_t = 4
