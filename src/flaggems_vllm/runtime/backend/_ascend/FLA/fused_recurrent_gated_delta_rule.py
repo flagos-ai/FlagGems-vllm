@@ -3,6 +3,7 @@
 # Retains the recurrent formulation from flash-linear-attention (MIT):
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 """Ascend recurrent GDN: unique logical tiles and strided state gathers."""
+import logging
 import math
 from functools import lru_cache
 
@@ -10,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 from triton.backends.ascend.driver import NPUUtils
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=None)
@@ -99,10 +102,17 @@ def _recurrent_gdn_kernel(
             # The tested Ascend compiler miscopies 2D strided state tiles.
             # Gather/scatter flat addresses and reshape only in registers.
             rr = tl.arange(0, BV * BK)
-            flat_v = iv * BV + rr // BK
-            flat_k = rr % BK
-            state_offsets = hv * SS[1] + flat_v * SS[2] + flat_k * SS[3]
-            state_mask = (flat_v < V) & (flat_k < K)
+            if BK == K and SS[2] == K * SS[3]:
+                # A uniform stride across rows is affine over the whole tile.
+                # Expose it directly to the compiler and store only view elements.
+                linear = iv * (BV * BK) + rr
+                state_offsets = hv * SS[1] + linear * SS[3]
+                state_mask = linear < V * K
+            else:
+                flat_v = iv * BV + rr // BK
+                flat_k = rr % BK
+                state_offsets = hv * SS[1] + flat_v * SS[2] + flat_k * SS[3]
+                state_mask = (flat_v < V) & (flat_k < K)
         acc = tl.full((BV, BK), 0, tl.float32)
         if INITIAL:
             loaded = tl.load(
@@ -197,6 +207,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     cu_seqlens must be monotone, start at zero and end at T. Index-table width
     must cover each sequence. These device metadata are caller preconditions.
     """
+    logger.debug("GEMS_ASCEND FUSED_RECURRENT_GATED_DELTA_RULE_FWD")
     if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
         raise ValueError("q/k must have identical [B,T,H,K] shapes; v must be rank 4")
     B, T, H, K = q.shape

@@ -7,17 +7,84 @@ from __future__ import annotations
 import logging
 
 import torch
+import triton
+import triton.language as tl
 
 from flaggems_vllm import runtime
-from flaggems_vllm.ops.qwen4.hc_combine import _hc_combine_kernel
+from flaggems_vllm.ops.qwen4.hc_combine import (
+    _hc_combine_kernel,
+    _hc_combine_vectorized,
+)
+from flaggems_vllm.utils import libentry
+from flaggems_vllm.utils.libentry import major_version, minor_version
 
 logger = logging.getLogger(__name__)
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-_BLOCK_D_VALUES = {
-    config.kwargs["BLOCK_D"] for config in runtime.get_tuned_config("hc_combine")
-}
-_GRID_BLOCK_D = next(iter(_BLOCK_D_VALUES)) if len(_BLOCK_D_VALUES) == 1 else None
+_CONFIGS = runtime.get_tuned_config("hc_combine")
+_FIXED_CONFIG = (
+    _CONFIGS[0] if len(_CONFIGS) == 1 and not _CONFIGS[0].kwargs["LOOP"] else None
+)
+_COMPILED_LAUNCH_HAS_CONSTEXPRS = major_version == 3 and 3 <= minor_version <= 6
+
+
+@libentry()
+@triton.jit(do_not_specialize=["D", "SR", "SB", "SI"])
+def _hc_combine_runtime_shape(
+    R,
+    B,
+    I,
+    O,
+    D,
+    SR,
+    SB,
+    SI,
+    HC: tl.constexpr,
+    HAS_INJECTION: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    block = tl.load(B + row * SB + d, d < D, other=0).to(tl.float32)
+    _hc_combine_vectorized(R, I, O, block, row, d, D, SR, SI, HC, HAS_INJECTION)
+
+
+def _launch_hc_combine(
+    residual, block_output, injection_logits, out, n, d, hc_count, sr, sb, si
+):
+    has_injection = injection_logits is not None
+    if _FIXED_CONFIG is None:
+        _hc_combine_kernel[lambda meta: (n, triton.cdiv(d, meta["BLOCK_D"]))](
+            R=residual,
+            B=block_output,
+            I=injection_logits,
+            O=out,
+            SHAPE=(n, d, hc_count, sr, sb, si, has_injection),
+        )
+    else:
+        block_d = _FIXED_CONFIG.kwargs["BLOCK_D"]
+        grid = (n, triton.cdiv(d, block_d), 1)
+        pointers = (residual, block_output, injection_logits, out)
+        dimensions = (d, sr, sb, si)
+        constants = [hc_count, has_injection, block_d]
+        kernel = _hc_combine_runtime_shape
+        if _COMPILED_LAUNCH_HAS_CONSTEXPRS:
+            # This fixed launch has no tuner or hooks. Reuse LibEntry's cache
+            # and key, skipping its general argument binder on warm calls.
+            device = runtime.torch_device_fn.current_device()
+            entry = kernel.kernel_cache[device].get(
+                kernel.key(pointers, dimensions, constants)
+            )
+            if entry is not None:
+                entry[0][grid](*pointers, *dimensions, *constants)
+                return
+        kernel[grid](
+            *pointers,
+            *dimensions,
+            *constants,
+            num_warps=_FIXED_CONFIG.num_warps,
+            num_stages=_FIXED_CONFIG.num_stages,
+        )
 
 
 def hc_combine(
@@ -65,17 +132,9 @@ def hc_combine(
     if device.type in ("cpu", "meta"):
         raise NotImplementedError("hc_combine requires accelerator tensors")
     out = residual.new_empty(shape)
-    if n and width:
-        grid = (
-            (n, (d + _GRID_BLOCK_D - 1) // _GRID_BLOCK_D)
-            if _GRID_BLOCK_D is not None
-            else lambda meta: (n, (d + meta["BLOCK_D"] - 1) // meta["BLOCK_D"])
-        )
-        _hc_combine_kernel[grid](
-            R=residual,
-            B=block_output,
-            I=injection_logits,
-            O=out,
-            SHAPE=(n, d, hc_count, sr, sb, si, has_injection),
-        )
+    if not n or not width:
+        return out
+    _launch_hc_combine(
+        residual, block_output, injection_logits, out, n, d, hc_count, sr, sb, si
+    )
     return out
