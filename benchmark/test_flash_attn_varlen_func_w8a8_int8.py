@@ -56,6 +56,10 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
         default_path = Path(self.DEFAULT_SHAPE_FILES)
         path = Path(shape_file_path) if shape_file_path else default_path
         if vendor_name == "thead":
+            if path.resolve() == default_path.resolve():
+                # Reuse the existing Qwen3.6 D256 representative workloads.
+                super().set_shapes(str(path))
+                return
             with path.open() as stream:
                 data = yaml.safe_load(stream)
             if isinstance(data, list):
@@ -76,13 +80,12 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
             )
             if benchmark_config.Config.bench_level == BenchLevel.CORE:
                 self.captured_shapes = self.captured_shapes[:10]
-            if path.resolve() != default_path.resolve():
-                # Explicit capture files define the entire requested workload.
-                self.shapes = []
-                return
+            # Explicit capture files define the entire requested workload.
+            self.shapes = []
+            return
         # vllm/benchmarks/attention_benchmarks/configs/standard_attention.yaml
         # Each group is (request count, query length, total KV length).
-        # Preserve historical D128 coverage on every existing backend.
+        # Preserve historical D128 coverage on the other backends.
         workloads = [
             ((1, 512, 512),),
             ((1, 2048, 2048),),
@@ -113,6 +116,8 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
 
     def flash_attn_varlen_input_fn(self, config, dtype, device):
         args = list(super().flash_attn_varlen_input_fn(config, dtype, device))
+        if vendor_name == "thead":
+            return tuple(args)
         # Match vLLM runner._build_common_attn_metadata: distinct sequential
         # cache blocks per request, including unused slots for shorter requests.
         batch = len(config[1])
@@ -122,7 +127,7 @@ class FlashAttnVarlenInt8Benchmark(FlashAttnVarlenBenchmark):
         return tuple(args)
 
     def get_input_iter(self, dtype):
-        if vendor_name == "metax":
+        if vendor_name in ("metax", "thead"):
             torch.manual_seed(0)
         for bf16_args in super().get_input_iter(dtype):
             q, k, v = bf16_args[:3]
