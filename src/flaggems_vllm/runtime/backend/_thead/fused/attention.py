@@ -319,7 +319,14 @@ def _flash_int8_fwd(
         # For D = sum(P) >= 1, the remaining error divided by D is bounded by
         # max(u, (nk - 1) * epsilon), since u * (D - 1) + (nk - 1) * epsilon
         # bounds the unnormalized error. |V_int8| <= 128 then bounds each output.
-        if SCALED_PV:
+        if SCALED_PV and D == 256:
+            # The final maximum is exact after scaling. For Z >= 1,
+            # (u * (Z - 1) + (nk - 1) * eps) / Z <= max(u, (nk - 1) * eps).
+            probability_error = tl.maximum(
+                PV_RELATIVE_ROUNDING,
+                tl.maximum(nk - 1, 0) * PV_SCALED_UNDERFLOW_BOUND,
+            )
+        elif SCALED_PV:
             probability_error = PV_RELATIVE_ROUNDING + nk * PV_SCALED_UNDERFLOW_BOUND
         else:
             probability_error = tl.maximum(
@@ -929,6 +936,18 @@ def flash_attn_varlen_func_w8a8_int8(
         block_m = 64 if logical_kv else 32 if max_seqlen_q > 16 else 16
         block_n, num_warps, half_pv = 64, 4, True
         num_stages = 2 if logical_kv or max_seqlen_k >= 512 else 1
+        if group <= 8 and max_seqlen_q == 1 and max_seqlen_k <= 32:
+            # A single KV tile avoids padded columns and excess decode warps.
+            block_m, block_n, num_warps = 8, 32, 2
+        elif (
+            fold
+            and group <= 8
+            and 1 < max_seqlen_q <= SHORT_QUERY_LIMIT.value
+            and max_seqlen_k >= SPLIT_KV_MIN_LENGTH.value
+            and num_splits != 1
+        ):
+            # Reuse each split's KV loads across more folded query rows.
+            block_m = 32
     split_kv = (
         common_gqa
         and max_seqlen_q == 1
@@ -941,12 +960,20 @@ def flash_attn_varlen_func_w8a8_int8(
         # More CTAs improve occupancy when one-token decode has few KV heads.
         block_m, block_n, num_warps, num_stages, half_pv = 8, 128, 2, 2, False
     splits = DECODE_KV_SPLITS.value if split_kv else 1
-    if dim == 256 and num_splits > 1:
-        # The hint is an upper bound: already-parallel batches need fewer splits.
+    if dim == 256 and (
+        num_splits > 1
+        or (
+            num_splits == 0
+            and max_seqlen_q <= SHORT_QUERY_LIMIT.value
+            and max_seqlen_k >= SPLIT_KV_MIN_LENGTH.value
+        )
+    ):
+        # Auto-split short queries; explicit hints remain upper bounds.
+        # Already-parallel batches need fewer splits.
         parallel_heads = batch * (kv_heads if fold else heads)
         workspace_cap = max(1, SPLIT_KV_MAX_BYTES // (total * heads * (dim + 2) * 4))
         splits = min(
-            num_splits,
+            num_splits or MAX_KV_SPLITS,
             max(1, triton.cdiv(SPLIT_KV_TARGET_BLOCKS, parallel_heads)),
             max(1, triton.cdiv(max_seqlen_k, block_n)),
             workspace_cap,
