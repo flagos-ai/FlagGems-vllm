@@ -186,6 +186,7 @@ def _route_rows(
     else:
         logits = tl.load(logits_ptr, columns[None, :] < EXPERTS, other=-float("inf"))
 
+    logits = logits.to(tl.float32)
     RANK_LOGITS: tl.constexpr = (
         SCORING == "softmax" and not HAS_BIAS and TOP_GROUPS == GROUPS
     )
@@ -278,7 +279,11 @@ def _route_rows(
     tl.store(weights_ptr + output, weights * (scale / (total[:, None] + 1e-20)), mask)
 
 
-def _validate_routing_sizes(topk, groups, top_groups):
+def _validate_routing(topk, groups, top_groups, logits_dtype):
+    assert logits_dtype in (
+        torch.float32,
+        torch.bfloat16,
+    ), "logits_dtype must be FP32 or BF16"
     assert (
         type(topk) is type(groups) is type(top_groups) is int
     ), "topk, groups and top_groups must be integers"
@@ -302,7 +307,7 @@ def _validate_gate_tensors(x, weight, bias):
 
 
 def _validate_v4_inputs(x, weight, input_ids, tid2eid, bias_vl, config):
-    topk, scoring, groups, top_groups, _, image_lo = config
+    topk, scoring, groups, top_groups, _, image_lo, _ = config
     if tid2eid is None and bias_vl is None:
         assert input_ids is None, "input_ids require hash or vision routing"
         return
@@ -367,7 +372,7 @@ def _validate_gate(x, weight, bias, topk, scoring, groups, top_groups, scale):
 
 
 def _gate_launch_args(
-    x, weight, bias, topk, scoring, groups, top_groups, routing_inputs
+    x, weight, bias, topk, scoring, groups, top_groups, routing_inputs, logits_dtype
 ):
     tokens, hidden = x.shape
     experts = weight.shape[0]
@@ -488,8 +493,10 @@ def _gate_launch_args(
         compile_options["multibuffer"] = False
     elif short_wave_preload:
         compile_options["enable_preload"] = True
+    # Storing the projection in the requested dtype fixes its rounding point
+    # before any scoring, bias, group selection or TopK.
     workspace = torch.empty(
-        (row_tiles * block_m, padded_experts), dtype=torch.float32, device=x.device
+        (row_tiles * block_m, padded_experts), dtype=logits_dtype, device=x.device
     )
     return (
         (workers,),
@@ -520,7 +527,7 @@ def _gate_launch_args(
 
 class _PreparedMegaGate:
     def __init__(self, x, weight, bias, routing_inputs, config):
-        topk, scoring, groups, top_groups, scale, image_lo = config
+        topk, scoring, groups, top_groups, scale, image_lo, logits_dtype = config
         tokens = x.shape[0]
         self.config = config
         self.x_shape = x.shape
@@ -540,7 +547,15 @@ class _PreparedMegaGate:
             self.fp32_input = torch.empty_like(x, dtype=torch.float32)
             x = _promote_activation(x, self.fp32_input)
         grid, self.workspace, options = _gate_launch_args(
-            x, weight, bias, topk, scoring, groups, top_groups, routing_inputs
+            x,
+            weight,
+            bias,
+            topk,
+            scoring,
+            groups,
+            top_groups,
+            routing_inputs,
+            logits_dtype,
         )
         options["IMAGE_LO"] = image_lo
         # FlagTree warmup accepts output dtypes as aligned placeholder tensors.
@@ -637,6 +652,7 @@ def prepare_mega_gate(
     tid2eid: torch.Tensor | None = None,
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 129257,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> _PreparedMegaGate:
     """Prepare one shape and routing configuration on the current NPU stream.
 
@@ -645,7 +661,7 @@ def prepare_mega_gate(
     until its captured graphs are reset, and replay them on the prepared stream
     or serialize their workspace use with stream dependencies.
     """
-    _validate_routing_sizes(topk, groups, top_groups)
+    _validate_routing(topk, groups, top_groups, logits_dtype)
     _validate_gate(x, weight, bias, topk, scoring, groups, top_groups, scale)
     assert (
         driver.active.get_current_device() == x.device.index
@@ -653,7 +669,7 @@ def prepare_mega_gate(
     assert (
         not torch.npu.is_current_stream_capturing()
     ), "Prepare MegaGate before capturing a graph"
-    config = (topk, scoring, groups, top_groups, scale, image_sentinel_lo)
+    config = (topk, scoring, groups, top_groups, scale, image_sentinel_lo, logits_dtype)
     routing_inputs = (input_ids, tid2eid, bias_vl)
     _validate_v4_inputs(x, weight, *routing_inputs, config)
     return _PreparedMegaGate(x, weight, bias, routing_inputs, config)
@@ -673,6 +689,7 @@ def mega_gate(
     tid2eid: torch.Tensor | None = None,
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 129257,
+    logits_dtype: torch.dtype = torch.float32,
     prepared: _PreparedMegaGate | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return expert IDs (int32 for V4) and FP32 routing weights.
@@ -683,6 +700,8 @@ def mega_gate(
     IDs in [0, E). With bias_vl, the five image sentinels use dynamic TopK.
     Input tensors use contiguous ND storage.
 
+    logits_dtype selects FP32 (default) or BF16 projection logits before
+    scoring. Routing weights are returned in FP32 for both modes.
     Supports sqrtsoftplus, sigmoid and softmax with optional grouped selection.
     Bias changes expert selection while the weights use the unbiased scores.
     Pass a handle from prepare_mega_gate to reuse its workspace and launcher.
@@ -690,8 +709,8 @@ def mega_gate(
     assert prepared is None or isinstance(
         prepared, _PreparedMegaGate
     ), "Invalid prepared MegaGate handle"
-    _validate_routing_sizes(topk, groups, top_groups)
-    config = (topk, scoring, groups, top_groups, scale, image_sentinel_lo)
+    _validate_routing(topk, groups, top_groups, logits_dtype)
+    config = (topk, scoring, groups, top_groups, scale, image_sentinel_lo, logits_dtype)
     routing_inputs = (input_ids, tid2eid, bias_vl)
     if prepared is not None:
         return prepared.run(x, weight, bias, routing_inputs, config)
@@ -706,7 +725,15 @@ def mega_gate(
         if x.dtype != weight.dtype:
             x = _promote_activation(x, torch.empty_like(x, dtype=torch.float32))
         grid, workspace, options = _gate_launch_args(
-            x, weight, bias, topk, scoring, groups, top_groups, routing_inputs
+            x,
+            weight,
+            bias,
+            topk,
+            scoring,
+            groups,
+            top_groups,
+            routing_inputs,
+            logits_dtype,
         )
         _mega_gate_kernel[grid](
             x,

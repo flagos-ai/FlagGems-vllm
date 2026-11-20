@@ -47,6 +47,18 @@ class GateCase:
     scale: float = 1.0
 
     @property
+    def input_dtype(self):
+        if self.profile in ("v32", "kimi-k25", "qwen-35b", "qwen-397b"):
+            return torch.bfloat16
+        return torch.float32
+
+    @property
+    def logits_dtype(self):
+        if self.profile in ("qwen-35b", "qwen-397b"):
+            return torch.bfloat16
+        return torch.float32
+
+    @property
     def id(self):
         return f"{self.profile}-t{self.tokens}"
 
@@ -70,9 +82,11 @@ def load_gate_cases(shape_file=GATE_SHAPE_FILE, *, quick=False):
 
 def gate_inputs(case, seed):
     rng = torch.Generator().manual_seed(seed)
-    x = torch.randn(case.tokens, case.hidden, generator=rng, dtype=torch.float32)
-    weight = torch.randn(case.experts, case.hidden, generator=rng).mul_(
-        case.hidden**-0.5
+    x = torch.randn(case.tokens, case.hidden, generator=rng, dtype=case.input_dtype)
+    weight = (
+        torch.randn(case.experts, case.hidden, generator=rng)
+        .mul_(case.hidden**-0.5)
+        .to(case.input_dtype)
     )
     bias = None
     if case.scoring != "softmax":
@@ -133,16 +147,44 @@ def _valid_group_tie(case, ranking, ids):
     return False
 
 
-def check_gate(case, inputs, outputs):
+def _check_qwen_bf16(case, inputs, ids, weights):
+    x, weight, bias = inputs
+    assert case.scoring == "softmax" and bias is None and case.groups == 1
+    raw = F.linear(x.float(), weight.float())
+    # FP32 reduction orders can land on opposite sides of a BF16 midpoint.
+    # For these unit-variance logits, only bins reachable within 1e-5 of
+    # the independent dot product are admissible.
+    low = (raw - 1e-5).bfloat16().float()
+    high = (raw + 1e-5).bfloat16().float()
+    best_omitted = low.scatter(1, ids, -torch.inf).amax(-1, keepdim=True)
+    low, high = low.gather(1, ids), high.gather(1, ids)
+    assert (high >= best_omitted).all(), "expert outside BF16 cutoff"
+    # Bound each selected probability with its own low (high) logit and
+    # all other selected logits at their high (low) values.
+    shift = high.amax(-1, keepdim=True)
+    lo, hi = (low - shift).exp(), (high - shift).exp()
+    lower = case.scale * lo / (hi.sum(-1, keepdim=True) - hi + lo)
+    upper = case.scale * hi / (lo.sum(-1, keepdim=True) - lo + hi)
+    assert (weights >= (lower - 2e-6).to(weights.dtype)).all()
+    assert (weights <= (upper + 2e-6).to(weights.dtype)).all()
+
+
+def check_gate(case, inputs, outputs, *, native=False):
     ids, weights = (tensor.cpu() for tensor in outputs)
     assert ids.shape == weights.shape == (case.tokens, case.topk)
-    assert ids.dtype in (torch.int32, torch.int64)
-    assert weights.dtype == torch.float32
+    expected_ids = (
+        torch.int32 if native or inputs[1].dtype == torch.float32 else torch.int64
+    )
+    assert ids.dtype == expected_ids
+    assert weights.dtype == (case.logits_dtype if native else torch.float32)
     ids = ids.long()
     assert ((ids >= 0) & (ids < case.experts)).all()
     ordered = ids.sort(-1).values
     assert (ordered[:, 1:] != ordered[:, :-1]).all()
 
+    if case.logits_dtype == torch.bfloat16:
+        _check_qwen_bf16(case, inputs, ids, weights)
+        return
     scores, ranking = gate_scores(case, *inputs)
     cutoff = ranking.topk(case.topk, dim=-1).values[:, -1:]
     # Ties can pick different IDs, but all dynamic experts must make the cut.
@@ -156,7 +198,7 @@ def check_gate(case, inputs, outputs):
         ), f"group or expert cutoff mismatch at row {row}"
 
     torch.testing.assert_close(
-        weights, gate_weights(case, scores, ids), rtol=2e-4, atol=2e-5
+        weights, gate_weights(case, scores, ids).to(weights.dtype), rtol=2e-4, atol=2e-5
     )
 
 
@@ -171,15 +213,20 @@ def gate_baseline(
     bias_vl=None,
     image_sentinel_lo=129257,
 ):
-    import torch_npu
-
-    logits = F.linear(x.float(), weight)
+    if case.profile in ("v32", "kimi-k25"):
+        # The BF16 fast path in AscendGateLinear.forward.
+        logits = torch.mm(x, weight.t(), out_dtype=torch.float32)
+    elif case.scoring == "sqrtsoftplus":
+        logits = F.linear(x.float(), weight)
+    else:
+        # Qwen's unquantized ReplicatedLinear retains BF16 output rounding.
+        logits = F.linear(x, weight)
     kwargs = dict(
         k=case.topk,
         k_group=case.top_groups,
         group_count=case.groups,
         group_select_mode=1,
-        renorm=int(case.scoring == "softmax"),
+        renorm=int(case.scoring != "sqrtsoftplus"),
         norm_type={"softmax": 0, "sigmoid": 1, "sqrtsoftplus": 2}[case.scoring],
         out_flag=False,
         routed_scaling_factor=case.scale,
@@ -224,7 +271,13 @@ def gate_baseline(
             logits, bias=bias, input_ids=input_ids, tid2eid=tid2eid, **kwargs
         )
     else:
-        weights, ids, _ = torch_npu.npu_moe_gating_top_k(logits, bias=bias, **kwargs)
+        # Initialize the native ops package before its device adaptor.
+        import vllm_ascend.ops  # noqa: F401
+        from vllm_ascend.device.device_op import DeviceOperator
+
+        weights, ids, _ = DeviceOperator.moe_gating_top_k(
+            logits, bias_opt=bias, **kwargs
+        )
     return ids.int(), weights
 
 
@@ -232,6 +285,7 @@ def gate_kwargs(case):
     return dict(
         topk=case.topk,
         scoring=case.scoring,
+        logits_dtype=case.logits_dtype,
         groups=case.groups,
         top_groups=case.top_groups,
         scale=case.scale,
@@ -280,11 +334,18 @@ def test_mega_gate_graph(case):
     from vllm_ascend.utils import enable_custom_op
 
     assert enable_custom_op()
-    for fn in (
+    validate_graph(
         partial(gate_baseline, case),
+        case,
+        gate_inputs,
+        partial(check_gate, native=True),
+    )
+    validate_graph(
         partial(flaggems_vllm.mega_gate, **gate_kwargs(case)),
-    ):
-        validate_graph(fn, case, gate_inputs, check_gate)
+        case,
+        gate_inputs,
+        check_gate,
+    )
 
 
 def test_mega_gate_prepared_streams():
@@ -385,6 +446,7 @@ def test_mega_gate_empty(empty_gate_inputs):
 @pytest.mark.parametrize(
     "kwargs,message",
     [
+        ({"logits_dtype": torch.float16}, "logits_dtype"),
         ({"topk": 6.0}, "must be integers"),
         ({"topk": True}, "must be integers"),
         ({"topk": 0}, "topk must be between"),
@@ -417,6 +479,7 @@ def v4_route_inputs(case, mode, device):
 
 
 @pytest.mark.parametrize("mode", ["hash", "vision", "vision-hash"])
+@torch.inference_mode()
 def test_mega_gate_v4_routes(mode):
     from vllm_ascend.utils import enable_custom_op
 
@@ -512,3 +575,33 @@ def test_mega_gate_group_cutoff_tie():
     assert _valid_group_tie(case, ranking, torch.tensor([2, 3]))
     assert not _valid_group_tie(case, ranking, torch.tensor([0, 2]))
     assert not _valid_group_tie(case, ranking, torch.tensor([4, 5]))
+
+
+def test_mega_gate_qwen_logits_rounding():
+    from vllm_ascend.utils import enable_custom_op
+
+    from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import prepare_mega_gate
+
+    assert enable_custom_op()
+    case = GateCase("qwen-35b", 2, 128, 16, 2, "softmax")
+    x = torch.zeros((2, 128), dtype=torch.bfloat16, device="npu")
+    weight = torch.zeros((16, 128), dtype=x.dtype, device=x.device)
+    # 1 and 1 + 2**-10 are distinct FP32 dot products but the same BF16 logit.
+    x[:, 0] = 1
+    x[:, 1] = torch.tensor([2**-10, -(2**-10)], dtype=x.dtype, device=x.device)
+    weight[0, 0] = 2
+    weight[1:3, 0] = 1
+    weight[2, 1] = 1
+    kwargs = gate_kwargs(case)
+    native_ids, native_weights = gate_baseline(case, x, weight, None)
+    handle = prepare_mega_gate(x, weight, **kwargs)
+    for prepared in (None, handle):
+        ids, weights = flaggems_vllm.mega_gate(x, weight, prepared=prepared, **kwargs)
+        torch.testing.assert_close(ids.int(), native_ids)
+        torch.testing.assert_close(weights.bfloat16(), native_weights)
+    fp32 = dict(kwargs, logits_dtype=torch.float32)
+    ids, _ = flaggems_vllm.mega_gate(x, weight, **fp32)
+    assert ids[:, -1].tolist() == [2, 1]
+    assert native_ids[0, -1].item() == native_ids[1, -1].item()
+    with pytest.raises(AssertionError, match="routing parameters"):
+        flaggems_vllm.mega_gate(x, weight, prepared=handle, **fp32)
