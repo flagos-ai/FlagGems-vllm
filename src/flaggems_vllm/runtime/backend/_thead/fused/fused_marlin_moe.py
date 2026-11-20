@@ -4012,8 +4012,7 @@ def _validate_inputs(
             raise ValueError("Output shape/dtype/device must match hidden_states")
         if not output.is_contiguous() or output.requires_grad:
             raise ValueError("Output must be contiguous and inference-only")
-    # All GEMM1 reads finish before writing the output. Aliasing activations
-    # is safe, but weights/scales/routing remain live during GEMM2.
+    # Weights, scales and routing remain live during GEMM2.
     target = a if inplace else output
     if target is not None and target.numel():
         for tensor in (w1, w2, s1, s2, tw, ids):
@@ -5027,6 +5026,13 @@ def _fused_marlin_moe_impl(
             )
             if batch_tokens < 1:
                 raise NotImplementedError("PPU dense MoE workspace exceeds its budget")
+            if batch_tokens < m and output is not None:
+                # A chunk can overwrite activations needed by a later chunk.
+                byte_offset = abs(output.data_ptr() - hidden_states.data_ptr())
+                if 0 < byte_offset < hidden_states.nbytes:
+                    raise ValueError(
+                        "output must not partially overlap hidden_states in chunked dense MoE"
+                    )
             for start in range(0, m, batch_tokens):
                 end = min(start + batch_tokens, m)
                 run_dense_wna16(
