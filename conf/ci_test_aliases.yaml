@@ -40,6 +40,8 @@ weight_norm_interface_backward: test_weight_norm_interface
 gather_sampler_output: test_batch_shard
 draft_watermarking_mask: test_watermark
 act_quant_triton: test_quant
+apply_trace_tokens: test_trace_replay
+apply_logit_bias: test_logit_bias
 apply_min_p: test_min_p
 apply_thinking_budget: test_thinking_budget
 flash_attn_varlen_opt_func: test_flash_attn_varlen_func
@@ -53,3 +55,5 @@ flash_attn_varlen_func_w8a8: test_flash_attn_varlen_func_w8a8_fp8
 fused_marlin_moe_w4a16: test_fused_marlin_moe
 fused_marlin_moe_w8a16: test_fused_marlin_moe
 pad_trailing_draft_slots: test_speculator
+
+paged_scatter_triton: test_paged_scatter

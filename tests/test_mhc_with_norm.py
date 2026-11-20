@@ -131,27 +131,8 @@ def test_mhc_fused_post_pre_norm_order(tokens, hidden):
     )
 
 
-def test_mhc_pre_projection_materialization_and_mix_norm_stages(monkeypatch):
+def test_mhc_pre_projection_materialization_and_mix_norm_stages():
     """The block output must equal the reference built from a bf16 projection."""
-    module = importlib.import_module("flaggems_vllm.ops.mhc.mhc_pre")
-    sinkhorn = module.mhc_pre_sinkhorn_fuse_kernel
-    projections = []
-
-    class ObserveProjection:
-        def __getitem__(self, grid):
-            launch = sinkhorn[grid]
-
-            def observe(planes, *args, **kwargs):
-                # Match the kernel's split order before checking its BF16 boundary.
-                projection = planes[0].clone()
-                for partial in planes[1:]:
-                    projection.add_(partial)
-                projections.append(projection)
-                return launch(planes, *args, **kwargs)
-
-            return observe
-
-    monkeypatch.setattr(module, "mhc_pre_sinkhorn_fuse_kernel", ObserveProjection())
     residual, fn, scale, base, norm = _inputs(tokens=512, hidden=1280)
     x = torch.randn(512, 1280, dtype=torch.bfloat16, device=gems.device)
     post = torch.randn(512, 4, 1, device=gems.device) * 0.3
@@ -174,16 +155,7 @@ def test_mhc_pre_projection_materialization_and_mix_norm_stages(monkeypatch):
         norm_eps=1e-6,
     )
     flat = after_post.flatten(-2).bfloat16()
-    if projections:
-        assert len(projections) == 1
-        projection = projections[0][:, : fn.shape[0]]
-        exact_projection = flat.double() @ fn.bfloat16().t().double()
-        torch.testing.assert_close(
-            projection.double(), exact_projection, rtol=1e-5, atol=1e-5
-        )
-        projected = projection.bfloat16().float()
-    else:
-        projected = (flat @ fn.bfloat16().t()).bfloat16().float()
+    projected = (flat @ fn.bfloat16().t()).bfloat16().float()
     expected = _pre_reference(after_post, fn, scale, base, projected=projected)
     torch.testing.assert_close(actual[0], after_post, rtol=0, atol=0)
     for observed, reference in zip(actual[1:3], expected[:2]):

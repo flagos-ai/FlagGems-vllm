@@ -17,9 +17,13 @@ from flaggems_vllm.ops.batch_shard import gather_sampler_output
 from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
+from flaggems_vllm.ops.logit_bias import apply_logit_bias
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.matmul_persistent import matmul_persistent
 from flaggems_vllm.ops.top_k_top_p import top_k_top_p
+from flaggems_vllm.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.ops.attn_res import attn_res
+from flaggems_vllm.ops.bad_words import apply_bad_words
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
 from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
@@ -56,7 +60,6 @@ from flaggems_vllm.ops.FLA import (
     chunk_kda_with_fused_gate,
     fused_recurrent_gated_delta_rule_fwd,
     fused_recurrent_gated_delta_rule_packed_decode,
-    fused_recurrent_kda,
 )
 from flaggems_vllm.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.ops.gate_sigmoid_mul import gate_sigmoid_mul
@@ -88,6 +91,7 @@ from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
     fp8_fp4_paged_mqa_logits_graph,
 )
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
+from flaggems_vllm.ops.fused_q import fused_q
 from flaggems_vllm.ops.fused_allreduce_rms_norm import (
     fused_allreduce_rms_norm,
 )
@@ -124,6 +128,7 @@ from flaggems_vllm.ops.input_batch import get_num_sampled_and_rejected
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
+from flaggems_vllm.ops.logprob import compute_topk_scores
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
@@ -201,6 +206,9 @@ from flaggems_vllm.ops.reglu import dreglu, reglu
 from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
+from flaggems_vllm.ops.reshape_and_cache_flash_strided import (
+    reshape_and_cache_flash_strided,
+)
 from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
@@ -257,6 +265,7 @@ from flaggems_vllm.ops.fused_minimax_m3_qknorm_rope_kv_insert import (
 )
 from flaggems_vllm.ops.kda_bounded import (
     chunk_kda_with_safe_gate,
+    fused_recurrent_kda,
     recurrent_kda,
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
@@ -285,10 +294,13 @@ from flaggems_vllm.ops.vit_attention import (
 __all__ = [
     "act_quant_triton",
     "add_rms_norm",
+    "apply_bad_words",
+    "apply_logit_bias",
     "apply_min_p",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
     "apply_thinking_budget",
+    "apply_trace_tokens",
     "attn_res",
     "beam_search_score",
     "beam_search_score_",
@@ -308,6 +320,7 @@ __all__ = [
     "clear_fused_matmul_reduce_scatter_cache",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
+    "compute_topk_scores",
     "concat_and_cache_mla",
     "concat_mla_q",
     "concat_query",
@@ -353,6 +366,7 @@ __all__ = [
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
+    "fused_q",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
@@ -388,6 +402,7 @@ __all__ = [
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
     "mamba_mixer",
+    "matmul_persistent",
     "mhc_bwd",
     "mhc_fused_post_pre_with_norm",
     "mhc_post",
@@ -448,6 +463,7 @@ __all__ = [
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",
+    "reshape_and_cache_flash_strided",
     "router_gemm",
     "rwkv_ka_fusion",
     "rwkv_mm_sparsity",
