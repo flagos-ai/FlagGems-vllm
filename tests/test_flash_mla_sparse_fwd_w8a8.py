@@ -195,3 +195,161 @@ def test_flash_mla_sparse_flashmla(shape):
         *quantize_sparse_fp8_fixture(*inputs)
     )
     assert_sparse_fixture_close(output[:, 0], lse[:, :, 0], reference, reference_lse)
+
+
+PPU_SPARSE_SUPPORTED = (
+    "flash_mla_sparse_fwd_w8a8"
+    in dict(flaggems_vllm.runtime.backend.get_customized_ops())
+    and flaggems_vllm.vendor_name == "thead"
+)
+
+
+def quantize_sparse_int8(x):
+    scale = x[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127
+    content = (x[..., :512].float() / scale).round().clamp(-127, 127).to(torch.int8)
+    rope = (x[..., 512:].float() / scale).to(x.dtype)
+    return content, rope, scale
+
+
+def make_sparse_decode_inputs(lengths, queries, heads, topk, dtype, rope_dim=64):
+    torch.manual_seed(0)
+    batch = len(lengths)
+    padded = math.ceil(max(lengths) / 256) * 256
+    device = flaggems_vllm.device
+    q = torch.randn(batch, queries, heads, 512 + rope_dim, dtype=dtype, device=device)
+    q, qr, qs = quantize_sparse_int8(q)
+    native_q = (torch.cat((q.float(), qr.float()), -1) * qs).to(dtype)
+    pages = batch * padded // 64
+    kv = torch.empty((pages, 64, 512), dtype=torch.int8, device=device)
+    kr = torch.empty((pages, 64, rope_dim), dtype=dtype, device=device)
+    ks = torch.empty((pages, 64, 1), dtype=torch.float32, device=device)
+    native_kv = torch.empty((pages, 64, 1, 512 + rope_dim), dtype=dtype, device=device)
+    # Chunk fixture construction to bound temporary memory on long ragged cases.
+    for start in range(0, pages, 1024):
+        part = slice(start, min(start + 1024, pages))
+        source = torch.randn_like(native_kv[part, :, 0])
+        v, r, s = quantize_sparse_int8(source)
+        kv[part], kr[part], ks[part] = v, r, s
+        native_kv[part, :, 0] = (torch.cat((v.float(), r.float()), -1) * s).to(dtype)
+    ids = torch.full((batch, queries, topk), -1, dtype=torch.int32)
+    generator = torch.Generator().manual_seed(0)
+    for i, length in enumerate(lengths):
+        if length < padded:
+            kr.view(batch, padded, rope_dim)[i, length:] = torch.nan
+            ks.view(batch, padded)[i, length:] = torch.nan
+            native_kv.view(batch, padded, 512 + rope_dim)[i, length:] = torch.nan
+        for j in range(queries):
+            visible = length - queries + j + 1
+            chosen = torch.randperm(visible, generator=generator)[:topk]
+            ids[i, j, : len(chosen)] = i * padded + chosen
+    return (q, qr, kv, kr, qs, ks, ids.to(device)), native_q, native_kv
+
+
+def check_sparse_decode_sample(inputs, native_q, native_cache, candidate, baseline):
+    from tests.test_flash_mla_sparse_fwd import FlashmlaSparseTestKit
+
+    q, qr, kv, kr, qs, ks, indices = inputs
+    # Check both precisions against their own FP32 logits on one complete request.
+    ids = indices[0].long()
+    selected = ids.clamp_min(0)
+    sparse_q = torch.cat((q[0].float(), qr[0].float()), -1) * qs[0]
+    v = kv.view(-1, 512)[selected].float()
+    r = kr.view(-1, 64)[selected].float()
+    sparse_k = torch.cat((v, r), -1) * ks.view(-1)[selected].unsqueeze(-1)
+    native_k = native_cache.view(-1, 576)[selected]
+    for query, keys, (out, lse) in (
+        (sparse_q, sparse_k, candidate),
+        (native_q[0], native_k, baseline),
+    ):
+        for j in range(query.shape[0]):
+            topk = ids.shape[1]
+            local_ids = torch.arange(topk).masked_fill(ids[j].cpu() < 0, -1)
+            y, _, logsum = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+                1,
+                topk,
+                query.shape[1],
+                1,
+                576,
+                topk,
+                query[j : j + 1].float().cpu(),
+                keys[j, :, None].float().cpu(),
+                local_ids.to(torch.int32).view(1, 1, topk),
+                576**-0.5,
+                512,
+                None,
+                None,
+            )
+            gems_assert_close(out[0, j].cpu(), y[0], torch.bfloat16, atol=0.004)
+            gems_assert_close(lse[0, :, j].cpu(), logsum[0], torch.float32, atol=2e-4)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not PPU_SPARSE_SUPPORTED, reason="Requires PPU INT8 sparse MLA")
+@pytest.mark.parametrize(
+    "queries,heads,topk", [(1, 16, 1), (2, 32, 129), (2, 65, 137), (1, 128, 257)]
+)
+@pytest.mark.parametrize("rope_dim", [0, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sparse_decode_ppu(queries, heads, topk, rope_dim, dtype):
+    from tests.test_flash_mla_sparse_fwd import FlashmlaSparseTestKit
+
+    inputs, _, _ = make_sparse_decode_inputs(
+        [79, 215, 302], queries, heads, topk, dtype, rope_dim
+    )
+    q, qr, kv, kr, qs, ks, indices = inputs
+    indices[0] = -1
+    indices[2, :, 3::5] = kv.shape[0] * 64
+    if topk > 1:
+        indices[2, :, 1] = indices[2, :, 0]
+    lengths = torch.tensor(
+        [topk, 0, max(1, topk - 5)], device=q.device, dtype=torch.int32
+    )
+    sink = torch.randn(heads, device=q.device)
+    sink[0], sink[1] = torch.inf, -torch.inf
+    out, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(
+        *inputs, softmax_scale=0.0625, attn_sink=sink, topk_length=lengths
+    )
+    rows = 3 * queries
+    dim = 512 + rope_dim
+    expected, _, expected_lse = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        rows,
+        kv.shape[0] * 64,
+        heads,
+        1,
+        dim,
+        topk,
+        (torch.cat((q.float(), qr.float()), -1) * qs).view(rows, heads, dim).cpu(),
+        (torch.cat((kv.float(), kr.float()), -1) * ks).view(-1, 1, dim).cpu(),
+        indices.view(rows, 1, topk).cpu(),
+        0.0625,
+        512,
+        sink.cpu(),
+        lengths.repeat_interleave(queries).cpu(),
+    )
+    gems_assert_close(
+        out.float().view_as(expected).cpu(), expected.float(), torch.float32, atol=0.008
+    )
+    actual_lse = lse.transpose(1, 2).reshape(rows, heads).cpu()
+    gems_assert_equal(torch.isposinf(actual_lse), torch.isposinf(expected_lse))
+    mask = torch.isfinite(expected_lse)
+    gems_assert_close(actual_lse[mask], expected_lse[mask], torch.float32, atol=2e-4)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not PPU_SPARSE_SUPPORTED, reason="Requires PPU INT8 sparse MLA")
+@pytest.mark.parametrize("empty", ["indices", "pages", "batch"])
+def test_sparse_decode_ppu_empty(empty):
+    inputs, _, _ = make_sparse_decode_inputs([8], 2, 16, 7, torch.bfloat16)
+    q, qr, kv, kr, qs, ks, ids = inputs
+    if empty == "indices":
+        ids = ids[..., :0]
+    elif empty == "pages":
+        kv, kr, ks = kv[:0], kr[:0], ks[:0]
+    else:
+        q, qr, qs, ids = q[:0], qr[:0], qs[:0], ids[:0]
+    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(
+        q, qr, kv.unsqueeze(2), kr.unsqueeze(2), qs, ks.unsqueeze(2), ids
+    )
+    assert output.shape == q.shape and lse.shape == (q.shape[0], 16, 2)
+    gems_assert_equal(output, torch.zeros_like(output))
+    gems_assert_equal(lse, torch.full_like(lse, torch.inf))
