@@ -328,6 +328,9 @@ def _ple_prefill_state_update_kernel(
         + channel_offsets * stride_state_channel
         + state_offsets * stride_state_token
     )
+    # A short query makes load addresses (query_len + s) overlap store
+    # addresses (s) inside this CTA. Finish every old-state load first.
+    tl.debug_barrier()
     tl.store(
         state_output_ptrs,
         next_state,

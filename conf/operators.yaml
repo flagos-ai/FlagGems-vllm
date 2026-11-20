@@ -37,6 +37,30 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: apply_bad_words
+  description: Masks logits for tokens that would complete configured bad-word sequences.
+  for:
+  - apply_bad_words
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
+- id: apply_logit_bias
+  description: |
+    Apply allowed-token filtering, per-token logit biases, and minimum-length
+    stop-token masking to vLLM sampling logits in place.
+  for:
+    - apply_logit_bias
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - NeuralNetwork
+  stages:
+    - alpha: '5.4'
 - id: apply_min_p
   description: Filter logits in place using per-request minimum probability ratios.
   for:
@@ -84,6 +108,18 @@ ops:
   description: Update reasoning-marker caches and force the budgeted end token.
   for:
   - apply_thinking_budget
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: apply_trace_tokens
+  description: |
+    Overwrite sampled tokens with request-specific trace tokens at the current decode step.
+  for:
+  - apply_trace_tokens
   labels:
   - fused
   - vLLM
@@ -422,6 +458,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: compute_topk_scores
+  description: Collect sampled and top-k token scores and sampled-token ranks for vLLM.
+  for:
+  - vllm.v1.worker.gpu.sample.logprob.compute_topk_scores
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
 - id: concat_and_cache_mla
   description: 'Writes the latent and RoPE value into KV cache for Multi-head Latent
     Attention forward case.
@@ -950,6 +997,23 @@ ops:
   - Quantization
   stages:
   - beta: '5.4'
+- id: fused_kimi_k3_mla_kv_concat
+  description: 'Copy Kimi-K3 NoPE keys and broadcast the shared PE component into a
+
+    caller-provided contiguous full-key output, preserving FP16/BF16 bits.
+
+    No cache, query, RoPE, or quantization work. Output/input overlap rejected.
+
+    '
+  for:
+  - _C.fused_kimi_k3_mla_kv_concat
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '5.4'
 - id: fused_marlin_moe_w4a16
   description: 'Fused mixture-of-experts computation with 4-bit weights and 16-bit
 
@@ -1291,6 +1355,20 @@ ops:
   - MoE
   stages:
   - stable: '5.0'
+- id: gumbel_sample
+  description: |
+    Stateless Murmur3 Gumbel-max sampling from logits for vLLM Model Runner V2,
+    with request temperatures, draft streams, bias and pre-temperature logits cache.
+    NaN logits and invalid device-side indices/temperatures are outside the contract.
+  for:
+    - vllm.v1.worker.gpu.sample.gumbel.gumbel_sample
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - Sampling
+  stages:
+    - alpha: '5.4'
 - id: hc_combine
   description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
   for:
@@ -1301,6 +1379,17 @@ ops:
   - Pointwise
   stages:
   - beta: '0.3'
+- id: hc_down_silu
+  description: BF16 HC down projection with FP32 accumulation and SiLU after BF16 rounding.
+  for:
+    - vllm.models.qwen4_exp.nvidia.ops.cute_dsl.hc_down_silu.hc_down_silu
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - NeuralNetwork
+  stages:
+    - beta: '0.3'
 - id: hc_head_fused_kernel
   description: 'The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
 
@@ -1931,6 +2020,29 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: ple_conv
+  description: 'Upstream-compatible Qwen4Exp PLE dilated short convolution. Writes
+
+    SiLU(conv) into residual (optionally fused with outer residual) and
+
+    updates the persistent conv cache for decode, prefill, and speculative
+
+    decode modes, matching vLLM ops.ple.ple_conv. The MetaX backend supplies
+
+    the same entry with programmatic dependent launch disabled.
+
+    '
+  for:
+  - vllm.models.qwen4_exp.common.ops.ple.ple_conv
+  labels:
+  - fused
+  - vLLM
+  - Qwen4Exp
+  - NoCPU
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: qsa_prepare
   description: 'Horizontally-fused Qwen4Exp QSA prepare: Gemma RMSNorm and MRoPE for
     the
@@ -2005,6 +2117,18 @@ ops:
   stages:
   - stable: '3.0'
   cpp: '4.0'
+- id: reshape_and_cache_flash_strided
+  description: Write unquantized keys and values into independently strided paged
+    cache views on Sunrise PTPU.
+  for:
+  - reshape_and_cache_flash_strided
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '0.3'
 - id: rwkv_ka_fusion
   description: 'Merges, aligns, and enhances features from different data sources
     or spatial directions
@@ -2339,6 +2463,17 @@ ops:
   description: iHC gated residual scatter with unfused FP32 multiply and addition.
   for:
   - triton_ihc_post
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.4'
+- id: triton_ihc_pre
+  description: iHC RMS-normalized FP32 gates and pre-gated channel reduction.
+  for:
+  - triton_ihc_pre
   labels:
   - fused
   - vLLM
