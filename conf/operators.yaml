@@ -37,6 +37,30 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: apply_bad_words
+  description: Masks logits for tokens that would complete configured bad-word sequences.
+  for:
+  - apply_bad_words
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
+- id: apply_logit_bias
+  description: |
+    Apply allowed-token filtering, per-token logit biases, and minimum-length
+    stop-token masking to vLLM sampling logits in place.
+  for:
+    - apply_logit_bias
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - NeuralNetwork
+  stages:
+    - alpha: '5.4'
 - id: apply_min_p
   description: Filter logits in place using per-request minimum probability ratios.
   for:
@@ -84,6 +108,18 @@ ops:
   description: Update reasoning-marker caches and force the budgeted end token.
   for:
   - apply_thinking_budget
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: apply_trace_tokens
+  description: |
+    Overwrite sampled tokens with request-specific trace tokens at the current decode step.
+  for:
+  - apply_trace_tokens
   labels:
   - fused
   - vLLM
@@ -422,6 +458,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: compute_topk_scores
+  description: Collect sampled and top-k token scores and sampled-token ranks for vLLM.
+  for:
+  - vllm.v1.worker.gpu.sample.logprob.compute_topk_scores
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
 - id: concat_and_cache_mla
   description: 'Writes the latent and RoPE value into KV cache for Multi-head Latent
     Attention forward case.
@@ -1316,6 +1363,20 @@ ops:
   - MoE
   stages:
   - stable: '5.0'
+- id: gumbel_sample
+  description: |
+    Stateless Murmur3 Gumbel-max sampling from logits for vLLM Model Runner V2,
+    with request temperatures, draft streams, bias and pre-temperature logits cache.
+    NaN logits and invalid device-side indices/temperatures are outside the contract.
+  for:
+    - vllm.v1.worker.gpu.sample.gumbel.gumbel_sample
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - Sampling
+  stages:
+    - alpha: '5.4'
 - id: hc_combine
   description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
   for:
@@ -1326,6 +1387,17 @@ ops:
   - Pointwise
   stages:
   - beta: '0.3'
+- id: hc_down_silu
+  description: BF16 HC down projection with FP32 accumulation and SiLU after BF16 rounding.
+  for:
+    - vllm.models.qwen4_exp.nvidia.ops.cute_dsl.hc_down_silu.hc_down_silu
+  labels:
+    - fused
+    - vLLM
+  kind:
+    - NeuralNetwork
+  stages:
+    - beta: '0.3'
 - id: hc_head_fused_kernel
   description: 'The head fusion kernel for MHC (Manifold-Constrained Hyper-Connections).
 
@@ -1608,6 +1680,17 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: matmul_persistent
+  description: vLLM batch-invariant matmul with bounded NVIDIA small-matrix optimization.
+  for:
+    - vllm.model_executor.determinism.batch_invariant.matmul_batch_invariant
+  labels:
+    - vLLM
+    - KernelGen
+  kind:
+    - NeuralNetwork
+  stages:
+    - alpha: '5.4'
 - id: megamoe_int8
   description: 'Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
 
@@ -2038,6 +2121,18 @@ ops:
   stages:
   - stable: '3.0'
   cpp: '4.0'
+- id: reshape_and_cache_flash_strided
+  description: Write unquantized keys and values into independently strided paged
+    cache views on Sunrise PTPU.
+  for:
+  - reshape_and_cache_flash_strided
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '0.3'
 - id: rwkv_ka_fusion
   description: 'Merges, aligns, and enhances features from different data sources
     or spatial directions
