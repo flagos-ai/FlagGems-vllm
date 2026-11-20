@@ -726,7 +726,13 @@ class ParallelBenchmarkMixin:
             pytest.fail(
                 f"--parallel is not supported on device type '{flaggems_vllm.device}'."
             )
-        env[visible_devices_env] = str(gpu_id)
+        # gpu_id is an ordinal within the parent's visible devices.
+        visible_devices = env.get(visible_devices_env)
+        env[visible_devices_env] = (
+            visible_devices.split(",")[gpu_id].strip()
+            if visible_devices is not None
+            else str(gpu_id)
+        )
         env[PARALLEL_WORKER_ENV] = "1"
         env[PARALLEL_RESULT_FILE_ENV] = tmp_result_path
 

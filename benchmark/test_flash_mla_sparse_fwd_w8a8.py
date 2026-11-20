@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
 import torch
+from packaging.version import Version
 
 import flaggems_vllm
 from tests.test_flash_mla_sparse_fwd_w8a8 import (
@@ -89,7 +91,8 @@ def prepare_mate_baseline(inputs, query, *, attn_sink=None, topk_length=None):
         topk_length = torch.full(
             (batch,), indices.shape[-1], dtype=torch.int32, device="cpu"
         ).to(query.device)
-    if qrope.shape[-1] == 0:
+    legacy_mate = Version(version("mate")) < Version("0.2.7")
+    if legacy_mate and qrope.shape[-1] == 0:
         extra_topk_length = torch.zeros((batch,), dtype=torch.int32, device="cpu").to(
             query.device
         )
@@ -98,10 +101,10 @@ def prepare_mate_baseline(inputs, query, *, attn_sink=None, topk_length=None):
         extra_topk_length = None
         extra_cache, extra_indices = None, None
     plans = []
-    # The installed MODEL1 fails at batch 16384. Time every original query
-    # through bounded native calls, including copies of the complete outputs.
-    for first in range(0, batch, 8192):
-        last = min(first + 8192, batch)
+    # MATE 0.2.4 needs bounded native calls for large batches.
+    batch_step = 8192 if legacy_mate else max(1, batch)
+    for first in range(0, batch, batch_step):
+        last = min(first + batch_step, batch)
         metadata, splits = get_mla_metadata(
             None,
             queries * heads,
@@ -238,14 +241,12 @@ class FlashmlaSparseBenchmark(base.Benchmark):
                 else None
             )
             kwargs = dict(attn_sink=attn_sink, topk_length=topk_length)
-            torch.backends.cuda.matmul.allow_tf32 = False
-            expected = mthreads_sparse_reference(
-                packed, reference_device=query.device, **kwargs
-            )
+            expected = mthreads_sparse_reference(packed, **kwargs)
             gems, actual = self.gems_op(*packed, **kwargs)
             assert_mthreads_sparse_accuracy(actual, expected, output_atol=2e-3)
             native = self.torch_op(packed, query, **kwargs)
             assert_mthreads_sparse_accuracy(native(), expected, output_atol=2e-3)
+            del expected
             yield native, gems, shape
 
     def unpack_to_args_kwargs(self, input_tuple):
@@ -264,5 +265,7 @@ class FlashmlaSparseBenchmark(base.Benchmark):
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @pytest.mark.skipif(not HAS_FP8_MLA, reason="Sparse FP8 MLA backend is unavailable")
-def test_flash_mla_sparse_fwd_w8a8():
+def test_flash_mla_sparse_fwd_w8a8(request):
+    if request.config.getoption("--parallel") > 0:
+        pytest.skip("Use test_blas_perf_parallel.py for --parallel")
     FlashmlaSparseBenchmark().run()

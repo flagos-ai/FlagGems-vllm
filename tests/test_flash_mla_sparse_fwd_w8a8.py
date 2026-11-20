@@ -29,6 +29,7 @@ import flaggems_vllm
 from tests.test_flash_mla_with_kvcache_w8a8 import SUPPORTED as HAS_CUDA_FP8_MLA
 from tests.test_flash_mla_with_kvcache_w8a8 import quantize_dense_fp8
 
+from . import conftest as cfg
 from .accuracy_utils import gems_assert_close, gems_assert_equal, to_cpu, to_reference
 
 MTHREADS_FP8_MLA = flaggems_vllm.vendor_name == "mthreads" and (
@@ -116,7 +117,7 @@ def make_sparse_inputs(shape, dtype=torch.bfloat16):
     # Coprime strides select unique tokens without allocating an SQ-by-SKV matrix.
     positions = torch.arange(min(s_kv, topk), dtype=torch.int64)
     indices = torch.full((s_q, topk), -1, dtype=torch.int32)
-    for row in range(s_q):
+    for row in range(s_q if s_kv else 0):
         offset = random.randrange(s_kv)
         step = random.randrange(1, s_kv) if s_kv > 1 else 1
         while math.gcd(step, s_kv) != 1:
@@ -222,9 +223,11 @@ def mthreads_sparse_reference(
     attn_sink=None,
     topk_length=None,
     softmax_scale=None,
-    reference_device="cpu",
+    reference_device=None,
     chunk_rows=16,
 ):
+    if reference_device is None:
+        reference_device = "cpu" if cfg.TO_CPU else inputs[0].device
     q, qr, kv, kr, qs, ks, indices = (tensor.to(reference_device) for tensor in inputs)
     attn_sink = None if attn_sink is None else attn_sink.to(reference_device)
     topk_length = (
@@ -240,14 +243,18 @@ def mthreads_sparse_reference(
     kv = kv.view(tokens, 1, 512)
     kr = kr.view(tokens, 1, kr.shape[-1])
     ks = ks.view(tokens, 1, 1)
-    cache = torch.empty((tokens, 1, dims), dtype=torch.float32, device=reference_device)
+    # Invalid indices must contribute zero even when token zero contains NaNs.
+    cache = torch.empty(
+        (tokens + 1, 1, dims), dtype=torch.float32, device=reference_device
+    )
+    cache[tokens].zero_()
     # Keep FP8 casts bounded: large unary datacast launches fail in muDNN.
     for first in range(0, tokens, 16384):
         last = min(first + 16384, tokens)
         cache[first:last] = dequantize_sparse_rows(
             kv[first:last], kr[first:last], ks[first:last]
         )
-    selected = indices.view(rows, -1)
+    selected = indices.view(rows, indices.shape[-1])
     scale = dims**-0.5 if softmax_scale is None else softmax_scale
     output = torch.empty(
         (rows, heads, 512), dtype=torch.float32, device=reference_device
@@ -262,7 +269,7 @@ def mthreads_sparse_reference(
         valid = (ids >= 0) & (ids < tokens)
         if topk_length is not None:
             valid &= positions < topk_length[begin:end, None]
-        keys = cache.index_select(0, ids.masked_fill(~valid, 0).flatten()).view(
+        keys = cache.index_select(0, ids.masked_fill(~valid, tokens).flatten()).view(
             end - begin, selected.shape[-1], dims
         )
         scores = (query @ keys.transpose(1, 2)) * scale
@@ -297,11 +304,7 @@ def assert_mthreads_sparse_accuracy(actual, expected, *, output_atol=4e-3):
         reference_value = ref_output[first:last]
         reference_logsum = ref_lse[first:last]
         gems_assert_close(value, reference_value, output.dtype, atol=output_atol)
-        gems_assert_equal(torch.isposinf(logsum), torch.isposinf(reference_logsum))
-        finite = torch.isfinite(reference_logsum)
-        gems_assert_close(
-            logsum[finite], reference_logsum[finite], torch.float32, atol=2e-4
-        )
+        gems_assert_close(logsum, reference_logsum, torch.float32, atol=2e-4)
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
@@ -328,7 +331,6 @@ def test_flash_mla_sparse_flashmla(shape):
             softmax_scale=packed[7],
             attn_sink=packed[8],
             topk_length=packed[9],
-            reference_device=packed[0].device,
         )
         assert_mthreads_sparse_accuracy(
             flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed), expected
@@ -341,6 +343,22 @@ def test_flash_mla_sparse_flashmla(shape):
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
+@pytest.mark.parametrize("tokens, topk", [(0, 128), (64, 0)])
+def test_mthreads_empty_attention(tokens, topk):
+    packed, _ = make_mthreads_sparse_inputs(
+        4, 64, topk, tokens, torch.bfloat16, 0, seed=42
+    )
+    run, (output, lse) = prepare_flash_mla_sparse_fwd_w8a8(*packed)
+    output.fill_(1)
+    lse.zero_()
+    expected = mthreads_sparse_reference(packed)
+    assert_mthreads_sparse_accuracy(run(), expected)
+    assert torch.all(output == 0)
+    assert torch.all(torch.isposinf(lse))
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mthreads_k128_prepared_row_update(dtype):
     packed, _ = make_mthreads_sparse_inputs(129, 64, 128, 4096, dtype, 0, seed=42)
@@ -348,7 +366,7 @@ def test_mthreads_k128_prepared_row_update(dtype):
     # One CTA can own both rejected and accepted queries in the same call.
     packed[6][0].fill_(-1)
     packed[4][1].mul_(256)
-    expected = mthreads_sparse_reference(packed, reference_device=packed[0].device)
+    expected = mthreads_sparse_reference(packed)
     assert_mthreads_sparse_accuracy(run(), expected, output_atol=2e-3)
 
 
@@ -359,13 +377,13 @@ def test_mthreads_v32_prepared_scale_update(dtype):
     packed, _ = make_mthreads_sparse_inputs(4, 64, 2048, 4096, dtype, 64, seed=42)
     packed[6][0].fill_(-1)
     run, actual = prepare_flash_mla_sparse_fwd_w8a8(*packed)
-    expected = mthreads_sparse_reference(packed, reference_device=packed[0].device)
+    expected = mthreads_sparse_reference(packed)
     assert_mthreads_sparse_accuracy(actual, expected, output_atol=2e-3)
 
     # A larger, non-power-of-two scale exercises the IEEE FP32 recomputation.
     packed[4][1::2].mul_(4.03125)
     packed[5].mul_(4.03125)
-    expected = mthreads_sparse_reference(packed, reference_device=packed[0].device)
+    expected = mthreads_sparse_reference(packed)
     assert_mthreads_sparse_accuracy(run(), expected, output_atol=2e-3)
 
 
@@ -390,9 +408,7 @@ def test_mthreads_v32_prepared_rope_update(rows, first_row):
     # The shape and address are fixed, but the error check must read the
     # current selected key. Use the softmax reference for the two touched rows.
     packed[3].view(-1, 64)[0].copy_(packed[1][updated_row, 0, 0].sign() * 32768.0)
-    expected = mthreads_sparse_reference(
-        reference_inputs, reference_device=packed[0].device
-    )
+    expected = mthreads_sparse_reference(reference_inputs)
     output, lse = run()
     assert_mthreads_sparse_accuracy(
         (output[affected_rows], lse[affected_rows]), expected, output_atol=2e-3
@@ -424,9 +440,6 @@ def test_mthreads_v32_nan_in_unselected_sentinel(rows, cache_component):
     reference_inputs = [
         data[:3] if i in (0, 1, 4, 6) else data for i, data in enumerate(packed)
     ]
-    expected = mthreads_sparse_reference(
-        reference_inputs, reference_device=packed[0].device
-    )
     run, _ = prepare_flash_mla_sparse_fwd_w8a8(*packed)
 
     # No query selects key zero. Invalid indices must not expose it to PV.
@@ -434,5 +447,6 @@ def test_mthreads_v32_nan_in_unselected_sentinel(rows, cache_component):
         packed[2].view(torch.uint8).flatten()[0] = 0x7F
     else:
         packed[cache_component].flatten()[0] = float("nan")
+    expected = mthreads_sparse_reference(reference_inputs)
     output, lse = run()
     assert_mthreads_sparse_accuracy((output[:3], lse[:3]), expected, output_atol=2e-3)
