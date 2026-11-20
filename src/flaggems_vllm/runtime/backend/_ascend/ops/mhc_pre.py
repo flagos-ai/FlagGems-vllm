@@ -35,9 +35,11 @@ untouched), with two deliberate deltas:
 Shape/dtype contract (ValueError) and the NPU-only device gate are kept
 from the original standalone implementation; outputs follow the generic
 contract: post ``(..., hc, 1)``, comb ``(..., hc, hc)``, hin ``(..., D)``.
-For ``hc_mult == 4`` the operator now runs a TLE fast path on a transposed
-(mix-major) layout; see the TLE section below for the layout reasoning. The
-tiled Triton twins above remain the fallback when TLE is unavailable.
+For ``hc_mult == 4`` the operator runs a fast path on a transposed (mix-major)
+layout; see the "mix-major fast path" section below for the layout reasoning.
+Every kernel on that path is plain Triton, so it no longer depends on a build
+that ships ``triton.experimental.tle``.  The clamped generic kernel above is
+retained for every other ``hc_mult``.
 """
 
 from __future__ import annotations
@@ -286,7 +288,7 @@ def _validate_inputs(residual, fn, hc_scale, hc_base):
 
 
 # ===========================================================================
-# TLE fast path for hc_mult == 4
+# Mix-major fast path for hc_mult == 4 (plain Triton, no TLE required)
 # ===========================================================================
 #
 # Why this path exists
@@ -308,11 +310,12 @@ def _validate_inputs(residual, fn, hc_scale, hc_base):
 #   * the 4x4 Sinkhorn becomes 8 element-wise vector adds + 32 multiplies per
 #     round, with no reduction primitive and no layout conversion at all,
 #   * the 20 Sinkhorn rounds live in UB as plain vectors.
-# TLE (``triton.experimental.tle.dsa``) is used for the mix stage: one 2D
-# DMA per program brings the whole ``(NC, BLOCK_T)`` tile from GM to UB
-# (``dsa.alloc`` / ``dsa.copy`` / ``dsa.to_tensor``), so the fine-grained
-# per-token work runs on wide, contiguous UB vectors, and the result is
-# written back as contiguous rows.
+# The mix stage then needs no re-layout primitive at all: because every mix
+# column is already a contiguous row over tokens, 24 plain 1D loads give the
+# gate/Sinkhorn math ``(BLOCK_T,)`` vectors to work on.  (An earlier revision
+# staged the ``(NC, BLOCK_T)`` tile through UB with ``triton.experimental.tle``
+# and paid two costs for it: a per-program 2D DMA, and a dispatch limit that
+# silently left every block past the core count unwritten.)
 #
 # Stage layout (all stage boundaries are contiguous rows over tokens):
 #   proj   : x(T,4D) @ fn^T -> mix_t(NC,T) f32 + sq(T)     [AB swapped dot]
@@ -323,6 +326,10 @@ def _validate_inputs(residual, fn, hc_scale, hc_base):
 # after the fact costs ~175us at 256 tokens (enough to dominate short
 # sequences), and 20 scattered 4-byte stores measure ~20x slower than the one
 # contiguous store per output that the interleave tree enables.
+# The kernels on the fast path are plain Triton, so they do not need a TLE
+# build.  The flag is kept because ``flaggems_vllm.ops.mhc.mhc_pre`` imports it
+# to pick its variant (``ASCEND_TLE`` vs the tiled fallback), and that contract
+# is not worth changing as part of a perf fix.
 try:
     import triton.experimental.tle as tle
 
@@ -344,6 +351,11 @@ _TLE_NC = 32
 # the token-major tile); smaller token counts shrink it so the K loop still
 # spreads over every AI core.
 _TLE_PROJ_BLOCK_M = 128
+# Re-swept on 910B4 at 20480x3584 with a cleared compile cache: BLOCK_K 512 and
+# 128 are within noise (594us vs 598us; 128 leads 131us vs 123us at 4096) and
+# 256/1024 are the same again, so the shipped value stands.  BLOCK_M is the tile
+# that matters and 128 is optimal - 256 overflows UB once the sumsq loop is
+# present, and 64 drops to 797 GB/s (737us).
 _TLE_PROJ_BLOCK_K = 512
 _TLE_PROJ_BLOCK_K_SQ = 256
 # mix: up to 256 tokens per program; the heuristic keeps enough programs for
@@ -353,6 +365,11 @@ _TLE_MIX_BLOCK_T = 256
 # tile buys occupancy (16x256 = five 16-bit tiles + the f32 accumulator fits
 # comfortably in UB, and 256 programs at 4096 tokens fill the vector cores).
 # Short sequences already have few token blocks, so they keep the wider tile.
+# Re-swept with a cleared compile cache at 4096 and 20480 tokens: {4,8,16} x
+# {128,256,512,1024} all land within ~5% of each other and this pair is the best
+# at 20480 (671us = 1093 GB/s, i.e. the machine's copy bandwidth) while 8/512
+# leads at 4096 (116us vs 120us).  Kept as shipped; the stage has no headroom
+# left to chase.
 _TLE_REDUCE_BLOCK_T = 16
 _TLE_REDUCE_BLOCK_T_SHORT = 32
 _TLE_REDUCE_BLOCK_D = 256
@@ -417,17 +434,17 @@ def _get_bt_padded_cached(fn: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _tle_row(t, r, BLOCK_T: tl.constexpr):
-    """Row ``r`` of a ``(NC, BLOCK_T)`` UB tensor as a ``(BLOCK_T,)`` vector."""
-    return tl.reshape(tle.dsa.extract_slice(t, (r, 0), (1, BLOCK_T), (1, 1)), [BLOCK_T])
+def _mix_row(t_ptr, r, stride, off):
+    """Row ``r`` of the ``(NC, stride)`` transposed mix buffer, over tokens."""
+    return tl.load(t_ptr + r * stride + off)
 
 
 @triton.jit
-def _tle_comb_logit(
-    t, r, rms_inv, scale, base, CLAMP_LOGITS: tl.constexpr, BLOCK_T: tl.constexpr
+def _comb_logit(
+    t_ptr, r, stride, off, rms_inv, scale, base_ptr, CLAMP_LOGITS: tl.constexpr
 ):
     """One comb logit over the token axis, clamped when the model requires it."""
-    v = _tle_row(t, r, BLOCK_T) * rms_inv * scale + base
+    v = tl.load(t_ptr + r * stride + off) * rms_inv * scale + tl.load(base_ptr + r)
     if CLAMP_LOGITS:
         v = tl.clamp(v, -30.0, 30.0)
     return v
@@ -521,35 +538,25 @@ def mhc_pre_ascend_tle_mix_kernel(
     BLOCK_T: tl.constexpr,
     CLAMP_LOGITS: tl.constexpr,
 ):
-    """Gates + Sinkhorn for a tile of ``BLOCK_T`` tokens, one row per mix column.
+    """Gates + Sinkhorn for ``BLOCK_T`` tokens, one contiguous row per mix column.
 
     Every quantity here is a vector over the token axis, so the 20 Sinkhorn
-    rounds are pure element-wise arithmetic: 4 row sums and 4 column sums are
-    the only "reductions" and they are written as explicit vector adds (never
-    ``tl.sum``), which is what keeps the cost down to ~35us at 4096x1280.
+    rounds are pure element-wise arithmetic (8 vector adds + 32 multiplies per
+    round); the 4 row sums and 4 column sums are written as explicit adds, never
+    ``tl.sum``.
+
+    The projection stores its result mix-major, so each of the 24 mix columns is
+    one contiguous ``(num_tokens,)`` row and is read with a plain 1D load.  The
+    earlier version staged the whole ``(NC, BLOCK_T)`` tile through UB with
+    ``tle.dsa``; that needed a 2D DMA per program and, at these shapes, made the
+    kernel dispatch only the first 40 blocks (i.e. it silently left every token
+    past the core count unwritten).  With plain loads the kernel is bitwise
+    identical and has no such limit.
     """
     pid = tl.program_id(0)
-    t0 = pid * BLOCK_T
-    t_off = t0 + tl.arange(0, BLOCK_T)
-    rows = tl.arange(0, NC)
-    mask = t_off < num_tokens
-    # The caller pads the sequence to BLOCK_T, so every program copies a full
-    # tile: a partial inner extent changes the UB row stride and would scramble
-    # the tile. Padding lanes are masked on store and never read back.
-    mix_ub = tle.dsa.alloc(
-        [NC, BLOCK_T], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
-    )
-    with tle.dsa.hint(inter_no_alias=True):
-        tle.dsa.copy(
-            mix_t_ptr + rows[:, None] * mix_stride + t_off[None, :],
-            mix_ub,
-            [NC, BLOCK_T],
-        )
-    mt = tle.dsa.to_tensor(mix_ub)
+    off = pid * BLOCK_T + tl.arange(0, BLOCK_T)
 
-    sq_ub = tle.dsa.alloc([BLOCK_T], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB)
-    tle.dsa.copy(sq_ptr + t_off, sq_ub, [BLOCK_T])
-    sq = tle.dsa.to_tensor(sq_ub)
+    sq = tl.load(sq_ptr + off, mask=off < num_tokens, other=1.0)
     rms_inv = tl.rsqrt(sq / hc_hidden_size + rms_eps)
 
     s0 = tl.load(hc_scale_ptr + 0)
@@ -564,50 +571,90 @@ def mhc_pre_ascend_tle_mix_kernel(
     b5 = tl.load(hc_base_ptr + 5)
     b6 = tl.load(hc_base_ptr + 6)
     b7 = tl.load(hc_base_ptr + 7)
-    b8 = tl.load(hc_base_ptr + 8)
-    b9 = tl.load(hc_base_ptr + 9)
-    b10 = tl.load(hc_base_ptr + 10)
-    b11 = tl.load(hc_base_ptr + 11)
-    b12 = tl.load(hc_base_ptr + 12)
-    b13 = tl.load(hc_base_ptr + 13)
-    b14 = tl.load(hc_base_ptr + 14)
-    b15 = tl.load(hc_base_ptr + 15)
-    b16 = tl.load(hc_base_ptr + 16)
-    b17 = tl.load(hc_base_ptr + 17)
-    b18 = tl.load(hc_base_ptr + 18)
-    b19 = tl.load(hc_base_ptr + 19)
-    b20 = tl.load(hc_base_ptr + 20)
-    b21 = tl.load(hc_base_ptr + 21)
-    b22 = tl.load(hc_base_ptr + 22)
-    b23 = tl.load(hc_base_ptr + 23)
 
-    p0 = tl.sigmoid(_tle_row(mt, 0, BLOCK_T) * rms_inv * s0 + b0) + hc_pre_eps
-    p1 = tl.sigmoid(_tle_row(mt, 1, BLOCK_T) * rms_inv * s0 + b1) + hc_pre_eps
-    p2 = tl.sigmoid(_tle_row(mt, 2, BLOCK_T) * rms_inv * s0 + b2) + hc_pre_eps
-    p3 = tl.sigmoid(_tle_row(mt, 3, BLOCK_T) * rms_inv * s0 + b3) + hc_pre_eps
+    p0 = (
+        tl.sigmoid(_mix_row(mix_t_ptr, 0, mix_stride, off) * rms_inv * s0 + b0)
+        + hc_pre_eps
+    )
+    p1 = (
+        tl.sigmoid(_mix_row(mix_t_ptr, 1, mix_stride, off) * rms_inv * s0 + b1)
+        + hc_pre_eps
+    )
+    p2 = (
+        tl.sigmoid(_mix_row(mix_t_ptr, 2, mix_stride, off) * rms_inv * s0 + b2)
+        + hc_pre_eps
+    )
+    p3 = (
+        tl.sigmoid(_mix_row(mix_t_ptr, 3, mix_stride, off) * rms_inv * s0 + b3)
+        + hc_pre_eps
+    )
 
-    q0 = tl.sigmoid(_tle_row(mt, 4, BLOCK_T) * rms_inv * s1 + b4) * hc_post_mult_value
-    q1 = tl.sigmoid(_tle_row(mt, 5, BLOCK_T) * rms_inv * s1 + b5) * hc_post_mult_value
-    q2 = tl.sigmoid(_tle_row(mt, 6, BLOCK_T) * rms_inv * s1 + b6) * hc_post_mult_value
-    q3 = tl.sigmoid(_tle_row(mt, 7, BLOCK_T) * rms_inv * s1 + b7) * hc_post_mult_value
+    q0 = (
+        tl.sigmoid(_mix_row(mix_t_ptr, 4, mix_stride, off) * rms_inv * s1 + b4)
+        * hc_post_mult_value
+    )
+    q1 = (
+        tl.sigmoid(_mix_row(mix_t_ptr, 5, mix_stride, off) * rms_inv * s1 + b5)
+        * hc_post_mult_value
+    )
+    q2 = (
+        tl.sigmoid(_mix_row(mix_t_ptr, 6, mix_stride, off) * rms_inv * s1 + b6)
+        * hc_post_mult_value
+    )
+    q3 = (
+        tl.sigmoid(_mix_row(mix_t_ptr, 7, mix_stride, off) * rms_inv * s1 + b7)
+        * hc_post_mult_value
+    )
 
     # Model contract: clamp the comb logits before Sinkhorn (CLAMP_LOGITS).
-    c00 = _tle_comb_logit(mt, 8, rms_inv, s2, b8, CLAMP_LOGITS, BLOCK_T)
-    c01 = _tle_comb_logit(mt, 9, rms_inv, s2, b9, CLAMP_LOGITS, BLOCK_T)
-    c02 = _tle_comb_logit(mt, 10, rms_inv, s2, b10, CLAMP_LOGITS, BLOCK_T)
-    c03 = _tle_comb_logit(mt, 11, rms_inv, s2, b11, CLAMP_LOGITS, BLOCK_T)
-    c10 = _tle_comb_logit(mt, 12, rms_inv, s2, b12, CLAMP_LOGITS, BLOCK_T)
-    c11 = _tle_comb_logit(mt, 13, rms_inv, s2, b13, CLAMP_LOGITS, BLOCK_T)
-    c12 = _tle_comb_logit(mt, 14, rms_inv, s2, b14, CLAMP_LOGITS, BLOCK_T)
-    c13 = _tle_comb_logit(mt, 15, rms_inv, s2, b15, CLAMP_LOGITS, BLOCK_T)
-    c20 = _tle_comb_logit(mt, 16, rms_inv, s2, b16, CLAMP_LOGITS, BLOCK_T)
-    c21 = _tle_comb_logit(mt, 17, rms_inv, s2, b17, CLAMP_LOGITS, BLOCK_T)
-    c22 = _tle_comb_logit(mt, 18, rms_inv, s2, b18, CLAMP_LOGITS, BLOCK_T)
-    c23 = _tle_comb_logit(mt, 19, rms_inv, s2, b19, CLAMP_LOGITS, BLOCK_T)
-    c30 = _tle_comb_logit(mt, 20, rms_inv, s2, b20, CLAMP_LOGITS, BLOCK_T)
-    c31 = _tle_comb_logit(mt, 21, rms_inv, s2, b21, CLAMP_LOGITS, BLOCK_T)
-    c32 = _tle_comb_logit(mt, 22, rms_inv, s2, b22, CLAMP_LOGITS, BLOCK_T)
-    c33 = _tle_comb_logit(mt, 23, rms_inv, s2, b23, CLAMP_LOGITS, BLOCK_T)
+    c00 = _comb_logit(
+        mix_t_ptr, 8, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c01 = _comb_logit(
+        mix_t_ptr, 9, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c02 = _comb_logit(
+        mix_t_ptr, 10, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c03 = _comb_logit(
+        mix_t_ptr, 11, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c10 = _comb_logit(
+        mix_t_ptr, 12, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c11 = _comb_logit(
+        mix_t_ptr, 13, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c12 = _comb_logit(
+        mix_t_ptr, 14, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c13 = _comb_logit(
+        mix_t_ptr, 15, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c20 = _comb_logit(
+        mix_t_ptr, 16, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c21 = _comb_logit(
+        mix_t_ptr, 17, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c22 = _comb_logit(
+        mix_t_ptr, 18, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c23 = _comb_logit(
+        mix_t_ptr, 19, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c30 = _comb_logit(
+        mix_t_ptr, 20, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c31 = _comb_logit(
+        mix_t_ptr, 21, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c32 = _comb_logit(
+        mix_t_ptr, 22, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
+    c33 = _comb_logit(
+        mix_t_ptr, 23, mix_stride, off, rms_inv, s2, hc_base_ptr, CLAMP_LOGITS
+    )
 
     # row softmax over j, then the first column normalisation
     m0 = tl.maximum(tl.maximum(c00, c01), tl.maximum(c02, c03))
@@ -654,14 +701,10 @@ def mhc_pre_ascend_tle_mix_kernel(
     c32 = e32 / r3 + hc_sinkhorn_eps
     c33 = e33 / r3 + hc_sinkhorn_eps
 
-    cs0 = c00 + c10 + c20 + c30
-    cs1 = c01 + c11 + c21 + c31
-    cs2 = c02 + c12 + c22 + c32
-    cs3 = c03 + c13 + c23 + c33
-    i0 = 1.0 / (cs0 + hc_sinkhorn_eps)
-    i1 = 1.0 / (cs1 + hc_sinkhorn_eps)
-    i2 = 1.0 / (cs2 + hc_sinkhorn_eps)
-    i3 = 1.0 / (cs3 + hc_sinkhorn_eps)
+    i0 = 1.0 / (c00 + c10 + c20 + c30 + hc_sinkhorn_eps)
+    i1 = 1.0 / (c01 + c11 + c21 + c31 + hc_sinkhorn_eps)
+    i2 = 1.0 / (c02 + c12 + c22 + c32 + hc_sinkhorn_eps)
+    i3 = 1.0 / (c03 + c13 + c23 + c33 + hc_sinkhorn_eps)
     c00 *= i0
     c10 *= i0
     c20 *= i0
@@ -680,39 +723,31 @@ def mhc_pre_ascend_tle_mix_kernel(
     c33 *= i3
 
     for _ in range(sinkhorn_repeat - 1):
-        r0 = c00 + c01 + c02 + c03
-        i0 = 1.0 / (r0 + hc_sinkhorn_eps)
+        i0 = 1.0 / (c00 + c01 + c02 + c03 + hc_sinkhorn_eps)
         c00 *= i0
         c01 *= i0
         c02 *= i0
         c03 *= i0
-        r1 = c10 + c11 + c12 + c13
-        i1 = 1.0 / (r1 + hc_sinkhorn_eps)
+        i1 = 1.0 / (c10 + c11 + c12 + c13 + hc_sinkhorn_eps)
         c10 *= i1
         c11 *= i1
         c12 *= i1
         c13 *= i1
-        r2 = c20 + c21 + c22 + c23
-        i2 = 1.0 / (r2 + hc_sinkhorn_eps)
+        i2 = 1.0 / (c20 + c21 + c22 + c23 + hc_sinkhorn_eps)
         c20 *= i2
         c21 *= i2
         c22 *= i2
         c23 *= i2
-        r3 = c30 + c31 + c32 + c33
-        i3 = 1.0 / (r3 + hc_sinkhorn_eps)
+        i3 = 1.0 / (c30 + c31 + c32 + c33 + hc_sinkhorn_eps)
         c30 *= i3
         c31 *= i3
         c32 *= i3
         c33 *= i3
 
-        cs0 = c00 + c10 + c20 + c30
-        cs1 = c01 + c11 + c21 + c31
-        cs2 = c02 + c12 + c22 + c32
-        cs3 = c03 + c13 + c23 + c33
-        i0 = 1.0 / (cs0 + hc_sinkhorn_eps)
-        i1 = 1.0 / (cs1 + hc_sinkhorn_eps)
-        i2 = 1.0 / (cs2 + hc_sinkhorn_eps)
-        i3 = 1.0 / (cs3 + hc_sinkhorn_eps)
+        i0 = 1.0 / (c00 + c10 + c20 + c30 + hc_sinkhorn_eps)
+        i1 = 1.0 / (c01 + c11 + c21 + c31 + hc_sinkhorn_eps)
+        i2 = 1.0 / (c02 + c12 + c22 + c32 + hc_sinkhorn_eps)
+        i3 = 1.0 / (c03 + c13 + c23 + c33 + hc_sinkhorn_eps)
         c00 *= i0
         c10 *= i0
         c20 *= i0
@@ -732,40 +767,37 @@ def mhc_pre_ascend_tle_mix_kernel(
 
     # ``pre`` stays mix-major: it is the only gate the reduce stage reads, and
     # one contiguous row per head is exactly what that stage wants.
-    tl.store(pre_ptr + 0 * mix_stride + t_off, p0, mask=mask)
-    tl.store(pre_ptr + 1 * mix_stride + t_off, p1, mask=mask)
-    tl.store(pre_ptr + 2 * mix_stride + t_off, p2, mask=mask)
-    tl.store(pre_ptr + 3 * mix_stride + t_off, p3, mask=mask)
+    tl.store(pre_ptr + 0 * mix_stride + off, p0, mask=off < num_tokens)
+    tl.store(pre_ptr + 1 * mix_stride + off, p1, mask=off < num_tokens)
+    tl.store(pre_ptr + 2 * mix_stride + off, p2, mask=off < num_tokens)
+    tl.store(pre_ptr + 3 * mix_stride + off, p3, mask=off < num_tokens)
 
     # ``post`` / ``comb`` go back to the token-major public contract here, with
     # interleave trees whose leaves are the bit-reversed pairs (v_j, v_j + NC/2):
     # a single contiguous store each, instead of 20 scattered 4-byte stores
-    # (measured ~20x slower) or an ATen transpose afterwards (~175us at 256
-    # tokens, which would dominate short sequences).
+    # (measured ~20x slower) or an ATen transpose afterwards.
     post_il = tl.reshape(
         tl.interleave(tl.interleave(q0, q2), tl.interleave(q1, q3)), [BLOCK_T, 4]
     )
-    e00i = tl.interleave(c00, c20)
-    e01i = tl.interleave(c10, c30)
-    e10i = tl.interleave(c02, c22)
-    e11i = tl.interleave(c12, c32)
-    o00i = tl.interleave(c01, c21)
-    o01i = tl.interleave(c11, c31)
-    o10i = tl.interleave(c03, c23)
-    o11i = tl.interleave(c13, c33)
-    eei = tl.interleave(tl.interleave(e00i, e01i), tl.interleave(e10i, e11i))
-    ooi = tl.interleave(tl.interleave(o00i, o01i), tl.interleave(o10i, o11i))
+    eei = tl.interleave(
+        tl.interleave(tl.interleave(c00, c20), tl.interleave(c10, c30)),
+        tl.interleave(tl.interleave(c02, c22), tl.interleave(c12, c32)),
+    )
+    ooi = tl.interleave(
+        tl.interleave(tl.interleave(c01, c21), tl.interleave(c11, c31)),
+        tl.interleave(tl.interleave(c03, c23), tl.interleave(c13, c33)),
+    )
     comb_il = tl.reshape(tl.interleave(eei, ooi), [BLOCK_T, 16])
 
     tl.store(
-        post_t_ptr + t_off[:, None] * 4 + tl.arange(0, 4)[None, :],
+        post_t_ptr + off[:, None] * 4 + tl.arange(0, 4)[None, :],
         post_il,
-        mask=mask[:, None],
+        mask=(off < num_tokens)[:, None],
     )
     tl.store(
-        comb_t_ptr + t_off[:, None] * 16 + tl.arange(0, 16)[None, :],
+        comb_t_ptr + off[:, None] * 16 + tl.arange(0, 16)[None, :],
         comb_il,
-        mask=mask[:, None],
+        mask=(off < num_tokens)[:, None],
     )
 
 
@@ -850,8 +882,10 @@ def _mhc_pre_tle_4(
     mix_stride = t_pad
 
     bt = _get_bt_padded_cached(fn)
-    # Padded to the mix tile: the mix stage reads whole BLOCK_T tiles.
-    sq = torch.zeros(t_pad, dtype=torch.float32, device=device)
+    # Padded to the mix tile size, but only num_tokens lanes are ever written
+    # by the projection; the mix stage masks its read of the padding and
+    # substitutes 1.0, so no zero-fill is needed here.
+    sq = torch.empty(t_pad, dtype=torch.float32, device=device)
     # Only the first num_tokens columns are written by the projection; the
     # padding lanes are masked on store and never read back.
     mix_t = torch.empty(_TLE_NC, mix_stride, dtype=torch.float32, device=device)
@@ -951,10 +985,9 @@ def npu_mhc_pre_clamp_sinkhorn(
         with the model-required ``clamp(-30, 30)`` before Sinkhorn.
 
     Execution:
-        ``hc_mult == 4`` runs the TLE path below (``proj -> mix -> reduce`` on a
-        transposed, mix-major layout) when TLE is available; every other case
-        (other ``hc_mult`` values, or a Triton build without TLE) runs the
-        clamped generic kernel, which also applies ``clamp(-30, 30)``.
+        ``hc_mult == 4`` runs the fast path below (``proj -> mix -> reduce`` on a
+        transposed, mix-major layout, all plain Triton); every other ``hc_mult``
+        runs the clamped generic kernel, which also applies ``clamp(-30, 30)``.
     """
     if residual.device.type != "npu":
         raise NotImplementedError("npu_mhc_pre_clamp_sinkhorn requires NPU tensors")
@@ -966,7 +999,7 @@ def npu_mhc_pre_clamp_sinkhorn(
     # hc==4: TLE fast path on the transposed (mix-major) layout. Without TLE
     # (stock Triton) fall through to the clamped generic kernel below -- do NOT
     # delegate to the generic ``mhc_pre``, whose Ascend paths do not clamp.
-    if hc_mult == 4 and _HAS_TLE:
+    if hc_mult == 4:
         post_mix, comb_mix, layer_input = _mhc_pre_tle_4(
             residual_flat,
             fn,
