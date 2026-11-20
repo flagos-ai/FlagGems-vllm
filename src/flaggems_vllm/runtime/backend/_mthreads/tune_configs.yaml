@@ -112,6 +112,81 @@ mthreads_dense_fp8_mla:
   num_warps: 8
   num_stages: 2
 
+cooperative_topk_mthreads_compact:
+- META:
+    TILE: 8192
+    BINS: 512
+    llc_options: "-mtgpu-opt-level=1"
+  num_warps: 32
+  num_stages: 1
+- META:
+    TILE: 4096
+    BINS: 1024
+    llc_options: "-mtgpu-opt-level=1"
+  num_warps: 32
+  num_stages: 1
+
+cooperative_topk_mthreads_wide_histogram:
+  - META:
+      BLOCK: 1024
+      llc_options: "-mtgpu-opt-level=1"
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK: 8192
+      llc_options: "-mtgpu-opt-level=1"
+    num_warps: 16
+    num_stages: 1
+
+cooperative_topk_mthreads_wide_finish:
+  - META:
+      llc_options: "-mtgpu-opt-level=1"
+    num_warps: 2
+    num_stages: 1
+  - META:
+      llc_options: "-mtgpu-opt-level=1"
+    num_warps: 4
+    num_stages: 1
+
+cooperative_topk_small:
+- META: {}
+  num_warps: 4
+  num_stages: 1
+- META: {}
+  num_warps: 8
+  num_stages: 1
+- META: {}
+  num_warps: 16
+  num_stages: 1
+
+cooperative_topk_histogram:
+- META:
+    BLOCK: 1024
+  num_warps: 4
+  num_stages: 1
+- META:
+    BLOCK: 2048
+  num_warps: 4
+  num_stages: 1
+- META:
+    BLOCK: 4096
+  num_warps: 8
+  num_stages: 1
+
+cooperative_topk_scatter:
+- META:
+    BLOCK: 1024
+  num_warps: 4
+  num_stages: 1
+- META:
+    BLOCK: 2048
+  num_warps: 4
+  num_stages: 1
+- META:
+    BLOCK: 4096
+  num_warps: 8
+  num_stages: 1
+
 w8a8_block_fp8_matmul_mthreads:
 - META:
     BLOCK_X: 16
@@ -873,6 +948,68 @@ hc_combine:
     num_stages: 1
   - META: {BLOCK_D: 1024, LOOP: true}
     num_warps: 4
+    num_stages: 1
+
+# mhc_shifted_post_pre (MUSA): the projection is a memory-bound skinny GEMM
+# over a packed (hc*H, 32) bf16 weight.  Split-K fills the 60 S5000 SMs; the
+# K loop pipelines, so num_stages 2/3 are safe (no fused reduction here).
+mhc_shifted_project_mthreads:
+  # The skinny N=32 GEMM needs the fat M tile: BLOCK_M=16/32 lose 3-7x on
+  # MUSA.  Four configs cover the split range; all are within ~2x of each
+  # other, so a noisy tune still lands near the best.
+  - META: {BLOCK_M: 64, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_M: 64, BLOCK_K: 256, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 2
+
+# One CTA per token, whole row live: post + collapse + ssq + RMSNorm.
+# BLOCK_H is next_power_of_2(H) and comes from the host, so only the warp
+# count is tuned.
+mhc_shifted_post_collapse_norm_mthreads:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+# Wide-row variant: H is streamed in BLOCK_H tiles; the norm runs a second
+# pass over the stored bf16 row.
+mhc_shifted_post_collapse_norm_loop_mthreads:
+  - gen: true
+    param_map:
+      META: {BLOCK_H: bh}
+      num_warps: w
+      num_stages: s
+    bh: [512, 1024, 2048]
+    w: [4, 8]
+    s: [1, 2]
+
+# Split-K reduction + Sinkhorn coefficients.  Tiny one-CTA-per-token launch;
+# every warp count tested produces bitwise-identical output.
+mhc_shifted_reduce_coeff_mthreads:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
     num_stages: 1
 
 fused_kimi_k3_mla_kv_concat:
