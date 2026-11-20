@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,7 @@ from . import accuracy_utils as utils
 
 
 @pytest.mark.moe_align_block_size_triton
+@pytest.mark.moe_align_block_size_ep
 @pytest.mark.parametrize("mapped", [False, True])
 def test_align_excludes_invalid_and_nonlocal_routes(mapped):
     if flaggems_vllm.vendor_name != "nvidia":
@@ -307,12 +309,13 @@ def test_moe_align_nonzero_launch_extents(
 ):
     """Empty compact buffers must not produce arange(0, 0) launch constants."""
     module = importlib.import_module("flaggems_vllm.ops.moe_align_block_size")
+    kernel_signature = inspect.signature(module.moe_align_block_size_stage1.fn)
     calls = []
 
     class Kernel:
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
-                calls.append(args)
+                calls.append((args, kwargs))
 
             return launch
 
@@ -328,7 +331,12 @@ def test_moe_align_nonzero_launch_extents(
         workspace=(None, None),
     )
     assert len(calls) == 4
-    extents = [calls[0][4], calls[0][-2], calls[0][-1]]
+    stage1_args, stage1_kwargs = calls[0]
+    launch = kernel_signature.bind(*stage1_args, **stage1_kwargs).arguments
+    extents = [
+        launch[field]
+        for field in ("tokens_per_thread", "block_size_sorted", "block_size_expert")
+    ]
     expected = [
         1 << (max(1, (n + num_experts - 1) // num_experts) - 1).bit_length()
         for n in [num_routes, num_sorted, num_blocks]
