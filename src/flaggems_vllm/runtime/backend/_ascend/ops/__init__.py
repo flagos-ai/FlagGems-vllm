@@ -217,4 +217,4 @@ if _tle is not None:
         sparse_flash_attention,
     )
 
-    __all__.extend(["cooperative_topk", "sparse_flash_attention"])
+    __all__ += ["cooperative_topk", "sparse_flash_attention"]
