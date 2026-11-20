@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+import flaggems_vllm
 import flaggems_vllm.testing as fg_testing
 from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
@@ -38,7 +39,7 @@ def _rmsnorm_ref(x, weight, eps):
     ],
 )
 def test_fused_q_kv_rmsnorm_accuracy(tokens, qdim, kvdim):
-    device = "cuda"
+    device = flaggems_vllm.runtime.device.name
     qr = torch.randn((tokens, qdim), device=device, dtype=torch.bfloat16)
     kv = torch.randn((tokens, kvdim), device=device, dtype=torch.bfloat16)
     q_weight = torch.randn((qdim,), device=device, dtype=torch.bfloat16)
