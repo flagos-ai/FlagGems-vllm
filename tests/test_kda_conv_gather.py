@@ -75,6 +75,44 @@ def _ref_gather(conv_state, cache_indices):
     return staged, local.view_as(cache_indices)
 
 
+def _load_upstream_triton_ref():
+    """Load the upstream Triton packer shipped by vllm-ascend >= 0.30.0
+    (``vllm_ascend/ops/triton/kda/conv_state.py``, replacing the legacy
+    torch chain).  The module only exists from 0.30.0 on, so the plain
+    import doubles as the version check; older releases (and boxes
+    without vllm_ascend) keep the torch-chain reference above."""
+    try:
+        from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state
+    except ImportError:
+        return None
+    return copy_conv_state
+
+
+UPSTREAM_COPY_CONV_STATE = _load_upstream_triton_ref()
+
+
+def _upstream_gather(conv_state, cache_indices):
+    """v0.30.0 upstream reference.  Contract mapping: upstream points PAD
+    rows at a dedicated null slot (packed_indices == N) and zeroes their
+    packed rows, while the legacy chain copies row 0 into them; only the
+    valid rows are bitwise comparable."""
+    flat = cache_indices.reshape(-1)
+    n = flat.shape[0]
+    starts = torch.arange(n + 1, dtype=torch.int32, device=flat.device)
+    packed = torch.empty(
+        (n + 1, *conv_state.shape[1:]),
+        dtype=conv_state.dtype,
+        device=conv_state.device,
+    )
+    packed_indices = torch.empty(n, dtype=torch.int32, device=flat.device)
+    UPSTREAM_COPY_CONV_STATE(
+        conv_state, packed, flat, starts, packed_indices, write_back=False
+    )
+    rows = torch.arange(n, device=flat.device)
+    local = torch.where(packed_indices == rows, packed_indices, PAD_SLOT_ID)
+    return packed[:n], local.to(flat.dtype).view_as(cache_indices)
+
+
 # Shape provenance: (state_len=6, conv_dim=1536) is the exact production
 # conv-state layout (conv kernel 4, MTP spec 3, 3*64*128/TP16); S/N are
 # reduced batch dimensions; the last case is an edge shape.
@@ -85,8 +123,17 @@ def _ref_gather(conv_state, cache_indices):
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 def test_conv_gather_accuracy(case, dtype):
     conv_state, idx = _make_inputs(case, dtype=dtype)
-    ref_staged, ref_local = _ref_gather(conv_state, idx)
+    use_upstream = UPSTREAM_COPY_CONV_STATE is not None
+    ref_gather = _upstream_gather if use_upstream else _ref_gather
+    ref_staged, ref_local = ref_gather(conv_state, idx)
     staged, local = flaggems_vllm.gather_conv_state(conv_state, idx)
     torch.npu.synchronize()
-    torch.testing.assert_close(staged, ref_staged, rtol=0, atol=0)
+    if use_upstream:
+        # The upstream packer zeroes PAD rows (null-slot contract) while
+        # this kernel copies row 0 into them; only valid rows agree, and
+        # PAD rows are flagged through local_indices in both contracts.
+        valid = idx.reshape(-1) != PAD_SLOT_ID
+        torch.testing.assert_close(staged[valid], ref_staged[valid], rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(staged, ref_staged, rtol=0, atol=0)
     assert torch.equal(local, ref_local)
