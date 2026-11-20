@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
+from itertools import product
+
 import pytest
 import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops.marlin_gemm import UINT4B8_ID, marlin_gemm
 
-from .accuracy_utils import gems_assert_close
+from . import accuracy_utils as utils
+from . import conftest as cfg
 
 GROUP_SIZE = 128
 
@@ -83,162 +87,111 @@ def _make_inputs(size_m, size_n, size_k, dtype, device, with_bias=False):
     w_ref, b_q_weight, b_scales = _quantize_uint4b8(w)
     a = torch.randn((size_m, size_k), dtype=dtype, device=device)
     b_bias = torch.randn((size_n,), dtype=dtype, device=device) if with_bias else None
-    workspace = torch.empty(0, dtype=dtype, device=device)
     ref = a.float() @ w_ref.float().T
     if with_bias:
         ref += b_bias.float()
     ref = ref.to(dtype)
-    return a, b_q_weight, b_scales, b_bias, workspace, ref
+    return a, b_q_weight, b_scales, b_bias, ref
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def _run_marlin_gemm(
+    a,
+    b_q_weight,
+    b_scales,
+    size_m,
+    size_n,
+    size_k,
+    b_bias=None,
+    c=None,
+    g_idx=None,
+    b_q_type=UINT4B8_ID,
+):
+    workspace = torch.empty(0, dtype=a.dtype, device=a.device)
+    return marlin_gemm(
+        a=a,
+        c=c,
+        b_q_weight=b_q_weight,
+        b_bias=b_bias,
+        b_scales=b_scales,
+        a_scales=None,
+        global_scale=None,
+        b_zeros=None,
+        g_idx=g_idx,
+        perm=None,
+        workspace=workspace,
+        b_q_type=b_q_type,
+        size_m=size_m,
+        size_n=size_n,
+        size_k=size_k,
+    )
+
+
+# Batch size
+_marlin_gemm_ms = [1, 16, 48, 128]
+_marlin_gemm_ns = [256, 512]
+_marlin_gemm_ks = [256, 512]
+_marlin_gemm_shapes = list(product(_marlin_gemm_ms, _marlin_gemm_ns, _marlin_gemm_ks))
+if cfg.QUICK_MODE:
+    _marlin_gemm_shapes = random.sample(_marlin_gemm_shapes, 8)
+
+
 @pytest.mark.marlin_gemm
-class TestMarlinGemmW4A16:
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("shape", _marlin_gemm_shapes)
+@pytest.mark.parametrize("dtype,atol", [(torch.float16, 5e-3), (torch.bfloat16, 5e-2)])
+def test_marlin_gemm(shape, dtype, atol):
+    size_m, size_n, size_k = shape
+    device = flaggems_vllm.device
+    a, b_q_weight, b_scales, _, ref = _make_inputs(
+        size_m, size_n, size_k, dtype, device
+    )
 
-    @pytest.mark.parametrize("size_m", [1, 16, 48, 128])
-    @pytest.mark.parametrize("size_n", [256, 512])
-    @pytest.mark.parametrize("size_k", [256, 512])
-    def test_w4a16_accuracy(self, size_m, size_n, size_k):
-        device = flaggems_vllm.device
-        a, b_q, s, _, ws, ref = _make_inputs(
-            size_m, size_n, size_k, torch.float16, device
-        )
-        out = marlin_gemm(
-            a=a,
-            c=None,
-            b_q_weight=b_q,
-            b_bias=None,
-            b_scales=s,
-            a_scales=None,
-            global_scale=None,
-            b_zeros=None,
-            g_idx=None,
-            perm=None,
-            workspace=ws,
-            b_q_type=UINT4B8_ID,
-            size_m=size_m,
-            size_n=size_n,
-            size_k=size_k,
-        )
-        assert out.shape == (size_m, size_n)
-        gems_assert_close(out, ref, torch.float16, atol=5e-3)
+    out = _run_marlin_gemm(a, b_q_weight, b_scales, size_m, size_n, size_k)
 
-    @pytest.mark.parametrize("size_m", [1, 16, 48, 128])
-    @pytest.mark.parametrize("size_n", [256, 512])
-    @pytest.mark.parametrize("size_k", [256, 512])
-    def test_w4a16_accuracy_bf16(self, size_m, size_n, size_k):
-        device = flaggems_vllm.device
-        a, b_q, s, _, ws, ref = _make_inputs(
-            size_m, size_n, size_k, torch.bfloat16, device
-        )
-        out = marlin_gemm(
-            a=a,
-            c=None,
-            b_q_weight=b_q,
-            b_bias=None,
-            b_scales=s,
-            a_scales=None,
-            global_scale=None,
-            b_zeros=None,
-            g_idx=None,
-            perm=None,
-            workspace=ws,
-            b_q_type=UINT4B8_ID,
-            size_m=size_m,
-            size_n=size_n,
-            size_k=size_k,
-        )
-        gems_assert_close(out, ref, torch.bfloat16, atol=5e-2)
+    assert out.shape == (size_m, size_n)
+    utils.gems_assert_close(out, ref, dtype, atol=atol)
 
-    def test_w4a16_with_bias(self):
-        device = flaggems_vllm.device
-        a, b_q, s, bias, ws, ref = _make_inputs(
-            32, 256, 256, torch.float16, device, with_bias=True
-        )
-        out = marlin_gemm(
-            a=a,
-            c=None,
-            b_q_weight=b_q,
-            b_bias=bias,
-            b_scales=s,
-            a_scales=None,
-            global_scale=None,
-            b_zeros=None,
-            g_idx=None,
-            perm=None,
-            workspace=ws,
-            b_q_type=UINT4B8_ID,
-            size_m=32,
-            size_n=256,
-            size_k=256,
-        )
-        gems_assert_close(out, ref, torch.float16, atol=5e-3)
 
-    def test_out_buffer(self):
-        device = flaggems_vllm.device
-        a, b_q, s, _, ws, ref = _make_inputs(16, 256, 256, torch.float16, device)
-        c = torch.empty((16, 256), dtype=torch.float16, device=device)
-        out = marlin_gemm(
-            a=a,
-            c=c,
-            b_q_weight=b_q,
-            b_bias=None,
-            b_scales=s,
-            a_scales=None,
-            global_scale=None,
-            b_zeros=None,
-            g_idx=None,
-            perm=None,
-            workspace=ws,
-            b_q_type=UINT4B8_ID,
-            size_m=16,
-            size_n=256,
-            size_k=256,
-        )
-        assert out is c
-        gems_assert_close(out, ref, torch.float16, atol=5e-3)
+@pytest.mark.marlin_gemm
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_marlin_gemm_with_bias():
+    device = flaggems_vllm.device
+    a, b_q_weight, b_scales, b_bias, ref = _make_inputs(
+        32, 256, 256, torch.float16, device, with_bias=True
+    )
 
-    def test_unsupported_quant_type(self):
-        device = flaggems_vllm.device
-        a, b_q, s, _, ws, _ = _make_inputs(16, 256, 256, torch.float16, device)
-        with pytest.raises(NotImplementedError):
-            marlin_gemm(
-                a=a,
-                c=None,
-                b_q_weight=b_q,
-                b_bias=None,
-                b_scales=s,
-                a_scales=None,
-                global_scale=None,
-                b_zeros=None,
-                g_idx=None,
-                perm=None,
-                workspace=ws,
-                b_q_type=UINT4B8_ID + 1,
-                size_m=16,
-                size_n=256,
-                size_k=256,
-            )
+    out = _run_marlin_gemm(a, b_q_weight, b_scales, 32, 256, 256, b_bias=b_bias)
 
-    def test_unsupported_act_order(self):
-        device = flaggems_vllm.device
-        a, b_q, s, _, ws, _ = _make_inputs(16, 256, 256, torch.float16, device)
-        g_idx = torch.zeros(256, dtype=torch.int32, device=device)
-        with pytest.raises(NotImplementedError):
-            marlin_gemm(
-                a=a,
-                c=None,
-                b_q_weight=b_q,
-                b_bias=None,
-                b_scales=s,
-                a_scales=None,
-                global_scale=None,
-                b_zeros=None,
-                g_idx=g_idx,
-                perm=None,
-                workspace=ws,
-                b_q_type=UINT4B8_ID,
-                size_m=16,
-                size_n=256,
-                size_k=256,
-            )
+    utils.gems_assert_close(out, ref, torch.float16, atol=5e-3)
+
+
+@pytest.mark.marlin_gemm
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_marlin_gemm_out_buffer():
+    device = flaggems_vllm.device
+    a, b_q_weight, b_scales, _, ref = _make_inputs(16, 256, 256, torch.float16, device)
+    c = torch.empty((16, 256), dtype=torch.float16, device=device)
+
+    out = _run_marlin_gemm(a, b_q_weight, b_scales, 16, 256, 256, c=c)
+
+    assert out is c
+    utils.gems_assert_close(out, ref, torch.float16, atol=5e-3)
+
+
+@pytest.mark.marlin_gemm
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_marlin_gemm_unsupported_quant_type():
+    device = flaggems_vllm.device
+    a, b_q_weight, b_scales, _, _ = _make_inputs(16, 256, 256, torch.float16, device)
+    with pytest.raises(NotImplementedError):
+        _run_marlin_gemm(a, b_q_weight, b_scales, 16, 256, 256, b_q_type=UINT4B8_ID + 1)
+
+
+@pytest.mark.marlin_gemm
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_marlin_gemm_unsupported_act_order():
+    device = flaggems_vllm.device
+    a, b_q_weight, b_scales, _, _ = _make_inputs(16, 256, 256, torch.float16, device)
+    g_idx = torch.zeros(256, dtype=torch.int32, device=device)
+    with pytest.raises(NotImplementedError):
+        _run_marlin_gemm(a, b_q_weight, b_scales, 16, 256, 256, g_idx=g_idx)
