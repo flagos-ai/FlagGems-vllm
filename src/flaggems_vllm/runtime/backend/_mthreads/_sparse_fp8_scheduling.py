@@ -6,8 +6,42 @@ from typing import Optional, Tuple
 
 import torch
 import triton
+import triton.language as tl
 from triton.compiler.errors import CompilationError
 from triton.runtime.errors import OutOfResources
+
+
+@triton.jit
+def collect_v32_tail_denominator(Denominators, Stats, split, write=True):
+    heads = tl.arange(0, 64)
+    columns = tl.arange(0, 4)
+    row = split * 64 + heads
+    values = tl.load(Denominators + row[:, None] * 4 + columns[None, :])
+    total = tl.sum(values, 1)
+    bits = total.to(tl.uint32, bitcast=True)
+    nonnegative_finite = (bits < 0x7F800000) | (bits == 0x80000000)
+    valid = tl.min(nonnegative_finite.to(tl.int32), 0) != 0
+    if valid and write:
+        center = tl.where((bits & 0x7FFFFFFF) != 0, 0, 0xFF800000).to(tl.uint64)
+        packet = center | (bits.to(tl.uint64) << 32)
+        tl.store(Stats.to(tl.pointer_type(tl.uint64)) + row, packet)
+    return valid
+
+
+@triton.jit
+def mixed_v32_span(
+    slot,
+    TOPK: tl.constexpr,
+    SPLITS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    FULL_ROWS: tl.constexpr,
+):
+    full = slot < FULL_ROWS
+    tail_slot = tl.maximum(slot - FULL_ROWS, 0)
+    row = tl.where(full, slot, FULL_ROWS + tail_slot // SPLITS)
+    start = tl.where(full, 0, tail_slot % SPLITS) * CHUNK
+    end = tl.where(full, TOPK, start + CHUNK)
+    return row, full, start, end
 
 
 def group_short_pages(
@@ -71,7 +105,7 @@ def prepare_persistent_combine(
     combine_heads, combine_warps = 16, 8
     if rows == 16 and topk >= 4096:
         combine_heads, combine_warps = 32, 16
-    elif rows <= 4 and topk >= 4096:
+    elif (rows <= 4 and topk >= 4096) or (rows == 4 and topk == 640):
         combine_heads, combine_warps = 8, 4
     options = dict(
         num_warps=combine_warps,

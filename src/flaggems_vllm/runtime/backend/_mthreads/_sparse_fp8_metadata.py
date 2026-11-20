@@ -146,6 +146,67 @@ def reduce_scales(
         tl.store(Global + 1, tl.where(codec_ok, minimum, 0).to(tl.float32))
 
 
+@triton.jit(noinline=True)
+def repair_k128(
+    Q,
+    QS,
+    KV,
+    KS,
+    Indices,
+    Output,
+    LSE,
+    row,
+    TOKENS: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    selected = tl.arange(0, 128)
+    indices = tl.load(Indices + row * 128 + selected)
+    valid = (indices >= 0) & (indices < TOKENS)
+    if tl.max(valid.to(tl.int32), 0) == 0:
+        lanes = tl.arange(0, 1024)
+        for start in range(0, 64 * 512, 1024):
+            tl.store(Output + row * (64 * 512) + start + lanes, 0.0)
+        tl.store(LSE + row * 64 + tl.arange(0, 64), float("inf"))
+    else:
+        HEADS: tl.constexpr = 8
+        FEATURES: tl.constexpr = 8
+        tokens = tl.where(valid, indices, 0).to(tl.int64)
+        gains = tl.load(KS + tokens, valid, 0.0)
+        columns = tl.arange(0, FEATURES)
+        # Reuse each key tile across a head group while bounding register use.
+        for group in range(64 // HEADS):
+            h = row * 64 + group * HEADS + tl.arange(0, HEADS)
+            q_scale = tl.load(QS + h)
+            scores = tl.full((HEADS, 128), 0.0, tl.float32)
+            for start in range(0, 512, FEATURES):
+                dims = start + columns
+                query = tl.load(Q + h[:, None] * 512 + dims[None, :]).to(tl.float32)
+                query *= q_scale[:, None]
+                key = tl.load(
+                    KV + tokens[:, None] * 512 + dims[None, :], valid[:, None], 0.0
+                ).to(tl.float32)
+                key *= gains[:, None]
+                scores += tl.sum(query[:, None, :] * key[None, :, :], 2)
+            logits = tl.where(valid[None, :], scores * SCALE, float("-inf"))
+            maximum = tl.max(logits, 1)
+            center = tl.where(maximum == float("-inf"), 0.0, maximum)
+            weights = tl.where(valid[None, :], tl.exp(logits - center[:, None]), 0.0)
+            total = tl.sum(weights, 1)
+            normal = tl.where(total > 0.0, total, 1.0)
+            tl.store(
+                LSE + h, tl.where(total > 0.0, center + tl.log(total), float("inf"))
+            )
+            weights /= normal[:, None]
+            for start in range(0, 512, FEATURES):
+                dims = start + columns
+                value = tl.load(
+                    KV + tokens[:, None] * 512 + dims[None, :], valid[:, None], 0.0
+                ).to(tl.float32)
+                value *= gains[:, None]
+                acc = tl.sum(value[None, :, :] * weights[:, :, None], 1)
+                tl.store(Output + h[:, None] * 512 + dims[None, :], acc)
+
+
 @triton.jit
 def query_bounds_global(
     Q,
@@ -164,6 +225,9 @@ def query_bounds_global(
     Offsets=None,
     TOKENS: tl.constexpr = 0,
     PACKED_META: tl.constexpr = False,
+    KV=None,
+    Output=None,
+    LSE=None,
 ):
     row = tl.program_id(0).to(tl.int64)
     if Indices is None:
@@ -263,3 +327,7 @@ def query_bounds_global(
     if BadCount is not None and not eligible:
         index = tl.atomic_add(BadCount, 1)
         tl.store(BadRows + index, row)
+    if KV is not None:
+        tl.static_assert(K == 128 and Indices is not None)
+        if not eligible:
+            repair_k128(Q, QS, KV, KS, Indices, Output, LSE, row, TOKENS, SCALE)

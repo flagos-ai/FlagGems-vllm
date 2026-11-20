@@ -837,10 +837,16 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
             driver.active.get_current_device()
         )
         programs = min(rows, properties["multiprocessor_count"])
-        kernel = compiled_kernel(*compile_args, use_byte_offsets, programs)
+        use_tme_q = properties["max_shared_mem"] >= 192 * 1024
+        kernel = compiled_kernel(*compile_args, use_byte_offsets, programs, use_tme_q)
+        if use_tme_q and kernel is None:
+            use_tme_q = False
+            kernel = compiled_kernel(*compile_args, use_byte_offsets, programs)
         if kernel is not None and kernel.metadata.shared > properties["max_shared_mem"]:
             kernel = None
     if kernel is None:
+        if programs:
+            use_tme_q = False
         programs = 0
         kernel = compiled_pipeline(
             *compile_args, use_byte_offsets, use_tme_q, packed_meta
@@ -905,18 +911,30 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         extern_libs={"native": native_library(QUERY_NORM_IR)},
     )
     k2 = None
-    if topk == 640 and rows >= 128 and _MIXED_PV_SUPPORTED.value:
+    repair_in_bounds = False
+    no_repair = (None, None, None)
+    if (programs and use_tme_q) or (
+        topk == 640 and rows >= 128 and _MIXED_PV_SUPPORTED.value
+    ):
         active_query_args = (*a2[:5], None, None, topk, scale)
         row_data = (indices, ks, selected, byte_offsets)
         row_args = (*active_query_args, True, *row_data, tokens, False)
-        try:
-            k2 = query_bounds_global.warmup(*row_args, **bounds_options)
-        except (CompilationError, OutOfResources, RuntimeError) as error:
-            logging.getLogger(__name__).debug("Sparse FP8 row bounds failed: %s", error)
+        row_options = dict(bounds_options, num_warps=8) if programs else bounds_options
+        repair_buffers = ((kv, output, lse), no_repair) if programs else (no_repair,)
+        for buffers in repair_buffers:
+            fused_args = (*row_args, *buffers)
+            try:
+                k2 = query_bounds_global.warmup(*fused_args, **row_options)
+            except (CompilationError, OutOfResources, RuntimeError) as error:
+                logging.getLogger(__name__).debug(
+                    "Sparse FP8 row bounds failed: %s", error
+                )
+            else:
+                a2 = fused_args
+                repair_in_bounds = buffers[0] is not None
+                break
     row_scales = k2 is not None
-    if row_scales:
-        a2 = row_args
-    else:
+    if not row_scales:
         scales = torch.empty(
             (parts * (3 if packed_meta else 1),), dtype=torch.float32, device=q.device
         )
@@ -940,7 +958,16 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
         r0 = cache_scale_bounds.warmup(*a0, num_warps=4, grid=(parts,))[(parts, 1, 1)]
         r1 = reduce_scales.warmup(*a1, num_warps=4, grid=(1,))[(1, 1, 1)]
         a2 = (
-            a2[:2] + (global_scale,) + a2[3:] + (None, None, None, None, 0, packed_meta)
+            *a2[:2],
+            global_scale,
+            *a2[3:],
+            None,
+            None,
+            None,
+            None,
+            0,
+            packed_meta,
+            *no_repair,
         )
         k2 = query_bounds_global.warmup(*a2, **bounds_options)
     a3 = (
@@ -981,6 +1008,8 @@ def prepare_pipeline(q, kv, qs, ks, indices, output, lse, scale):
             r3(*a3)
         r4(*a4)
 
+    if repair_in_bounds:
+        return run_pipeline, None, None
     if row_scales:
         return run_pipeline, flags, None
     return run_pipeline, bad_rows, bad_count
@@ -1019,7 +1048,11 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     single_split = persistent and rows == 16 and topk == 640
     can_prefetch = False
     if direct:
-        heads, warps = (64, 16) if rows > 16 else (32, 8)
+        if topk == 128 and rows < 16:
+            heads, warps = 16, 8
+        else:
+            heads = 64 if rows > 16 else 32
+            warps = 16 if heads == 64 or topk == 128 else 8
         splits = 1
         programs, groups = rows, None
     elif persistent:

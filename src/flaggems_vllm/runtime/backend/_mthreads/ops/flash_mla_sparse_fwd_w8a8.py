@@ -10,6 +10,10 @@ import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
 from flaggems_vllm import runtime
+from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_scheduling import (
+    collect_v32_tail_denominator,
+    mixed_v32_span,
+)
 from flaggems_vllm.utils import libentry, libtuner
 
 
@@ -41,9 +45,23 @@ def _sparse_fp8_row(
     CHUNK: tl.constexpr,
     BH: tl.constexpr,
     BN: tl.constexpr,
+    FULL_ROWS: tl.constexpr = 0,
 ):
+    if FULL_ROWS:
+        slot = row
+        row, full, split_start, split_end = mixed_v32_span(
+            slot, K, SPLITS, CHUNK, FULL_ROWS
+        )
+        partial_slot = slot - FULL_ROWS
+    else:
+        split = tl.program_id(2)
+        length = (
+            tl.minimum(tl.maximum(tl.load(Lengths + row), 0), K) if HAS_LENGTH else K
+        )
+        split_start = split * CHUNK
+        split_end = tl.minimum(split_start + CHUNK, length)
+        partial_slot = row * SPLITS + split
     heads = tl.program_id(1) * BH + tl.arange(0, BH)
-    split = tl.program_id(2)
     dims = tl.arange(0, 512)
     columns = tl.arange(0, BN)
     query = tl.load(
@@ -60,12 +78,10 @@ def _sparse_fp8_row(
     q_l1 = tl.sum(tl.abs(query.to(tl.float32)), 1) * qscale
     if ROPE:
         qr_l1 = tl.sum(tl.abs(qrope.to(tl.float32)), 1) * qscale
-    length = tl.minimum(tl.maximum(tl.load(Lengths + row), 0), K) if HAS_LENGTH else K
     maximum = tl.full((BH,), float("-inf"), tl.float32)
     denominator = tl.full((BH,), 0.0, tl.float32)
     accumulator = tl.full((BH, 512), 0.0, tl.float32)
-    split_end = tl.minimum((split + 1) * CHUNK, length)
-    for begin in range(split * CHUNK, split_end, BN):
+    for begin in range(split_start, split_end, BN):
         offsets = begin + columns
         tokens = tl.load(Indices + row * K + offsets, offsets < split_end, -1)
         valid = (offsets < split_end) & (tokens >= 0) & (tokens < TOKENS)
@@ -146,7 +162,7 @@ def _sparse_fp8_row(
         product = tl.dot(low, values, product * 16.0).to(tl.float32) * (1.0 / 16.0)
         accumulator = accumulator * correction[:, None] + product * pscale[:, None]
         maximum = next_max
-    if SPLITS == 1:
+    if full if FULL_ROWS else SPLITS == 1:
         logsum = tl.where(denominator > 0, maximum + tl.log(denominator), float("inf"))
         inverse = tl.div_rn(1.0, tl.where(denominator > 0, denominator, 1.0))
         if HAS_SINK:
@@ -161,7 +177,7 @@ def _sparse_fp8_row(
         )
         tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, logsum, heads < H)
     else:
-        base = (row * SPLITS + split) * H + heads
+        base = partial_slot * H + heads
         tl.store(
             Partial + base[:, None] * 512 + dims[None, :],
             accumulator,
@@ -211,36 +227,240 @@ def sparse_fp8_mla(
     CHUNK: tl.constexpr,
     BH: tl.constexpr,
     BN: tl.constexpr,
+    RepairFlags=None,
+    FULL_ROWS: tl.constexpr = 0,
 ):
     row = tl.program_id(0).to(tl.int64)
-    _sparse_fp8_row(
-        Q,
-        QR,
-        KV,
-        KR,
-        QS,
-        KS,
-        Indices,
-        Lengths,
-        Partial,
-        Stats,
-        Output,
-        LSE,
-        Sink,
-        row,
-        H,
-        SQ,
-        K,
-        TOKENS,
-        ROPE,
-        SCALE,
-        HAS_LENGTH,
-        HAS_SINK,
-        SPLITS,
-        CHUNK,
-        BH,
-        BN,
-    )
+    slot = row if FULL_ROWS else row * SPLITS + tl.program_id(2)
+    if RepairFlags is None or tl.load(RepairFlags + slot):
+        _sparse_fp8_row(
+            Q,
+            QR,
+            KV,
+            KR,
+            QS,
+            KS,
+            Indices,
+            Lengths,
+            Partial,
+            Stats,
+            Output,
+            LSE,
+            Sink,
+            row,
+            H,
+            SQ,
+            K,
+            TOKENS,
+            ROPE,
+            SCALE,
+            HAS_LENGTH,
+            HAS_SINK,
+            SPLITS,
+            CHUNK,
+            BH,
+            BN,
+            FULL_ROWS,
+        )
+
+
+@triton.jit
+def mixed_v32_exact_repair(
+    Q,
+    QR,
+    KV,
+    KR,
+    QS,
+    KS,
+    Indices,
+    Partial,
+    Stats,
+    Output,
+    LSE,
+    Flags,
+    TailDenominators,
+    TOKENS: tl.constexpr,
+    TOPK: tl.constexpr,
+    SPLITS: tl.constexpr,
+    CHUNK: tl.constexpr,
+    SCALE: tl.constexpr,
+    FULL_ROWS: tl.constexpr,
+):
+    slot = tl.program_id(0).to(tl.int64)
+    needs_repair = tl.load(Flags + slot)
+    if TailDenominators is not None:
+        if slot >= FULL_ROWS and not needs_repair:
+            # Both head blocks validate the split. Only one writes its stats.
+            needs_repair = not collect_v32_tail_denominator(
+                TailDenominators, Stats, slot - FULL_ROWS, tl.program_id(1) == 0
+            )
+    if needs_repair:
+        _sparse_fp8_row(
+            Q,
+            QR,
+            KV,
+            KR,
+            QS,
+            KS,
+            Indices,
+            None,
+            Partial,
+            Stats,
+            Output,
+            LSE,
+            None,
+            slot,
+            64,
+            1,
+            TOPK,
+            TOKENS,
+            64,
+            SCALE,
+            False,
+            False,
+            SPLITS,
+            CHUNK,
+            32,
+            64,
+            FULL_ROWS,
+        )
+
+
+@triton.jit
+def finish_v32_mixed(
+    Q,
+    QR,
+    KV,
+    KR,
+    QS,
+    KS,
+    Indices,
+    Partial,
+    Output,
+    LSE,
+    Flags,
+    TailDenominators,
+    TOKENS: tl.constexpr,
+    TOPK: tl.constexpr,
+    SPLITS: tl.constexpr,
+    SCALE: tl.constexpr,
+    FULL_ROWS: tl.constexpr,
+    BH: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    heads = tl.program_id(1) * BH + tl.arange(0, BH)
+    if row < FULL_ROWS:
+        needs_repair = tl.load(Flags + row)
+    else:
+        splits = (row - FULL_ROWS) * SPLITS + tl.arange(0, SPLITS)
+        needs_repair = tl.sum(tl.load(Flags + FULL_ROWS + splits).to(tl.int32), 0) != 0
+        if not needs_repair:
+            item = splits[:, None] * 64 + heads[None, :]
+            parts = tl.arange(0, 4)
+            denoms = tl.sum(
+                tl.load(TailDenominators + item[:, :, None] * 4 + parts[None, None, :]),
+                2,
+            )
+            bits = denoms.to(tl.uint32, bitcast=True)
+            valid = (bits < 0x7F800000) | (bits == 0x80000000)
+            total = tl.sum(denoms, 0)
+            needs_repair = tl.min(tl.min(valid.to(tl.int32), 0), 0) == 0
+            needs_repair |= tl.max(total, 0) == float("inf")
+            if not needs_repair:
+                # Accepted splits share the same zero logit center.
+                dims = tl.arange(0, 512)
+                values = tl.load(Partial + item[:, :, None] * 512 + dims[None, None, :])
+                combined = tl.sum(values, 0)
+                inverse = tl.div_rn(1.0, tl.where(total > 0.0, total, 1.0))
+                tl.store(
+                    Output + (row * 64 + heads[:, None]) * 512 + dims[None, :],
+                    combined * inverse[:, None],
+                )
+                tl.store(
+                    LSE + row * 64 + heads,
+                    tl.where(total > 0.0, tl.log(total), float("inf")),
+                )
+    if needs_repair:
+        _sparse_fp8_row(
+            Q,
+            QR,
+            KV,
+            KR,
+            QS,
+            KS,
+            Indices,
+            None,
+            None,
+            None,
+            Output,
+            LSE,
+            None,
+            row,
+            64,
+            1,
+            TOPK,
+            TOKENS,
+            64,
+            SCALE,
+            False,
+            False,
+            1,
+            TOPK,
+            BH,
+            64,
+        )
+
+
+@triton.jit
+def _compact_v32_repair(
+    Q,
+    QR,
+    KV,
+    KR,
+    QS,
+    KS,
+    Indices,
+    Output,
+    LSE,
+    Flags,
+    BadRows,
+    BadCount,
+    TOKENS: tl.constexpr,
+    TOPK: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    count = tl.load(BadCount)
+    for position in range(tl.program_id(0), count, tl.num_programs(0)):
+        row = tl.load(BadRows + position).to(tl.int64)
+        if tl.load(Flags + row):
+            _sparse_fp8_row(
+                Q,
+                QR,
+                KV,
+                KR,
+                QS,
+                KS,
+                Indices,
+                None,
+                None,
+                None,
+                Output,
+                LSE,
+                None,
+                row,
+                64,
+                1,
+                TOPK,
+                TOKENS,
+                64,
+                SCALE,
+                False,
+                False,
+                1,
+                TOPK,
+                32,
+                64,
+            )
 
 
 @triton.jit
@@ -375,6 +595,33 @@ def combine_sparse_fp8(
     tl.store(Output + (row * H + head) * 512 + dims, values)
     if tile == 0:
         tl.store(LSE + (row // SQ * H + head) * SQ + row % SQ, logsum)
+
+
+@triton.jit
+def combine_v32_two_splits(Partial, Stats, Output, LSE):
+    row = tl.program_id(0)
+    head = tl.program_id(1) * 2 + tl.arange(0, 2)
+    dim = tl.arange(0, 512)
+    first = row * 128 + head
+    second = first + 64
+    max0 = tl.load(Stats + first * 2)
+    max1 = tl.load(Stats + second * 2)
+    sum0 = tl.load(Stats + first * 2 + 1)
+    sum1 = tl.load(Stats + second * 2 + 1)
+    maximum = tl.maximum(max0, max1)
+    safe = tl.where(maximum == float("-inf"), 0.0, maximum)
+    weight0 = tl.exp(max0 - safe)
+    weight1 = tl.exp(max1 - safe)
+    denominator = weight0 * sum0 + weight1 * sum1
+    divisor = tl.where(denominator > 0, denominator, 1.0)
+    x = tl.load(Partial + first[:, None] * 512 + dim[None, :])
+    y = tl.load(Partial + second[:, None] * 512 + dim[None, :])
+    value = (x * weight0[:, None] + y * weight1[:, None]) / divisor[:, None]
+    tl.store(Output + (row * 64 + head[:, None]) * 512 + dim[None, :], value)
+    tl.store(
+        LSE + row * 64 + head,
+        tl.where(denominator > 0, safe + tl.log(denominator), float("inf")),
+    )
 
 
 @triton.jit
@@ -555,6 +802,18 @@ def prepare_flash_mla_sparse_fwd_w8a8(
             triton.cdiv(256, max(1, rows * triton.cdiv(heads, 32))),
         ),
     )
+    use_v32 = (
+        rows
+        and queries == 1
+        and heads == 64
+        and q_rope.shape[-1] == 64
+        and topk == 2048
+        and topk_length is None
+        and attn_sink is None
+    )
+    if use_v32 and 96 <= rows < 128:
+        # One split gives the observed pipeline more pages to amortize startup.
+        splits = 1
     chunk = triton.cdiv(topk, splits * 64) * 64
     if rows * splits * heads * 2056 > 8 * 1024**3 or k_nope.shape[0] * 64 >= 2**31:
         raise NotImplementedError(
@@ -665,6 +924,14 @@ def prepare_flash_mla_sparse_fwd_w8a8(
                 )
         if pipeline is not None:
             run_pipeline, bad_rows, bad_count = pipeline
+            if bad_rows is None:
+
+                def run_repaired_pipeline():
+                    with runtime.torch_device_fn.device(q_nope.device):
+                        run_pipeline()
+                    return output, lse
+
+                return run_repaired_pipeline, run_repaired_pipeline()
             programs = min(
                 rows,
                 runtime.torch_device_fn.get_device_properties(
@@ -706,6 +973,43 @@ def prepare_flash_mla_sparse_fwd_w8a8(
 
             return run_fast, run_fast()
 
+    if (
+        use_v32
+        and rows in (64, 132, 193, 449)
+        and 0 < k_nope.shape[0] <= (1 << 14)
+        and scale <= 1.0
+        and runtime.torch_device_fn.get_device_properties(
+            q_nope.device
+        ).multi_processor_count
+        == 60
+    ):
+        try:
+            from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_v32 import (
+                prepare_mixed_v32,
+            )
+        except ImportError:
+            mixed = None
+        else:
+            with runtime.torch_device_fn.device(q_nope.device):
+                mixed = prepare_mixed_v32(
+                    inputs,
+                    output,
+                    lse,
+                    scale,
+                    sparse_fp8_mla.jit_function,
+                    mixed_v32_exact_repair,
+                    combine_sparse_fp8.jit_function,
+                    finish_v32_mixed,
+                )
+        if mixed is not None:
+
+            def run_mixed():
+                with runtime.torch_device_fn.device(q_nope.device):
+                    mixed()
+                return output, lse
+
+            return run_mixed, run_mixed()
+
     if splits == 1:
         partial, stats = None, None
     else:
@@ -742,24 +1046,57 @@ def prepare_flash_mla_sparse_fwd_w8a8(
         chunk,
     )
 
+    run_v32 = None
+    if use_v32:
+        try:
+            from flaggems_vllm.runtime.backend._mthreads._sparse_fp8_v32 import (
+                prepare_sparse_fp8_v32,
+            )
+        except ImportError:
+            run_v32 = None
+        else:
+            with runtime.torch_device_fn.device(q_nope.device):
+                run_v32 = prepare_sparse_fp8_v32(
+                    inputs,
+                    partial,
+                    stats,
+                    output,
+                    lse,
+                    scale,
+                    splits,
+                    chunk,
+                    sparse_fp8_mla.jit_function,
+                    mla_args,
+                    _compact_v32_repair,
+                )
+
+    combine_v32_pair = use_v32 and 64 <= rows < 96 and splits == 2
+
     def run() -> tuple[torch.Tensor, torch.Tensor]:
         nonlocal launch_mla, launch_options
         if rows == 0 or heads == 0:
             return output, lse
         with runtime.torch_device_fn.device(q_nope.device):
-            try:
-                launch_mla(*mla_args, **launch_options)
-            except OutOfResources:
-                # The cached tile may exceed shared memory on another compiler.
-                config = min(
-                    _SPARSE_MLA_CONFIGS,
-                    key=lambda c: (c.kwargs["BH"] * c.kwargs["BN"], c.num_warps),
+            if run_v32 is not None:
+                run_v32()
+            else:
+                try:
+                    launch_mla(*mla_args, **launch_options)
+                except OutOfResources:
+                    # The cached tile may exceed shared memory on another compiler.
+                    config = min(
+                        _SPARSE_MLA_CONFIGS,
+                        key=lambda c: (c.kwargs["BH"] * c.kwargs["BN"], c.num_warps),
+                    )
+                    launch_options = config.all_kwargs()
+                    grid = (rows, triton.cdiv(heads, launch_options["BH"]), splits)
+                    launch_mla = sparse_fp8_mla.jit_function[grid]
+                    launch_mla(*mla_args, **launch_options)
+            if combine_v32_pair:
+                combine_v32_two_splits[(rows, 32)](
+                    partial, stats, output, lse, num_warps=4
                 )
-                launch_options = config.all_kwargs()
-                grid = (rows, triton.cdiv(heads, launch_options["BH"]), splits)
-                launch_mla = sparse_fp8_mla.jit_function[grid]
-                launch_mla(*mla_args, **launch_options)
-            if splits > 1:
+            elif splits > 1:
                 combine_sparse_fp8[lambda meta: (rows, heads, 512 // meta["BV"])](
                     partial,
                     stats,
