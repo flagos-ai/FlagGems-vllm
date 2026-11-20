@@ -134,10 +134,10 @@ def _tile(m):
         return 64, 128, 4, 2, 8, 128, 1
     if m <= 128:
         return 128, 128, 8, 1, 8, 128, 1
-    # 128x128 with unroll 2 wins every m >= 256 bucket once the scales are
-    # block-major: 0.100 vs 0.111 ms at 256 tokens and 1.058 vs 1.321 ms at
-    # 4096 (259 vs 208 TFLOPS).
-    return 128, 128, 8, 1, 8, 128, 2
+    # 128x128 with unroll 4 wins every m >= 256 bucket once the scales are
+    # block-major: 0.098 vs 0.100 ms at 256 tokens, 0.173 vs 0.182 at 512 and
+    # 1.049 vs 1.058 at 4096 (263 vs 260 TFLOPS).
+    return 128, 128, 8, 1, 8, 128, 4
 
 
 def _lean_bmm(act, weight, act_scale, weight_scale, out):
@@ -1088,12 +1088,12 @@ def deep_gemm_fp8_o_proj(
             act_i8, act_scale_i8 = _activation_to_int8(act, act_scale)
         else:
             act_i8, act_scale_i8 = _quant_buffers_cached(o, n_groups, heads_per_group)
-            # 8-token tiles keep the vector units busy from 64 to 256 tokens
-            # (-2% to -15% vs 4); below 64 tokens there are not enough rows and
-            # from 512 the row-wise pass takes over.
+            # 8-token tiles keep the vector units busy up to 512 tokens (-2% to
+            # -15% vs 4); below 64 tokens there are not enough rows and the
+            # larger prefill shapes prefer 4.
             if num_tokens < 64:
                 block_t = 2
-            elif num_tokens <= 256:
+            elif num_tokens <= 512:
                 block_t = 8
             else:
                 block_t = 4
@@ -1103,6 +1103,7 @@ def deep_gemm_fp8_o_proj(
             # below 512 tokens the row tiles are too coarse to hide latency.
             heads = n_groups * heads_per_group
             if _QUANT_ROWS and heads >= 128 and num_tokens >= 512:
+                block_t = 8
                 _launch_quant_rows(
                     o,
                     positions,
