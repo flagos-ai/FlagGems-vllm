@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MHC oracle keeps the BF16 projection and weighted-sum boundaries."""
+"""MHC oracle keeps the FP32 projection and BF16 weighted-sum boundary."""
 
 import importlib
 
@@ -25,9 +25,9 @@ def _norm_reference(x, weight, eps):
 def _pre_reference(residual, fn, scales, base, eps=1e-6, repeats=5, projected=None):
     hc = residual.shape[-2]
     flat = residual.flatten(-2).bfloat16()
-    # Both GEMM output and the weighted layer input materialize in BF16.
+    # The optimized path packs weights in BF16 but accumulates into FP32.
     if projected is None:
-        projected = (flat @ fn.bfloat16().t()).bfloat16().float()
+        projected = (flat.double() @ fn.bfloat16().double().t()).float()
     rms = torch.rsqrt(flat.float().square().mean(-1, keepdim=True) + eps)
     expanded = torch.cat(
         (scales[0].expand(hc), scales[1].expand(hc), scales[2].expand(hc * hc))
@@ -132,7 +132,7 @@ def test_mhc_fused_post_pre_norm_order(tokens, hidden):
 
 
 def test_mhc_pre_projection_materialization_and_mix_norm_stages():
-    """The block output must equal the reference built from a bf16 projection."""
+    """The block output keeps the projection in FP32 until the gate math."""
     residual, fn, scale, base, norm = _inputs(tokens=512, hidden=1280)
     x = torch.randn(512, 1280, dtype=torch.bfloat16, device=gems.device)
     post = torch.randn(512, 4, 1, device=gems.device) * 0.3
@@ -155,7 +155,7 @@ def test_mhc_pre_projection_materialization_and_mix_norm_stages():
         norm_eps=1e-6,
     )
     flat = after_post.flatten(-2).bfloat16()
-    projected = (flat @ fn.bfloat16().t()).bfloat16().float()
+    projected = (flat.double() @ fn.bfloat16().double().t()).float()
     expected = _pre_reference(after_post, fn, scale, base, projected=projected)
     torch.testing.assert_close(actual[0], after_post, rtol=0, atol=0)
     for observed, reference in zip(actual[1:3], expected[:2]):
@@ -259,8 +259,9 @@ def test_mhc_pre_empty_preserves_output_contract(hc, with_norm):
 def test_mhc_inference_tensor_without_version_counter():
     residual, fn, scale, base, norm = _inputs()
     assert fn.is_inference()
-    expected = _pre_reference(residual, fn, scale, base)
-    for _ in range(2):
+    for factor in (1.0, 1.0, 1.25):
+        fn.mul_(factor)
+        expected = _pre_reference(residual, fn, scale, base)
         actual = gems.mhc_pre_with_norm(
             residual,
             fn,
