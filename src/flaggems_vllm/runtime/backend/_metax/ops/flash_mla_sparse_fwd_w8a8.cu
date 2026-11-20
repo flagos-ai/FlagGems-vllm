@@ -113,19 +113,21 @@ __device__ __forceinline__ int roff(int token, int dim) {
 
 } // namespace
 
-#if defined(FMLA_SPARSE_RAW) && defined(FMLA_SCALE_TABLE) && HEADS == 32 && FMLA_NO_ROPE && FMLA_SPLITS == 1 && FMLA_CAP > 128
+#if defined(FMLA_SPARSE_RAW) && defined(FMLA_SCALE_TABLE) && HEADS == 32 && \
+    (FMLA_NO_ROPE || FMLA_CAP == 2048) && FMLA_SPLITS == 1 && FMLA_CAP > 128
 #define FMLA_PEEL_LAST_PAGE 1
 #else
 #define FMLA_PEEL_LAST_PAGE 0
 #endif
 
-extern "C" __device__ __attribute__((used, always_inline)) float
-mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
+template <bool DirectExp>
+__device__ __forceinline__ bool
+compute_sparse_tile(long long qp, long long qrp, long long kp, long long krp,
                long long qsp, long long ksp, long long tp, long long lp,
                long long pp, long long sp, long long op, long long lsep,
                long long ts, long long ls, long long orderp, long long selectedp, int batches,
                int hq, int sq, int splits, int causal, int bf16,
-               float scale_log2, int head_tile, int batch, int split) {
+               float scale_log2, int head_tile, int batch, int split, unsigned char (*planes)[8192]) {
   qp = uniform(qp);
   qrp = uniform(qrp);
   kp = uniform(kp);
@@ -237,8 +239,6 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                                              ((row & 3) * 16))) *              \
                                     2))
 #endif
-  // Two K planes overlap H16 copies with QK; H32 retains four planes for PV.
-  __shared__ unsigned char planes[HEADS == 32 ? 4 : 2][8192];
   auto copy_wait = [&]() {
     __builtin_mxc_arrive_gvmcnt(0);
     __builtin_mxc_barrier_ex(2);
@@ -300,6 +300,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #pragma unroll
   for (int a = 0; a < QV * 4; ++a)
     acc[a] = (float4_){0, 0, 0, 0};
+  float lane_denominator = 0.f;
   float maximum = -INFINITY, denominator = 0.f;
 #if FMLA_PEEL_LAST_PAGE && FMLA_CAP >= 4096 && FMLA_CAP <= 16384
 #define FMLA_DEFER_NORMALIZATION 1
@@ -378,7 +379,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
 #if FMLA_PEEL_LAST_PAGE
-      const int chunk = (i + 1) & 3;
+      const int chunk = FMLA_NO_ROPE ? ((i + 1) & 3) : i;
 #else
       const int chunk = i;
 #endif
@@ -497,77 +498,107 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
     // K readers already synchronized; only RoPE readers still need this barrier.
     if (!FMLA_NO_ROPE && !FMLA_SEPARATE_ROPE_STATS)
       sync();
-    local_max = fmaxf(local_max, __shfl_xor(local_max, 16, 64));
-    local_max = fmaxf(local_max, __shfl_xor(local_max, 32, 64));
-    // H16 retains V in registers, so plane 1 can hold stats beside RoPE in plane 0.
-    float *stats = FMLA_SEPARATE_ROPE_STATS
-                       ? (float *)planes[1]
-                       : (float *)(planes[0] + (HEADS == 16 || stats_outside_probability ? 4096 : 0));
-    auto *sum_peak = (float2_ *)(stats + (stats_outside_probability ? NW * HEADS : 0));
-    if (group == 0)
-      stats[wn * HEADS + wm * 16 + row] = local_max;
-    sync();
-    float page_max = -INFINITY;
+    float next_max, next_den, pscale, old_weight, outscale;
+    if (DirectExp) {
+      // With a fixed exponential reference, each lane can keep its own
+      // denominator until the final reduction. PV still uses both INT8 digits.
+      float local_peak = 0.f;
 #pragma unroll
-    for (int n = 0; n < NW; ++n)
-      page_max = fmaxf(page_max, stats[n * HEADS + wm * 16 + row]);
-    const float next_max = fmaxf(maximum, page_max),
-                safe = next_max == -INFINITY ? 0.f : next_max;
-    float local_sum = 0.f, local_peak = 0.f;
+      for (int n = 0; n < NR; ++n) {
 #pragma unroll
-    for (int n = 0; n < NR; ++n) {
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        probability[n][j] = exp2f(probability[n][j] - safe);
-        local_sum += probability[n][j];
-        probability[n][j] *= scales[n][j];
-        local_peak = fmaxf(local_peak, probability[n][j]);
+        for (int j = 0; j < 4; ++j) {
+          const float mass = exp2f(probability[n][j]);
+          lane_denominator += mass;
+          probability[n][j] = mass * scales[n][j];
+          local_peak = fmaxf(local_peak, probability[n][j]);
+        }
       }
-    }
-    local_sum += __shfl_xor(local_sum, 16, 64);
-    local_sum += __shfl_xor(local_sum, 32, 64);
-    local_peak = fmaxf(local_peak, __shfl_xor(local_peak, 16, 64));
-    local_peak = fmaxf(local_peak, __shfl_xor(local_peak, 32, 64));
-    if (HEADS == 32 && !stats_outside_probability)
+      local_peak = fmaxf(local_peak, __shfl_xor(local_peak, 16, 64));
+      local_peak = fmaxf(local_peak, __shfl_xor(local_peak, 32, 64));
+      auto *peaks = (float *)(planes[0] + 4096);
+      const int head_row = wm * 16 + row;
+      if (group == 0)
+        peaks[wn * HEADS + head_row] = local_peak;
       sync();
-    if (group == 0) {
-      if (pair_stats) {
-        sum_peak[wn * HEADS + wm * 16 + row] = (float2_){local_sum, local_peak};
-      } else {
-        stats[((HEADS == 16 ? 2 * NW : 0) + wn) * HEADS + wm * 16 + row] =
-            local_sum;
-        stats[((HEADS == 16 ? 3 * NW : NW) + wn) * HEADS + wm * 16 + row] =
-            local_peak;
-      }
-    }
-    sync();
-    float page_sum = 0.f, peak = 0.f;
+      const float peak = fmaxf(peaks[head_row], peaks[HEADS + head_row]);
+      pscale = fmaxf(peak / 32512.f, 1.e-30f);
+      old_weight = 1.f;
+      outscale = pscale;
+      next_max = 0.f;
+      next_den = 1.f;
+    } else {
+      local_max = fmaxf(local_max, __shfl_xor(local_max, 16, 64));
+      local_max = fmaxf(local_max, __shfl_xor(local_max, 32, 64));
+      // H16 retains V in registers, so plane 1 can hold stats beside RoPE in plane 0.
+      float *stats = FMLA_SEPARATE_ROPE_STATS
+                         ? (float *)planes[1]
+                         : (float *)(planes[0] + (HEADS == 16 || stats_outside_probability ? 4096 : 0));
+      auto *sum_peak = (float2_ *)(stats + (stats_outside_probability ? NW * HEADS : 0));
+      if (group == 0)
+        stats[wn * HEADS + wm * 16 + row] = local_max;
+      sync();
+      float page_max = -INFINITY;
 #pragma unroll
-    for (int n = 0; n < NW; ++n) {
-      if (pair_stats) {
-        const float2_ pair = sum_peak[n * HEADS + wm * 16 + row];
-        page_sum += pair[0];
-        peak = fmaxf(peak, pair[1]);
-      } else {
-        page_sum +=
-            stats[((HEADS == 16 ? 2 * NW : 0) + n) * HEADS + wm * 16 + row];
-        peak = fmaxf(
-            peak,
-            stats[((HEADS == 16 ? 3 * NW : NW) + n) * HEADS + wm * 16 + row]);
+      for (int n = 0; n < NW; ++n)
+        page_max = fmaxf(page_max, stats[n * HEADS + wm * 16 + row]);
+      next_max = fmaxf(maximum, page_max);
+      const float safe = next_max == -INFINITY ? 0.f : next_max;
+      float local_sum = 0.f, local_peak = 0.f;
+#pragma unroll
+      for (int n = 0; n < NR; ++n) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          probability[n][j] = exp2f(probability[n][j] - safe);
+          local_sum += probability[n][j];
+          probability[n][j] *= scales[n][j];
+          local_peak = fmaxf(local_peak, probability[n][j]);
+        }
       }
-    }
-    const float pscale =
-        fmaxf(peak / (HEADS == 32 ? 32512.f : 16129.f), 1.e-30f);
+      local_sum += __shfl_xor(local_sum, 16, 64);
+      local_sum += __shfl_xor(local_sum, 32, 64);
+      local_peak = fmaxf(local_peak, __shfl_xor(local_peak, 16, 64));
+      local_peak = fmaxf(local_peak, __shfl_xor(local_peak, 32, 64));
+      if (HEADS == 32 && !stats_outside_probability)
+        sync();
+      if (group == 0) {
+        if (pair_stats) {
+          sum_peak[wn * HEADS + wm * 16 + row] = (float2_){local_sum, local_peak};
+        } else {
+          stats[((HEADS == 16 ? 2 * NW : 0) + wn) * HEADS + wm * 16 + row] =
+              local_sum;
+          stats[((HEADS == 16 ? 3 * NW : NW) + wn) * HEADS + wm * 16 + row] =
+              local_peak;
+        }
+      }
+      sync();
+      float page_sum = 0.f, peak = 0.f;
+#pragma unroll
+      for (int n = 0; n < NW; ++n) {
+        if (pair_stats) {
+          const float2_ pair = sum_peak[n * HEADS + wm * 16 + row];
+          page_sum += pair[0];
+          peak = fmaxf(peak, pair[1]);
+        } else {
+          page_sum +=
+              stats[((HEADS == 16 ? 2 * NW : 0) + n) * HEADS + wm * 16 + row];
+          peak = fmaxf(
+              peak,
+              stats[((HEADS == 16 ? 3 * NW : NW) + n) * HEADS + wm * 16 + row]);
+        }
+      }
+      pscale =
+          fmaxf(peak / (HEADS == 32 ? 32512.f : 16129.f), 1.e-30f);
 #if FMLA_DEFER_NORMALIZATION
-    const float old_weight = exp2f(maximum - safe);
-    const float next_den = denominator * old_weight + page_sum;
-    const float outscale = pscale * (1.f / numerator_bound);
+      old_weight = exp2f(maximum - safe);
+      next_den = denominator * old_weight + page_sum;
+      outscale = pscale * (1.f / numerator_bound);
 #else
-    const float next_den = denominator * exp2f(maximum - safe) + page_sum;
-    const float inverse_den = reciprocal(next_den > 0.f ? next_den : 1.f);
-    const float old_weight = denominator * exp2f(maximum - safe) * inverse_den,
-                outscale = pscale * inverse_den;
+      next_den = denominator * exp2f(maximum - safe) + page_sum;
+      const float inverse_den = reciprocal(next_den > 0.f ? next_den : 1.f);
+      old_weight = denominator * exp2f(maximum - safe) * inverse_den;
+      outscale = pscale * inverse_den;
 #endif
+    }
     const float inv = reciprocal(pscale);
     if (HEADS == 32 && !stats_outside_probability)
       sync();
@@ -680,7 +711,9 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
   struct More { enum { value = true }; };
   struct Last { enum { value = false }; };
   // Remove the next-page branch from each of the four PV copy sites.
-#if defined(FMLA_PAGE_UNROLL)
+#if !FMLA_NO_ROPE
+#pragma unroll 1
+#elif defined(FMLA_PAGE_UNROLL)
 #pragma unroll FMLA_PAGE_UNROLL
 #elif FMLA_CAP >= 4096 && FMLA_CAP <= 16384
 #pragma unroll 2
@@ -692,11 +725,46 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #else
   }
 #endif
+  if (DirectExp) {
+    lane_denominator += __shfl_xor(lane_denominator, 16, 64);
+    lane_denominator += __shfl_xor(lane_denominator, 32, 64);
+    auto *sums = (float *)(planes[0] + 4096);
+    if (group == 0)
+      sums[wn * HEADS + wm * 16 + row] = lane_denominator;
+    sync();
+    denominator = sums[wm * 16 + row] + sums[HEADS + wm * 16 + row];
+
+    // Positive masses bound every term by their sum. These limits keep
+    // the FP32 numerator in range and make underflowed terms negligible.
+    // All lanes retry together before any output or split state is stored.
+    sync();
+    auto *retry = (int *)(planes[0] + 7168);
+    if (t == 0)
+      *retry = 0;
+    sync();
+    bool unstable = !(denominator >= 0x1p-8f && denominator <= 0x1p48f);
+    for (int pos = begin * 64 + t; pos < end * 64; pos += 256) {
+      const float weight = input<float>(uniform(selectedp))[(long long)batch * FMLA_CAP + pos];
+      unstable |= weight != -1.f && !(weight >= 0x1p-16f && weight <= 0x1p16f);
+    }
+    if (unstable)
+      atomicOr(retry, 1);
+    sync();
+    const int failed = uniform(*retry);
+    sync();
+    if (failed)
+      return false;
+    const float inverse_den = reciprocal(denominator);
+#pragma unroll
+    for (int i = 0; i < QV * 4; ++i)
+      acc[i] *= inverse_den;
+    maximum = 0.f;
+  }
 #if FMLA_DEFER_NORMALIZATION
   const float final_scale = numerator_bound * reciprocal(denominator > 0.f ? denominator : 1.f);
 #pragma unroll
   for (int i = 0; i < QV * 4; ++i)
-    acc[i] *= final_scale;
+    if (!DirectExp) acc[i] *= final_scale;
 #endif
 #undef FMLA_DEFER_NORMALIZATION
   const long long outrow = ((long long)batch * allheads + head) * 512;
@@ -756,6 +824,29 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
           denominator;
     }
   }
+  return true;
+}
+
+extern "C" __device__ __attribute__((used, always_inline)) float
+mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
+               long long qsp, long long ksp, long long tp, long long lp,
+               long long pp, long long sp, long long op, long long lsep,
+               long long ts, long long ls, long long orderp, long long selectedp, int batches,
+               int hq, int sq, int splits, int causal, int bf16,
+               float scale_log2, int head_tile, int batch, int split) {
+  __shared__ unsigned char planes[HEADS == 32 ? 4 : 2][8192];
+#if defined(FMLA_SCALE_TABLE) && HEADS == 32 && FMLA_CAP <= 16384 && \
+    (FMLA_SPLITS == 1 || FMLA_CAP >= 4096)
+  if (compute_sparse_tile<true>(
+          qp, qrp, kp, krp, qsp, ksp, tp, lp, pp, sp, op, lsep, ts, ls,
+          orderp, selectedp, batches, hq, sq, splits, causal, bf16, scale_log2,
+          head_tile, batch, split, planes))
+    return 0.f;
+#endif
+  compute_sparse_tile<false>(
+      qp, qrp, kp, krp, qsp, ksp, tp, lp, pp, sp, op, lsep, ts, ls, orderp,
+      selectedp, batches, hq, sq, splits, causal, bf16, scale_log2, head_tile,
+      batch, split, planes);
   return 0.f;
 }
 

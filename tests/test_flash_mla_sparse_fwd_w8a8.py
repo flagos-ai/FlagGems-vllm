@@ -482,6 +482,27 @@ def test_sparse_raw_selected_partitions(batch, topk, rope_dim):
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @requires_int8_mla
+@pytest.mark.parametrize("batch,topk,rope_dim", [(8, 4096, 0), (64, 2048, 64)])
+def test_sparse_extreme_logits(batch, topk, rope_dim):
+    inputs = make_int8_inputs(batch, 1, 64, topk, pages=2, rope_dim=rope_dim)
+    q, qr, kv, kr, qs, ks, indices = inputs
+    q.zero_()
+    q[:, :, 0].fill_(1)
+    q[:, :, 1].fill_(-1)
+    qr.zero_()
+    kv.fill_(1)
+    kv.view(-1, 512)[1].fill_(2)
+    kr.zero_()
+    qs.fill_(1)
+    ks.fill_(1)
+    indices.fill_(0)
+    indices[..., 1::2] = 1
+    actual = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*inputs, softmax_scale=1.0)
+    assert_accuracy(actual, reference(inputs, softmax_scale=1.0))
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@requires_int8_mla
 @pytest.mark.parametrize("topk, variable_lengths", [(8192, False), (4096, True)])
 def test_sparse_value_split_merge(topk, variable_lengths):
     # For D512, 33 rows use the cached path instead of the fused path.
