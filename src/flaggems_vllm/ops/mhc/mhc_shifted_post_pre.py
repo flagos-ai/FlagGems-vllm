@@ -529,51 +529,52 @@ def mhc_shifted_post_pre(
             mix_size,
         )
 
-    # The C550 boundary is bandwidth bound; the MetaX extra fuses post with the
-    # collapse and the row sum of squares, and turns the project stage into a
-    # split-K pure GEMM.  hc != 4 keeps the fully generic stages.
-    use_metax_fused = runtime.device.vendor_name == "metax" and hc == 4
-    if use_metax_fused:
+    # MetaX C550 hc=4 boundary: fuse post with the collapse, the row sum of
+    # squares and (for small batches) the norm, then fuse the project
+    # reduction with the coefficient epilogue.  hc != 4 keeps the fully
+    # generic stages below.
+    if hc == 4 and runtime.device.vendor_name == "metax":
         from flaggems_vllm.runtime.backend._metax.ops.mhc_shifted_post_pre import (
-            _fn_bf16_packed,
-            mhc_shifted_norm_metax,
-            mhc_shifted_post_collapse,
-            mhc_shifted_project_metax,
+            mhc_shifted_post_pre_metax,
         )
 
-        # (1)+(4) post, collapse and the row sum of squares in one pass.
-        residual_cur, layer_input, aux, sqsum = mhc_shifted_post_collapse(
+        return mhc_shifted_post_pre_metax(
             x,
             residual,
             post_layer_mix,
             comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
             pre_mix,
-            num_tokens,
-            hidden_size,
+            norm_weight,
+            norm_eps,
             capture_aux,
-        )
-    else:
-        # (1) post, with the coefficients the previous boundary produced.  The
-        # comb layout is vLLM's, which is mhc_post's TRANSPOSED default.
-        residual_cur = mhc_post(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-            mix_layout=MixLayout.TRANSPOSED,
+            num_tokens,
+            hc,
+            hidden_size,
+            mix_size,
         )
 
-    # (2) projection.  The MetaX path consumes a precomputed sum of squares and
-    # a transposed-contiguous weight; the generic path computes both in one pass.
+    # (1) post, with the coefficients the previous boundary produced.  The
+    # comb layout is vLLM's, which is mhc_post's TRANSPOSED default.
+    residual_cur = mhc_post(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        mix_layout=MixLayout.TRANSPOSED,
+    )
+
+    # (2) projection.  The generic path computes the row sum of squares in the
+    # same pass.
     a_flat = residual_cur.view(num_tokens, hc * hidden_size)
-    if use_metax_fused:
-        mixes = mhc_shifted_project_metax(
-            a_flat, _fn_bf16_packed(fn), num_tokens, mix_size
-        )
-    else:
-        mixes, sqsum = _mhc_shifted_project(
-            a_flat, _fn_bf16(fn).t(), num_tokens, mix_size
-        )
+    mixes, sqsum = _mhc_shifted_project(a_flat, _fn_bf16(fn).t(), num_tokens, mix_size)
 
     # (3) the three coefficient groups for the next boundary.
     post_mix = torch.empty(num_tokens, hc, 1, dtype=torch.float32, device=device)
@@ -599,50 +600,42 @@ def mhc_shifted_post_pre(
         SINK_REPEAT=sinkhorn_repeat,
     )
 
-    # (4) collapse with the carried pre-mix, plus the stream mean.  The MetaX
-    # fused path already produced both while the post values were in registers.
-    if not use_metax_fused:
-        layer_input = torch.empty(
+    # (4) collapse with the carried pre-mix, plus the stream mean.
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    aux = (
+        torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+        if capture_aux
+        else residual_cur.new_empty(0, hidden_size)
+    )
+    _mhc_shifted_collapse_kernel[
+        lambda meta: (num_tokens, triton.cdiv(hidden_size, meta["BLOCK_H"]))
+    ](
+        residual_cur,
+        pre_mix if pre_mix is not None else post_mix,
+        layer_input,
+        aux if capture_aux else layer_input,
+        hidden_size,
+        HC=hc,
+        USE_PRE=pre_mix is not None,
+        WRITE_AUX=capture_aux,
+    )
+
+    # (5) optional RMSNorm of the collapsed input.
+    if norm_weight is not None:
+        normed = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
-        aux = (
-            torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-            if capture_aux
-            else residual_cur.new_empty(0, hidden_size)
-        )
-        _mhc_shifted_collapse_kernel[
-            lambda meta: (num_tokens, triton.cdiv(hidden_size, meta["BLOCK_H"]))
-        ](
-            residual_cur,
-            pre_mix if pre_mix is not None else post_mix,
+        _mhc_shifted_norm_kernel[(num_tokens,)](
             layer_input,
-            aux if capture_aux else layer_input,
+            norm_weight,
+            normed,
             hidden_size,
-            HC=hc,
-            USE_PRE=pre_mix is not None,
-            WRITE_AUX=capture_aux,
+            EPS=norm_eps,
+            HAS_W=True,
         )
-
-    # (5) optional RMSNorm of the collapsed input.  The MetaX path loads the
-    # row once when it fits in a single CTA instead of the generic two-pass
-    # kernel's two reads.  It only wins for wide rows: the H=1280 decode
-    # shapes regress because one CTA per row is launch bound there.
-    if norm_weight is not None:
-        if use_metax_fused and 4096 <= hidden_size <= 8192:
-            layer_input = mhc_shifted_norm_metax(layer_input, norm_weight, norm_eps)
-        else:
-            normed = torch.empty(
-                num_tokens, hidden_size, dtype=torch.bfloat16, device=device
-            )
-            _mhc_shifted_norm_kernel[(num_tokens,)](
-                layer_input,
-                norm_weight,
-                normed,
-                hidden_size,
-                EPS=norm_eps,
-                HAS_W=True,
-            )
-            layer_input = normed
+        layer_input = normed
 
     return residual_cur, post_mix, comb_mix, layer_input, next_pre, aux
 

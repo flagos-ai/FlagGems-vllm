@@ -19,6 +19,7 @@ from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.logit_bias import apply_logit_bias
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.matmul_persistent import matmul_persistent
 from flaggems_vllm.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.ops.attn_res import attn_res
@@ -402,6 +403,7 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "matmul_persistent",
     "mhc_bwd",
     "mhc_fused_post_pre_with_norm",
     "mhc_post",

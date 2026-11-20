@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from flaggems_vllm import NULL_BLOCK_ID, ple_conv
 
-pytestmark = pytest.mark.ple_fusion
+pytestmark = pytest.mark.ple_conv
 
 _KERNEL_STATE_BLOCKS = 64
 
