@@ -881,6 +881,68 @@ mthreads_sparse_fp8_combine:
   num_warps: 4
   num_stages: 1
 
+# mhc_shifted_post_pre (MUSA): the projection is a memory-bound skinny GEMM
+# over a packed (hc*H, 32) bf16 weight.  Split-K fills the 60 S5000 SMs; the
+# K loop pipelines, so num_stages 2/3 are safe (no fused reduction here).
+mhc_shifted_project_mthreads:
+  # The skinny N=32 GEMM needs the fat M tile: BLOCK_M=16/32 lose 3-7x on
+  # MUSA.  Four configs cover the split range; all are within ~2x of each
+  # other, so a noisy tune still lands near the best.
+  - META: {BLOCK_M: 64, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 3
+  - META: {BLOCK_M: 64, BLOCK_K: 256, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 2
+
+# One CTA per token, whole row live: post + collapse + ssq + RMSNorm.
+# BLOCK_H is next_power_of_2(H) and comes from the host, so only the warp
+# count is tuned.
+mhc_shifted_post_collapse_norm_mthreads:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+# Wide-row variant: H is streamed in BLOCK_H tiles; the norm runs a second
+# pass over the stored bf16 row.
+mhc_shifted_post_collapse_norm_loop_mthreads:
+  - gen: true
+    param_map:
+      META: {BLOCK_H: bh}
+      num_warps: w
+      num_stages: s
+    bh: [512, 1024, 2048]
+    w: [4, 8]
+    s: [1, 2]
+
+# Split-K reduction + Sinkhorn coefficients.  Tiny one-CTA-per-token launch;
+# every warp count tested produces bitwise-identical output.
+mhc_shifted_reduce_coeff_mthreads:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
 fused_kimi_k3_mla_kv_concat:
   - META: {BLOCK: 8, ROW_LAYOUT: false}
     num_warps: 4
