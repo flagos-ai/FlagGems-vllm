@@ -3122,6 +3122,11 @@ def _tle_ready(w1, w2, total, H, n_inter):
         return False
     if total % 128 or H % 128 or (2 * n_inter) % 128:
         return False
+    # TME descriptors address the flattened [E * N, K] view; beyond 2**20 rows
+    # the hardware descriptor no longer covers the tensor and the copy silently
+    # reads the wrong rows (observed on the M=8192 / N=8192 shape).
+    if w1.size(0) * (2 * n_inter) > (1 << 20) or w2.size(0) * H > (1 << 20):
+        return False
     return True
 
 
