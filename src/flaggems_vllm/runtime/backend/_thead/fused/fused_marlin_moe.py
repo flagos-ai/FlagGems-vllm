@@ -55,7 +55,7 @@ _PPU_SMALL_ALIGN_MAX_TOPK = 6
 _PPU_DENSE_MIN_TOKENS = 4096
 _PPU_DENSE_GATE_TILE = 256
 _PPU_DENSE_DOWN_TILE = 1024
-_PPU_FP8_WIDE_SHARED_BYTES = 64 << 10
+_PPU_WIDE_SHARED_BYTES = 64 << 10
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 # Inputs and the caller-visible output are outside the temporary workspace budget.
 _PPU_DENSE_MAX_WORKSPACE_BYTES = 2 << 30
@@ -1126,9 +1126,35 @@ def _store_k32(k):
 
 
 @triton.jit
-def _dup_mx_scale(byte):
+def mx_scale_source(ptr, PACKED_SCALE: tl.constexpr):
+    if PACKED_SCALE:
+        return tl.load(ptr.to(tl.pointer_type(tl.uint32)))
+    else:
+        return ptr
+
+
+@triton.jit
+def mx_scale_fragment(
+    source, stride_group, group: tl.constexpr, PACKED_SCALE: tl.constexpr
+):
+    if PACKED_SCALE:
+        byte = (source >> (group * 8)) & 255
+    else:
+        byte = tl.load(source + group * stride_group).to(tl.uint32)
     bits = e8m0_to_bf16_bits(byte)
     return bits | (bits << 16)
+
+
+@triton.jit
+def decode_w4_fragment_pair(q0, q8, s0, s1, half: tl.constexpr, MX: tl.constexpr):
+    lo, hi = q0 >> (half * 16), q8 >> (half * 16)
+    if MX:
+        a0, a1 = decode_mx_register(lo, s0, s0)
+        a2, a3 = decode_mx_register(hi, s1, s1)
+    else:
+        a0, a1 = decode_i4_register(lo, s0, s0)
+        a2, a3 = decode_i4_register(hi, s1, s1)
+    return a0, a1, a2, a3
 
 
 @triton.jit
@@ -1214,15 +1240,10 @@ def _raw_w4_square_kernel(
     c6 = c0
     c7 = c0
     for kg in range(K // 128):
-        if MX and PACKED_SCALE:
-            scale_word0 = tl.load(
-                (S + expert * SE + kg * 4 + n0 * SN).to(tl.pointer_type(tl.uint32))
-            )
-            scale_word1 = tl.load(
-                (S + expert * SE + kg * 4 + (n0 + 8) * SN).to(
-                    tl.pointer_type(tl.uint32)
-                )
-            )
+        if MX:
+            scale_ptr = S + expert * SE + (kg * 4) * SG + n0 * SN
+            src0 = mx_scale_source(scale_ptr, PACKED_SCALE)
+            src1 = mx_scale_source(scale_ptr + 8 * SN, PACKED_SCALE)
         if not MX and ROWS == 16:
             scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
             scale1 = tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
@@ -1256,35 +1277,12 @@ def _raw_w4_square_kernel(
             r0, r1, r2, r3 = _load_matrix_x4(qhere, warp * 16, 64, group * 32, dep)
             for chunk in tl.static_range(2):
                 if MX:
-                    if PACKED_SCALE:
-                        e0 = (scale_word0 >> ((group * 2 + chunk) * 8)) & 255
-                        e1 = (scale_word1 >> ((group * 2 + chunk) * 8)) & 255
-                    else:
-                        e0 = tl.load(
-                            S
-                            + expert * SE
-                            + (kg * 4 + group * 2 + chunk) * SG
-                            + n0 * SN
-                        ).to(tl.uint32)
-                        e1 = tl.load(
-                            S
-                            + expert * SE
-                            + (kg * 4 + group * 2 + chunk) * SG
-                            + (n0 + 8) * SN
-                        ).to(tl.uint32)
-                    s0 = _dup_mx_scale(e0)
-                    s1 = _dup_mx_scale(e1)
+                    s0 = mx_scale_fragment(src0, SG, group * 2 + chunk, PACKED_SCALE)
+                    s1 = mx_scale_fragment(src1, SG, group * 2 + chunk, PACKED_SCALE)
                 q0 = r0 if chunk == 0 else r1
                 q8 = r2 if chunk == 0 else r3
                 for part in tl.static_range(2):
-                    v0 = q0 if part == 0 else q0 >> 16
-                    v8 = q8 if part == 0 else q8 >> 16
-                    if MX:
-                        a0, a1 = decode_mx_register(v0, s0, s0)
-                        a2, a3 = decode_mx_register(v8, s1, s1)
-                    else:
-                        a0, a1 = decode_i4_register(v0, s0, s0)
-                        a2, a3 = decode_i4_register(v8, s1, s1)
+                    a0, a1, a2, a3 = decode_w4_fragment_pair(q0, q8, s0, s1, part, MX)
                     sub = group * 4 + chunk * 2 + part
                     if ROWS == 8:
                         b0, b1 = _load_activation_fragment_x2(
@@ -3260,16 +3258,18 @@ def _silu_and_stage_grouped(
 
 
 @triton.jit
-def prefetch_fp8_wide_tile(qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep):
+def prefetch_quantized_wide_tile(
+    qs, aa, Q, A, QN, K: tl.constexpr, pm, kg, dep, WEIGHT_K_BYTES: tl.constexpr
+):
     ab = A.to(tl.pointer_type(tl.uint8)) + pm * 64 * K * 2
     dep = _copy_w8_tile_async(aa, ab, 64, K * 2, 128, kg * 256, dep)
     dep = _copy_w8_tile_async(aa + 8192, ab, 64, K * 2, 128, kg * 256 + 128, dep)
-    dep = _copy_w8_tile_async(qs, Q, 128, QN, 128, kg * 128, dep)
+    dep = _copy_w8_tile_async(qs, Q, 128, QN, WEIGHT_K_BYTES, kg * WEIGHT_K_BYTES, dep)
     return _commit_w8_tile(dep)
 
 
 @triton.jit
-def accumulate_fp8_wide_tile(
+def accumulate_quantized_wide_tile(
     qs,
     aa,
     qb,
@@ -3284,72 +3284,105 @@ def accumulate_fp8_wide_tile(
     SE,
     SG,
     SN,
+    QTYPE: tl.constexpr,
+    PACKED_SCALE: tl.constexpr,
     FAST: tl.constexpr,
     LIVE: tl.constexpr,
 ):
+    MX: tl.constexpr = QTYPE == _TL_QUANT_TYPE_FP4_E2M1
+    W4: tl.constexpr = MX or QTYPE == _TL_QUANT_TYPE_UINT4B8
+    WEIGHT_K_BYTES: tl.constexpr = 64 if W4 else 128
     dep = tl.full((256,), 0, tl.int32)
-    dep = prefetch_fp8_wide_tile(qs, aa, qb, A, QN, K, pm, 0, dep)
+    dep = prefetch_quantized_wide_tile(qs, aa, qb, A, QN, K, pm, 0, dep, WEIGHT_K_BYTES)
     zero = tl.full((256,), 0.0, tl.float32)
     acc = ()
     for j in tl.static_range(LIVE // 2):
         acc += (zero,)
     for kg in range(K // 128):
-        scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
-        scale1 = tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
+        if not MX:
+            scale0 = tl.load(S + expert * SE + kg * SG + n0 * SN)
+            scale1 = tl.load(S + expert * SE + kg * SG + (n0 + 8) * SN)
+        else:
+            scale_ptr = S + expert * SE + (kg * 4) * SG + n0 * SN
+            src0 = mx_scale_source(scale_ptr, PACKED_SCALE)
+            src1 = mx_scale_source(scale_ptr + 8 * SN, PACKED_SCALE)
         if kg + 1 < K // 128:
             next_offset = (kg + 1) % 2 * 16384
-            dep = prefetch_fp8_wide_tile(
-                qs + next_offset, aa + next_offset, qb, A, QN, K, pm, kg + 1, dep
+            dep = prefetch_quantized_wide_tile(
+                qs + (kg + 1) % 2 * 128 * WEIGHT_K_BYTES,
+                aa + next_offset,
+                qb,
+                A,
+                QN,
+                K,
+                pm,
+                kg + 1,
+                dep,
+                WEIGHT_K_BYTES,
             )
             dep = _wait_w8_tile(dep, True)
         else:
             dep = _wait_w8_tile(dep, False)
-        s0 = w8_scale_fragment(scale0, kg, False, FAST)
-        s1 = w8_scale_fragment(scale1, kg, False, FAST)
+        if not MX:
+            s0 = w8_scale_fragment(scale0, kg, False, FAST)
+            s1 = w8_scale_fragment(scale1, kg, False, FAST)
         current_offset = kg % 2 * 16384
-        qhere = qs + current_offset
+        qhere = qs + kg % 2 * 128 * WEIGHT_K_BYTES
         ahere = aa + current_offset
-        for group in tl.static_range(4):
+        for group in tl.static_range(WEIGHT_K_BYTES // 32):
             r0, r1, r2, r3 = _load_matrix_x4(qhere, warp * 16, 128, group * 32, dep)
             for part in tl.static_range(2):
                 q0 = r0 if part == 0 else r1
                 q8 = r2 if part == 0 else r3
-                sub = group * 2 + part
-                if FAST:
-                    a0, a1, a2, a3 = paired_fp8_folded(q0, q8, s0, s1)
-                else:
-                    a0, a1, a2, a3 = paired_fp8_robust(q0, q8, s0, s1)
-                # A decoded weight fragment feeds four 16-route MMA instructions.
-                next_acc = ()
-                for chunk in tl.static_range(LIVE // 16):
-                    b0, b1, b2, b3 = _load_matrix_x4(
-                        ahere + sub // 4 * 8192, chunk * 16, 64, sub % 4 * 32, dep
-                    )
-                    next_acc += _mma_bf16_square(
-                        a0,
-                        a1,
-                        a2,
-                        a3,
-                        b0,
-                        b1,
-                        b2,
-                        b3,
-                        acc[chunk * 8],
-                        acc[chunk * 8 + 1],
-                        acc[chunk * 8 + 2],
-                        acc[chunk * 8 + 3],
-                        acc[chunk * 8 + 4],
-                        acc[chunk * 8 + 5],
-                        acc[chunk * 8 + 6],
-                        acc[chunk * 8 + 7],
-                    )
-                acc = next_acc
+                if MX:
+                    s0 = mx_scale_fragment(src0, SG, group * 2 + part, PACKED_SCALE)
+                    s1 = mx_scale_fragment(src1, SG, group * 2 + part, PACKED_SCALE)
+                for half in tl.static_range(2 if W4 else 1):
+                    if W4:
+                        sub = group * 4 + part * 2 + half
+                        a0, a1, a2, a3 = decode_w4_fragment_pair(
+                            q0, q8, s0, s1, half, MX
+                        )
+                    else:
+                        sub = group * 2 + part
+                        if QTYPE == _TL_QUANT_TYPE_UINT8B128:
+                            a0, a1 = _decode_int8_fragment_bf16(q0, s0, s0)
+                            a2, a3 = _decode_int8_fragment_bf16(q8, s1, s1)
+                        elif FAST:
+                            a0, a1, a2, a3 = paired_fp8_folded(q0, q8, s0, s1)
+                        else:
+                            a0, a1, a2, a3 = paired_fp8_robust(q0, q8, s0, s1)
+                    # Reuse the decoded fragment for each live group of 16 routes.
+                    next_acc = ()
+                    for chunk in tl.static_range(LIVE // 16):
+                        b0, b1, b2, b3 = _load_matrix_x4(
+                            ahere + sub // 4 * 8192, chunk * 16, 64, sub % 4 * 32, dep
+                        )
+                        next_acc += _mma_bf16_square(
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            b0,
+                            b1,
+                            b2,
+                            b3,
+                            acc[chunk * 8],
+                            acc[chunk * 8 + 1],
+                            acc[chunk * 8 + 2],
+                            acc[chunk * 8 + 3],
+                            acc[chunk * 8 + 4],
+                            acc[chunk * 8 + 5],
+                            acc[chunk * 8 + 6],
+                            acc[chunk * 8 + 7],
+                        )
+                    acc = next_acc
         tl.debug_barrier()
     return acc
 
 
 @triton.jit
-def project_fp8_wide_tile(
+def project_quantized_wide_tile(
     qs,
     aa,
     qb,
@@ -3359,6 +3392,8 @@ def project_fp8_wide_tile(
     TW,
     Ids,
     SSafe,
+    QTYPE: tl.constexpr,
+    PACKED_SCALE: tl.constexpr,
     K: tl.constexpr,
     QN,
     SE,
@@ -3380,12 +3415,46 @@ def project_fp8_wide_tile(
 ):
     can_fold = tl.load(SSafe + expert) != 0 if SSafe is not None else False
     if can_fold:
-        acc = accumulate_fp8_wide_tile(
-            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, True, LIVE
+        acc = accumulate_quantized_wide_tile(
+            qs,
+            aa,
+            qb,
+            A,
+            S,
+            QN,
+            K,
+            pm,
+            expert,
+            n0,
+            warp,
+            SE,
+            SG,
+            SN,
+            QTYPE,
+            PACKED_SCALE,
+            True,
+            LIVE,
         )
     else:
-        acc = accumulate_fp8_wide_tile(
-            qs, aa, qb, A, S, QN, K, pm, expert, n0, warp, SE, SG, SN, False, LIVE
+        acc = accumulate_quantized_wide_tile(
+            qs,
+            aa,
+            qb,
+            A,
+            S,
+            QN,
+            K,
+            pm,
+            expert,
+            n0,
+            warp,
+            SE,
+            SG,
+            SN,
+            QTYPE,
+            PACKED_SCALE,
+            False,
+            LIVE,
         )
     if K == 256:
         for chunk in tl.static_range(LIVE // 16):
@@ -3441,7 +3510,7 @@ def project_fp8_wide_tile(
 
 
 @triton.jit
-def fp8_wide_grouped_kernel(
+def quantized_wide_grouped_kernel(
     A,
     Q,
     C,
@@ -3462,6 +3531,8 @@ def fp8_wide_grouped_kernel(
     CN,
     MUL: tl.constexpr,
     SSafe,
+    QTYPE: tl.constexpr,
+    PACKED_SCALE: tl.constexpr,
     USE32: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -3476,8 +3547,11 @@ def fp8_wide_grouped_kernel(
     warp = thread // 32
     n0 = pn * 128 + warp * 16 + lane // 4
     t = lane % 4
+    W4: tl.constexpr = (
+        QTYPE == _TL_QUANT_TYPE_UINT4B8 or QTYPE == _TL_QUANT_TYPE_FP4_E2M1
+    )
     qmem = tle_async.gpu.alloc(
-        [32768],
+        [16384 if W4 else 32768],
         tl.uint8,
         layout=None,
         scope=tle_async.gpu.smem,
@@ -3505,7 +3579,7 @@ def fp8_wide_grouped_kernel(
     qb = Q + expert * QE + pn * 128 * QN
     # Padding is contiguous at the end of each expert tile.
     if tl.load(Ids + pm * 64 + 48) >= VALID:
-        project_fp8_wide_tile(
+        project_quantized_wide_tile(
             qs,
             aa,
             qb,
@@ -3515,6 +3589,8 @@ def fp8_wide_grouped_kernel(
             TW,
             Ids,
             SSafe,
+            QTYPE,
+            PACKED_SCALE,
             K,
             QN,
             SE,
@@ -3535,7 +3611,7 @@ def fp8_wide_grouped_kernel(
             pn,
         )
     else:
-        project_fp8_wide_tile(
+        project_quantized_wide_tile(
             qs,
             aa,
             qb,
@@ -3545,6 +3621,8 @@ def fp8_wide_grouped_kernel(
             TW,
             Ids,
             SSafe,
+            QTYPE,
+            PACKED_SCALE,
             K,
             QN,
             SE,
@@ -3603,6 +3681,43 @@ def _invoke_marlin_moe_gemm_grouped(
             num_valid_tokens * C.stride(-2) + n * C.stride(-1),
         )
         use32 = largest_offset < (1 << 31)
+    packed_mx_scales = (
+        raw_w4
+        and quant_type_id == QUANT_TYPE_FP4_E2M1
+        and B_scale.stride(1) == 1
+        and B_scale.stride(0) % 4 == 0
+        and B_scale.stride(2) % 4 == 0
+        and B_scale.data_ptr() % 4 == 0
+    )
+    if (raw_w8 or raw_w4) and block_m == 64:
+        quantized_wide_grouped_kernel[(triton.cdiv(em, 64) * triton.cdiv(n, 128),)](
+            routed_a,
+            B,
+            C,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            n,
+            routed_a.size(1),
+            num_valid_tokens,
+            B.stride(0),
+            B.stride(2),
+            B_scale.stride(0),
+            B_scale.stride(1),
+            B_scale.stride(2),
+            C.stride(-2),
+            C.stride(-1),
+            mul_routed_weight,
+            stage.scale_safe,
+            quant_type_id,
+            packed_mx_scales,
+            use32,
+            num_warps=8,
+            num_stages=1,
+        )
+        return
     if raw_w4:
         _raw_w4_square_kernel[(triton.cdiv(em, block_m) * triton.cdiv(n, 64),)](
             routed_a,
@@ -3625,41 +3740,10 @@ def _invoke_marlin_moe_gemm_grouped(
             C.stride(-1),
             mul_routed_weight,
             quant_type_id == QUANT_TYPE_FP4_E2M1,
-            quant_type_id == QUANT_TYPE_FP4_E2M1
-            and B_scale.stride(1) == 1
-            and B_scale.stride(0) % 4 == 0
-            and B_scale.stride(2) % 4 == 0
-            and B_scale.data_ptr() % 4 == 0,
+            packed_mx_scales,
             ROWS=block_m,
             USE32=use32,
             num_warps=4,
-            num_stages=1,
-        )
-        return
-    if raw_w8 and block_m == 64:
-        fp8_wide_grouped_kernel[(triton.cdiv(em, 64) * triton.cdiv(n, 128),)](
-            routed_a,
-            B,
-            C,
-            B_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            n,
-            routed_a.size(1),
-            num_valid_tokens,
-            B.stride(0),
-            B.stride(2),
-            B_scale.stride(0),
-            B_scale.stride(1),
-            B_scale.stride(2),
-            C.stride(-2),
-            C.stride(-1),
-            mul_routed_weight,
-            stage.scale_safe,
-            use32,
-            num_warps=8,
             num_stages=1,
         )
         return
@@ -4815,21 +4899,18 @@ def _fused_marlin_moe_impl(
             == w2_scale.dtype
             == torch.bfloat16
         )
-        wide_fp8_gate_shape = (
-            packed_fp8
-            and group_size == 128
-            and k == 4096
-            and n == 256
-            and 4 <= topk <= 8
-        )
-        use_fp8_wide_tile = (
-            wide_fp8_gate_shape
+        wide_gate_shape = k == 4096 and n == 256 and 4 <= topk <= 8
+        wide_fp8_gate_shape = packed_fp8 and group_size == 128 and wide_gate_shape
+        # A 64-row tile reuses each decoded weight fragment across three or four MMAs.
+        use_wide_tile = (
+            wide_gate_shape
+            and hidden_states.dtype == torch.bfloat16
             and 1024 <= m < _PPU_DENSE_MIN_TOKENS
             and 32 * e < m * topk <= 64 * e
             and torch.cuda.get_device_properties(
                 hidden_states.device
             ).shared_memory_per_block_optin
-            >= _PPU_FP8_WIDE_SHARED_BYTES
+            >= _PPU_WIDE_SHARED_BYTES
         )
         raw_w8 = (
             quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
@@ -4838,7 +4919,7 @@ def _fused_marlin_moe_impl(
             and w1_scale.dtype == w2_scale.dtype == torch.bfloat16
             and k % 128 == 0
             and n % 128 == 0
-            and (m * topk <= 16 * e or use_fp8_wide_tile)
+            and (m * topk <= 16 * e or use_wide_tile)
             and w1.is_contiguous()
             and w2.is_contiguous()
         )
@@ -4846,7 +4927,7 @@ def _fused_marlin_moe_impl(
             compute_type == tl.bfloat16
             and k % 128 == 0
             and n % 128 == 0
-            and m * topk <= 16 * e
+            and (m * topk <= 16 * e or use_wide_tile)
             and w1.is_contiguous()
             and w2.is_contiguous()
             and (
@@ -5115,14 +5196,14 @@ def _fused_marlin_moe_impl(
         else:
             packed_width = False
             bm = _select_grouped_block_m(m, e, topk)
-            if raw_w8 and use_fp8_wide_tile:
+            if (raw_w8 or raw_w4) and use_wide_tile:
                 bm = 64
             elif raw_w8:
                 narrow_density = 5 if quant_type_id == QUANT_TYPE_FP8_E4M3 else 6
                 if wide_fp8_gate_shape:
                     narrow_density = 3
                 bm = 8 if m * topk <= narrow_density * e else 16
-            if raw_w4:
+            elif raw_w4:
                 bm = 8 if m * topk <= 5 * e else 16
             if (
                 sparse_raw
@@ -5206,7 +5287,8 @@ def _fused_marlin_moe_impl(
                     sorted_ids,
                     padded,
                     top_k=topk,
-                    use_packed_gather=raw_w4 or (raw_w8 and packed_fp8),
+                    use_packed_gather=raw_w4
+                    or (raw_w8 and (packed_fp8 or use_wide_tile)),
                     **staging,
                 ),
                 C=c1,
