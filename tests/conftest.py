@@ -216,6 +216,8 @@ def pytest_runtest_teardown(item, nextitem):
             "device context poisoned after %s, remaining tests will be skipped",
             item.nodeid,
         )
+        # An asynchronous fault may surface only after the test call passed.
+        pytest.fail(f"device context poisoned after {item.nodeid}")
 
     if not RECORD_LOG:
         return
@@ -290,6 +292,10 @@ def pytest_runtest_logreport(report):
             result["reason"] = reason
         else:
             result["reason"] = None
+    elif report.when == "teardown" and report.outcome == "failed":
+        if result["result"] != "failed":
+            result["result"] = "failed"
+            result["reason"] = get_reason(report)
 
 
 def pytest_terminal_summary(terminalreporter):
