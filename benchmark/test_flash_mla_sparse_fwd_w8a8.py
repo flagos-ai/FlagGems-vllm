@@ -14,6 +14,7 @@
 
 from functools import partial
 from importlib import import_module
+from pathlib import Path
 
 import pytest
 import torch
@@ -36,6 +37,7 @@ from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
     RECORD_PARALLEL_RESULTS = True
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
 
     def __init__(self):
         reference = import_module("flash_mla") if HAS_INT8_MLA else flashmla_reference()
@@ -46,6 +48,16 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
         )
         self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
 
+    def set_shapes(self, shape_file_path):
+        if HAS_INT8_MLA and Path(shape_file_path).resolve() == Path(
+            self.DEFAULT_SHAPE_FILES
+        ):
+            shape_file_path = (
+                Path(__file__).resolve().parents[1]
+                / "src/flaggems_vllm/runtime/backend/_metax/core_shapes.yaml"
+            )
+        super().set_shapes(shape_file_path)
+
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             if len(shape) not in (7, 10):
@@ -53,7 +65,8 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
                     "Sparse MLA shapes need SQ,HQ,DQK,SKV,HKV,TOPK,DV, "
                     "optionally followed by sink,topk_length,seed"
                 )
-            inputs = make_sparse_inputs(shape, dtype=dtype)
+            scale = 576**-0.5 if HAS_INT8_MLA and shape[2] == 576 else 0.5
+            inputs = make_sparse_inputs(shape, dtype=dtype, sm_scale=scale)
             packed, query, cache = quantize_sparse_fixture(*inputs)
             if HAS_INT8_MLA:
                 native, handle = self.prepare_metax_inputs(packed, query, cache)

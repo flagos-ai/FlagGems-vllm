@@ -108,7 +108,7 @@ def flashmla_reference() -> ModuleType:
     return module
 
 
-def make_sparse_inputs(shape, dtype=torch.bfloat16):
+def make_sparse_inputs(shape, dtype=torch.bfloat16, *, sm_scale=0.5):
     s_q, h_q, d_qk, s_kv, h_kv, topk, d_v = shape[:7]
     sink, length, seed = shape[7:] if len(shape) == 10 else (False, False, 0)
     random.seed(seed)
@@ -145,7 +145,7 @@ def make_sparse_inputs(shape, dtype=torch.bfloat16):
         if length
         else None
     )
-    return q, kv, indices, 0.5, d_v, attn_sink, topk_length
+    return q, kv, indices, sm_scale, d_v, attn_sink, topk_length
 
 
 def quantize_sparse_fixture(
@@ -280,7 +280,9 @@ def make_int8_inputs(
 
 
 def reference(inputs, *, attn_sink=None, topk_length=None, softmax_scale=None):
-    q, qr, kv, kr, qs, ks, indices = inputs
+    q, qr, kv, kr, qs, ks, indices = map(to_reference, inputs)
+    attn_sink = to_reference(attn_sink)
+    topk_length = to_reference(topk_length)
     batch, queries, heads, _ = q.shape
     dims = 512 + qr.shape[-1]
     query = (torch.cat((q.float(), qr.float()), -1) * qs).view(-1, heads, dims)
@@ -308,12 +310,30 @@ def reference(inputs, *, attn_sink=None, topk_length=None, softmax_scale=None):
 
 def assert_accuracy(actual, expected):
     output, lse = actual
-    ref_output, ref_lse = map(to_reference, expected)
+    ref_output, ref_lse = expected
     output, lse = to_cpu(output, ref_output), to_cpu(lse, ref_lse)
     gems_assert_close(output, ref_output, output.dtype, atol=2e-3)
-    gems_assert_equal(torch.isposinf(lse), torch.isposinf(ref_lse))
-    finite = torch.isfinite(ref_lse)
-    gems_assert_close(lse[finite], ref_lse[finite], torch.float32, atol=2e-4)
+    gems_assert_close(lse, ref_lse, torch.float32, atol=2e-4)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@requires_int8_mla
+@pytest.mark.parametrize("batch, topk", [(1, 1), (4, 256), (33, 64)])
+def test_sink_before_fp16_store(batch, topk):
+    inputs = make_int8_inputs(batch, 1, 64, topk, dtype=torch.float16)
+    inputs[0].zero_()
+    inputs[1].zero_()
+    inputs[2].fill_(4)
+    inputs[3].zero_()
+    inputs[5].fill_(32768)
+    inputs[-1].fill_(-1)
+    inputs[-1][..., 0] = 0
+    sink = torch.full((64,), math.log(3), device=inputs[0].device)
+    sink[0] = torch.inf
+    run, (out, lse) = prepare_sparse_int8(*inputs, attn_sink=sink)
+    assert_accuracy((out, lse), reference(inputs, attn_sink=sink))
+    sink.fill_(math.log(7))
+    assert_accuracy(run(), reference(inputs, attn_sink=sink))
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
@@ -365,8 +385,10 @@ def test_sparse_decode_lengths(topk, rope_dim):
     handle, _ = prepare_sparse_int8(*inputs)
     actual = handle()
     if topk == 0:
-        gems_assert_equal(actual[0], torch.zeros_like(actual[0]))
-        gems_assert_equal(actual[1], torch.full_like(actual[1], float("inf")))
+        gems_assert_equal(actual[0], torch.zeros_like(to_reference(actual[0])))
+        gems_assert_equal(
+            actual[1], torch.full_like(to_reference(actual[1]), float("inf"))
+        )
     else:
         assert_accuracy(actual, reference(inputs))
 
@@ -386,8 +408,8 @@ def test_sparse_decode_empty(empty):
         for index in (2, 3, 5):
             inputs[index] = inputs[index][:0]
     output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*inputs)
-    gems_assert_equal(output, torch.zeros_like(output))
-    gems_assert_equal(lse, torch.full_like(lse, float("inf")))
+    gems_assert_equal(output, torch.zeros_like(to_reference(output)))
+    gems_assert_equal(lse, torch.full_like(to_reference(lse), float("inf")))
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
@@ -413,6 +435,24 @@ def test_sparse_decode_large_batch(topk, has_lengths):
     )
     actual = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*inputs, topk_length=lengths)
     assert_accuracy(actual, reference(inputs, topk_length=lengths))
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@requires_int8_mla
+def test_sparse_rope_at_cached_index_limit(monkeypatch):
+    from importlib import import_module
+
+    op = import_module(
+        "flaggems_vllm.runtime.backend._metax.ops.flash_mla_sparse_fwd_w8a8"
+    )
+    # Exercise the exact row limit without allocating a production-sized cache.
+    monkeypatch.setattr(op, "MAX_SPARSE_ROWS", 258)
+    inputs = make_int8_inputs(129, 2, 64, 129, pages=4, rope_dim=64)
+    run, _ = prepare_sparse_int8(*inputs)
+    inputs[-1][-1, 0].fill_(-1)
+    inputs[5].mul_(1.25)
+    actual = run()
+    assert_accuracy(actual, reference(inputs))
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8

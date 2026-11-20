@@ -699,6 +699,12 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #pragma unroll
   for (int chunk = 0; chunk < 4; ++chunk) {
     const int dim = chunk * 128 + wn * (128 / NW) + group * (4 * QV);
+#ifdef FMLA_FP32_OUTPUT
+    if (splits == 1) {
+#pragma unroll
+      for (int i = 0; i < 4 * QV; ++i)
+        output<float>(op)[outrow + dim + i] = acc[chunk * QV + i % QV][i / QV];
+#else
     if (splits == 1 && bf16) {
 #pragma unroll
       for (int v = 0; v < QV / 2; ++v) {
@@ -716,6 +722,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
       for (int i = 0; i < 4 * QV; ++i)
         output<_Float16>(op)[outrow + dim + i] =
             (_Float16)acc[chunk * QV + i % QV][i / QV];
+#endif
     } else {
 #pragma unroll
       for (int v = 0; v < QV; ++v) {
@@ -1216,6 +1223,9 @@ mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
         const long long index = ((long long)batch * heads + head) * 512 + dim;
         if (split_count == 1) {
           const float4_ result = raw * scale;
+#ifdef FMLA_FP32_OUTPUT
+          *output<float4_>(output_ptr + index * 4) = result;
+#else
           if (output_bf16) {
             const uint2_ packed = {pack_bf16(result[0], result[1]),
                                    pack_bf16(result[2], result[3])};
@@ -1225,6 +1235,7 @@ mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
             for (int m = 0; m < 4; ++m)
               output<_Float16>(output_ptr)[index + m] = (_Float16)result[m];
           }
+#endif
         } else {
           const long long partial_index =
               (long long)split * batches * heads * 512 + index;

@@ -33,7 +33,7 @@ from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
 
 MAX_SPARSE_SPLITS = 24
-LARGE_D512_ROWS = 256
+LARGE_BATCH_ROWS = 256
 MAX_SPARSE_ROWS = 16384
 LENGTH_BLOCK = 256
 
@@ -100,6 +100,7 @@ class FlashMLAInt8PreparedHandle:
         scale: float,
         *,
         uses_raw_indices: bool = False,
+        fp32_output: bool = False,
     ):
         self.tensors = tensors
         self.uses_raw_indices = uses_raw_indices
@@ -120,7 +121,7 @@ class FlashMLAInt8PreparedHandle:
         self.normalized_partials = False
         self.output = torch.empty(
             (self.batch, self.queries, self.heads, 512),
-            dtype=rope.dtype,
+            dtype=torch.float32 if fp32_output else rope.dtype,
             device=query.device,
         )
         self.lse = torch.empty(
@@ -709,6 +710,8 @@ class SmallKernel:
         spec = _scale_spec(handle) + (("B", batch_stride), ("SPLITS", handle.splits))
         if "SelectedScales" in handle.kernel_arguments:
             spec += (("SCALE_TABLE", 1),)
+        if handle.output.dtype == torch.float32:
+            spec += (("FP32_OUTPUT", 1),)
         pages = handle.tensors[6].shape[1]
         # With one remainder page, only the last partition is longer.
         self.reverse_splits = (
@@ -782,6 +785,8 @@ class ValuesKernel:
             ("UNIFORM", handle.uniform_value_splits),
             ("BF16", int(handle.output.dtype == torch.bfloat16)),
         )
+        if handle.output.dtype == torch.float32:
+            spec += (("FP32_OUTPUT", 1),)
         if handle.uses_raw_indices:
             spec += (
                 ("SPARSE_RAW", 1),
@@ -805,7 +810,7 @@ class ValuesKernel:
 
 
 class NativeSmallHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors, scale, *, uses_raw_indices=False):
+    def __init__(self, tensors, scale, *, uses_raw_indices=False, fp32_output=False):
         capacity = tensors[6].shape[1] * 64
         splits = min(
             (
@@ -820,6 +825,7 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
             splits,
             scale,
             uses_raw_indices=uses_raw_indices,
+            fp32_output=fp32_output,
         )
         self.head_tile = self.queries * self.heads
         self.normalized_partials = True
@@ -834,12 +840,13 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
 
 
 class NativeCachedHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors, scale, *, uses_raw_indices=False):
+    def __init__(self, tensors, scale, *, uses_raw_indices=False, fp32_output=False):
         super().__init__(
             tensors,
             1,
             scale,
             uses_raw_indices=uses_raw_indices,
+            fp32_output=fp32_output,
         )
         merged = self.queries * self.heads
         rows = self.batch * merged
@@ -1074,15 +1081,19 @@ def sparse_output_epilogue(
         lse = tl.load(LSE + row * H + head)
         sink = tl.load(Sink + head)
         # Empty rows use +inf LSE and must remain zero even for an infinite sink.
-        weight = tl.where(lse == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - lse)))
-        values *= weight
+        delta = sink - lse
+        ratio = tl.exp(-tl.abs(delta))
+        weight = tl.where(delta > 0, ratio, 1.0) / (1.0 + ratio)
+        values *= tl.where(lse == float("inf"), 0.0, weight)
     tl.store(Output + (row * H + head) * 512 + dims, values)
 
 
 class SparseMLAInt8PreparedHandle:
     """Reuse workspace; calls must be serialized on one stream. Indices may change."""
 
-    def __init__(self, tensors: tuple[torch.Tensor, ...], lengths, sink, out, scale):
+    def __init__(
+        self, tensors: tuple[torch.Tensor, ...], lengths, sink, out, scale, fused_large
+    ):
         q, qr, kv, kr, qs, ks, indices = tensors
         self.batch, self.queries, self.heads, _ = q.shape
         self.indices, self.lengths, self.sink = indices, lengths, sink
@@ -1130,13 +1141,14 @@ class SparseMLAInt8PreparedHandle:
                     native_tensors,
                     scale,
                     uses_raw_indices=self.uses_raw_indices,
+                    fp32_output=sink is not None,
                 )
-            elif rows <= 32 or (rows > LARGE_D512_ROWS and qr.shape[-1] == 0):
+            elif rows <= 32 or fused_large:
                 route = _c550_small_route(
                     rows, self.heads, self.capacity, qr, self.uses_raw_indices
                 )
                 prefetch_scales = route == "prefetch_scales"
-                if rows > LARGE_D512_ROWS:
+                if rows > LARGE_BATCH_ROWS:
                     # Large batches already fill the device without split workspace.
                     tile, splits = 32, 1
                 elif self.heads == 64 and self.capacity >= 4096:
@@ -1190,6 +1202,7 @@ class SparseMLAInt8PreparedHandle:
                     splits,
                     scale,
                     uses_raw_indices=self.uses_raw_indices,
+                    fp32_output=sink is not None,
                 )
                 self.native.head_tile = tile
                 self.native.normalized_partials = True
@@ -1198,7 +1211,7 @@ class SparseMLAInt8PreparedHandle:
                     self.uses_raw_indices
                     and qr.shape[-1] == 0
                     and (
-                        rows > LARGE_D512_ROWS
+                        rows > LARGE_BATCH_ROWS
                         or prefetch_scales
                         or (rows <= 32 and self.heads == 64 and self.capacity >= 4096)
                     )
@@ -1215,12 +1228,16 @@ class SparseMLAInt8PreparedHandle:
                     native_tensors,
                     scale,
                     uses_raw_indices=self.uses_raw_indices,
+                    fp32_output=sink is not None,
                 )
-            self.output = (
-                self.native.output.view(self.batch, self.queries, self.heads, 512)
-                if out is None
-                else out
-            )
+            if out is not None:
+                self.output = out
+            elif sink is not None:
+                self.output = torch.empty(q.shape, dtype=qr.dtype, device=q.device)
+            else:
+                self.output = self.native.output.view(
+                    self.batch, self.queries, self.heads, 512
+                )
             self.lse = self.native.lse.view(
                 self.batch, self.queries, self.heads
             ).transpose(1, 2)
@@ -1397,25 +1414,31 @@ def _prepare_flash_mla_sparse_fwd_w8a8(
         )
     rows = batch * queries
     capacity = max(64, triton.cdiv(indices.shape[-1], 64) * 64)
-    uses_fused_large = rows > LARGE_D512_ROWS and heads >= 64 and q_rope.shape[-1] == 0
-    if uses_fused_large:
-        # Single-split fusion needs no intermediate score or split buffers.
-        workspace = rows * (capacity * 4 + heads * (512 * 2 + 4))
+    cached_workspace = rows * (capacity * (3 * heads + 4) + heads * 8192)
+    cached_fits = (
+        rows < MAX_SPARSE_ROWS
+        and rows * capacity * max(heads, 1) < 2**30
+        and cached_workspace <= 8 * 1024**3
+    )
+    # Use the single-split kernel's RoPE path when cached scores would exceed
+    # the workspace or indexing limit. Each CTA finishes its own query tile.
+    fused_large = (
+        rows > LARGE_BATCH_ROWS
+        and heads >= 64
+        and (q_rope.shape[-1] == 0 or not cached_fits)
+    )
+    if fused_large:
+        output_bytes = 6 if attn_sink is not None else 2
+        fits = rows * (capacity * 4 + heads * (512 * output_bytes + 4)) <= 8 * 1024**3
     else:
-        workspace = rows * capacity * (3 * heads + 4) + rows * heads * 8192
-    if (
-        rows > MAX_SPARSE_ROWS
-        or (
-            not uses_fused_large
-            and (rows == MAX_SPARSE_ROWS or rows * capacity * max(heads, 1) >= 2**30)
-        )
-        or k_nope.shape[0] * 64 >= 2**31
-        or workspace > 8 * 1024**3
-    ):
+        fits = cached_fits
+    if rows > MAX_SPARSE_ROWS or k_nope.shape[0] * 64 >= 2**31 or not fits:
         raise NotImplementedError(
             "native sparse workspace exceeds its indexing or 8 GiB budget"
         )
-    handle = SparseMLAInt8PreparedHandle(tensors, topk_length, attn_sink, out, scale)
+    handle = SparseMLAInt8PreparedHandle(
+        tensors, topk_length, attn_sink, out, scale, fused_large
+    )
     return handle, handle()
 
 
