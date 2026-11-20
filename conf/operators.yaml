@@ -2577,16 +2577,6 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
-- id: v2_penalty_bincount
-  description: Rebuild packed prompt bits and output counts for vLLM V2.
-  for:
-  - vllm.v1.worker.gpu.sample.penalties.bincount
-  labels:
-  - vLLM
-  kind:
-  - NeuralNetwork
-  stages:
-  - alpha: '5.4'
 - id: v2_apply_temperature
   description: Scale vLLM V2 Ascend logits by per-request temperature in place.
   for:
@@ -2604,6 +2594,16 @@ ops:
   - vllm.v1.worker.gpu.sample.gumbel.murmur3_hash32
   - vllm.v1.worker.gpu.sample.gumbel.murmur3_uniform32
   - vllm.v1.worker.gpu.sample.gumbel.murmur3_uniform64
+  labels:
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: v2_penalty_bincount
+  description: Rebuild packed prompt bits and output counts for vLLM V2.
+  for:
+  - vllm.v1.worker.gpu.sample.penalties.bincount
   labels:
   - vLLM
   kind:
