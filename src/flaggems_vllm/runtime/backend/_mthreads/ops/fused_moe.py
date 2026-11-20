@@ -2860,7 +2860,13 @@ def _transposed(w, cache):
     if entry is not None and entry[0]() is w:
         return entry[1]
     _prune_dead_entries(cache)
-    t = w.permute(0, 2, 1).contiguous()
+    experts, n, k = w.shape
+    t = torch.empty((experts, k, n), dtype=w.dtype, device=w.device)
+    # See _dense_transpose_weights: one multi-GiB permute().contiguous() copy
+    # is unreliable on MUSA, bounded chunks are not.
+    step = max(1, (1 << 30) // (n * k))
+    for start in range(0, experts, step):
+        t[start : start + step] = w[start : start + step].permute(0, 2, 1)
     cache[key] = (__import__("weakref").ref(w), t)
     return t
 
