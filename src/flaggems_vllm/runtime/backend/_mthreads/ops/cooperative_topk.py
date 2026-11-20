@@ -30,10 +30,10 @@ HAS_TLE = bool(
 
 
 @triton.jit
-def _cooperative_topk_bucket(x, BINS: tl.constexpr):
-    digit = tl.minimum(tl.maximum(x * (BINS / 16.0) + BINS / 2.0, 0.0), BINS - 1.0).to(
-        tl.int32
-    )
+def _cooperative_topk_bucket(x, BINS: tl.constexpr, LIMIT: tl.constexpr = 8.0):
+    # Bias the integer bucket so histogram and refinement agree near zero.
+    scaled = tl.minimum(tl.maximum(x, -LIMIT), LIMIT) * (BINS / (2.0 * LIMIT))
+    digit = tl.minimum(scaled.to(tl.int32) + BINS // 2, BINS - 1)
     bits = x.to(tl.uint32, bitcast=True)
     return tl.where((bits & 0x7FFFFFFF) > 0x7F800000, BINS - 1, digit)
 
@@ -266,10 +266,7 @@ if HAS_TLE:
 
     @triton.jit
     def _cooperative_topk_wide_bucket(values):
-        bits = values.to(tl.uint32, bitcast=True)
-        mag = bits & 2147483647
-        q = tl.minimum(tl.maximum(values * 32.0 + 128.0, 0.0), 255.0).to(tl.int32)
-        return tl.where(mag > 2139095040, 255, q)
+        return _cooperative_topk_bucket(values, 256, 4.0)
 
     @triton.jit
     def _store_partition_histogram(

@@ -245,6 +245,25 @@ def test_arbitrary_fp32_bit_patterns(width, k):
 
 
 @gpu
+@pytest.mark.parametrize("rows,width", [(2, 65539), (5, 65539), (2, 262144)])
+def test_partial_wide_rows_with_near_zero_cutoff(rows, width):
+    # A short active prefix places the kth value below zero even in a wide row.
+    k, active = 2048, 4097
+    bits = torch.arange(active, dtype=torch.int32).remainder(7).bitwise_or(-2147483648)
+    prefix = bits.view(torch.float32)
+    prefix[::5] = -0.0
+    prefix[::11] = 0.0
+    logits = torch.full((rows, width), float("nan"), dtype=torch.float32)
+    logits[:, :active] = prefix
+    logits = logits.to(device)
+    lengths, output, workspace = _buffers(
+        logits, [active if i % 2 == 0 else active - 17 for i in range(rows)], k
+    )
+    flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
 @pytest.mark.parametrize(
     "width,candidate_count,k",
     [
