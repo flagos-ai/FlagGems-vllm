@@ -52,5 +52,6 @@ __all__ = [
     "disable_symm_mem",
     "enable_symm_mem",
     "SUPPORTED_FP8_DTYPE",
+    "gumbel_sample",
     "use_symm_mem",
 ]

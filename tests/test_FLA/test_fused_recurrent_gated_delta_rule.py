@@ -101,6 +101,18 @@ def build(case, dtype, device, normalize=True):
 
 
 def reference(data):
+    # Small per-sequence reductions should not compete for full CPU thread pools.
+    threads = torch.get_num_threads()
+    if threads == 1:
+        return _reference_cpu(data)
+    torch.set_num_threads(1)
+    try:
+        return _reference_cpu(data)
+    finally:
+        torch.set_num_threads(threads)
+
+
+def _reference_cpu(data):
     q, k, v = (data[x].detach().cpu().double() for x in ("q", "k", "v"))
     g = data["g"].cpu().double() if data["g"] is not None else None
     beta = data["beta"].cpu().double() if data["beta"] is not None else None
