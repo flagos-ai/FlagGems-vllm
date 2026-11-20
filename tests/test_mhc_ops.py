@@ -460,6 +460,14 @@ MHC_SPLIT_SINKHORN_CONFIGS = [
 
 @pytest.mark.hc_split_sinkhorn
 @pytest.mark.hc_split_sinkhorn_forward
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "ascend",
+    reason=(
+        "hc_split_sinkhorn is not validated on Ascend: the hc_mult=4 kernel "
+        "with num_tokens > 16384 (BLOCK_N=256, num_warps=8) fails to compile "
+        "in BiShengIR (UB overflow), so the large-shape case cannot run there"
+    ),
+)
 @pytest.mark.parametrize(
     "batch, seqlen, hc_mult",
     MHC_SPLIT_SINKHORN_CONFIGS,

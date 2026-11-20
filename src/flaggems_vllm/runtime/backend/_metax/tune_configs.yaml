@@ -190,6 +190,11 @@ fused_recurrent_kda:
     num_warps: 1
     num_stages: 1
 
+hc_down_silu_wide_gemv:
+  - META: {BLOCK_N: 1, BLOCK_K: 1}
+    num_warps: 4
+    num_stages: 1
+
 hc_combine:
   - META: {BLOCK_D: 128, LOOP: false}
     num_warps: 4
@@ -207,6 +212,32 @@ hc_combine:
     num_warps: 4
     num_stages: 1
   - META: {BLOCK_D: 1024, LOOP: true}
+    num_warps: 4
+    num_stages: 1
+
+fused_kimi_k3_mla_kv_concat:
+  - META: {BLOCK: 256, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 256, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 2048, ROW_LAYOUT: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096, ROW_LAYOUT: true}
     num_warps: 4
     num_stages: 1
 
@@ -357,3 +388,48 @@ mhc_shifted_project_metax:
     bn: [32]
     w: [4, 8]
     s: [3]
+
+# Token-fused post + collapse + sum-of-squares + RMSNorm (H <= 2048).  BLOCK_H
+# is next_power_of_2(H) and comes from the host, so only the warp count is
+# tuned.  num_warps stays <= 8, matching the largest CTA this backend uses on
+# C550 (whose per-CTA thread limit is 512).
+mhc_shifted_post_collapse_norm_metax:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+# Wide-row variant: H is streamed in BLOCK_H tiles and the kernel-level
+# num_stages pipelines the next residual/x tile behind the post/collapse work.
+# The norm's second pass re-reads the stored bf16 row.
+mhc_shifted_post_collapse_norm_loop_metax:
+  - gen: true
+    param_map:
+      META: {BLOCK_H: bh}
+      num_warps: w
+      num_stages: s
+    bh: [512, 1024, 2048]
+    w: [4, 8]
+    s: [1, 2]
+
+# Split-K reduction + sum-of-squares reduction + Sinkhorn coefficients in one
+# launch; for the small-token wide-row post it also folds the layer_input tile
+# partials and writes the normalised row.  The 4x4 Sinkhorn chain is fastest
+# at one warp for medium batches (measured 1.8x over four warps at 512
+# tokens) while the tiny shapes prefer four; every warp count tested produces
+# bitwise-identical output.
+mhc_shifted_reduce_coeff_metax:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1

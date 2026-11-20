@@ -67,6 +67,7 @@
 # 优化建议: Q/KV 布局与 CTA 调度；head_dim=576 专用 tile、增大 smem 复用、
 #           减少 KV 重复读取
 flash_mla_sparse_fwd:
+  vllm_api: "_flashmla_C::sparse_prefill_fwd"
   profiling:
     prefill:
       pct: 38.55
@@ -85,6 +86,7 @@ flash_mla_sparse_fwd:
 # 稀疏索引器族合计 14.43%；logits 计算与 per-row TopK 分离，可与 logits 融合减少落盘
 # 优化建议: logits 与 topK 融合，减少中间张量物化；paged 版减少页表间接访问
 top_k_per_row_prefill:
+  vllm_api: "_C::top_k_per_row_prefill"
   profiling:
     prefill:
       pct: 4.33
@@ -103,6 +105,7 @@ top_k_per_row_prefill:
 # 量化与后续 GEMM 可融合，避免独立 kernel 落盘
 # 优化建议: per-token FP8 量化与后续 GEMM 融合，避免单独 kernel
 per_token_group_quant_fp8:
+  vllm_api: "_C::per_token_group_fp8_quant"
   profiling:
     prefill:
       pct: 1.44
@@ -120,6 +123,7 @@ per_token_group_quant_fp8:
 # 请求索引转换族合计 prefill 1.11%；concat nope+rope 拼接 Q
 # 优化建议: 按 profiler 数据评估
 concat_mla_q:
+  vllm_api: "_C_cache_ops::concat_mla_q"
   profiling:
     prefill:
       pct: 1.06
@@ -138,6 +142,7 @@ concat_mla_q:
 # 请求索引转换族的 KV 写入部分；prefill/decode 均有调用
 # 优化建议: 按 profiler 数据评估
 concat_and_cache_mla:
+  vllm_api: "_C_cache_ops::concat_and_cache_mla"
   profiling:
     prefill:
       pct: 0.33
@@ -157,6 +162,7 @@ concat_and_cache_mla:
 # cache_stride=132 → head_dim=128 + head_dim*4/quant_block_size=4 → quant_block_size=128
 # 优化建议: logits 与 topK 融合，减少中间张量物化；paged 版减少页表间接访问
 indexer_k_quant_and_cache:
+  vllm_api: "_C_cache_ops::indexer_k_quant_and_cache"
   profiling:
     prefill:
       pct: 0.14
@@ -175,6 +181,7 @@ indexer_k_quant_and_cache:
 # prefill 时从 KV cache 聚合已量化的 K 块
 # 优化建议: logits 与 topK 融合，减少中间张量物化；paged 版减少页表间接访问
 cp_gather_indexer_k_quant_cache:
+  vllm_api: "_C_cache_ops::cp_gather_indexer_k_quant_cache"
   profiling:
     prefill:
       pct: 0.04
@@ -193,6 +200,11 @@ cp_gather_indexer_k_quant_cache:
 # Inductor 融合内核；与相邻算子融合可减少一次显存往返
 # 优化建议: 与相邻算子融合，减少一次读写
 fused_add_rms_norm:
+  vllm_api:
+    - "triton_red_fused_fused_add_rms_norm_moe_forward_shared_0"
+    - "triton_red_fused_fused_add_rms_norm_2"
+    - "triton_red_fused_fused_add_rms_norm_1"
+    - "triton_red_fused_fused_add_rms_norm_0"
   profiling:
     prefill:
       pct: 2.60
@@ -210,6 +222,7 @@ fused_add_rms_norm:
 # routed-expert（intermediate=2304）
 # 优化建议: 按 profiler 数据评估；可与 MoE GEMM 融合
 silu_and_mul:
+  vllm_api: "SiluAndMul"
   profiling:
     prefill:
       pct: 0.06
