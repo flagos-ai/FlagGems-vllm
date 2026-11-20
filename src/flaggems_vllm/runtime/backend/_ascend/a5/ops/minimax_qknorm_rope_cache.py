@@ -28,19 +28,6 @@ _NSTAGE = 2
 
 
 @triton.jit
-def _rope_inplace(y, cos, sin, ROWS: tl.constexpr, HALF: tl.constexpr):
-    """NeoX rotate dims [0, 2*HALF) of a (ROWS, HEAD_DIM) tile in registers.
-
-    cos/sin are (ROWS, HALF) tiles so each row may carry its own position.
-    """
-    a = _extract_slice(y, (0, 0), (ROWS, HALF), (1, 1))
-    b = _extract_slice(y, (0, HALF), (ROWS, HALF), (1, 1))
-    y = _insert_slice(y, a * cos - b * sin, (0, 0), (ROWS, HALF), (1, 1))
-    y = _insert_slice(y, b * cos + a * sin, (0, HALF), (ROWS, HALF), (1, 1))
-    return y
-
-
-@triton.jit
 def _rope_inplace3(y, cos, sin, T: tl.constexpr, H: tl.constexpr, HALF: tl.constexpr):
     """NeoX rotate dims [0, 2*HALF) of a (T, H, HEAD_DIM) tile in registers.
 
@@ -75,83 +62,9 @@ def _rms_norm3(x, w, HEAD_DIM: tl.constexpr, EPS: tl.constexpr):
     return y.to(tl.bfloat16)
 
 
-@triton.jit
-def _rms_norm(x, w, HEAD_DIM: tl.constexpr, EPS: tl.constexpr):
-    """(ROWS, HEAD_DIM) fp32 tile -> bf16 round-tripped, (1+w)-scaled fp32 tile."""
-    inv = tl.rsqrt(tl.sum(x * x, 1) / HEAD_DIM + EPS)
-    y = x * inv[:, None] * (1.0 + w)[None, :]
-    return y.to(tl.bfloat16).to(tl.float32)
-
-
 # --------------------------------------------------------------------------- #
 # fallback: one token per program (masked lane-partner reload for RoPE)
 # --------------------------------------------------------------------------- #
-@triton.jit
-def _norm_rope_row(
-    base, roff, w_ptr, cs, HEAD_DIM: tl.constexpr, HALF: tl.constexpr, EPS: tl.constexpr
-):
-    cols = tl.arange(0, HEAD_DIM)
-    x = tl.load(base + roff + cols).to(tl.float32)
-    w = tl.load(w_ptr + cols).to(tl.float32)
-    inv = tl.rsqrt(tl.sum(x * x) / HEAD_DIM + EPS)
-    y = x * inv * (1.0 + w)
-    y = y.to(tl.bfloat16).to(tl.float32)
-
-    lo = cols < HALF
-    hi = (cols >= HALF) & (cols < 2 * HALF)
-    m = lo | hi
-    poff = tl.where(lo, cols + HALF, cols - HALF)
-    p = tl.load(base + roff + poff, mask=m, other=0.0).to(tl.float32)
-    pw = tl.load(w_ptr + poff, mask=m, other=0.0).to(tl.float32)
-    p = p * inv * (1.0 + pw)
-    p = p.to(tl.bfloat16).to(tl.float32)
-
-    cidx = tl.where(lo, cols, cols - HALF)
-    cos = tl.load(cs + cidx, mask=m, other=0.0).to(tl.float32)
-    sin = tl.load(cs + HALF + cidx, mask=m, other=0.0).to(tl.float32)
-    rot = tl.where(lo, y * cos - p * sin, y * cos + p * sin)
-    return tl.where(m, rot, y)
-
-
-@triton.jit
-def _norm_rope_tile(
-    base,
-    roff,
-    w_ptr,
-    cs,
-    ROWS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    HALF: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    cols = tl.arange(0, HEAD_DIM)
-    rows = tl.arange(0, ROWS)
-    x = tl.load(base + roff[:, None] + cols[None, :]).to(tl.float32)
-    w = tl.load(w_ptr + cols).to(tl.float32)
-    inv = tl.rsqrt(tl.sum(x * x, 1) / HEAD_DIM + EPS)
-    y = x * inv[:, None] * (1.0 + w)[None, :]
-    y = y.to(tl.bfloat16).to(tl.float32)
-
-    lo = cols < HALF
-    hi = (cols >= HALF) & (cols < 2 * HALF)
-    m = lo | hi
-    poff = tl.where(lo, cols + HALF, cols - HALF)
-    p = tl.load(base + roff[:, None] + poff[None, :], mask=m[None, :], other=0.0).to(
-        tl.float32
-    )
-    pw = tl.load(w_ptr + poff, mask=m, other=0.0).to(tl.float32)
-    p = p * inv[:, None] * (1.0 + pw)[None, :]
-    p = p.to(tl.bfloat16).to(tl.float32)
-
-    cidx = tl.where(lo, cols, cols - HALF)
-    cos = tl.load(cs + cidx, mask=m, other=0.0).to(tl.float32)
-    sin = tl.load(cs + HALF + cidx, mask=m, other=0.0).to(tl.float32)
-    rot = tl.where(
-        lo[None, :],
-        y * cos[None, :] - p * sin[None, :],
-        y * cos[None, :] + p * sin[None, :],
-    )
-    return tl.where(m[None, :], rot, y)
 
 
 # Short-token path adapted from vllm-ascend/ops/triton/msa/minimax_qknorm_rope_cache.py.
