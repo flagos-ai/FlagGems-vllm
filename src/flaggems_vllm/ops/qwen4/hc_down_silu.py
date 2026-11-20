@@ -14,6 +14,18 @@ from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 
 logger = logging.getLogger(__name__)
+_IS_ASCEND = runtime.device.vendor_name == "ascend"
+
+
+def _tuned_configs(name, ascend_meta, num_stages):
+    # The 910B workload favors these tiles across the core shapes. Use one
+    # candidate on Ascend to avoid compiling every tile for every shape.
+    if _IS_ASCEND:
+        return [triton.Config(ascend_meta, num_warps=4, num_stages=num_stages)]
+    return runtime.get_tuned_config(name)
+
+
+_GEMV_CONFIGS = _tuned_configs("hc_down_silu_gemv", {"BLOCK_N": 4, "BLOCK_K": 1024}, 1)
 
 
 @triton.jit
@@ -26,7 +38,7 @@ def _hc_down_silu_epilogue(acc, columns, RANK: tl.constexpr, HC: tl.constexpr):
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("hc_down_silu_gemv"),
+    configs=_GEMV_CONFIGS,
     key=["SHAPE"],
     strategy=str,
     warmup=5,
@@ -70,7 +82,9 @@ def _hc_down_silu_gemv(
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("hc_down_silu_gemm"),
+    configs=_tuned_configs(
+        "hc_down_silu_gemm", {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 128}, 2
+    ),
     key=["SHAPE"],
     strategy=str,
     warmup=5,
@@ -123,10 +137,10 @@ def _hc_down_silu_gemm(
 @libtuner(
     # Current MACA vector loads fail on this large-span path. Scalar K tiles
     # retain the same FP32 reduction and BF16 epilogue without that lowering.
-    configs=runtime.get_tuned_config(
-        "hc_down_silu_wide_gemv"
+    configs=(
+        runtime.get_tuned_config("hc_down_silu_wide_gemv")
         if runtime.device.vendor_name == "metax"
-        else "hc_down_silu_gemv"
+        else _GEMV_CONFIGS
     ),
     key=["SHAPE"],
     strategy=str,
@@ -233,12 +247,15 @@ def hc_down_silu(
             use_gemv = m <= 16
         elif runtime.device.vendor_name == "mthreads":
             use_gemv = m <= 49
-    shape = (m, k, n, rank, hc, sx[0], sw[0], int(use_gemv))
+    # Both GEMV kernels get the row count from the launch grid. With the
+    # fixed Ascend tile, changing M does not require another compiled kernel.
+    kernel_m = 0 if _IS_ASCEND and (wide or use_gemv) else m
+    shape = (kernel_m, k, n, rank, hc, sx[0], sw[0], int(use_gemv))
     with runtime.torch_device_fn.device(x.device.index):
         if wide:
             _hc_down_silu_wide_gemv[
                 lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))
-            ](x, weight, output, (m, k, n, rank, hc, sx[0], sw[0], 2))
+            ](x, weight, output, (kernel_m, k, n, rank, hc, sx[0], sw[0], 2))
         elif use_gemv:
             _hc_down_silu_gemv[
                 lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))
