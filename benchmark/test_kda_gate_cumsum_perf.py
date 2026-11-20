@@ -112,7 +112,7 @@ class KdaGateCumsumBenchmark(base.Benchmark):
             yield g, A_log, dt_bias, cu_dev, chunk_indices, LOWER_BOUND, CHUNK
 
 
-@pytest.mark.kda_gate_cumsum
+@pytest.mark.kda_gate_cumsum_triton
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "ascend",
     reason="the optimized KDA gate cumsum targets Ascend",
@@ -123,13 +123,10 @@ def test_kda_gate_cumsum_perf():
         # production shape (31.1x); the E2E aggregate vs AscendC is ~96x
         # (84.6s -> 0.87s over the 16-rank serving run).
         torch_op = _ascendc
-        op_name = "kda_gate_cumsum_vs_ascendc"
     else:
         # extension-free environments: torch-chain reference instead
         def torch_op(g, A_log, dt_bias, cu_dev, chunk_indices, lower_bound, chunk):
             return _official(g, A_log, dt_bias, cu_dev.tolist(), lower_bound, chunk)
-
-        op_name = "kda_gate_cumsum"
 
     def gems_op(g, A_log, dt_bias, cu_dev, chunk_indices, lower_bound, chunk):
         return flaggems_vllm.kda_gate_cumsum_triton(
@@ -137,7 +134,7 @@ def test_kda_gate_cumsum_perf():
         )
 
     benchmark = KdaGateCumsumBenchmark(
-        op_name=op_name,
+        op_name="kda_gate_cumsum_triton",
         torch_op=torch_op,
         gems_op=gems_op,
         dtypes=[torch.bfloat16],
