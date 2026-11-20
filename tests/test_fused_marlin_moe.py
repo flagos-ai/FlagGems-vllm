@@ -40,6 +40,10 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     QUANT_TYPE_UINT4B8,
     QUANT_TYPE_UINT8B128,
     _dequant_w8a16_int8_packed,
+    _e8m0_fold_safe,
+    _pack_scale_e8m0,
+    _pack_scale_e8m0_fold,
+    _pack_w_interleave,
     _prepare_w8a16_routing,
     fused_marlin_moe,
 )
@@ -521,6 +525,94 @@ def _make_inputs_w4a16_mxfp4(
     )
 
 
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(not _is_hopper(), reason="generic Hopper W4 packing")
+@pytest.mark.parametrize("block_size_k", [8, 16, 24, 64, 128])
+@pytest.mark.parametrize("strided", [False, True])
+def test_fused_marlin_moe_interleaved_packing(block_size_k, strided):
+    E, N, K_half = 2, 5, block_size_k
+    shape = (2 * E, 2 * N, 2 * K_half) if strided else (E, N, K_half)
+    w = (
+        torch.arange(shape[0] * shape[1] * shape[2], device=flaggems_vllm.device)
+        .to(torch.uint8)
+        .reshape(shape)
+    )
+    if strided:
+        w = w[::2, ::2, ::2]
+    # Preserve the original unpack/reshape/transpose oracle independently of
+    # the production kernel's direct gather into each output word.
+    logical = torch.stack((w & 0xF, (w >> 4) & 0xF), dim=-1)
+    B = block_size_k // 8
+    tiled = logical.reshape(E, N, 2, 8, B).transpose(-2, -1)
+    shifts = torch.tensor(
+        (0, 16, 4, 20, 8, 24, 12, 28), dtype=torch.int32, device=w.device
+    )
+    expected = (tiled.to(torch.int32) << shifts).sum(-1, dtype=torch.int32)
+    expected = expected.reshape(E, N, K_half // 4).transpose(-2, -1).contiguous()
+    actual = _pack_w_interleave(w, block_size_k)
+    assert actual.is_contiguous()
+    gems_assert_equal(actual, expected)
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(not _is_hopper(), reason="generic Hopper W4 packing")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("fold", [False, True])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("scale_view", [False, True])
+def test_fused_marlin_moe_e8m0_packing_all_bytes(dtype, fold, strided, scale_view):
+    raw = (
+        torch.arange(256, device=flaggems_vllm.device).to(torch.uint8).reshape(2, 16, 8)
+    )
+    if strided:
+        storage = torch.empty((4, 32, 16), dtype=torch.uint8, device=raw.device)
+        s = storage[::2, ::2, ::2]
+        s.copy_(raw)
+    else:
+        s = raw
+    if scale_view:
+        s = s.view(_MXFP4_SCALE_DTYPE)
+    bias = (126 if dtype == torch.bfloat16 else 14) if fold else 0
+    expected = torch.exp2((raw.to(torch.int32) - 127 + bias).float()).to(dtype)
+    expected = expected.transpose(-2, -1).contiguous()
+    if fold:
+        bits = expected.view(torch.int16).to(torch.int32) & 0xFFFF
+        expected = (bits << 16) | bits
+        actual = _pack_scale_e8m0_fold(s, dtype)
+    else:
+        actual = _pack_scale_e8m0(s, dtype)
+        # Bitwise comparison includes byte0's BF16 subnormal and byte255's +inf.
+        actual = actual.view(torch.int16)
+        expected = expected.view(torch.int16)
+    assert actual.is_contiguous()
+    gems_assert_equal(actual, expected)
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(not _is_hopper(), reason="generic Hopper W4 packing")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("max_byte", [0, 128, 129, 255])
+def test_fused_marlin_moe_e8m0_fold_boundary(dtype, max_byte):
+    s = torch.tensor([0, max_byte], dtype=torch.uint8, device=flaggems_vllm.device)
+    s = s.reshape(1, 1, 2)
+    assert _e8m0_fold_safe(s, dtype) == (max_byte <= 128)
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(not _is_hopper(), reason="generic Hopper W4 packing")
+@pytest.mark.parametrize("shape", [(0, 5, 16), (2, 0, 16), (2, 5, 0)])
+def test_fused_marlin_moe_empty_packing(shape):
+    empty = torch.empty(shape, dtype=torch.uint8, device=flaggems_vllm.device)
+    packed = _pack_w_interleave(empty, 16)
+    assert packed.shape == (shape[0], shape[2] // 4, shape[1])
+    assert packed.dtype == torch.int32
+    assert packed.numel() == 0
+    for pack in (_pack_scale_e8m0, _pack_scale_e8m0_fold):
+        scales = pack(empty, torch.bfloat16)
+        assert scales.shape == (shape[0], shape[2], shape[1])
+        assert scales.numel() == 0
+
+
 def _quantize_moe_weight_fp8(w_fp, group_size):
     """Quantize each expert's weights to FP8 E4M3 with per-group scales."""
     num_experts, out_dim, in_dim = w_fp.shape
@@ -729,6 +821,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
     [
         (4, 256, 512),
         (1, 1024, 1024),
+        (1, 512, 512),
         (65, 256, 512),
         pytest.param(
             (1, 1024, 128),
