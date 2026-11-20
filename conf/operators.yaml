@@ -679,6 +679,17 @@ ops:
   - Indexing
   stages:
   - beta: '0.3'
+- id: fla_causal_conv1d_update
+  description: FLA single-token causal convolution with channel-last state and explicit output on Atlas A5.
+  for:
+  - fla_causal_conv1d_update
+  labels:
+  - non-aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: flash_attention_forward
   description: Forward pass of FlashAttention computing scaled dot-product attention.
   for:
