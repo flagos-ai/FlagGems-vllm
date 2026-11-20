@@ -106,6 +106,11 @@ RUN_LARGE_MOE_TESTS = not QUICK_MODE and os.environ.get(
 ).lower() in {"1", "true", "yes", "on"}
 
 FUSED_MOE_CONFIGS = [
+    # Qwen3.6 production shape (TP=8). The dense grouped path, and with it the
+    # TLE (SQMMA + TME) GEMMs, only engages from 4096 tokens on, so these two
+    # are the smallest cases that cover it.
+    (4096, 256, 2048, 512, 8),
+    (16384, 256, 2048, 512, 8),
     # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
     (1, 8, 128, 256, 2),
     (4, 8, 128, 256, 2),
@@ -137,6 +142,12 @@ if RUN_LARGE_MOE_TESTS:
         (64, 256, 7168, 2048, 8),
         (128, 256, 7168, 2048, 8),
         (256, 256, 7168, 2048, 8),
+        # Wide shards that push the grouped GEMM past int32: 256 x 4096 x 4096
+        # elements per weight slab, and a 2**21-row TME descriptor view. The
+        # literal DeepSeek-V3 shard (7168/2048) does not fit in a test process
+        # once the reference and both transposed copies are live.
+        (4096, 256, 4096, 2048, 8),
+        (4096, 256, 512, 4096, 8),
     ]
 
 

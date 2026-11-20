@@ -2769,7 +2769,7 @@ def _nopad_fused_moe_kernel(
 
     b_ptrs = (
         b_ptr
-        + expert * stride_be
+        + expert.to(tl.int64) * stride_be
         + offs_k[:, None] * stride_bk
         + offs_n[None, :] * stride_bn
     )
@@ -3033,8 +3033,11 @@ def _grouped_gemm_kernel(
     offs_m = pm * BM + tl.arange(0, BM)
     offs_n = pn * BN + tl.arange(0, BN)
     offs_k = tl.arange(0, BK)
+    # E*K*N easily passes 2**31 on wide shards (e.g. 256 experts x 7168 x
+    # 4096), so the per-expert base must be 64-bit or the pointer wraps.
+    expert_base = expert.to(tl.int64) * K * N
     a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
-    b_ptrs = b_ptr + expert * K * N + offs_k[:, None] * N + offs_n[None, :]
+    b_ptrs = b_ptr + expert_base + offs_k[:, None] * N + offs_n[None, :]
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BK)):
         a = tl.load(a_ptrs)
@@ -3149,7 +3152,14 @@ def _dense_transpose_weights(w):
     if entry is not None and entry[0]() is w:
         return entry[1]
     _prune_dead_entries(_DENSE_TW_DENSE_CACHE)
-    t = w.permute(0, 2, 1).contiguous()
+    experts, n, k = w.shape
+    t = torch.empty((experts, k, n), dtype=w.dtype, device=w.device)
+    # A single permute().contiguous() over a multi-GiB slab comes back wrong on
+    # MUSA (256 x 4096 x 7168: even expert 0 mismatches), while the same copy
+    # done in bounded chunks is correct. Keep each copy under 2**30 elements.
+    step = max(1, (1 << 30) // (n * k))
+    for start in range(0, experts, step):
+        t[start : start + step] = w[start : start + step].permute(0, 2, 1)
     _DENSE_TW_DENSE_CACHE[key] = (__import__("weakref").ref(w), t)
     return t
 
