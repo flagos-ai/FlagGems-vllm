@@ -129,6 +129,7 @@ def _block_scores_kernel(
     width,
     nblocks,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_POW2: tl.constexpr,
     K: tl.constexpr,
     TILE: tl.constexpr,
 ):
@@ -145,7 +146,7 @@ def _block_scores_kernel(
         for tile in range(0, K, TILE):
             slots = tile + tl.arange(0, TILE)
             tl.store(out + row * K + slots, -1, slots < K)
-    offsets = tl.arange(0, triton.next_power_of_2(BLOCK_SIZE))
+    offsets = tl.arange(0, BLOCK_POW2)
     cols = blocks[:, None] * BLOCK_SIZE + offsets[None, :]
     values = tl.load(
         logits + row * stride_row + cols * stride_col,
@@ -295,6 +296,7 @@ def select_candidate_blocks_cooperative(
         width,
         nblocks,
         BLOCK_SIZE=block_size,
+        BLOCK_POW2=triton.next_power_of_2(block_size),
         K=k,
         TILE=tile,
         num_warps=num_warps,
