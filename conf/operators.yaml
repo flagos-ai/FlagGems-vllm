@@ -768,8 +768,9 @@ ops:
   stages:
   - alpha: '5.3'
 - id: flash_mla_sparse_fwd_w8a8
-  description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and
-    shared key/value.
+  description: Sparse MLA decoding with per-token scales for 8-bit query and KV NoPE
+    and separate RoPE. The precision convention is FP8 for NVIDIA and Moore Threads
+    and INT8 for other backends.
   for:
   - flash_mla_sparse_fwd_w8a8
   labels:
