@@ -98,6 +98,8 @@ _SHAPE_CASES = (
         (256, 5120, 4),
         (64, 4096, 4),
         (256, 7168, 4),
+        # Small-token wide row: the vendor tiled post + norm-in-reduce path.
+        (128, 5120, 4),
         (3, 127, 4),
         (5, 257, 2),
         (7, 5120, 4),
@@ -604,8 +606,9 @@ def test_production_path_has_no_torch_compute():
     root = Path(__file__).resolve().parents[1]
     paths = [
         root / "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py",
-        # Vendor path: same production contract as the generic module.
+        # Vendor paths: same production contract as the generic module.
         root / "src/flaggems_vllm/runtime/backend/_thead/ops/mhc_shifted_post_pre.py",
+        root / "src/flaggems_vllm/runtime/backend/_metax/ops/mhc_shifted_post_pre.py",
     ]
     # The whole modules are production; the torch reference lives in this test.
     allowed = {
