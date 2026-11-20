@@ -1804,6 +1804,12 @@ def test_fused_marlin_moe_mxfp4_scale_updates_ppu(
         scale = kwargs[updated_tensor]
         flaggems_vllm.fused_marlin_moe(**kwargs)
         if capture:
+            backend = importlib.import_module(
+                "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
+            )
+            version = scale._version
+            cached = backend._SCALE_CACHE.get(scale)
+            assert cached is not None and cached[0] == version
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -1814,6 +1820,7 @@ def test_fused_marlin_moe_mxfp4_scale_updates_ppu(
         else:
             ref2 = ref2 * 2
         if capture:
+            assert scale._version > version
             graph.replay()
         else:
             actual = flaggems_vllm.fused_marlin_moe(**kwargs)

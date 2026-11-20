@@ -24,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 from flag_gems import zeros
+from torch.utils.weak import WeakTensorKeyDictionary
 
 try:
     from triton.experimental.tle import language as tle_async
@@ -59,6 +60,7 @@ _PPU_WIDE_SHARED_BYTES = 64 << 10
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 # Inputs and the caller-visible output are outside the temporary workspace budget.
 _PPU_DENSE_MAX_WORKSPACE_BYTES = 2 << 30
+_SCALE_CACHE = WeakTensorKeyDictionary()
 _PPU_QUANT_TYPES = (
     QUANT_TYPE_UINT4B8,
     QUANT_TYPE_UINT8B128,
@@ -4051,23 +4053,31 @@ def check_routed_fp8_scales(
         write_fp8_expert_scale_safety(S2, F2, expert, N2, G2, SE2, SN2, SG2, BLOCK2)
 
 
+def e8m0_byte_view(scale: torch.Tensor) -> torch.Tensor:
+    if scale.is_inference():
+        return scale.view(torch.uint8)
+    version = scale._version
+    cached = _SCALE_CACHE.get(scale)
+    if cached is not None and cached[0] == version and cached[1].is_set_to(scale):
+        return cached[1]
+    # The view shares storage for graph replay but must not keep the weak key alive.
+    raw = scale.detach().view(torch.uint8)
+    _SCALE_CACHE[scale] = (version, raw)
+    return raw
+
+
 def _prepare_quantized_weights(
     w1,
     w2,
     w1_scale,
     w2_scale,
-    quant_type_id,
     *,
     needs_expert_flags: bool,
 ):
     b1 = w1.view(torch.uint8).transpose(1, 2)
     b2 = w2.view(torch.uint8).transpose(1, 2)
-    s1 = (
-        w1_scale.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else w1_scale
-    ).transpose(1, 2)
-    s2 = (
-        w2_scale.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else w2_scale
-    ).transpose(1, 2)
+    s1 = w1_scale.transpose(1, 2)
+    s2 = w2_scale.transpose(1, 2)
     if needs_expert_flags:
         safe1 = torch.empty((w1.size(0),), device=w1.device, dtype=torch.int32)
         safe2 = torch.empty_like(safe1)
@@ -4712,7 +4722,7 @@ def run_dense_wna16(
                 (triton.cdiv(width, decode_cols), triton.cdiv(reduction, 128), e)
             ](
                 qw.view(torch.uint8),
-                (ss.view(torch.uint8) if quant_type_id == QUANT_TYPE_FP4_E2M1 else ss),
+                ss,
                 scratch,
                 width,
                 reduction,
@@ -4891,6 +4901,9 @@ def _fused_marlin_moe_impl(
         return out
     compute_type = tl.float16 if hidden_states.dtype == torch.float16 else tl.bfloat16
     with torch.cuda.device(hidden_states.device):
+        if quant_type_id == QUANT_TYPE_FP4_E2M1:
+            w1_scale = e8m0_byte_view(w1_scale)
+            w2_scale = e8m0_byte_view(w2_scale)
         packed_fp8 = (
             quant_type_id == QUANT_TYPE_FP8_E4M3
             and hidden_states.dtype
@@ -5057,7 +5070,6 @@ def _fused_marlin_moe_impl(
             w2,
             w1_scale,
             w2_scale,
-            quant_type_id,
             needs_expert_flags=is_joint_safety,
         )
         split_silu = direct and (
