@@ -743,7 +743,8 @@ def dense_int8_mla_kernel(
         )
         maximum = new_maximum
     if SPLITS == 1:
-        normalized = accumulator / tl.where(denominator > 0, denominator, 1.0)[:, None]
+        inv_denominator = 1.0 / tl.where(denominator > 0, denominator, 1.0)
+        normalized = accumulator * inv_denominator[:, None]
         tl.store(
             Output + (batch * H + heads[:, None]) * 512 + dims[None, :],
             normalized,
