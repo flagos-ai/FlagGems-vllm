@@ -12,16 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
+"""Use --mode cudagraph for ACL Graph or --mode operator for synchronized eager."""
+
 from dataclasses import asdict
+from functools import partial
 from statistics import mean
 
 import pytest
+import torch
 
 import flaggems_vllm
-from tests.test_mega_mhc import load_mhc_cases, mhc_inputs, mhc_operations, time_graphs
+from tests.test_mega_mhc import (
+    _to_npu,
+    load_mhc_cases,
+    mhc_eps,
+    mhc_inputs,
+    mhc_operations,
+)
 
 from . import conftest
+from .base import Benchmark
+from .consts import BenchMode
 
 pytestmark = [
     pytest.mark.mega_mhc,
@@ -40,34 +51,61 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize("case", cases, ids=[case.id for case in cases])
 
 
-def test_mega_mhc_graph_latency(case):
+@torch.inference_mode()
+def test_mega_mhc_latency(case):
     config = conftest.Config
-    samples = time_graphs(
-        mhc_operations(case),
-        mhc_inputs(case, 2026),
-        config.warm_up,
-        config.repetition,
-    )
-    latencies = {
-        name: {
-            key: mean(sample[key] for sample in rounds)
-            for key in ("event_us", "host_us")
-        }
-        for name, rounds in samples.items()
-    }
+    mode = config.mode
+    inputs = _to_npu(mhc_inputs(case, 2026))
+    calls = {name: partial(op, *inputs) for name, op, _ in mhc_operations(case)}
+    baseline = next(iter(calls))
+    if mode == BenchMode.OPERATOR:
+        eps = mhc_eps(case)
+        context = flaggems_vllm.create_mega_mhc_context(*inputs, rms_eps=eps)
+        calls["prepared"] = partial(
+            flaggems_vllm.mega_mhc, *inputs, rms_eps=eps, context=context
+        )
+        for call in calls.values():
+            call()  # Exclude initialization and JIT from eager calibration.
+        torch.npu.synchronize()
+
+    benchmark = Benchmark("mega_mhc", calls[baseline])
+    samples = {name: [] for name in calls}
+    names = list(calls)
+    for index in range(3):
+        first = index % len(names)
+        for name in names[first:] + names[:first]:
+            samples[name].append(1000 * benchmark.get_latency(calls[name]))
+
+    us = {name: mean(values) for name, values in samples.items()}
+    mode_name, metric = {
+        BenchMode.CUDAGRAPH: ("acl_graph", "event_us"),
+        BenchMode.OPERATOR: ("eager", "host_us"),
+        BenchMode.KERNEL: ("kernel", "kernel_us"),
+        BenchMode.WRAPPER: ("wrapper", "host_us"),
+    }[mode]
     result = {
         "shape": asdict(case),
         "case_id": case.id,
-        "mode": "acl_graph",
-        "warmup": config.warm_up,
-        "iterations": config.repetition,
-        "latencies": latencies,
-        "samples": samples,
+        "mode": mode_name,
+        "latencies": {name: {metric: value} for name, value in us.items()},
+        "samples": {
+            name: [{metric: v} for v in values] for name, values in samples.items()
+        },
     }
-    if "candidate" in latencies:
-        baseline = next(name for name in latencies if name != "candidate")
-        result["speedup_event"] = (
-            latencies[baseline]["event_us"] / latencies["candidate"]["event_us"]
+    if mode == BenchMode.CUDAGRAPH:
+        result.update(
+            warmup=config.warm_up,
+            iterations=config.repetition,
+            speedup_event=us[baseline] / us["candidate"],
         )
-    print(json.dumps(result))
+    elif mode == BenchMode.OPERATOR:
+        result.update(
+            warmup_ms=config.warm_up,
+            repetition_ms=config.repetition,
+            speedup_host={
+                name: us[baseline] / us[name] for name in ("candidate", "prepared")
+            },
+        )
+    else:
+        result["speedup"] = us[baseline] / us["candidate"]
     conftest.update_result("mega_mhc", result)

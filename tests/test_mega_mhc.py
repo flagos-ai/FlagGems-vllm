@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from time import perf_counter_ns
 
 import pytest
 import torch
@@ -115,12 +116,15 @@ def mhc_reference(case, x, residual, post, comb, fn, scale, base, norm_weight, p
 def check_mhc(case, inputs, outputs, *, exact_comb=False):
     actual = tuple(tensor.cpu() for tensor in outputs)
     expected = mhc_reference(case, *inputs)
-    torch.testing.assert_close(
-        actual,
-        expected,
-        rtol=1e-2,
-        atol=2e-2,
-    )
+    # Keep BF16 activation rounding separate from absolute FP32 coefficient bounds.
+    # The native pipeline and fused kernel are both checked against the CPU reference.
+    names = ("current", "post", "comb", "output", "pre")
+    tolerances = ((1e-2, 2e-2), (0, 6e-5), (0, 3e-5), (1e-2, 2e-2), (0, 2e-5))
+    assert len(actual) == len(expected)
+    for name, value, ref, (rtol, atol) in zip(names, actual, expected, tolerances):
+        torch.testing.assert_close(
+            value, ref, rtol=rtol, atol=atol, msg=lambda msg: f"{name}: {msg}"
+        )
     if exact_comb:
         torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=1e-5)
 
@@ -226,41 +230,6 @@ def validate_graph(fn, case, make_inputs, check, *, prepare=None, stream=None):
     graph.reset()
 
 
-@torch.inference_mode()
-def time_graphs(operations, cpu_inputs, warmup, iterations, rounds=3, *, stream=None):
-    assert warmup >= 0 and iterations > 0 and rounds > 0, "Invalid Graph timing counts"
-    # Keep captured inputs and outputs alive for all replays.
-    graphs = []
-    for name, fn, prepare in operations:
-        inputs = prepare(cpu_inputs) if prepare is not None else cpu_inputs
-        graphs.append((name, *capture_graph(fn, inputs, stream=stream)))
-    measurements = {name: [] for name, *_ in graphs}
-    for _, graph, _, _ in graphs:
-        for _ in range(warmup):
-            graph.replay()
-    torch.npu.synchronize()
-    for index in range(rounds):
-        order = graphs if index % 2 == 0 else reversed(graphs)
-        for name, graph, _, _ in order:
-            start = torch.npu.Event(enable_timing=True)
-            end = torch.npu.Event(enable_timing=True)
-            host_start = perf_counter_ns()
-            start.record()
-            for _ in range(iterations):
-                graph.replay()
-            end.record()
-            torch.npu.synchronize()
-            measurements[name].append(
-                {
-                    "event_us": start.elapsed_time(end) * 1000 / iterations,
-                    "host_us": (perf_counter_ns() - host_start) / 1000 / iterations,
-                }
-            )
-    for _, graph, _, _ in graphs:
-        graph.reset()
-    return measurements
-
-
 def pytest_generate_tests(metafunc):
     if "case" in metafunc.fixturenames:
         cases = load_mhc_cases(quick=metafunc.config.getoption("--quick"))
@@ -270,6 +239,70 @@ def pytest_generate_tests(metafunc):
 def test_mega_mhc_graph(case):
     for _, fn, prepare in mhc_operations(case):
         validate_graph(fn, case, mhc_inputs, check_mhc, prepare=prepare)
+
+
+@torch.inference_mode()
+def _stress_pair_local_replay():
+    from triton.runtime import driver
+
+    from flaggems_vllm.runtime.backend._ascend.ops.mega_mhc import _launch_config
+
+    utils = driver.active.utils
+    cores = utils.get_aicore_num()
+    graphs = []
+    try:
+        # Both originally used inter-program split-K. The shifted case also
+        # leaves a partial tile and unequal work across the participating pairs.
+        for case in (MhcCase("normal", 17, 4096), MhcCase("shifted", 73, 5120, True)):
+            (workers,), _, opts = _launch_config(
+                case.tokens,
+                case.hidden,
+                case.shifted,
+                cores,
+                utils.get_aivector_core_num(),
+            )
+            assert 1 < workers <= cores
+            if case.shifted:
+                assert case.tokens % opts["BLOCK_M"] != 0
+            stream = torch.npu.Stream()
+            fn = partial(flaggems_vllm.mega_mhc, rms_eps=mhc_eps(case))
+            graph, inputs, outputs = capture_graph(
+                fn, mhc_inputs(case, 3600), stream=stream
+            )
+            graphs.append((case, stream, graph, inputs, outputs))
+        for seed in (*range(3600, 3616), 3600):
+            changed = [mhc_inputs(case, seed) for case, *_ in graphs]
+            for (_, stream, _, inputs, _), values in zip(graphs, changed):
+                with torch.npu.stream(stream):
+                    for dst, src in zip(inputs, values):
+                        if dst is not None:
+                            dst.copy_(src)
+            # Enqueue on both streams before waiting on either one.
+            for _, stream, graph, _, _ in graphs:
+                with torch.npu.stream(stream):
+                    graph.replay()
+            torch.npu.synchronize()
+            for (case, _, _, _, outputs), values in zip(graphs, changed):
+                check_mhc(case, values, outputs)
+    finally:
+        for _, _, graph, _, _ in graphs:
+            graph.reset()
+
+
+def test_mega_mhc_cross_program_replay():
+    # A device-side barrier can block synchronize() indefinitely. Bound the child
+    # from a separate process so the deadline also applies inside native code.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tests.test_mega_mhc import _stress_pair_local_replay;"
+            " _stress_pair_local_replay()",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        timeout=300,
+    )
 
 
 @pytest.mark.parametrize("tokens,hidden", [(384, 3968), (704, 2048), (4096, 2048)])
