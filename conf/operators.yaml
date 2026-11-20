@@ -486,7 +486,7 @@ ops:
 - id: cooperative_topk
   description: 'Select exact top-k indices from FP32 logits through vLLM''s in-place
 
-    interface, with Ascend and Iluvatar fast paths. Supports up to 64 rows,
+    interface, with Ascend, Iluvatar, and MThreads fast paths. Supports up to 64 rows,
 
     k in {512, 1024, 2048}, variable lengths, and -1 padding for short rows.
 
@@ -497,6 +497,7 @@ ops:
   - fused
   - NoCPU
   - vLLM
+  - DSA
   kind:
   - NeuralNetwork
   stages:
