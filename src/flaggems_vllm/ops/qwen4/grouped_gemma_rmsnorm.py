@@ -16,6 +16,7 @@
 
 import logging
 from numbers import Integral, Real
+from typing import Tuple
 
 import torch
 import triton
@@ -114,25 +115,9 @@ def _grouped_gemma_rmsnorm_kernel(X, W, Y, N, SPEC: tl.constexpr):
             tl.store(Y + row * DIM + group_offset + columns, result, mask)
 
 
-def grouped_gemma_rmsnorm(
+def _validate_grouped_gemma_rmsnorm_inputs(
     x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
-) -> torch.Tensor:
-    """Normalize each group and apply Gemma's ``z + z * weight`` affine.
-
-    ``x`` is a two-dimensional accelerator tensor with unit inner stride;
-    nonnegative row strides, including row gaps, are supported. A contiguous
-    ``weight`` has either ``DIM // num_groups`` elements shared across groups,
-    or ``DIM`` elements. The tensors independently use FP16, BF16, or FP32.
-    Accumulation and affine arithmetic use FP32, then round to ``x.dtype``.
-
-    ``eps`` accepts real scalars, including zero, negative values, NaN, and Inf.
-    These values follow the native FP32 sum/rsqrt expression without clamping;
-    invalid square roots and nonfinite arithmetic can produce NaN or Inf.
-    The result is fresh and contiguous. This is an inference-only forward API;
-    CPU/meta tensors and autograd are not supported.
-    """
-    logger.debug("GEMS GROUPED_GEMMA_RMSNORM")
-
+) -> Tuple[float, int]:
     if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
         raise TypeError("x and weight must be tensors")
     if x.layout != torch.strided or weight.layout != torch.strided:
@@ -145,7 +130,7 @@ def grouped_gemma_rmsnorm(
         num_groups = int(num_groups)
     if num_groups <= 0:
         raise ValueError("num_groups must be positive")
-    n, dim = x.shape
+    dim = x.shape[1]
     if dim <= 0 or dim % num_groups:
         raise ValueError("x.shape[1] must be positive and divisible by num_groups")
     row_stride = x.stride(0)
@@ -172,6 +157,30 @@ def grouped_gemma_rmsnorm(
         if isinstance(eps, bool) or not isinstance(eps, Real):
             raise TypeError("eps must be a real scalar")
         eps = float(eps)
+    return eps, num_groups
+
+
+def grouped_gemma_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
+) -> torch.Tensor:
+    """Normalize each group and apply Gemma's ``z + z * weight`` affine.
+
+    ``x`` is a two-dimensional accelerator tensor with unit inner stride;
+    nonnegative row strides, including row gaps, are supported. A contiguous
+    ``weight`` has either ``DIM // num_groups`` elements shared across groups,
+    or ``DIM`` elements. The tensors independently use FP16, BF16, or FP32.
+    Accumulation and affine arithmetic use FP32, then round to ``x.dtype``.
+
+    ``eps`` accepts real scalars, including zero, negative values, NaN, and Inf.
+    These values follow the native FP32 sum/rsqrt expression without clamping;
+    invalid square roots and nonfinite arithmetic can produce NaN or Inf.
+    The result is fresh and contiguous. This is an inference-only forward API;
+    CPU/meta tensors and autograd are not supported.
+    """
+    logger.debug("GEMS GROUPED_GEMMA_RMSNORM")
+
+    eps, num_groups = _validate_grouped_gemma_rmsnorm_inputs(x, weight, eps, num_groups)
+    n, dim = x.shape
     output = x.new_empty((n, dim))
     if n == 0:
         return output
@@ -182,18 +191,15 @@ def grouped_gemma_rmsnorm(
 
         _launch_grouped_gemma_rmsnorm(x, weight, output, eps, num_groups)
         return output
-    if runtime.device.vendor_name == "thead":
-        from flaggems_vllm.runtime.backend._thead.ops.grouped_gemma_rmsnorm import (
-            _launch_grouped_gemma_rmsnorm,
-        )
-
-        _launch_grouped_gemma_rmsnorm(x, weight, output, eps, num_groups)
-        return output
+    x_device = x.device
+    group_dim = dim // num_groups
+    row_stride = x.stride(0)
+    weight_numel = weight.numel()
     # C550 trials favor larger tiles for FP32 prefill; BF16 did not benefit.
     max_block_size = _MAX_BLOCK_SIZE
     if (
         _IS_METAX
-        and x_dtype == torch.float32
+        and x.dtype == torch.float32
         and (n >= _METAX_FP32_PREFILL_MIN_ROWS)
         and (group_dim >= _METAX_FP32_PREFILL_MIN_GROUP_DIM)
     ):

@@ -3,12 +3,19 @@
 
 """Grouped Gemma RMSNorm with runtime strides and epsilon on THead."""
 
+import logging
 from contextlib import nullcontext
 
+import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.ops.qwen4.grouped_gemma_rmsnorm import (
+    _validate_grouped_gemma_rmsnorm_inputs,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit(do_not_specialize=["STRIDE_X", "STRIDE_W", "EPS"])
@@ -62,9 +69,19 @@ def _thead_grouped_gemma_rmsnorm_kernel(
             tl.store(Y + y_base + columns, tl.fma(normalized, weight, normalized), mask)
 
 
-def _launch_grouped_gemma_rmsnorm(x, weight, output, eps, groups):
+def grouped_gemma_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
+) -> torch.Tensor:
+    """Apply grouped Gemma RMSNorm on THead with a fresh contiguous output."""
+    logger.debug("GEMS_THEAD GROUPED_GEMMA_RMSNORM")
+
+    eps, num_groups = _validate_grouped_gemma_rmsnorm_inputs(x, weight, eps, num_groups)
     n, dim = x.shape
-    group_dim = dim // groups
+    output = x.new_empty((n, dim))
+    if n == 0:
+        return output
+
+    group_dim = dim // num_groups
     row_stride = x.stride(0)
     # A single row has no row offset. Reuse the contiguous path even if the
     # unused row stride has padding or would require a 64-bit scalar.
@@ -85,12 +102,13 @@ def _launch_grouped_gemma_rmsnorm(x, weight, output, eps, groups):
             0 if contiguous_rows else row_stride,
             weight_stride,
             eps,
-            groups,
+            num_groups,
             group_dim,
             block_size,
             contiguous_rows,
-            grid=(n * groups,),
+            grid=(n * num_groups,),
             warmup=False,
             num_warps=4,
             num_stages=1,
         )
+    return output
