@@ -30,7 +30,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
     compressor_prepared,
     prepare_compressor_workspace,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._ascend.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
@@ -124,9 +123,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.slot_mapping import (
 from flaggems_vllm.runtime.backend._ascend.ops.sparse_attn_sharedkv import (
     sparse_attn_sharedkv,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention import (
-    sparse_flash_attention,
-)
 from flaggems_vllm.runtime.backend._ascend.ops.swiglu import swiglu
 from flaggems_vllm.runtime.backend._ascend.ops.top_k_per_row_decode import (
     top_k_per_row_decode,
@@ -151,7 +147,6 @@ __all__ = [
     "compressor",
     "compressor_prepared",
     "compute_slot_mapping_parallel",
-    "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
@@ -195,7 +190,6 @@ __all__ = [
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
     "sparse_attn_sharedkv",
-    "sparse_flash_attention",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
     "top_k_per_row_decode",
@@ -205,3 +199,22 @@ __all__ = [
     "triton_ihc_pre",
     "unpack_seq_triton",
 ]
+
+# The standard Triton-Ascend distribution does not ship the optional TLE
+# package. Preserve the common exports when loading this backend on that stack.
+try:
+    import triton.experimental.tle as _tle
+except ModuleNotFoundError as exc:
+    if exc.name not in ("triton.experimental", "triton.experimental.tle"):
+        raise
+    _tle = None
+
+if _tle is not None:
+    from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import (
+        cooperative_topk,
+    )
+    from flaggems_vllm.runtime.backend._ascend.ops.sparse_flash_attention import (
+        sparse_flash_attention,
+    )
+
+    __all__.extend(["cooperative_topk", "sparse_flash_attention"])
