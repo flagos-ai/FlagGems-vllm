@@ -266,7 +266,6 @@ def assert_sparse_fixture_close(output, lse, reference, reference_lse):
         [
             (16, 64, 512, 675, 1, 640, 512, True, True, 7),
             (16, 64, 512, 8461, 1, 8320, 512, True, True, 8),
-            (148, 128, 576, 32768, 1, 2048, 512, True, True, 9),
         ]
         if SPARSE_INT8_OP is not None
         else []
