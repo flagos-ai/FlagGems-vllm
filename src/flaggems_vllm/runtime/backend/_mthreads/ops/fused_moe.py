@@ -3083,8 +3083,19 @@ except ImportError:  # pragma: no cover - older FlagTree builds
 
 
 @triton.jit
-def _tle_gemm_producer(writer, A, B, pm, pn, expert, N, K,
-                       BM: tl.constexpr, BN: tl.constexpr, TK: tl.constexpr):
+def _tle_gemm_producer(
+    writer,
+    A,
+    B,
+    pm,
+    pn,
+    expert,
+    N,
+    K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    TK: tl.constexpr,
+):
     brow = expert * N + pn * BN
     for it in tl.range(0, tl.cdiv(K, TK), num_stages=1):
         slot = writer.acquire(it)
@@ -3094,8 +3105,9 @@ def _tle_gemm_producer(writer, A, B, pm, pn, expert, N, K,
 
 
 @triton.jit
-def _tle_gemm_consumer(reader, C, pm, pn, N, K,
-                       BM: tl.constexpr, BN: tl.constexpr, TK: tl.constexpr):
+def _tle_gemm_consumer(
+    reader, C, pm, pn, N, K, BM: tl.constexpr, BN: tl.constexpr, TK: tl.constexpr
+):
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for it in tl.range(0, tl.cdiv(K, TK), num_stages=1):
         wait = reader.wait(it)
@@ -3109,23 +3121,37 @@ def _tle_gemm_consumer(reader, C, pm, pn, N, K,
 
 
 @triton.jit
-def _tle_grouped_gemm_kernel(A, B, C, mi_ptr, N, K,
-                             BM: tl.constexpr, BN: tl.constexpr,
-                             TK: tl.constexpr, STAGES: tl.constexpr):
+def _tle_grouped_gemm_kernel(
+    A,
+    B,
+    C,
+    mi_ptr,
+    N,
+    K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    TK: tl.constexpr,
+    STAGES: tl.constexpr,
+):
     pid = tl.program_id(0)
     num_n = tl.cdiv(N, BN)
     pm = pid // num_n
     pn = pid % num_n
     expert = tl.load(mi_ptr + pm * BM)
-    a = tle.gpu.alloc((STAGES, BM, TK), tl.bfloat16, scope=tle.gpu.smem,
-                      nv_mma_shared_layout=True)
-    b = tle.gpu.alloc((STAGES, BN, TK), tl.bfloat16, scope=tle.gpu.smem,
-                      nv_mma_shared_layout=True)
+    a = tle.gpu.alloc(
+        (STAGES, BM, TK), tl.bfloat16, scope=tle.gpu.smem, nv_mma_shared_layout=True
+    )
+    b = tle.gpu.alloc(
+        (STAGES, BN, TK), tl.bfloat16, scope=tle.gpu.smem, nv_mma_shared_layout=True
+    )
     pipe = tle.pipe(capacity=STAGES, scope="cta", name="moetle", a=a, b=b)
     tle.gpu.warp_specialize(
         [
             (_tle_gemm_consumer, (pipe.reader(), C, pm, pn, N, K, BM, BN, TK)),
-            (_tle_gemm_producer, (pipe.writer(), A, B, pm, pn, expert, N, K, BM, BN, TK)),
+            (
+                _tle_gemm_producer,
+                (pipe.writer(), A, B, pm, pn, expert, N, K, BM, BN, TK),
+            ),
         ],
         worker_num_warps=[4],
         worker_num_regs=[24],
@@ -3285,7 +3311,9 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
 
     use_tle = _tle_ready(w1, w2, total, H, n_inter)
     if use_tle:
-        _tle_gemm(hidden_perm, w1, gate_up, m_indices, E, total, 2 * n_inter, H, STAGES=3)
+        _tle_gemm(
+            hidden_perm, w1, gate_up, m_indices, E, total, 2 * n_inter, H, STAGES=3
+        )
     else:
         w1t = _dense_transpose_weights(w1)
         g1 = (total // BM) * triton.cdiv(2 * n_inter, 128)
