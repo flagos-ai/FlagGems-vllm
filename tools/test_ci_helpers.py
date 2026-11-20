@@ -81,6 +81,75 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
             ["tests/deep/nested/test_second.py", "tests/test_first.py"],
         )
 
+    def test_nvidia_tuning_changes_select_all_functional_tests(self):
+        self.make_file("tests/test_first.py")
+        self.make_file("tests/deep/nested/test_second.py")
+        self.make_file("benchmark/test_first.py")
+
+        for directory in ("_nvidia", "_nvidia/hopper"):
+            with self.subTest(directory=directory):
+                mode, tests, benchmarks = select_tests.select_targets(
+                    self.repo_root,
+                    [
+                        f"src/flaggems_vllm/runtime/backend/{directory}/tune_configs.yaml"
+                    ],
+                )
+                self.assertEqual(mode, "smoke")
+                self.assertEqual(
+                    tests,
+                    ["tests/deep/nested/test_second.py", "tests/test_first.py"],
+                )
+                self.assertEqual(benchmarks, [])
+
+    def test_benchmark_changes_keep_functional_tests_without_benchmarks(self):
+        cases = (
+            ("deep/nested/test_mul.py", "tests/deep/nested/test_mul.py"),
+            ("test_fused_marlin_moe_w8a16_fp8.py", "tests/test_fused_marlin_moe.py"),
+            ("test_fused_marlin_moe_w8a16_int8.py", "tests/test_fused_marlin_moe.py"),
+        )
+        changed_files = self.repo_root / "changed.txt"
+        for benchmark, target in cases:
+            with self.subTest(benchmark=benchmark):
+                self.make_file(f"benchmark/{benchmark}")
+                self.make_file(target)
+                changed_files.write_text(f"benchmark/{benchmark}\n", encoding="utf-8")
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(select_tests.__file__).resolve()),
+                        "--repo-root",
+                        str(self.repo_root),
+                        "--changed-files",
+                        str(changed_files),
+                        "--no-benchmarks",
+                        "--format",
+                        "json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["mode"], "selected")
+                self.assertEqual(payload["tests"], [target])
+                self.assertEqual(payload["benchmarks"], [])
+
+    def test_docs_and_environment_changes_keep_zero_operator_targets(self):
+        self.make_file("tests/test_mul.py")
+        self.make_file("benchmark/test_mul.py")
+        cases = (
+            ("docs/guide.md", "skip"),
+            ("pyproject.toml", "smoke"),
+            ("src/flaggems_vllm/runtime/backend/_nvidia/__init__.py", "smoke"),
+            ("src/flaggems_vllm/runtime/backend/_metax/tune_configs.yaml", "smoke"),
+        )
+        for path, mode in cases:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    select_tests.select_targets(self.repo_root, [path]),
+                    (mode, [], []),
+                )
+
     def test_backend_operator_change_selects_matching_test(self):
         self.make_file("tests/test_mul.py")
 

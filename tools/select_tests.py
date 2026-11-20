@@ -585,6 +585,16 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
     return matching_targets_for_stem(stem, benchmarks, "benchmark")
 
 
+def tests_for_benchmark(path: str, tests: set[str]) -> list[str]:
+    stem = Path(path).stem.removeprefix("test_")
+    targets = set(matching_targets_for_stem(stem, tests, "tests"))
+    # Reuse existing dependencies when benchmark and functional names differ.
+    for source, benchmarks in EXPLICIT_SOURCE_TO_BENCHMARKS.items():
+        if path in benchmarks:
+            targets.update(tests_for_source(source, tests))
+    return sorted(targets)
+
+
 def is_non_test_change(path: str) -> bool:
     return path in NON_TEST_FILES or path.startswith(NON_TEST_PREFIXES)
 
@@ -635,8 +645,14 @@ def select_targets(
     smoke_required = any(
         triggers_env_smoke_tests(path) for path in normalized_changed_files
     )
+    # Tuning tables change generated kernels, so environment smoke is insufficient.
     full_tests_required = any(
-        path in FULL_TEST_TRIGGER_FILES for path in normalized_changed_files
+        path in FULL_TEST_TRIGGER_FILES
+        or (
+            path.startswith("src/flaggems_vllm/runtime/backend/_nvidia/")
+            and Path(path).name == "tune_configs.yaml"
+        )
+        for path in normalized_changed_files
     )
     full_benchmarks_required = any(
         path in FULL_BENCHMARK_TRIGGER_FILES for path in normalized_changed_files
@@ -648,6 +664,8 @@ def select_targets(
 
         if path.startswith("benchmark/") and Path(path).name.startswith("test_"):
             add_target(benchmark_targets, path, benchmarks)
+            for target in tests_for_benchmark(path, tests):
+                add_target(test_targets, target, tests)
 
         source_tests = tests_for_source(path, tests)
         for target in source_tests:
