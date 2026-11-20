@@ -66,6 +66,26 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
             ("smoke", [], []),
         )
 
+    def test_hopper_w8a8_moe_changes_select_focused_tests(self):
+        targets = [
+            "tests/test_fused_experts_impl.py",
+            "tests/test_fused_moe.py",
+            "tests/test_hopper_w8a8_moe.py",
+        ]
+        for target in [*targets, "tests/test_unrelated.py"]:
+            self.make_file(target)
+
+        mode, tests, _ = select_tests.select_targets(
+            self.repo_root,
+            [
+                "src/flaggems_vllm/ops/fused_moe.py",
+                "src/flaggems_vllm/ops/_hopper_w8a8_moe.py",
+            ],
+        )
+
+        self.assertEqual(mode, "selected")
+        self.assertEqual(tests, targets)
+
     def test_unknown_operator_change_selects_all_tests(self):
         self.make_file("tests/test_first.py")
         self.make_file("tests/deep/nested/test_second.py")

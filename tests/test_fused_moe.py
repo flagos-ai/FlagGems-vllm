@@ -4,12 +4,47 @@ import importlib
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 moe = importlib.import_module("flaggems_vllm.ops.fused_moe")
 pytestmark = [
     pytest.mark.fused_moe,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "name",
+    ["gelu", "swiglustep", "relu2", "silu_no_mul", "gelu_no_mul", "relu2_no_mul"],
+)
+def test_moe_activation_no_torch_fallback(dtype, name):
+    activation = moe.MoEActivation.from_str(name)
+    n = 129
+    # Noncontiguous rows and columns, including a partial final tile.
+    input = torch.randn(
+        (2 * n if activation.is_gated else n, 5), device="cuda", dtype=dtype
+    ).T
+    input[0, :4] = input.new_tensor([-3.0, 0.0, 3.0, float("nan")])
+    output = torch.empty((n, 5), device=input.device, dtype=input.dtype).T
+    before = input.clone()
+    x, up = before.chunk(2, dim=-1) if activation.is_gated else (before, None)
+    if name.startswith("gelu"):
+        expected = F.gelu(x)
+    elif name == "swiglustep":
+        expected = torch.sigmoid(x)
+    elif name == "silu_no_mul":
+        expected = F.silu(x)
+    else:
+        expected = F.relu(x).square()
+    if up is not None:
+        expected = expected * up
+
+    assert moe.apply_moe_activation(activation, output, input) is output
+    # Compare against ATen's dtype rounding, with tolerance for libdevice erf.
+    torch.testing.assert_close(output, expected, equal_nan=True)
+    expected_input = F.relu(before) if name == "relu2_no_mul" else before
+    torch.testing.assert_close(input, expected_input, rtol=0, atol=0, equal_nan=True)
 
 
 def literal_oai(x):
