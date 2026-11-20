@@ -52,7 +52,6 @@ def test_reglu(shape, dtype):
     x1, x2 = input_tensor.chunk(2, dim=-1)
     ref_out = torch.relu(x1) * x2
     ref_out = utils.to_reference(ref_out)
-    with flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.reglu(input_tensor)
+    res_out = flaggems_vllm.reglu(input_tensor)
 
     utils.gems_assert_close(res_out, ref_out, dtype)

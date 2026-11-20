@@ -1,0 +1,238 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 285B 模型算子 Profiling — Benchmark Shapes
+#
+# 采集日期   : 2026-11-16
+# 硬件       : 8×H100 80GB
+# 运行时     : vllm_fl + USE_FLAGGEMS=1（bf16 权重，未量化）
+# 服务配置   : TP=8  max-model-len=40960  max-num-seqs=64
+#              max-num-batched-tokens=8192  util=0.95
+#
+# 采集方法
+#   Profiler   : vLLM --profiler-config (torch profiler, record_shapes=true,
+#                8 个 TP rank 全采)
+#   阶段分离   : 两次独立采集
+#                prefill — 16384 输入 / 8 输出 / 1 请求
+#                decode  — 128 输入 / 1024 输出 / 1 请求
+#   归因方式   : kernel → cudaLaunchKernel correlation → aten cpu_op
+#                (含 Input Dims / Input type)；prefill 覆盖率 22–100%
+#   时间口径   : 8 个 rank 的 kernel 耗时求和；用于相对排序，非验收指标
+#   decode 注意: decode 走 CUDA Graph replay，无 aten 关联；其 shape 由实测
+#                prefill 与模型配置推导，表中已标注
+#
+# 复现命令
+#   vllm serve /models/285b ... --profiler-config \
+#     '{"profiler":"torch","torch_profiler_dir":"/workspace/task/runtime/profiles",
+#       "torch_profiler_record_shapes":true,"max_iterations":20}'
+#   curl -X POST http://127.0.0.1:8015/start_profile -d '{}'
+#   vllm bench serve ... --random-input-len 16384 --random-output-len 8 --num-prompts 1
+#   curl -X POST http://127.0.0.1:8015/stop_profile
+#   python3 /workspace/task/runtime/analyze_final.py
+#   python3 /tmp/gen_deliverable.py
+#
+# FlagGems 命中说明
+#   本轮 FlagGems 实际命中 41 个算子，对应 kernel 在总 GPU 时间中占比约 3–5%
+#   （主要为逐元素/搬运类）。主要耗时在 FlashMLA、MoE GEMM、TP AllReduce、
+#   cuBLAS 线性层，这些不在 FlagGems 接管范围内。
+#   仍走 aten native 的逐元素算子（mul_scalar、memcpy32_post 等）是 FlagGems
+#   可接管但当前未覆盖或未生效的部分，建议重点关注。
+#
+# 收录原则
+#   仅收录 CSV 中有 concrete tensor shape 的行（非 CUDA Graph replay 标注行）。
+#   decode 阶段 shape 在 eager 模式下采集，已折算到各 op shape_tuple 格式。
+#
+# 用法
+#   pytest -q benchmark/test_<op>.py --model-profile \
+#          benchmark/model_shapes/285B.yaml --level core
+#   # --model-profile 会同时 (1) 把 --shape_file 指向此 YAML，
+#   # (2) 把每个 op 的 profiling 块作为 'Time Share' 列显示。
+#   # 只测 YAML 中列出的算子：直接选对应 test_<op>.py 即可。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── FlashMLA 稀疏注意力 ──────────────────────────────────────────────────────
+# prefill 绝对热点；每 CTA 处理一个 KV 块，Q 为 8192 token 一批
+# 优化建议: Q/KV 布局与 CTA 调度；head_dim=576 专用 tile、增大 smem 复用、
+#           减少 KV 重复读取
+flash_mla_sparse_fwd:
+  vllm_api: "_flashmla_C::sparse_prefill_fwd"
+  profiling:
+    prefill:
+      pct: 38.55
+      calls: 12960
+    decode:
+      pct: 8.55
+      calls: 28800
+  shapes:
+    # prefill  bs=1  SQ=8192  HQ=64  DQK=576  SKV=83264  HKV=1  TOPK=2048  DV=512
+    - [8192, 64, 576, 83264, 1, 2048, 512]
+    # decode   bs=128 (CUDA Graph, shapes captured in eager mode)
+    - [128, 64, 576, 83264, 1, 2048, 512]
+  shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
+
+# ── TopK-per-row (prefill) ───────────────────────────────────────────────────
+# 稀疏索引器族合计 14.43%；logits 计算与 per-row TopK 分离，可与 logits 融合减少落盘
+# 优化建议: logits 与 topK 融合，减少中间张量物化；paged 版减少页表间接访问
+top_k_per_row_prefill:
+  vllm_api: "_C::top_k_per_row_prefill"
+  profiling:
+    prefill:
+      pct: 4.33
+      calls: 720
+    decode:
+      pct: 0.0
+      calls: 0
+  shapes:
+    # prefill  num_rows=8192  vocab_size=8192   top_k=2048
+    - [8192, 8192, 2048, 8192, 1]
+    # prefill  num_rows=8192  vocab_size=16384  top_k=2048
+    - [8192, 16384, 2048, 16384, 1]
+  shape_desc: "num_rows, vocab_size, top_k, stride0, stride1"
+
+# ── per-token group FP8 量化 ─────────────────────────────────────────────────
+# 量化与后续 GEMM 可融合，避免独立 kernel 落盘
+# 优化建议: per-token FP8 量化与后续 GEMM 融合，避免单独 kernel
+per_token_group_quant_fp8:
+  vllm_api: "_C::per_token_group_fp8_quant"
+  profiling:
+    prefill:
+      pct: 1.44
+      calls: 3240
+    decode:
+      pct: 0.86
+      calls: 7200
+  shapes:
+    # prefill  all heads flattened: 8192 tokens × 64 heads, d=group_size=128
+    # 524288 = 8192 tokens × 64 heads（对每个 head 独立量化）
+    - [524288, 128, 128]
+  shape_desc: "num_tokens, d, group_size"
+
+# ── Concat MLA Q ─────────────────────────────────────────────────────────────
+# 请求索引转换族合计 prefill 1.11%；concat nope+rope 拼接 Q
+# 优化建议: 按 profiler 数据评估
+concat_mla_q:
+  vllm_api: "_C_cache_ops::concat_mla_q"
+  profiling:
+    prefill:
+      pct: 1.06
+      calls: 3240
+    decode:
+      pct: 0.68
+      calls: 7200
+  shapes:
+    # prefill  tokens=8192  heads=16  nope=512  rope=64
+    - [8192, 16, 512, 64]
+    # decode   tokens=128
+    - [128, 16, 512, 64]
+  shape_desc: "tokens, heads, nope_width, rope_width"
+
+# ── Concat-and-cache MLA ──────────────────────────────────────────────────────
+# 请求索引转换族的 KV 写入部分；prefill/decode 均有调用
+# 优化建议: 按 profiler 数据评估
+concat_and_cache_mla:
+  vllm_api: "_C_cache_ops::concat_and_cache_mla"
+  profiling:
+    prefill:
+      pct: 0.33
+      calls: 3240
+    decode:
+      pct: 0.64
+      calls: 7200
+  shapes:
+    # prefill  tokens=8192  kv_lora_rank=512  rope_dim=64  block_size=64  blocks=1301
+    - [512, 64, 8192, 64, 1301]
+    # decode   tokens=128
+    - [512, 64, 128, 64, 1301]
+  shape_desc: "kv_lora_rank, qk_rope_head_dim, num_tokens, block_size, num_blocks"
+
+# ── Indexer-K quant-and-cache ────────────────────────────────────────────────
+# 稀疏索引器族的 KV 量化写入；decode 相对更热
+# cache_stride=132 → head_dim=128 + head_dim*4/quant_block_size=4 → quant_block_size=128
+# 优化建议: logits 与 topK 融合，减少中间张量物化；paged 版减少页表间接访问
+indexer_k_quant_and_cache:
+  vllm_api: "_C_cache_ops::indexer_k_quant_and_cache"
+  profiling:
+    prefill:
+      pct: 0.14
+      calls: 3240
+    decode:
+      pct: 0.73
+      calls: 7200
+  shapes:
+    # prefill  tokens=8192  blocks=1301  block_size=64  head_dim=128  quant=128
+    - [8192, 1301, 64, 128, 128]
+    # decode   tokens=128
+    - [128, 1301, 64, 128, 128]
+  shape_desc: "num_tokens, num_blocks, block_size, head_dim, quant_block_size"
+
+# ── CP-gather indexer-K quant-cache ──────────────────────────────────────────
+# prefill 时从 KV cache 聚合已量化的 K 块
+# 优化建议: logits 与 topK 融合，减少中间张量物化；paged 版减少页表间接访问
+cp_gather_indexer_k_quant_cache:
+  vllm_api: "_C_cache_ops::cp_gather_indexer_k_quant_cache"
+  profiling:
+    prefill:
+      pct: 0.04
+      calls: 720
+    decode:
+      pct: 0.0
+      calls: 0
+  shapes:
+    # prefill  total_tokens=8192   → batch=1  seq_len=8192  block_size=64
+    - [1, 8192, 64, 128, 128]
+    # prefill  total_tokens=16384  → batch=1  seq_len=16384
+    - [1, 16384, 64, 128, 128]
+  shape_desc: "batch_size, seq_len, block_size, head_dim, quant_block_size"
+
+# ── Fused add-RMSNorm ────────────────────────────────────────────────────────
+# Inductor 融合内核；与相邻算子融合可减少一次显存往返
+# 优化建议: 与相邻算子融合，减少一次读写
+fused_add_rms_norm:
+  vllm_api:
+    - "triton_red_fused_fused_add_rms_norm_moe_forward_shared_0"
+    - "triton_red_fused_fused_add_rms_norm_2"
+    - "triton_red_fused_fused_add_rms_norm_1"
+    - "triton_red_fused_fused_add_rms_norm_0"
+  profiling:
+    prefill:
+      pct: 2.60
+      calls: 4696
+    decode:
+      pct: 0.84
+      calls: 7928
+  shapes:
+    # prefill/decode  num_tokens=8192  hidden_size=4096
+    - [8192, 4096]
+  shape_desc: "num_tokens, hidden_size"
+
+# ── SiLU-and-mul ────────────────────────────────────────────────────────────
+# MoE 专家内部激活；两种专家形态：shared-expert（intermediate=256）和
+# routed-expert（intermediate=2304）
+# 优化建议: 按 profiler 数据评估；可与 MoE GEMM 融合
+silu_and_mul:
+  vllm_api: "SiluAndMul"
+  profiling:
+    prefill:
+      pct: 0.06
+      calls: 720
+    decode:
+      pct: 0.0
+      calls: 0
+  shapes:
+    # shared-expert path:   intermediate_size=256
+    - [8192, 256]
+    # routed-expert path:   intermediate_size=2304
+    - [8192, 2304]
+  shape_desc: "num_tokens, intermediate_size"

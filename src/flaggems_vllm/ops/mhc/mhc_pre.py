@@ -1803,6 +1803,7 @@ class _MhcVariant(enum.IntEnum):
     SPLIT_PASS = 7
     MM_FUSE_TILED = 10
     ASCEND_TILED = 12
+    ASCEND_TLE = 13
     PACKED_READER = 21
 
 
@@ -1825,8 +1826,15 @@ def _mhc_pre_default_variant(num_tokens, hidden_size, hc_hidden_size):
     if _VENDOR == "ascend":
         # Only hc_mult == 4 reaches the dispatch; flagtree crashes on the
         # packed-reader / mm-fuse kernels and mm-fuse-tiled costs ~13us/token.
-        _MHC_PRE_VARIANT_CACHE[key] = _MhcVariant.ASCEND_TILED
-        return _MhcVariant.ASCEND_TILED
+        # TLE (when the Triton build ships it) runs the mix-major layout from
+        # the standalone Ascend operator, measured ~2.3x the tiled epilogue at
+        # 910B4 (the mix stage, 20 Sinkhorn rounds, drops ~12x); without TLE
+        # fall back to the tiled kernels. Neither path clamps: this operator
+        # must keep the reference math, the model-contract clamp belongs to
+        # npu_mhc_pre_clamp_sinkhorn.
+        variant = _MhcVariant.ASCEND_TLE if _HAS_TLE else _MhcVariant.ASCEND_TILED
+        _MHC_PRE_VARIANT_CACHE[key] = variant
+        return variant
 
     reader_ok = (
         num_tokens % 128 == 0
@@ -2036,6 +2044,26 @@ def mhc_pre(
                 TOKEN_TILE=tile7,
                 BLOCK_H=bh7,
             )
+        elif variant == _MhcVariant.ASCEND_TLE:
+
+            # Mix-major TLE path, shared with npu_mhc_pre_clamp_sinkhorn.
+            # ``clamp_logits=False`` keeps this operator's reference math: the
+            # model-contract clamp is opt-in and belongs to the standalone op.
+            _mhc_pre_tle_4(
+                residual_flat,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                clamp_logits=False,
+                post_out=post_mix,
+                comb_out=comb_mix,
+                hin_out=layer_input,
+            )
         elif variant == _MhcVariant.ASCEND_TILED:
 
             # The projection also emits the row sum of squares.
@@ -2210,6 +2238,8 @@ def mhc_pre(
 # Imported last: the hygon companion imports this module's kernels (circular otherwise).
 if _VENDOR == "ascend":
     from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import (
+        _HAS_TLE,
+        _mhc_pre_tle_4,
         mhc_pre_ascend_mix_kernel,
         mhc_pre_ascend_proj_kernel,
         mhc_pre_ascend_reduce_kernel,

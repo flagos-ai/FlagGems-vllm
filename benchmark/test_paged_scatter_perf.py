@@ -76,13 +76,15 @@ class PagedScatterBenchmark(base.Benchmark):
 
 
 def _torch_scatter(cache, slots, values, bs):
-    valid = (slots >= 0) & (slots < cache.shape[0] * bs)
-    safe = torch.where(valid, slots, torch.zeros_like(slots))
-    bids = torch.div(safe, bs, rounding_mode="floor")
-    offs = torch.remainder(safe, bs)
-    sv = torch.where(valid.view(-1, 1), values, cache[0, 0].unsqueeze(0))
+    total = cache.shape[0] if bs == 1 else cache.shape[0] * bs
+    valid = (slots >= 0) & (slots < total)
+    # Select valid rows directly: padding must never race with a real slot zero.
+    selected = slots[valid]
     out = cache.clone()
-    out[bids, offs] = sv.reshape(-1, *cache.shape[2:])
+    if bs == 1:
+        out[selected] = values[valid].reshape(-1, *cache.shape[1:])
+    else:
+        out[selected // bs, selected % bs] = values[valid].reshape(-1, *cache.shape[2:])
     return out
 
 
@@ -96,7 +98,7 @@ def _gems_scatter(cache, slots, values, bs):
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="targets Ascend")
 def test_paged_scatter_perf():
     PagedScatterBenchmark(
-        op_name="paged_scatter",
+        op_name="paged_scatter_triton",
         torch_op=_torch_scatter,
         gems_op=_gems_scatter,
         dtypes=[torch.bfloat16],
