@@ -26,6 +26,22 @@ import yaml
 
 import flaggems_vllm
 
+# ---------------------------------------------------------------------------
+# Device context health tracking
+#
+# A hardware-level kernel fault (e.g. cudaErrorIllegalInstruction on NVIDIA)
+# permanently poisons the device context of the current process.  Every
+# subsequent device call, even a simple torch.randint, then raises, making it
+# look as if hundreds of unrelated tests have failed.
+#
+# _CUDA_CONTEXT_DEAD is set to True the first time a probe through
+# flaggems_vllm.runtime.torch_device_fn fails in pytest_runtest_teardown.
+# pytest_runtest_setup then skips every remaining test so they are reported
+# as "skipped" rather than "failed", keeping the failure list focused on the
+# actual culprit.
+# ---------------------------------------------------------------------------
+_CUDA_CONTEXT_DEAD = False
+
 # On platforms without a native CUDA backend, torchada redirects
 # torch.cuda.* entry points (e.g. torch.cuda.synchronize) to the vendor
 # backend; tests call them directly.
@@ -141,7 +157,48 @@ def pytest_configure(config):
         )
 
 
+def _probe_cuda_context() -> bool:
+    """Return True when the CUDA context is healthy, False when it is dead.
+
+    A hardware-level kernel fault (cudaErrorIllegalInstruction and similar)
+    poisons the device context permanently: every subsequent device call
+    raises. We surface that with a synchronize, the cheapest reliable probe,
+    which needs no device allocation and works even when the allocator is in
+    a bad state. It goes through ``torch_device_fn`` (the vendor's
+    ``torch.cuda`` equivalent) so non-CUDA backends are probed the same way.
+    """
+    torch_device_fn = flaggems_vllm.runtime.torch_device_fn
+    try:
+        if not torch_device_fn.is_available():
+            return True
+        torch_device_fn.synchronize()
+        return True
+    except Exception:
+        return False
+
+
+def pytest_runtest_setup(item):
+    """Stop scheduling tests once the CUDA context has been poisoned.
+
+    Once a kernel faults, the context cannot recover inside this process, so
+    every remaining test would fail with the same AcceleratorError regardless
+    of the operator under test.  Skip them so the failure list reflects only
+    the real culprit.
+    """
+    global _CUDA_CONTEXT_DEAD
+    if _CUDA_CONTEXT_DEAD:
+        pytest.skip("device context poisoned by an earlier test failure")
+
+
 def pytest_runtest_teardown(item, nextitem):
+    global _CUDA_CONTEXT_DEAD
+    if not _CUDA_CONTEXT_DEAD and not _probe_cuda_context():
+        _CUDA_CONTEXT_DEAD = True
+        logging.warning(
+            "device context poisoned after %s, remaining tests will be skipped",
+            item.nodeid,
+        )
+
     if not RECORD_LOG:
         return
 
