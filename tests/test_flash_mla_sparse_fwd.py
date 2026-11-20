@@ -356,9 +356,28 @@ class FlashmlaSparseTestKit:
         return q, kv, indices, attn_sink, topk_length
 
 
+# KV rings of the T-Head TLE kernel (FLAGGEMS_FLASHMLA_SPARSE_PIPE); on other
+# vendors the switch is ignored and the pipe ring is skipped
+RINGS = ["asm", "pipe"]
+
+
+@pytest.fixture(params=RINGS)
+def ring(request, monkeypatch):
+    ring = request.param
+    if ring == "pipe":
+        if flaggems_vllm.vendor_name != "thead":
+            pytest.skip("the tle.pipe ring belongs to the T-Head kernel")
+        from flaggems_vllm.runtime.backend._thead.fused import flashmla_sparse
+
+        if not flashmla_sparse._flash_mla_sparse_tle_enabled("pipe"):
+            pytest.skip("the TLE kernels are disabled or unsupported")
+    monkeypatch.setenv("FLAGGEMS_FLASHMLA_SPARSE_PIPE", "1" if ring == "pipe" else "0")
+    return ring
+
+
 @pytest.mark.flash_mla_sparse_fwd
 @pytest.mark.parametrize("param", FlashmlaSparseTestKit.get_correctness_test_params())
-def test_flashmla_sparse(param):
+def test_flashmla_sparse(param, ring):
     """Sparse MLA forward propagation test"""
     # Skip FlashMLA unsupported cases
     if param.h_q != 64 and param.h_q != 128:
@@ -424,7 +443,7 @@ def test_flashmla_sparse(param):
 @pytest.mark.parametrize(
     "param", FlashmlaSparseTestKit.get_correctness_test_params_flashmla()
 )
-def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
+def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param, ring):
     """Sparse MLA forward propagation test from FlashMLA"""
     # Create input
     q, kv, indices, attn_sink, topk_length = FlashmlaSparseTestKit.make_input_flashmla(
