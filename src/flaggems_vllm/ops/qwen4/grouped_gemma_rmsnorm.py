@@ -182,6 +182,13 @@ def grouped_gemma_rmsnorm(
 
         _launch_grouped_gemma_rmsnorm(x, weight, output, eps, num_groups)
         return output
+    if runtime.device.vendor_name == "thead":
+        from flaggems_vllm.runtime.backend._thead.ops.grouped_gemma_rmsnorm import (
+            _launch_grouped_gemma_rmsnorm,
+        )
+
+        _launch_grouped_gemma_rmsnorm(x, weight, output, eps, num_groups)
+        return output
     # C550 trials favor larger tiles for FP32 prefill; BF16 did not benefit.
     max_block_size = _MAX_BLOCK_SIZE
     if (
