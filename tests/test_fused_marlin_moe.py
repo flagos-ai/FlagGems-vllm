@@ -729,6 +729,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
     [
         (4, 256, 512),
         (1, 1024, 1024),
+        (1, 512, 512),
         (65, 256, 512),
         pytest.param(
             (1, 1024, 128),

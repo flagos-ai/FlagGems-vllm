@@ -102,6 +102,7 @@ from flaggems_vllm.ops.moe_align_block_size import (
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
+from flaggems_vllm.runtime.backend import BackendArchEvent
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
@@ -125,6 +126,9 @@ _SUPPORTED_QUANT_TYPES = (
     _QUANT_TYPE_INT4 | _QUANT_TYPE_INT8 | _QUANT_TYPE_FP4 | {QUANT_TYPE_FP8_E4M3}
 )
 _FULL_HOPPER_MIN_SM_COUNT = 100
+_IS_HOPPER_ARCH = (
+    runtime.device.vendor_name == "nvidia" and BackendArchEvent().arch == "hopper"
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -3793,9 +3797,10 @@ def invoke_fused_moe_full_swiglu(
     down_grid_n_first = num_valid_tokens >= 64
     preweight_intermediate = use_fused_gateup_silu and num_valid_tokens <= 512
 
-    # Tiny FP8 unit-test dimensions can trigger unsupported Hopper codegen.
+    # Hopper's single-stage table supports 512-wide decode; keep smaller tiles out.
+    unified_min_dimension = 512 if _IS_HOPPER_ARCH else 1024
     unified_shape_supported = not quant_config.use_fp8 or (
-        H >= 1024 and intermediate_size >= 1024
+        H >= unified_min_dimension and intermediate_size >= unified_min_dimension
     )
     if num_valid_tokens == 1 and unified_shape_supported:
 
