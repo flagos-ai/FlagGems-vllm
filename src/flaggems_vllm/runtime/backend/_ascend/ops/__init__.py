@@ -97,10 +97,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import (
-    mega_gate,
-    prepare_mega_gate,
-)
+from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import mega_gate
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
@@ -185,7 +182,6 @@ __all__ = [
     "persistent_topk",
     "ple_state_scatter_",
     "prepare_compressor_workspace",
-    "prepare_mega_gate",
     "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",

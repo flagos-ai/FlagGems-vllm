@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused BF16 router projection and expert selection on Ascend."""
+"""Fused router projection and expert selection on Ascend."""
 
 import math
 
@@ -24,15 +24,38 @@ from triton.runtime import driver
 
 
 @triton.jit
+def _promote_activation_kernel(src, dst, count, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(src + offsets, offsets < count, other=0)
+    tl.store(dst + offsets, values.to(tl.float32), offsets < count)
+
+
+def _promote_activation(x, out):
+    count = x.numel()
+    _promote_activation_kernel[(triton.cdiv(count, 2048),)](
+        x,
+        out,
+        count,
+        BLOCK=2048,
+        use_bytecode=False,
+    )
+    return out
+
+
+@triton.jit
 def _mega_gate_kernel(
     x_ptr,
     weight_ptr,
     bias_ptr,
+    input_ids_ptr,
+    table_ptr,
+    vision_bias_ptr,
     workspace_ptr,
     indices_ptr,
     weights_ptr,
     tokens,
     scale,
+    IMAGE_LO: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HIDDEN: tl.constexpr,
     EXPERTS: tl.constexpr,
@@ -65,7 +88,7 @@ def _mega_gate_kernel(
                 other=0,
             )
             b = tl.load(weight_ptr + columns[None, :] * HIDDEN + reduction[:, None])
-            acc = tl.dot(a, b, acc=acc)
+            acc = tl.dot(a, b, acc=acc, input_precision="ieee")
         tl.store(workspace_ptr + rows[:, None] * PAD_EXPERTS + columns[None, :], acc)
 
     # All projection tiles must be visible before a vector worker reads a row.
@@ -82,6 +105,10 @@ def _mega_gate_kernel(
         _route_rows(
             workspace_ptr,
             bias_ptr,
+            input_ids_ptr,
+            table_ptr,
+            vision_bias_ptr,
+            IMAGE_LO,
             indices_ptr,
             weights_ptr,
             rows,
@@ -132,6 +159,10 @@ def _mask_unselected_groups(
 def _route_rows(
     workspace_ptr,
     bias_ptr,
+    input_ids_ptr,
+    table_ptr,
+    vision_bias_ptr,
+    IMAGE_LO: tl.constexpr,
     indices_ptr,
     weights_ptr,
     rows,
@@ -177,32 +208,59 @@ def _route_rows(
     else:
         exp_logits = tl.exp(logits - tl.max(logits, axis=1)[:, None])
         raw_scores = exp_logits / tl.sum(exp_logits, axis=1)[:, None]
-    ranking = raw_scores
-    if HAS_BIAS:
-        if PAD_EXPERTS == EXPERTS:
-            bias = tl.load(bias_ptr + columns)
-        else:
-            bias = tl.load(bias_ptr + columns, columns < EXPERTS, other=0)
-        ranking = ranking + bias[None, :]
-    if PAD_EXPERTS != EXPERTS:
-        ranking = tl.where(columns[None, :] < EXPERTS, ranking, -float("inf"))
-    if TOP_GROUPS < GROUPS:
-        ranking = _mask_unselected_groups(ranking, ROWS, EXPERTS, GROUPS, TOP_GROUPS)
-
     slots = tl.arange(0, BLOCK_TOPK)
     indices = tl.full((ROWS, BLOCK_TOPK), 0, tl.int32)
-    if KEEP_SELECTED_LOGITS:
-        selected_logits = tl.full((ROWS, BLOCK_TOPK), 0.0, tl.float32)
-    for slot in tl.static_range(TOPK):
-        if KEEP_SELECTED_LOGITS:
-            value, winner = tl.max(ranking, axis=1, return_indices=True)
-            selected_logits = tl.where(
-                slots[None, :] == slot, value[:, None], selected_logits
+    if input_ids_ptr is not None:
+        token_ids = tl.load(input_ids_ptr + rows, rows < tokens, other=0)
+        # The V4 router maps sequence-parallel padding (-1) to token zero.
+        token_ids = tl.where(token_ids == -1, 0, token_ids)
+    if vision_bias_ptr is not None:
+        image = (token_ids >= IMAGE_LO) & (token_ids < IMAGE_LO + 5)
+    if table_ptr is None or vision_bias_ptr is not None:
+        ranking = raw_scores
+        if HAS_BIAS:
+            if PAD_EXPERTS == EXPERTS:
+                bias = tl.load(bias_ptr + columns)
+            else:
+                bias = tl.load(bias_ptr + columns, columns < EXPERTS, other=0)
+            ranking = ranking + bias[None, :]
+        if vision_bias_ptr is not None:
+            vision_bias = tl.load(vision_bias_ptr + columns, columns < EXPERTS, other=0)
+            ranking = tl.where(
+                image[:, None], raw_scores + vision_bias[None, :], ranking
             )
-        else:
-            winner = tl.argmax(ranking, axis=1, tie_break_left=True)
-        ranking = tl.where(columns[None, :] == winner[:, None], -float("inf"), ranking)
-        indices = tl.where(slots[None, :] == slot, winner[:, None], indices)
+        if PAD_EXPERTS != EXPERTS:
+            ranking = tl.where(columns[None, :] < EXPERTS, ranking, -float("inf"))
+        if TOP_GROUPS < GROUPS:
+            ranking = _mask_unselected_groups(
+                ranking, ROWS, EXPERTS, GROUPS, TOP_GROUPS
+            )
+
+        if KEEP_SELECTED_LOGITS:
+            selected_logits = tl.full((ROWS, BLOCK_TOPK), 0.0, tl.float32)
+        for slot in tl.static_range(TOPK):
+            if KEEP_SELECTED_LOGITS:
+                value, winner = tl.max(ranking, axis=1, return_indices=True)
+                selected_logits = tl.where(
+                    slots[None, :] == slot, value[:, None], selected_logits
+                )
+            else:
+                winner = tl.argmax(ranking, axis=1, tie_break_left=True)
+            ranking = tl.where(
+                columns[None, :] == winner[:, None], -float("inf"), ranking
+            )
+            indices = tl.where(slots[None, :] == slot, winner[:, None], indices)
+
+    if table_ptr is not None:
+        lookup_row = rows < tokens
+        if vision_bias_ptr is not None:
+            lookup_row &= ~image
+        lookup_ids = tl.load(
+            table_ptr + token_ids[:, None].to(tl.int64) * TOPK + slots[None, :],
+            lookup_row[:, None] & (slots[None, :] < TOPK),
+            other=0,
+        ).to(tl.int32)
+        indices = tl.where(lookup_row[:, None], lookup_ids, indices)
 
     if KEEP_SELECTED_LOGITS:
         weights = selected_logits
@@ -216,7 +274,7 @@ def _route_rows(
 
     output = rows[:, None] * TOPK + slots[None, :]
     mask = (rows[:, None] < tokens) & (slots[None, :] < TOPK)
-    tl.store(indices_ptr + output, indices.to(tl.int64), mask)
+    tl.store(indices_ptr + output, indices, mask)
     tl.store(weights_ptr + output, weights * (scale / (total[:, None] + 1e-20)), mask)
 
 
@@ -230,16 +288,50 @@ def _validate_gate_tensors(x, weight, bias):
     device = x.device
     assert (
         weight.device == device
-        and x.dtype == weight.dtype == torch.bfloat16
+        and x.dtype in (torch.bfloat16, torch.float32)
+        and (weight.dtype == torch.float32 or weight.dtype == x.dtype)
         and x.is_contiguous()
         and weight.is_contiguous()
-    ), "x and weight must be contiguous BF16 on the same NPU"
+    ), "x and weight must be contiguous BF16 or FP32 on the same NPU, with FP32 weights for FP32 x"
     assert bias is None or (
         bias.shape == (weight.shape[0],)
         and bias.dtype == torch.float32
         and bias.device == device
         and bias.is_contiguous()
     ), "bias must be contiguous FP32 [E] on the same NPU"
+
+
+def _validate_v4_inputs(x, weight, input_ids, tid2eid, bias_vl, config):
+    topk, scoring, groups, top_groups, _, image_lo = config
+    if tid2eid is None and bias_vl is None:
+        assert input_ids is None, "input_ids require hash or vision routing"
+        return
+    assert (
+        scoring == "sqrtsoftplus" and groups == top_groups == 1
+    ), "V4 routing requires flat sqrtsoftplus"
+    assert input_ids is not None and (
+        input_ids.shape == (x.shape[0],)
+        and input_ids.dtype in (torch.int32, torch.int64)
+        and input_ids.device == x.device
+        and input_ids.is_contiguous()
+    ), "input_ids must be contiguous integer [T] on the same NPU"
+    if tid2eid is not None:
+        assert (
+            tid2eid.ndim == 2
+            and tid2eid.shape[0] > 0
+            and tid2eid.shape[1] == topk
+            and tid2eid.dtype in (torch.int32, torch.int64)
+            and tid2eid.device == x.device
+            and tid2eid.is_contiguous()
+        ), "tid2eid must be contiguous integer [vocab, K] on the same NPU"
+    if bias_vl is not None:
+        assert type(image_lo) is int and image_lo >= 0, "invalid image_sentinel_lo"
+        assert (
+            bias_vl.shape == (weight.shape[0],)
+            and bias_vl.dtype == torch.float32
+            and bias_vl.device == x.device
+            and bias_vl.is_contiguous()
+        ), "bias_vl must be contiguous FP32 [E] on the same NPU"
 
 
 def _validate_gate(x, weight, bias, topk, scoring, groups, top_groups, scale):
@@ -274,7 +366,9 @@ def _validate_gate(x, weight, bias, topk, scoring, groups, top_groups, scale):
     _validate_gate_tensors(x, weight, bias)
 
 
-def _gate_launch_args(x, weight, bias, topk, scoring, groups, top_groups):
+def _gate_launch_args(
+    x, weight, bias, topk, scoring, groups, top_groups, routing_inputs
+):
     tokens, hidden = x.shape
     experts = weight.shape[0]
     has_bias = bias is not None
@@ -286,7 +380,7 @@ def _gate_launch_args(x, weight, bias, topk, scoring, groups, top_groups):
     # enough rows to distribute at least four tiles.
     wide_projection = experts >= 512 and tokens >= 4 * 128
     wide_row_tiles = triton.cdiv(tokens, 128)
-    weight_bytes = hidden * experts * 2  # BF16
+    weight_bytes = hidden * experts * weight.element_size()
     # The small weight footprint can be reused across a wider row tile.
     long_narrow_projection = (
         rank_logits
@@ -340,6 +434,8 @@ def _gate_launch_args(x, weight, bias, topk, scoring, groups, top_groups):
             block_k = min(512, block_k)
     else:
         block_k = 512
+    if weight.dtype == torch.float32:
+        block_k = min(block_k, 32768 // block_n, 256)
     block_k = min(block_k, hidden & -hidden)
     if row_tiles == 1:
         route_rows = min(4, triton.next_power_of_2(tokens))
@@ -380,6 +476,13 @@ def _gate_launch_args(x, weight, bias, topk, scoring, groups, top_groups):
             < triton.cdiv(rows_per_vector, route_rows) * route_rows
         ):
             route_rows = half_rows
+    _, table, vision_bias = routing_inputs
+    if table is not None or vision_bias is not None:
+        # Additional per-row indirect loads and vision rankings share the AIV
+        # local buffer. The combined route needs room for both live sets.
+        max_rows = 2 if table is not None and vision_bias is not None else 4
+        route_rows = min(route_rows, max_rows, max(1, 1024 // padded_experts))
+        use_both_subcores = triton.cdiv(tokens, route_rows) > workers
     compile_options = {}
     if short_projection:
         compile_options["multibuffer"] = False
@@ -416,32 +519,38 @@ def _gate_launch_args(x, weight, bias, topk, scoring, groups, top_groups):
 
 
 class _PreparedMegaGate:
-    def __init__(self, x, weight, bias, config):
-        topk, scoring, groups, top_groups, scale = config
+    def __init__(self, x, weight, bias, routing_inputs, config):
+        topk, scoring, groups, top_groups, scale, image_lo = config
         tokens = x.shape[0]
         self.config = config
         self.x_shape = x.shape
         self.weight_shape = weight.shape
-        self.has_bias = bias is not None
+        tensors = (x, weight, bias, *routing_inputs)
+        self.dtypes = tuple(t.dtype if t is not None else None for t in tensors)
         self.device = x.device
         self.stream = driver.active.get_current_stream(x.device.index)
         self.aligned_inputs = tuple(
-            tensor is not None and tensor.data_ptr() % 16 == 0
-            for tensor in (x, weight, bias)
+            tensor is not None and tensor.data_ptr() % 16 == 0 for tensor in tensors
         )
+        self.fp32_input = None
         self.launcher = None
         if tokens == 0:
             return
+        if x.dtype != weight.dtype:
+            self.fp32_input = torch.empty_like(x, dtype=torch.float32)
+            x = _promote_activation(x, self.fp32_input)
         grid, self.workspace, options = _gate_launch_args(
-            x, weight, bias, topk, scoring, groups, top_groups
+            x, weight, bias, topk, scoring, groups, top_groups, routing_inputs
         )
+        options["IMAGE_LO"] = image_lo
         # FlagTree warmup accepts output dtypes as aligned placeholder tensors.
         warmup_args = (
             x,
             weight,
             bias,
+            *routing_inputs,
             self.workspace,
-            torch.int64,
+            _index_dtype(weight),
             torch.float32,
             tokens,
             scale,
@@ -457,17 +566,19 @@ class _PreparedMegaGate:
         )
         self.launcher = compiled[grid + (1, 1)]
 
-    def run(self, x, weight, bias, config):
+    def run(self, x, weight, bias, routing_inputs, config):
         assert config == self.config, "MegaGate routing parameters differ from prepare"
         assert (
             x.shape == self.x_shape
             and weight.shape == self.weight_shape
             and x.device == self.device
         ), "MegaGate inputs differ from the prepared shape or device"
+        tensors = (x, weight, bias, *routing_inputs)
         assert (
-            bias is not None
-        ) == self.has_bias, "MegaGate bias presence differs from prepare"
+            tuple(t.dtype if t is not None else None for t in tensors) == self.dtypes
+        ), "MegaGate input dtypes or routing mode differ from prepare"
         _validate_gate_tensors(x, weight, bias)
+        _validate_v4_inputs(x, weight, *routing_inputs, config)
         active_driver = driver.active
         device = active_driver.get_current_device()
         assert (
@@ -479,14 +590,17 @@ class _PreparedMegaGate:
         # The compiled kernel may specialize on 16-byte pointer alignment.
         assert all(
             not aligned or tensor.data_ptr() % 16 == 0
-            for aligned, tensor in zip(self.aligned_inputs, (x, weight, bias))
+            for aligned, tensor in zip(self.aligned_inputs, tensors)
         ), "MegaGate input alignment differs from prepare"
-        ids, weights = _gate_outputs(x, config[0])
+        ids, weights = _gate_outputs(x, weight, config[0])
         if self.launcher is not None:
+            if self.fp32_input is not None:
+                x = _promote_activation(x, self.fp32_input)
             self.launcher(
                 x,
                 weight,
                 bias,
+                *routing_inputs,
                 self.workspace,
                 ids,
                 weights,
@@ -496,10 +610,15 @@ class _PreparedMegaGate:
         return ids, weights
 
 
-def _gate_outputs(x, topk):
+def _index_dtype(weight):
+    # V4 returns int32 by default. Preserve the original BF16 interface.
+    return torch.int32 if weight.dtype == torch.float32 else torch.int64
+
+
+def _gate_outputs(x, weight, topk):
     shape = (x.shape[0], topk)
     return (
-        torch.empty(shape, dtype=torch.int64, device=x.device),
+        torch.empty(shape, dtype=_index_dtype(weight), device=x.device),
         torch.empty(shape, dtype=torch.float32, device=x.device),
     )
 
@@ -514,6 +633,10 @@ def prepare_mega_gate(
     groups: int = 1,
     top_groups: int = 1,
     scale: float = 1.5,
+    input_ids: torch.Tensor | None = None,
+    tid2eid: torch.Tensor | None = None,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 129257,
 ) -> _PreparedMegaGate:
     """Prepare one shape and routing configuration on the current NPU stream.
 
@@ -530,9 +653,10 @@ def prepare_mega_gate(
     assert (
         not torch.npu.is_current_stream_capturing()
     ), "Prepare MegaGate before capturing a graph"
-    return _PreparedMegaGate(
-        x, weight, bias, (topk, scoring, groups, top_groups, scale)
-    )
+    config = (topk, scoring, groups, top_groups, scale, image_sentinel_lo)
+    routing_inputs = (input_ids, tid2eid, bias_vl)
+    _validate_v4_inputs(x, weight, *routing_inputs, config)
+    return _PreparedMegaGate(x, weight, bias, routing_inputs, config)
 
 
 def mega_gate(
@@ -545,9 +669,19 @@ def mega_gate(
     groups: int = 1,
     top_groups: int = 1,
     scale: float = 1.5,
+    input_ids: torch.Tensor | None = None,
+    tid2eid: torch.Tensor | None = None,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 129257,
     prepared: _PreparedMegaGate | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return int64 expert IDs and FP32 weights from contiguous BF16 router inputs.
+    """Return expert IDs (int32 for V4) and FP32 routing weights.
+
+    V4 projects FP32 activations (or promotes a BF16 activation) with FP32
+    router weights. Pass row-aligned input_ids and a [vocab, topk] tid2eid
+    table for hash layers. Text IDs index valid table rows containing expert
+    IDs in [0, E). With bias_vl, the five image sentinels use dynamic TopK.
+    Input tensors use contiguous ND storage.
 
     Supports sqrtsoftplus, sigmoid and softmax with optional grouped selection.
     Bias changes expert selection while the weights use the unbiased scores.
@@ -557,19 +691,34 @@ def mega_gate(
         prepared, _PreparedMegaGate
     ), "Invalid prepared MegaGate handle"
     _validate_routing_sizes(topk, groups, top_groups)
+    config = (topk, scoring, groups, top_groups, scale, image_sentinel_lo)
+    routing_inputs = (input_ids, tid2eid, bias_vl)
     if prepared is not None:
-        return prepared.run(x, weight, bias, (topk, scoring, groups, top_groups, scale))
+        return prepared.run(x, weight, bias, routing_inputs, config)
+    _validate_v4_inputs(x, weight, *routing_inputs, config)
     _validate_gate(x, weight, bias, topk, scoring, groups, top_groups, scale)
     tokens = x.shape[0]
     assert (
         not tokens or driver.active.get_current_device() == x.device.index
     ), "Run MegaGate on the input device"
-    indices, weights = _gate_outputs(x, topk)
+    indices, weights = _gate_outputs(x, weight, topk)
     if tokens:
+        if x.dtype != weight.dtype:
+            x = _promote_activation(x, torch.empty_like(x, dtype=torch.float32))
         grid, workspace, options = _gate_launch_args(
-            x, weight, bias, topk, scoring, groups, top_groups
+            x, weight, bias, topk, scoring, groups, top_groups, routing_inputs
         )
         _mega_gate_kernel[grid](
-            x, weight, bias, workspace, indices, weights, tokens, scale, **options
+            x,
+            weight,
+            bias,
+            *routing_inputs,
+            workspace,
+            indices,
+            weights,
+            tokens,
+            scale,
+            IMAGE_LO=image_sentinel_lo,
+            **options,
         )
     return indices, weights
