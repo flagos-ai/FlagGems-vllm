@@ -45,6 +45,8 @@ apply_logit_bias: test_logit_bias
 apply_min_p: test_min_p
 apply_thinking_budget: test_thinking_budget
 flash_attn_varlen_opt_func: test_flash_attn_varlen_func
+flash_topk_decode: test_flash_topk
+flash_topk_prefill: test_flash_topk
 megamoe_int8: test_megamoe
 moe_align_block_size_triton: test_moe_align_block_size
 pad_indexer_heads: test_pad_indexer_heads
