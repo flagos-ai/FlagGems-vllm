@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Use --mode cudagraph for ACL Graph or --mode operator for synchronized eager."""
+"""Use --mode cudagraph for ACL Graph or --mode operator for eager with a reusable context."""
 
 from dataclasses import asdict
 from functools import partial
@@ -59,11 +59,8 @@ def test_mega_mhc_latency(case):
     calls = {name: partial(op, *inputs) for name, op, _ in mhc_operations(case)}
     baseline = next(iter(calls))
     if mode == BenchMode.OPERATOR:
-        eps = mhc_eps(case)
-        context = flaggems_vllm.create_mega_mhc_context(*inputs, rms_eps=eps)
-        calls["prepared"] = partial(
-            flaggems_vllm.mega_mhc, *inputs, rms_eps=eps, context=context
-        )
+        context = flaggems_vllm.create_mega_mhc_context(*inputs, rms_eps=mhc_eps(case))
+        calls["candidate"] = partial(calls["candidate"], context=context)
         for call in calls.values():
             call()  # Exclude initialization and JIT from eager calibration.
         torch.npu.synchronize()
@@ -102,9 +99,7 @@ def test_mega_mhc_latency(case):
         result.update(
             warmup_ms=config.warm_up,
             repetition_ms=config.repetition,
-            speedup_host={
-                name: us[baseline] / us[name] for name in ("candidate", "prepared")
-            },
+            speedup_host=us[baseline] / us["candidate"],
         )
     else:
         result["speedup"] = us[baseline] / us["candidate"]
