@@ -95,7 +95,8 @@ reciprocal(float) __asm("llvm.mxc.rcp.f32");
 #define FMLA_PIPELINE_ROPE 0
 #endif
 namespace {
-#if defined(FMLA_SPARSE_RAW) && defined(FMLA_SCALE_TABLE) && HEADS == 32 && FMLA_NO_ROPE && FMLA_SPLITS == 1
+#if defined(FMLA_SPARSE_RAW) && defined(FMLA_SCALE_TABLE) && HEADS == 32 && \
+    FMLA_SPLITS == 1 && (FMLA_NO_ROPE || FMLA_CAP == 2048)
 #define FMLA_EARLY_SCALE 1
 #else
 #define FMLA_EARLY_SCALE 0
@@ -171,7 +172,9 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #endif
   const int allheads = hq * sq;
   // The aligned raw path has no per-query length, so all capacity slots are visited.
-  const int length = fixed_h16 ? FMLA_CAP : uniform(input<int>(lp)[batch * ls]);
+  const int length = fixed_h16 || (!FMLA_NO_ROPE && FMLA_EARLY_SCALE)
+                         ? FMLA_CAP
+                         : uniform(input<int>(lp)[batch * ls]);
   const int pages = (length + 63) / 64, begin = pages * split / splits,
             end = pages * (split + 1) / splits;
   const int bound = causal ? max(length - sq + head / hq + 1, 0) : length;
@@ -306,7 +309,7 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #define FMLA_DEFER_NORMALIZATION 0
 #endif
 #if defined(FMLA_SPARSE_RAW)
-  constexpr bool prefetch_k = HEADS == 32 && FMLA_NO_ROPE;
+  constexpr bool prefetch_k = HEADS == 32 && (FMLA_NO_ROPE || FMLA_EARLY_SCALE);
 #else
   constexpr bool prefetch_k = false;
 #endif
@@ -466,8 +469,9 @@ mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
 #else
         scales[n][j] = valid ? weight : 0.f;
 #endif
-        probability[n][j] = valid ? (float)content[n][j] * qs * weight * scale_log2
-                                  : -INFINITY;
+        probability[n][j] =
+            valid ? ((float)content[n][j] + rope[n][j]) * qs * weight * scale_log2
+                  : -INFINITY;
         local_max = fmaxf(local_max, probability[n][j]);
       }
 #else

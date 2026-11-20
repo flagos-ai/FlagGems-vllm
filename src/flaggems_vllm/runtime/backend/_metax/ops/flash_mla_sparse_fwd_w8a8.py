@@ -726,7 +726,10 @@ class SmallKernel:
             _bsm_offset_kernel()
             if heads == 32
             and handle.uses_raw_indices
-            and handle.tensors[1].shape[-1] == 0
+            and (
+                handle.tensors[1].shape[-1] == 0
+                or "SelectedScales" in handle.kernel_arguments
+            )
             and torch.cuda.get_device_properties(handle.tensors[0].device).name
             == "MetaX C550"
             else small_native
@@ -1092,7 +1095,7 @@ class SparseMLAInt8PreparedHandle:
     """Reuse workspace; calls must be serialized on one stream. Indices may change."""
 
     def __init__(
-        self, tensors: tuple[torch.Tensor, ...], lengths, sink, out, scale, fused_large
+        self, tensors: tuple[torch.Tensor, ...], lengths, sink, out, scale, single_split
     ):
         q, qr, kv, kr, qs, ks, indices = tensors
         self.batch, self.queries, self.heads, _ = q.shape
@@ -1143,13 +1146,13 @@ class SparseMLAInt8PreparedHandle:
                     uses_raw_indices=self.uses_raw_indices,
                     fp32_output=sink is not None,
                 )
-            elif rows <= 32 or fused_large:
+            elif rows <= 32 or single_split:
                 route = _c550_small_route(
                     rows, self.heads, self.capacity, qr, self.uses_raw_indices
                 )
                 prefetch_scales = route == "prefetch_scales"
-                if rows > LARGE_BATCH_ROWS:
-                    # Large batches already fill the device without split workspace.
+                if single_split:
+                    # Each CTA completes its output tile without writing split partials.
                     tile, splits = 32, 1
                 elif self.heads == 64 and self.capacity >= 4096:
                     tile = 32
@@ -1209,9 +1212,12 @@ class SparseMLAInt8PreparedHandle:
                 self.native.grid = (triton.cdiv(self.heads, tile), rows, splits)
                 if (
                     self.uses_raw_indices
-                    and qr.shape[-1] == 0
                     and (
-                        rows > LARGE_BATCH_ROWS
+                        qr.shape[-1] == 0
+                        or (single_split and self.heads == 64 and self.capacity == 2048)
+                    )
+                    and (
+                        single_split
                         or prefetch_scales
                         or (rows <= 32 and self.heads == 64 and self.capacity >= 4096)
                     )
@@ -1420,14 +1426,19 @@ def _prepare_flash_mla_sparse_fwd_w8a8(
         and rows * capacity * max(heads, 1) < 2**30
         and cached_workspace <= 8 * 1024**3
     )
-    # Use the single-split kernel's RoPE path when cached scores would exceed
-    # the workspace or indexing limit. Each CTA finishes its own query tile.
-    fused_large = (
+    # Fusing QK and PV reuses the gathered K tile and avoids cached-score traffic.
+    aligned_rope = (
+        heads == 64
+        and q_rope.shape[-1] == 64
+        and indices.shape[-1] == 2048
+        and topk_length is None
+    )
+    single_split = (rows > 32 and aligned_rope) or (
         rows > LARGE_BATCH_ROWS
         and heads >= 64
         and (q_rope.shape[-1] == 0 or not cached_fits)
     )
-    if fused_large:
+    if single_split:
         output_bytes = 6 if attn_sink is not None else 2
         fits = rows * (capacity * 4 + heads * (512 * output_bytes + 4)) <= 8 * 1024**3
     else:
@@ -1437,7 +1448,7 @@ def _prepare_flash_mla_sparse_fwd_w8a8(
             "native sparse workspace exceeds its indexing or 8 GiB budget"
         )
     handle = SparseMLAInt8PreparedHandle(
-        tensors, topk_length, attn_sink, out, scale, fused_large
+        tensors, topk_length, attn_sink, out, scale, single_split
     )
     return handle, handle()
 

@@ -457,9 +457,14 @@ def test_sparse_rope_at_cached_index_limit(monkeypatch):
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @requires_int8_mla
-@pytest.mark.parametrize("batch, topk", [(8, 4096), (16, 640), (257, 4096)])
-def test_sparse_raw_selected_partitions(batch, topk):
-    inputs = make_int8_inputs(batch, 1, 64, topk, pages=max(32, topk // 32), rope_dim=0)
+@pytest.mark.parametrize(
+    "batch, topk, rope_dim",
+    [(8, 4096, 0), (16, 640, 0), (257, 4096, 0), (64, 2048, 64)],
+)
+def test_sparse_raw_selected_partitions(batch, topk, rope_dim):
+    inputs = make_int8_inputs(
+        batch, 1, 64, topk, pages=max(32, topk // 32), rope_dim=rope_dim
+    )
     indices = inputs[-1]
     indices[0].fill_(-1)
     indices[1, :, :-64].fill_(-1)
