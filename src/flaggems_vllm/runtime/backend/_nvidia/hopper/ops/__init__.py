@@ -29,3 +29,13 @@ if _triton_version_utils.has_triton_tle(3, 6, 0):
     )
 
     __all__.append("megamoe_fp8")
+
+if _triton_version_utils.has_triton_tle_attrs(
+    ("gpu.alloc", "gpu.wgmma", "gpu.wgmma_wait"), 3, 6, 0
+):
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_topk import (  # noqa: F401
+        flash_topk_decode,
+        flash_topk_prefill,
+    )
+
+    __all__.extend(("flash_topk_decode", "flash_topk_prefill"))

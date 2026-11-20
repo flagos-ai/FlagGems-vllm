@@ -808,6 +808,32 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: flash_topk_decode
+  description: Paged H64 FP8 score and exact FP32 top-2048 for packed vLLM decode.
+  for:
+  - None
+  labels:
+  - fused
+  - NoCPU
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: flash_topk_prefill
+  description: Paged H64 FP8 score and exact FP32 top-2048 for a vLLM prefill chunk.
+  for:
+  - None
+  labels:
+  - fused
+  - NoCPU
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: fp8_einsum
   description: 'Block-scaled bhr,hdr->bhd contraction. Precisions: FP8 (NVIDIA Hopper,
 

@@ -305,6 +305,7 @@ def _cooperative_topk_impl(
     small_max_rows=64,
     wide_kernel=None,
     wide_max_width=2147483647,
+    max_rows=64,
 ):
     """Implementation shared by the generic and vendor-specialized entrypoints.
 
@@ -342,9 +343,9 @@ def _cooperative_topk_impl(
     if logits.ndim != 2:
         raise ValueError("logits must have shape [rows, width]")
     rows, width = logits.shape
-    if not isinstance(k, int) or k not in (512, 1024, 2048) or rows > 64:
+    if not isinstance(k, int) or k not in (512, 1024, 2048) or rows > max_rows:
         raise NotImplementedError(
-            "cooperative_topk requires k in {512, 1024, 2048} and rows <= 64"
+            f"cooperative_topk requires k in {{512, 1024, 2048}} and rows <= {max_rows}"
         )
     if width > 2147483647:
         raise NotImplementedError(

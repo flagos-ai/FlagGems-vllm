@@ -22,6 +22,7 @@ from importlib.metadata import version as _metadata_version
 from flaggems_vllm import testing  # noqa: F401
 from flaggems_vllm import runtime
 from flaggems_vllm.ops import *  # noqa: F401,F403
+from flaggems_vllm.ops.flash_topk import flash_topk_workspace_specs
 from flaggems_vllm.runtime.symm_mem import (
     disable_symm_mem,
     enable_symm_mem,
@@ -51,7 +52,10 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 __all__ = [
     "disable_symm_mem",
     "enable_symm_mem",
-    "SUPPORTED_FP8_DTYPE",
+    "flash_topk_decode",
+    "flash_topk_prefill",
+    "flash_topk_workspace_specs",
     "gumbel_sample",
+    "SUPPORTED_FP8_DTYPE",
     "use_symm_mem",
 ]
