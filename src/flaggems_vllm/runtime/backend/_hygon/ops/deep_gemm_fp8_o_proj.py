@@ -133,7 +133,7 @@ def _tile(m):
     if m <= 64:
         return 64, 128, 4, 2, 8, 128, 1
     if m <= 128:
-        return 128, 128, 8, 1, 8, 128, 1
+        return 128, 128, 8, 1, 8, 128, 2
     # 128x128 with unroll 4 wins every m >= 256 bucket once the scales are
     # block-major: 0.098 vs 0.100 ms at 256 tokens, 0.173 vs 0.182 at 512 and
     # 1.049 vs 1.058 at 4096 (263 vs 260 TFLOPS).
