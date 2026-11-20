@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TLE-tiled implementation of the vLLM GPU bad-words operator."""
+"""Tiled implementation of the vLLM GPU bad-words operator."""
 
 import torch
 import triton
@@ -19,27 +19,6 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
-
-try:
-    import triton.experimental.tle.language as tle
-
-    HAS_TLE = hasattr(tle, "load")
-except ImportError:  # pragma: no cover - depends on the Triton distribution
-    tle = None
-    HAS_TLE = False
-
-
-if HAS_TLE:
-
-    @triton.jit
-    def _bad_words_load(ptr, mask=None, other=None):
-        return tle.load(ptr, mask=mask, other=other)
-
-else:
-
-    @triton.jit
-    def _bad_words_load(ptr, mask=None, other=None):
-        return tl.load(ptr, mask=mask, other=other)
 
 
 @libentry()
@@ -75,8 +54,8 @@ def _bad_words_kernel(
     token_idx = tl.program_id(0).to(tl.int64)
     bad_word_tile_idx = tl.program_id(1).to(tl.int64)
 
-    req_state_idx = _bad_words_load(expanded_idx_mapping_ptr + token_idx)
-    num_bad_words = _bad_words_load(num_bad_words_ptr + req_state_idx)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+    num_bad_words = tl.load(num_bad_words_ptr + req_state_idx)
 
     bad_word_idx = bad_word_tile_idx * BAD_WORDS_TILE + tl.arange(0, BAD_WORDS_TILE)
     active_word = bad_word_idx < num_bad_words
@@ -87,12 +66,12 @@ def _bad_words_kernel(
     tokens_base = (
         bad_word_token_ids_ptr + req_state_idx.to(tl.int64) * bad_word_token_ids_stride
     )
-    start = _bad_words_load(
+    start = tl.load(
         offsets_base + bad_word_idx,
         mask=active_word,
         other=0,
     )
-    end = _bad_words_load(
+    end = tl.load(
         offsets_base + bad_word_idx + 1,
         mask=active_word,
         other=0,
@@ -101,7 +80,7 @@ def _bad_words_kernel(
     prefix_len = bad_word_len - 1
 
     valid_word = active_word & (bad_word_len > 0)
-    last_token = _bad_words_load(
+    last_token = tl.load(
         tokens_base + end - 1,
         mask=valid_word,
         other=0,
@@ -119,10 +98,10 @@ def _bad_words_kernel(
     else:
         matches = valid_word
 
-    pos = _bad_words_load(expanded_local_pos_ptr + token_idx)
+    pos = tl.load(expanded_local_pos_ptr + token_idx)
     cur_req_first_pos = token_idx - pos.to(tl.int64)
-    prompt_len = _bad_words_load(prompt_len_ptr + req_state_idx)
-    total_len = _bad_words_load(total_len_ptr + req_state_idx)
+    prompt_len = tl.load(prompt_len_ptr + req_state_idx)
+    total_len = tl.load(total_len_ptr + req_state_idx)
     output_len = total_len - prompt_len
     effective_len = output_len + pos
     output_base = (
@@ -139,20 +118,20 @@ def _bad_words_kernel(
         short_offset = short_lane
         short_mask = matches[:, None] & (short_offset < prefix_len[:, None])
 
-        short_expected = _bad_words_load(
+        short_expected = tl.load(
             tokens_base + start[:, None] + short_offset,
             mask=short_mask,
             other=0,
         )
         short_actual_pos = effective_len - prefix_len[:, None] + short_offset
         short_from_spec = short_actual_pos >= output_len
-        short_committed = _bad_words_load(
+        short_committed = tl.load(
             output_base + short_actual_pos,
             mask=short_mask & ~short_from_spec,
             other=0,
         )
         short_spec_offset = short_actual_pos - output_len
-        short_speculative = _bad_words_load(
+        short_speculative = tl.load(
             input_ids_ptr + cur_req_first_pos + short_spec_offset + 1,
             mask=short_mask & short_from_spec,
             other=0,
@@ -182,7 +161,7 @@ def _bad_words_kernel(
                 long_offset = prefix_base + long_lane
                 long_mask = matches[:, None] & (long_offset < prefix_len[:, None])
 
-            long_expected = _bad_words_load(
+            long_expected = tl.load(
                 tokens_base + start[:, None] + long_offset,
                 mask=long_mask,
                 other=0,
@@ -191,13 +170,13 @@ def _bad_words_kernel(
             long_actual_pos = effective_len - prefix_len[:, None] + long_offset
             long_from_spec = long_actual_pos >= output_len
 
-            long_committed = _bad_words_load(
+            long_committed = tl.load(
                 output_base + long_actual_pos,
                 mask=long_mask & ~long_from_spec,
                 other=0,
             )
             long_spec_offset = long_actual_pos - output_len
-            long_speculative = _bad_words_load(
+            long_speculative = tl.load(
                 input_ids_ptr + cur_req_first_pos + long_spec_offset + 1,
                 mask=long_mask & long_from_spec,
                 other=0,
@@ -233,7 +212,7 @@ def apply_bad_words(
     expanded_local_pos: torch.Tensor,
     max_num_bad_words: int,
 ) -> None:
-    """Apply vLLM bad-word masking with a TLE-tiled Triton kernel."""
+    """Apply vLLM bad-word masking with a tiled Triton kernel."""
     num_tokens = logits.shape[0]
     if num_tokens == 0 or max_num_bad_words == 0:
         return

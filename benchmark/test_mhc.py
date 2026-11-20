@@ -506,7 +506,7 @@ def test_mhc_post():
 class MHCPreBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "N, hidden_size"
 
-    def __init__(self, *args, hc_mult=4, sinkhorn_repeat=10, **kwargs):
+    def __init__(self, *args, hc_mult=4, sinkhorn_repeat=20, **kwargs):
         self.hc_mult = hc_mult
         self.sinkhorn_repeat = sinkhorn_repeat
         super().__init__(*args, **kwargs)

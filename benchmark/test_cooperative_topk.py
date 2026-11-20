@@ -21,9 +21,9 @@ from . import base
 pytestmark = [
     pytest.mark.cooperative_topk,
     pytest.mark.skipif(
-        flaggems_vllm.device not in ("cuda", "npu")
+        flaggems_vllm.device not in ("cuda", "musa", "npu")
         or not flaggems_vllm.runtime.torch_device_fn.is_available(),
-        reason="CUDA or NPU device required",
+        reason="CUDA, MUSA or NPU device required",
     ),
 ]
 
