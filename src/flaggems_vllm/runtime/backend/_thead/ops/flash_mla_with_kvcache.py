@@ -59,20 +59,7 @@ def _usable():
 
         if runtime.device.vendor_name != "thead":
             return False
-        is_tle_supported = getattr(tle_api, "is_tle_supported", None)
-        if is_tle_supported is not None:
-            return is_tle_supported(_PRIMITIVES)
-        # FlagTree before the is_tle_supported/require_tle rework asked per
-        # primitive and per backend, and named the backend after the package
-        # the active driver comes from, since GPUTarget.backend reads "cuda"
-        # on this device.
-        import triton
-
-        backend = type(triton.runtime.driver.active).__module__.split(".")[2]
-        return all(
-            tle_api.is_primitive_supported(backend, primitive)
-            for primitive in _PRIMITIVES
-        )
+        return tle_api.is_tle_supported(_PRIMITIVES)
     except Exception:
         return False
 
