@@ -32,6 +32,7 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import device as _device
 from flaggems_vllm.runtime import get_tuned_config
+from flaggems_vllm.utils import libentry
 
 _MHC_PRE_MIX_PAD = tl.constexpr(32)
 
@@ -2253,3 +2254,6 @@ elif _VENDOR == "hygon":
     from flaggems_vllm.runtime.backend._hygon.ops import mhc_pre as _HYGON
 
     _HYGON.install_fastlaunch(globals(), _HYGON.KERNELS)
+elif _VENDOR == "nvidia":
+    mhc_pre_packed_reader_kernel = libentry()(mhc_pre_packed_reader_kernel)
+    mhc_pre_sinkhorn_fuse_kernel = libentry()(mhc_pre_sinkhorn_fuse_kernel)
