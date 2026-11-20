@@ -142,23 +142,28 @@ def make_sparse_inputs(shape, dtype=torch.bfloat16):
     return q, kv, indices, 0.5, d_v, attn_sink, topk_length
 
 
+def _pack_sparse_qkv(q, kv, *, power_of_two=False):
+    pages = math.ceil(kv.shape[0] / 64)
+    if kv.shape[0] % 64:
+        cache = kv.new_zeros((pages * 64, *kv.shape[1:]))
+        cache[: kv.shape[0]].copy_(kv)
+        kv = cache
+    q_nope, q_rope, q_scale, _ = quantize_dense_fp8(
+        q[:, None], dequantize=False, power_of_two=power_of_two
+    )
+    k_nope, k_rope, k_scale, _ = quantize_dense_fp8(
+        kv.view(pages, 64, *kv.shape[1:]), dequantize=False, power_of_two=power_of_two
+    )
+    return q_nope, q_rope, k_nope, k_rope, q_scale, k_scale
+
+
 def quantize_sparse_fp8_fixture(
     q, kv, indices, sm_scale, value_dim, attn_sink=None, topk_length=None
 ):
     if value_dim != 512:
         raise ValueError("FP8 sparse MLA requires value_dim=512")
-    q_nope, q_rope, q_scale, _ = quantize_dense_fp8(q, dequantize=False)
-    pages = math.ceil(kv.shape[0] / 64)
-    cache = torch.zeros((pages * 64, kv.shape[-1]), dtype=kv.dtype, device=kv.device)
-    cache[: kv.shape[0]].copy_(kv[:, 0])
-    k_nope, k_rope, k_scale, _ = quantize_dense_fp8(cache, dequantize=False)
     return (
-        q_nope[:, None],
-        q_rope[:, None],
-        k_nope.view(pages, 64, 512),
-        k_rope.view(pages, 64, q_rope.shape[-1]),
-        q_scale[:, None],
-        k_scale.view(pages, 64, 1),
+        *_pack_sparse_qkv(q, kv[:, 0]),
         torch.where((indices >= 0) & (indices < kv.shape[0]), indices, -1),
         sm_scale,
         attn_sink,
@@ -193,51 +198,22 @@ def dequantize_sparse_rows(content, rope, scale):
     return values * scale
 
 
-def _mthreads_quantize(tensor, *, dequantize=True):
-    scale = (
-        tensor[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448.0
-    )
-    scale = torch.exp2(torch.ceil(torch.log2(scale)))
-    content = (tensor[..., :512].float() / scale).to(torch.float8_e4m3fn)
-    rope = (tensor[..., 512:].float() / scale).to(torch.bfloat16)
-    if not dequantize:
-        return content, rope, scale
-    native = torch.empty(tensor.shape, dtype=torch.bfloat16, device=tensor.device)
-    row_elements = math.prod(tensor.shape[1:-1]) * 512
-    chunk = max(1, (1 << 23) // max(1, row_elements))
-    for first in range(0, tensor.shape[0], chunk):
-        last = min(first + chunk, tensor.shape[0])
-        native[first:last] = dequantize_sparse_rows(
-            content[first:last], rope[first:last], scale[first:last]
-        ).to(torch.bfloat16)
-    return content, rope, scale, native
-
-
 def make_mthreads_sparse_inputs(batch, heads, topk, tokens, dtype, rope_dim, seed):
-    pages = math.ceil(tokens / 64)
     shape = (batch, heads, 576, tokens, 1, topk, 512, False, False, seed)
     query, cache, indices, *_ = make_sparse_inputs(shape)
-    q, qr, qs, native_q = _mthreads_quantize(query.view(batch, 1, heads, 576))
-    if tokens % 64:
-        padded = torch.zeros(
-            (pages * 64, 1, 576), dtype=cache.dtype, device=cache.device
-        )
-        padded[:tokens].copy_(cache)
-        cache = padded
-    kv, kr, ks = _mthreads_quantize(cache.view(pages, 64, 1, 576), dequantize=False)
-    if rope_dim == 0:
-        qr, kr = qr[..., :0].contiguous(), kr[..., :0].contiguous()
-        native_q = native_q[..., :512].contiguous()
-    inputs = [
-        q,
-        qr.to(dtype),
-        kv,
-        kr.to(dtype),
-        qs,
-        ks,
-        indices.view(batch, 1, topk),
-    ]
-    return inputs, native_q
+    width = 512 + rope_dim
+    q, qr, kv, kr, qs, ks = _pack_sparse_qkv(
+        query[..., :width], cache[..., :width], power_of_two=True
+    )
+    native_q = torch.empty(
+        (*q.shape[:-1], width), dtype=torch.bfloat16, device=q.device
+    )
+    # Keep FP8 casts within the muDNN unary datacast launch limit.
+    chunk = max(1, (1 << 23) // max(1, heads * 512))
+    for first in range(0, batch, chunk):
+        rows = slice(first, first + chunk)
+        native_q[rows] = dequantize_sparse_rows(q[rows], qr[rows], qs[rows])
+    return [q, qr.to(dtype), kv, kr.to(dtype), qs, ks, indices], native_q
 
 
 def mthreads_sparse_reference(

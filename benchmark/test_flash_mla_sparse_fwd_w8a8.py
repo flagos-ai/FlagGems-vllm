@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -33,7 +32,6 @@ from tests.test_flash_mla_sparse_fwd_w8a8 import (
 )
 
 from . import base
-from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 
 def prepare_mate_baseline(inputs, query, *, attn_sink=None, topk_length=None):
@@ -161,8 +159,8 @@ def prepare_mate_baseline(inputs, query, *, attn_sink=None, topk_length=None):
     return run
 
 
-class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
-    RECORD_PARALLEL_RESULTS = True
+class FlashmlaSparseBenchmark(base.Benchmark):
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
 
     def __init__(self):
         super().__init__(
@@ -200,43 +198,32 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             yield inputs, packed, shape
 
     def set_shapes(self, shape_file_path):
-        super().set_shapes(shape_file_path)
-        if (
-            MTHREADS_FP8_MLA
-            and Path(shape_file_path).resolve()
-            == Path(__file__).with_name("core_shapes.yaml").resolve()
+        if MTHREADS_FP8_MLA and Path(shape_file_path).resolve() == Path(
+            self.DEFAULT_SHAPE_FILES
         ):
-            # GLM-5.2 V32 batches, ordered by FlagOSTune call count (7173d21a).
-            batches = (64, 193, 449, 4033, 16384, 512, 3586, 132, 1280, 2048)
-            self.shapes.extend(
-                (batch, 64, 576, 361344, 1, 2048, 512, False, False, seed)
-                for seed, batch in enumerate(batches, start=len(self.shapes))
+            shape_file_path = (
+                Path(__file__).resolve().parents[1]
+                / "src/flaggems_vllm/runtime/backend/_mthreads/core_shapes.yaml"
             )
+        super().set_shapes(shape_file_path)
 
     def _get_mthreads_inputs(self, dtype):
-        def shape_key(shape):
-            _, heads, dims, tokens, h_kv, topk, value_dim = shape[:7]
-            if len(shape) not in (7, 10) or h_kv != 1 or value_dim != 512:
+        for shape in self.shapes:
+            if len(shape) not in (7, 10):
+                raise ValueError(
+                    "MThreads sparse FP8 MLA requires 7 or 10 shape fields"
+                )
+            batch, heads, dims, tokens, h_kv, topk, value_dim = shape[:7]
+            if h_kv != 1 or value_dim != 512:
                 raise ValueError(
                     "MThreads sparse FP8 MLA requires one KV head and DV=512"
                 )
             if dims not in (512, 576):
                 raise ValueError("MThreads sparse FP8 MLA requires DQK=512 or 576")
-            return heads, dims, tokens, topk, shape[9] if len(shape) == 10 else 42
-
-        @lru_cache(maxsize=3)
-        def fixture(key):
-            heads, dims, tokens, topk, seed = key
-            batch = max(shape[0] for shape in self.shapes if shape_key(shape) == key)
-            return make_mthreads_sparse_inputs(
+            seed = shape[9] if len(shape) == 10 else 42
+            packed, query = make_mthreads_sparse_inputs(
                 batch, heads, topk, tokens, dtype, dims - 512, seed
             )
-
-        for shape in self.shapes:
-            batch = shape[0]
-            heads, _, _, topk, _ = key = shape_key(shape)
-            full, query = fixture(key)
-            packed = [t[:batch] if i in (0, 1, 4, 6) else t for i, t in enumerate(full)]
             sink, length = shape[7:9] if len(shape) == 10 else (False, False)
             attn_sink = (
                 torch.randn(heads, device=query.device, dtype=torch.float32)
@@ -257,7 +244,7 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             )
             gems, actual = self.gems_op(*packed, **kwargs)
             assert_mthreads_sparse_accuracy(actual, expected, output_atol=2e-3)
-            native = self.torch_op(packed, query[:batch], **kwargs)
+            native = self.torch_op(packed, query, **kwargs)
             assert_mthreads_sparse_accuracy(native(), expected, output_atol=2e-3)
             yield native, gems, shape
 

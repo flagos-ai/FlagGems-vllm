@@ -43,6 +43,7 @@ from benchmark.consts import (
 )
 
 from . import consts
+from .test_flash_mla_sparse_fwd_w8a8 import HAS_FP8_MLA, FlashmlaSparseBenchmark
 from .test_w8a8_block_matmul import (
     VLLM_W8A8_BLOCK_FP8_AVAILABLE,
     VLLM_W8A8_BLOCK_INT8_AVAILABLE,
@@ -861,6 +862,18 @@ class ParallelBenchmarkMixin:
             if os.environ.get(PARALLEL_RESULT_FILE_ENV):
                 with open(os.environ[PARALLEL_RESULT_FILE_ENV], "wb") as result_file:
                     pickle.dump(result, result_file)
+
+
+class ParallelFlashmlaSparseBenchmark(ParallelBenchmarkMixin, FlashmlaSparseBenchmark):
+    RECORD_PARALLEL_RESULTS = True
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not HAS_FP8_MLA, reason="Sparse FP8 MLA backend is unavailable")
+def test_perf_flash_mla_sparse_fwd_w8a8_parallel():
+    if not Config.parallel and not os.environ.get(PARALLEL_WORKER_ENV):
+        pytest.skip("Requires --parallel N")
+    ParallelFlashmlaSparseBenchmark().run()
 
 
 class ParallelBlasBenchmark(ParallelBenchmarkMixin, BlasBenchmark):

@@ -1046,6 +1046,15 @@ def collect_v32_tail_denominator(Denominators, Stats, split, write=True):
 
 
 @triton.jit
+def _mixed_v32_tail_span(
+    tail_slot, SPLITS: tl.constexpr, CHUNK: tl.constexpr, FULL_ROWS: tl.constexpr
+):
+    row = FULL_ROWS + tail_slot // SPLITS
+    start = (tail_slot % SPLITS) * CHUNK
+    return row, start, start + CHUNK
+
+
+@triton.jit
 def mixed_v32_span(
     slot,
     TOPK: tl.constexpr,
@@ -1054,11 +1063,15 @@ def mixed_v32_span(
     FULL_ROWS: tl.constexpr,
 ):
     full = slot < FULL_ROWS
-    tail_slot = tl.maximum(slot - FULL_ROWS, 0)
-    row = tl.where(full, slot, FULL_ROWS + tail_slot // SPLITS)
-    start = tl.where(full, 0, tail_slot % SPLITS) * CHUNK
-    end = tl.where(full, TOPK, start + CHUNK)
-    return row, full, start, end
+    row, start, end = _mixed_v32_tail_span(
+        tl.maximum(slot - FULL_ROWS, 0), SPLITS, CHUNK, FULL_ROWS
+    )
+    return (
+        tl.where(full, slot, row),
+        full,
+        tl.where(full, 0, start),
+        tl.where(full, TOPK, end),
+    )
 
 
 def group_short_pages(
@@ -2136,9 +2149,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     rows, topk = q.shape[0], indices.shape[-1]
     if any(t.data_ptr() % 16 for t in (q, kv, qs, ks, indices, output, lse)):
         return None
-    fixed_pv = _MIXED_PV_SUPPORTED.value and (
-        topk >= 256 or (topk == 128 and rows >= 128)
-    )
+    fixed_pv = _MIXED_PV_SUPPORTED.value and topk >= 256
     if (
         fixed_pv
         and rows == 16
@@ -2153,11 +2164,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
         if staged is not None:
             return staged
     pages = triton.cdiv(topk, 128)
-    direct = _MIXED_PV_SUPPORTED.value and (
-        64 < topk <= 128 and not (topk == 128 and rows >= 128)
-    )
-    if rows > 16 and not direct:
-        return None
+    direct = _MIXED_PV_SUPPORTED.value and 64 < topk <= 128
     persistent = direct or (fixed_pv and topk >= 512)
     single_split = persistent and rows == 16 and topk == 640
     can_prefetch = False
@@ -2165,8 +2172,7 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
         if topk == 128 and rows < 16:
             heads, warps = 16, 8
         else:
-            heads = 64 if rows > 16 else 32
-            warps = 16 if heads == 64 or topk == 128 else 8
+            heads, warps = 32, 16 if topk == 128 else 8
         splits = 1
         programs, groups = rows, None
     elif persistent:
@@ -2256,8 +2262,8 @@ def prepare_short_pipeline(q, kv, qs, ks, indices, output, lse, scale, combine, 
     else:
         kernel_function = fixed_scale_sparse_fp8 if fixed_pv else short_sparse_fp8
         grid = (rows, 64 // heads, splits)
-    # Single-split CTAs can repair their own head group before writing.
-    repairs = (repair, None) if (direct and rows <= 16) or single_split else (None,)
+    # The 16-head K128 tile needs a separate launch for deterministic FP32 repair.
+    repairs = (repair, None) if (direct and heads == 32) or single_split else (None,)
     for direct_repair in repairs:
         kernel_args = (
             arguments + (direct_repair, can_prefetch) if persistent else arguments
@@ -4531,13 +4537,11 @@ def v32_consume(
                     row = split_index
                     start: tl.constexpr = 0
                     end: tl.constexpr = TOPK
-                    pages: tl.constexpr = TOPK // BN
                 else:
-                    tail_slot = split_index - FULL_ROWS
-                    row = FULL_ROWS + tail_slot // SPLITS
-                    start = (tail_slot % SPLITS) * CHUNK
-                    end = start + CHUNK
-                    pages: tl.constexpr = CHUNK // BN
+                    row, start, end = _mixed_v32_tail_span(
+                        split_index - FULL_ROWS, SPLITS, CHUNK, FULL_ROWS
+                    )
+                pages: tl.constexpr = (TOPK if full_row else CHUNK) // BN
             else:
                 split_index, row, full_row, start, end, pages = pipeline_plan(
                     TOPK, SPLITS, CHUNK, BN, FULL_ROWS
@@ -4654,13 +4658,11 @@ def load_pages(
                     row = split_index
                     start: tl.constexpr = 0
                     end: tl.constexpr = TOPK
-                    pages: tl.constexpr = TOPK // BN
                 else:
-                    tail_slot = split_index - FULL_ROWS
-                    row = FULL_ROWS + tail_slot // SPLITS
-                    start = (tail_slot % SPLITS) * CHUNK
-                    end = start + CHUNK
-                    pages: tl.constexpr = CHUNK // BN
+                    row, start, end = _mixed_v32_tail_span(
+                        split_index - FULL_ROWS, SPLITS, CHUNK, FULL_ROWS
+                    )
+                pages: tl.constexpr = (TOPK if full_row else CHUNK) // BN
             else:
                 split_index, row, full_row, start, end, pages = pipeline_plan(
                     TOPK, SPLITS, CHUNK, BN, FULL_ROWS
@@ -4861,13 +4863,11 @@ def produce_preloaded(
                     row = split_index
                     start: tl.constexpr = 0
                     end: tl.constexpr = TOPK
-                    pages: tl.constexpr = TOPK // BN
                 else:
-                    tail_slot = split_index - FULL_ROWS
-                    row = FULL_ROWS + tail_slot // SPLITS
-                    start = (tail_slot % SPLITS) * CHUNK
-                    end = start + CHUNK
-                    pages: tl.constexpr = CHUNK // BN
+                    row, start, end = _mixed_v32_tail_span(
+                        split_index - FULL_ROWS, SPLITS, CHUNK, FULL_ROWS
+                    )
+                pages: tl.constexpr = (TOPK if full_row else CHUNK) // BN
             else:
                 split_index, row, full_row, start, end, pages = pipeline_plan(
                     TOPK, SPLITS, CHUNK, BN, FULL_ROWS
@@ -7517,6 +7517,50 @@ def _compact_v32_repair(
 
 
 @triton.jit
+def _repair_model1_row(
+    Q,
+    KV,
+    QS,
+    KS,
+    Indices,
+    Output,
+    LSE,
+    row,
+    K: tl.constexpr,
+    TOKENS: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    _sparse_fp8_row(
+        Q,
+        None,
+        KV,
+        None,
+        QS,
+        KS,
+        Indices,
+        None,
+        None,
+        None,
+        Output,
+        LSE,
+        None,
+        row,
+        64,
+        1,
+        K,
+        TOKENS,
+        0,
+        SCALE,
+        False,
+        False,
+        1,
+        tl.cdiv(K, 64) * 64,
+        32,
+        64,
+    )
+
+
+@triton.jit
 def compact_sparse_fp8(
     Q,
     KV,
@@ -7541,33 +7585,8 @@ def compact_sparse_fp8(
         first = tl.min(tl.where(active, positions, ROWS), 0)
         while first < ROWS:
             row = first.to(tl.int64)
-            _sparse_fp8_row(
-                Q,
-                None,
-                KV,
-                None,
-                QS,
-                KS,
-                Indices,
-                None,
-                None,
-                None,
-                Output,
-                LSE,
-                None,
-                row,
-                64,
-                1,
-                K,
-                TOKENS,
-                0,
-                SCALE,
-                False,
-                False,
-                1,
-                tl.cdiv(K, 64) * 64,
-                32,
-                64,
+            _repair_model1_row(
+                Q, KV, QS, KS, Indices, Output, LSE, row, K, TOKENS, SCALE
             )
             active = active & (positions > first)
             first = tl.min(tl.where(active, positions, ROWS), 0)
@@ -7575,33 +7594,8 @@ def compact_sparse_fp8(
         count = tl.load(BadCount)
         for request in range(tl.program_id(0), count, tl.num_programs(0)):
             row = tl.load(BadRows + request).to(tl.int64)
-            _sparse_fp8_row(
-                Q,
-                None,
-                KV,
-                None,
-                QS,
-                KS,
-                Indices,
-                None,
-                None,
-                None,
-                Output,
-                LSE,
-                None,
-                row,
-                64,
-                1,
-                K,
-                TOKENS,
-                0,
-                SCALE,
-                False,
-                False,
-                1,
-                tl.cdiv(K, 64) * 64,
-                32,
-                64,
+            _repair_model1_row(
+                Q, KV, QS, KS, Indices, Output, LSE, row, K, TOKENS, SCALE
             )
 
 
@@ -7687,64 +7681,17 @@ def flagged_sparse_fp8(
     Flags,
     Output,
     LSE,
-    ROWS: tl.constexpr,
     K: tl.constexpr,
     TOKENS: tl.constexpr,
     SCALE: tl.constexpr,
     FLAGS_PER_ROW: tl.constexpr,
     BLOCK_FLAGS: tl.constexpr,
 ):
-    # Check a block of flags at once for the large single-page path.
-    SCAN_ROWS: tl.constexpr = 32 if ROWS >= 128 and FLAGS_PER_ROW == 1 else 1
+    row = tl.program_id(0).to(tl.int64)
     columns = tl.arange(0, BLOCK_FLAGS)
-    for first in range(
-        tl.program_id(0) * SCAN_ROWS, ROWS, tl.num_programs(0) * SCAN_ROWS
-    ):
-        if SCAN_ROWS > 1:
-            positions = first + tl.arange(0, SCAN_ROWS)
-            active = tl.load(Flags + positions, positions < ROWS, 0) != 0
-            request = tl.min(tl.where(active, positions, ROWS), 0)
-        else:
-            flags = tl.load(
-                Flags + first * FLAGS_PER_ROW + columns, columns < FLAGS_PER_ROW, 0
-            )
-            request = tl.where(tl.max(flags, 0) != 0, first, ROWS)
-        while request < ROWS:
-            row = request.to(tl.int64)
-            _sparse_fp8_row(
-                Q,
-                None,
-                KV,
-                None,
-                QS,
-                KS,
-                Indices,
-                None,
-                None,
-                None,
-                Output,
-                LSE,
-                None,
-                row,
-                64,
-                1,
-                K,
-                TOKENS,
-                0,
-                SCALE,
-                False,
-                False,
-                1,
-                tl.cdiv(K, 64) * 64,
-                32,
-                64,
-            )
-            if SCAN_ROWS > 1:
-                request = tl.min(
-                    tl.where(active & (positions > request), positions, ROWS), 0
-                )
-            else:
-                request = ROWS
+    flags = tl.load(Flags + row * FLAGS_PER_ROW + columns, columns < FLAGS_PER_ROW, 0)
+    if tl.max(flags, 0) != 0:
+        _repair_model1_row(Q, KV, QS, KS, Indices, Output, LSE, row, K, TOKENS, SCALE)
 
 
 def prepare_flash_mla_sparse_fwd_w8a8(
@@ -7880,10 +7827,9 @@ def prepare_flash_mla_sparse_fwd_w8a8(
     lse = torch.empty(
         (batch, heads, queries), dtype=torch.float32, device=q_nope.device
     )
-    large_single_page = rows >= 128 and topk == 128
     if (
         HAS_MODEL1_PIPELINE
-        and (0 < rows <= 16 or large_single_page)
+        and 0 < rows <= 16
         and queries == 1
         and heads == 64
         and q_rope.shape[-1] == 0
@@ -7917,7 +7863,6 @@ def prepare_flash_mla_sparse_fwd_w8a8(
                     flags,
                     output,
                     lse,
-                    rows,
                     topk,
                     k_nope.shape[0] * 64,
                     scale,
@@ -7925,15 +7870,7 @@ def prepare_flash_mla_sparse_fwd_w8a8(
                     triton.next_power_of_2(flags.shape[1]),
                 )
                 with runtime.torch_device_fn.device(q_nope.device):
-                    programs = rows
-                    if large_single_page:
-                        programs = min(
-                            rows,
-                            runtime.torch_device_fn.get_device_properties(
-                                q_nope.device
-                            ).multi_processor_count,
-                        )
-                    grid = (programs, 2, 1)
+                    grid = (rows, 2, 1)
                     fallback = flagged_sparse_fp8.warmup(
                         *fallback_args, num_warps=4, num_stages=1, grid=grid
                     )
