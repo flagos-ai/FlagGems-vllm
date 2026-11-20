@@ -52,6 +52,7 @@ def _mhc_post_tile(
     H_TILES: tl.constexpr,
     BF16_CUBE: tl.constexpr,
     ALIGNED_ROWS: tl.constexpr,
+    write_current=True,
 ):
     live = None if ALIGNED_ROWS else rows[:, None] < tokens
     x = _mhc_load(x_ptr + rows[:, None] * HIDDEN + columns[None, :], live)
@@ -78,9 +79,10 @@ def _mhc_post_tile(
     if BF16_CUBE:
         tl.store(current_ptr + offsets, value, cube_mask)
     else:
-        tl.store(
-            current_ptr + offsets, value, None if ALIGNED_ROWS else live[:, :, None]
-        )
+        if write_current:
+            tl.store(
+                current_ptr + offsets, value, None if ALIGNED_ROWS else live[:, :, None]
+            )
         tl.store(cube_input_ptr + offsets, rounded, cube_mask)
     squares = tl.sum(tl.sum(rounded * rounded, 2), 1)
     tl.store(
@@ -97,6 +99,8 @@ def _mhc_project_tile(
     projection_ptr,
     rows,
     tokens,
+    head_start,
+    SPLIT_HEADS: tl.constexpr,
     HIDDEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -105,8 +109,8 @@ def _mhc_project_tile(
 ):
     width: tl.constexpr = 4 * HIDDEN
     chunks: tl.constexpr = width // BLOCK_K
-    block_n: tl.constexpr = 64 if BF16_CUBE else 32
-    channels = tl.arange(0, block_n)
+    block_n: tl.constexpr = 16 if SPLIT_HEADS else 64 if BF16_CUBE else 32
+    channels = head_start + tl.arange(0, block_n)
     lanes = tl.arange(0, BLOCK_K)
     acc = tl.full((BLOCK_M, block_n), 0.0, tl.float32)
     for chunk in range(chunks):
@@ -125,7 +129,12 @@ def _mhc_project_tile(
             residual = tl.load(
                 cube_input_ptr + residual_offsets, rows[:, None] < tokens, other=0
             )
-            weight = tl.load(fn_ptr + weight_offsets, channels[None, :] < 24, other=0)
+            if SPLIT_HEADS:
+                weight = tl.load(fn_ptr + weight_offsets)
+            else:
+                weight = tl.load(
+                    fn_ptr + weight_offsets, channels[None, :] < 24, other=0
+                )
         if BF16_CUBE:
             acc = tl.dot(residual, weight, acc=acc)
         else:
@@ -388,6 +397,7 @@ def _mhc_post_range(
     POST_H: tl.constexpr,
     BF16_CUBE: tl.constexpr,
     ALIGNED_ROWS: tl.constexpr,
+    write_current=True,
 ):
     h_tiles: tl.constexpr = HIDDEN // POST_H
     for task in range(start, end, step):
@@ -411,6 +421,7 @@ def _mhc_post_range(
             h_tiles,
             BF16_CUBE,
             ALIGNED_ROWS,
+            write_current,
         )
 
 
@@ -436,6 +447,8 @@ def _mega_mhc_kernel(
     packed_fn_ptr,
     tokens,
     rms_eps,
+    SPLIT_HEADS: tl.constexpr,
+    DIRECT_PIPELINE: tl.constexpr,
     HIDDEN: tl.constexpr,
     H_PAD: tl.constexpr,
     SHIFTED: tl.constexpr,
@@ -457,10 +470,21 @@ def _mega_mhc_kernel(
     SPLIT_VECTOR_TAIL: tl.constexpr,
     SHARE_RMS: tl.constexpr,
 ):
-    pipelined: tl.constexpr = BF16_CUBE and EXPLICIT_VECTOR
+    pipelined: tl.constexpr = EXPLICIT_VECTOR and (BF16_CUBE or DIRECT_PIPELINE)
     early_rms: tl.constexpr = SHIFTED and not pipelined and EXPLICIT_VECTOR
     worker = tl.program_id(0)
     workers = tl.num_programs(0)
+    head_start = 0
+    if SPLIT_HEADS:
+        # Each pair stages one copy of the token. The two 16-head projections
+        # cover the independent pre/post and Sinkhorn outputs, respectively.
+        group = worker
+        cube_input_ptr += group * 4 * HIDDEN
+        stats_ptr += group * (HIDDEN // POST_H)
+        projection_ptr += group * 32
+        head_start = group * 8
+        worker = 0
+        workers = 1
     if EXPLICIT_VECTOR:
         # Each Vector subcore processes complete tiles, including its own stores.
         sub = tle.dsa.ascend.sub_vec_id()
@@ -506,6 +530,7 @@ def _mega_mhc_kernel(
         first_row_of_worker = worker * BLOCK_M
         end_row_of_worker = cube_rows
         projection_end = tokens
+    cube_tile = current_ptr if BF16_CUBE else cube_input_ptr
     if pipelined and first_tile < last_tile:
         first_rows = (
             tl.minimum(BLOCK_M, end_row_of_worker - first_row_of_worker)
@@ -518,7 +543,7 @@ def _mega_mhc_kernel(
             post_ptr,
             comb_ptr,
             current_ptr,
-            current_ptr,
+            cube_tile,
             stats_ptr,
             first_row_of_worker,
             sub,
@@ -529,7 +554,7 @@ def _mega_mhc_kernel(
             HIDDEN,
             POST_ROWS,
             POST_H,
-            True,
+            BF16_CUBE,
             ALIGNED_ROWS,
         )
         tle.dsa.ascend.sync_block_set("vector", "cube", 2)
@@ -540,7 +565,6 @@ def _mega_mhc_kernel(
         else:
             first_row = tile * BLOCK_M
             active_rows = BLOCK_M
-        cube_tile = current_ptr if BF16_CUBE else cube_input_ptr
         post_start, post_end, post_step = (
             sub,
             tl.cdiv(active_rows, POST_ROWS) * h_tiles,
@@ -571,6 +595,7 @@ def _mega_mhc_kernel(
                 POST_H,
                 BF16_CUBE,
                 ALIGNED_ROWS,
+                not SPLIT_HEADS or head_start == 0,
             )
             tle.dsa.ascend.sync_block_set("vector", "cube", 2)
         odd_slot = tile % 2 != 0 if BALANCED_ROWS else tile // workers % 2 != 0
@@ -586,6 +611,8 @@ def _mega_mhc_kernel(
             projection_ptr,
             project_rows,
             projection_end,
+            head_start,
+            SPLIT_HEADS,
             HIDDEN,
             BLOCK_M,
             BLOCK_K,
@@ -611,7 +638,7 @@ def _mega_mhc_kernel(
                     post_ptr,
                     comb_ptr,
                     current_ptr,
-                    current_ptr,
+                    cube_tile,
                     stats_ptr,
                     next_row,
                     sub,
@@ -622,7 +649,7 @@ def _mega_mhc_kernel(
                     HIDDEN,
                     POST_ROWS,
                     POST_H,
-                    True,
+                    BF16_CUBE,
                     ALIGNED_ROWS,
                 )
                 # Alternate the event IDs since two token tiles can be in flight.
@@ -630,7 +657,7 @@ def _mega_mhc_kernel(
                     tle.dsa.ascend.sync_block_set("vector", "cube", 2)
                 else:
                     tle.dsa.ascend.sync_block_set("vector", "cube", 5)
-        if early_rms:
+        if early_rms and (not SPLIT_HEADS or head_start == 0):
             # Both Vector halves may read residual columns written by their partner.
             tle.dsa.ascend.sync_block_all("all_sub_vector", 0)
             # The shifted output depends only on the previous pre mix.
@@ -659,6 +686,10 @@ def _mega_mhc_kernel(
         else:
             tle.dsa.ascend.sync_block_wait("cube", "vector", 3)
 
+        if SPLIT_HEADS:
+            # Post used both Vector halves. One half now consumes this group's
+            # projection and writes the outputs owned by the group.
+            active_rows = 1 if sub == 0 else 0
         if SPLIT_VECTOR_TAIL:
             # Both subcores share the completed Cube projection. One can normalize
             # a wider Sinkhorn batch while the other applies the pre mix and RMS.
@@ -733,9 +764,16 @@ def _mega_mhc_kernel(
                         "mix",
                     )
             else:
-                if sub == 0:
-                    for mix_task in range(tl.cdiv(active_rows, 4)):
-                        out_rows = first_row + mix_task * 4 + tl.arange(0, 4)
+                # Masked loads of both projection planes need extra Vector buffer space.
+                masked_bf16: tl.constexpr = BF16_CUBE and not ALIGNED_ROWS
+                mix_rows: tl.constexpr = 1 if SPLIT_HEADS else 2 if masked_bf16 else 4
+                sink_rows: tl.constexpr = 1 if SPLIT_HEADS else 4 if masked_bf16 else 8
+                write_mixes = head_start == 0 if SPLIT_HEADS else sub == 0
+                if write_mixes:
+                    for mix_task in range(tl.cdiv(active_rows, mix_rows)):
+                        out_rows = (
+                            first_row + mix_task * mix_rows + tl.arange(0, mix_rows)
+                        )
                         _mhc_pre_norm_tile(
                             current_ptr,
                             stats_ptr,
@@ -755,7 +793,7 @@ def _mega_mhc_kernel(
                             h_tiles,
                             STATS_TILE,
                             SHIFTED,
-                            4,
+                            mix_rows,
                             H_PAD,
                             BF16_CUBE,
                             ALIGNED_ROWS,
@@ -764,10 +802,13 @@ def _mega_mhc_kernel(
                             False,
                             EXACT_SINKHORN,
                             "mix",
+                            early_rms,
                         )
                 else:
-                    for sink_task in range(tl.cdiv(active_rows, 8)):
-                        out_rows = first_row + sink_task * 8 + tl.arange(0, 8)
+                    for sink_task in range(tl.cdiv(active_rows, sink_rows)):
+                        out_rows = (
+                            first_row + sink_task * sink_rows + tl.arange(0, sink_rows)
+                        )
                         _mhc_pre_norm_tile(
                             current_ptr,
                             stats_ptr,
@@ -787,7 +828,7 @@ def _mega_mhc_kernel(
                             h_tiles,
                             STATS_TILE,
                             SHIFTED,
-                            8,
+                            sink_rows,
                             H_PAD,
                             BF16_CUBE,
                             False,
@@ -918,6 +959,7 @@ def _launch_config(tokens, hidden, shifted, cores, vector_cores):
     wide_single_token = tokens == 1 and hidden >= 4096 and hidden % 1024 == 0
     tiny_tile = tokens <= 4 and (hidden % 2048 == 0 or wide_single_token)
     explicit_vector = (tiny_tile or tokens > 4) and vector_cores == 2 * cores
+    split_heads = wide_single_token and hidden > 4096 and explicit_vector
     tiny_tile = tiny_tile and explicit_vector
     short_aligned_tile = (
         explicit_vector
@@ -973,10 +1015,26 @@ def _launch_config(tokens, hidden, shifted, cores, vector_cores):
         balance_rows = True
         block_m = 32
     row_tiles = triton.cdiv(tokens, block_m)
-    # Small sequences use direct FP32 weights. Longer ones amortize two BF16
-    # weight planes over multiple row tiles owned by the same core pair.
-    bf16_cube = row_tiles > cores or balance_rows
-    if not bf16_cube:
+    # A single wave of direct FP32 projection avoids packing a private copy of
+    # both BF16 weight planes on every core for at most 16 rows per core.
+    direct_wave = (
+        explicit_vector and split_tail_fits and not shifted and tokens <= cores * 16
+    )
+    # The next Post tile can run on Vector while Cube consumes the previous
+    # FP32 residual tile. Eight-row tiles give medium batches multiple waves.
+    direct_pipeline = (
+        explicit_vector
+        and not shifted
+        and hidden == 4096
+        and cores * 8 < tokens <= cores * 24
+    )
+    bf16_cube = (row_tiles > cores or balance_rows) and not (
+        direct_wave or direct_pipeline
+    )
+    if direct_pipeline:
+        block_m = 8
+        row_tiles = triton.cdiv(tokens, block_m)
+    elif not bf16_cube:
         # A second wave just for a few rows delays the last core pair.
         block_m = (
             1
@@ -985,16 +1043,16 @@ def _launch_config(tokens, hidden, shifted, cores, vector_cores):
         )
         row_tiles = triton.cdiv(tokens, block_m)
     cube_rows = row_tiles * block_m if bf16_cube else tokens
-    block_k = min(1024, k_alignment)
+    block_k = min(2048 if split_heads else 1024, k_alignment)
     post_h_limit = (
         2048
         if explicit_vector
         else 1024 if bf16_cube else 512 if tokens > cores else 256
     )
-    post_h = min(post_h_limit, hidden & -hidden)
+    post_h = min(512 if split_heads else post_h_limit, hidden & -hidden)
     post_rows = min(4, 2048 // post_h, triton.next_power_of_2(tokens))
     out_rows = 2 if four_row_tail and tokens > 1 else 1
-    if explicit_vector and bf16_cube and four_row_tail:
+    if explicit_vector and (bf16_cube or direct_pipeline) and four_row_tail:
         out_rows = 4
     post_rows = min(post_rows, block_m)
     out_rows = min(out_rows, block_m)
@@ -1004,12 +1062,20 @@ def _launch_config(tokens, hidden, shifted, cores, vector_cores):
         aligned_rows = tokens % 4 == 0
     workers = min(cores, row_tiles)
     split_vector_tail = (
-        bf16_cube
-        and explicit_vector
+        explicit_vector
         and split_tail_fits
-        and (medium_tile or tokens > cores * 16)
+        and (
+            direct_pipeline
+            or (direct_wave and block_m >= 4)
+            or (bf16_cube and (medium_tile or tokens > cores * 16))
+        )
     )
+    if split_heads:
+        workers = 2
+        split_vector_tail = True
     options = dict(
+        SPLIT_HEADS=split_heads,
+        DIRECT_PIPELINE=direct_pipeline,
         HIDDEN=hidden,
         H_PAD=h_pad,
         SHIFTED=shifted,
@@ -1025,12 +1091,16 @@ def _launch_config(tokens, hidden, shifted, cores, vector_cores):
         BALANCED_ROWS=balance_rows,
         BF16_CUBE=bf16_cube,
         RECIPROCAL=(
-            bf16_cube and hidden >= 4096 and not medium_tile and tokens <= cores * 32
+            (bf16_cube or direct_pipeline)
+            and hidden >= 4096
+            and not medium_tile
+            and tokens <= cores * 32
         ),
         MERGE_PROJECTION=bf16_cube
         and hidden >= 4096
         and cores * 16 < tokens <= cores * 32,
         EXACT_SINKHORN=bf16_cube
+        or split_vector_tail
         or tiny_tile
         or short_aligned_tile
         or (explicit_vector and tokens <= cores and hidden >= 4096),
@@ -1061,22 +1131,26 @@ def _prepare_launch(x, residual, post, comb, pre_mix):
         utils.get_aivector_core_num(),
     )
     bf16_cube = options["BF16_CUBE"]
+    # Independent head groups each need one row of residuals and statistics.
+    scratch_rows = cube_rows * (2 if options["SPLIT_HEADS"] else 1)
     output_rows = cube_rows if bf16_cube else None
     outputs = _allocate_outputs(x, residual, post, comb, pre_mix, output_rows)
     device = x.device
     projection_width = 64 if bf16_cube else 32
     stats = torch.empty(
-        (tokens, hidden // options["POST_H"]), dtype=torch.float32, device=device
+        (2 if options["SPLIT_HEADS"] else tokens, hidden // options["POST_H"]),
+        dtype=torch.float32,
+        device=device,
     )
     projection = torch.empty(
-        (cube_rows, projection_width),
+        (scratch_rows, projection_width),
         dtype=torch.float32,
         device=device,
     )
     cube_input = (
         None
         if bf16_cube
-        else torch.empty((cube_rows, 4, hidden), dtype=torch.float32, device=device)
+        else torch.empty((scratch_rows, 4, hidden), dtype=torch.float32, device=device)
     )
     packed_fn = (
         torch.empty(
