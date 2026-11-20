@@ -425,20 +425,28 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
         initial.shape != (b, h, d, e) or initial.dtype != torch.float32
     ):
         raise ValueError("kv_history must have shape [B,H,D,E] and dtype float32")
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    wide_ctas = b * h * triton.cdiv(t, 64) * triton.cdiv(e, 64)
+    wide_values = e >= 128 and 2 * wide_ctas >= 3 * num_sms
     c = 64
     warps = 4
     if t <= 32:
         c = 16 if t <= 16 else 32
         warps = 2
-    elif 64 < t <= 128 and b * h >= 16:
+    elif (
+        64 < t <= 128 and not wide_values and 2 * b * h * triton.cdiv(e, 32) >= num_sms
+    ):
         c = 128
     n = triton.cdiv(t, c)
-    if t <= 128:
+    if 64 < t <= 128 and wide_values:
+        value_tile = 64
+    elif t <= 128:
         value_tile = 32 if c == 128 else 16
     elif t <= 256 and d == 64:
         value_tile = 16
     else:
-        value_tile = 64 if e >= 128 and b * h * n > 64 else 32
+        # Keep at least one and a half waves before reducing CTA parallelism.
+        value_tile = 64 if wide_values else 32
     # Overlapping the two Q products helps short, single-tile prefixes with
     # relatively few heads. Larger launches run faster with immediate waits.
     overlap_q = (
@@ -446,7 +454,7 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
         and n == 1
         and d == 128
         and e >= 32
-        and b * h <= 16
+        and 8 * b * h <= num_sms
         and initial is not None
         and k.stride(3) == 1
     )
@@ -510,7 +518,9 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
                     num_warps=4,
                 )
                 if n >= 24:
-                    width = 256 if n <= 128 and (d * e >= 16384 or b * h >= 16) else 64
+                    # Keep enough independent state tiles for the current device.
+                    wide_ctas = b * h * triton.cdiv(d * e, 256)
+                    width = 256 if n <= 128 and 2 * wide_ctas >= num_sms else 64
                     _scan_parallel[(triton.cdiv(d * e, width), h, b)](
                         prefix,
                         base,
@@ -594,6 +604,7 @@ def lightning_attention_decode(q, k, v, kv_caches, slope_rate, slot_idx, BLOCK_S
         )
     if BLOCK_SIZE < 1 or BLOCK_SIZE & (BLOCK_SIZE - 1):
         raise ValueError("BLOCK_SIZE must be a positive power of two")
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     if kv_caches.stride(2) == 1:
         tile = min(BLOCK_SIZE, 8 if d == 64 else 4)
         warps, layout = 1, _TRANSPOSED_LAYOUT
@@ -601,8 +612,11 @@ def lightning_attention_decode(q, k, v, kv_caches, slope_rate, slot_idx, BLOCK_S
         tile, warps, layout = min(BLOCK_SIZE, 16), 2, _NARROW_LAYOUT
     elif d == 64:
         tile, warps, layout = min(BLOCK_SIZE, 32), 1, _SMALL_LAYOUT
-    elif b * h <= 128:
+    elif b * h <= num_sms:
         tile, warps, layout = min(BLOCK_SIZE, 16), 2, _NARROW_LAYOUT
+    elif 2 * b * h <= 3 * num_sms:
+        # More independent heads can hide memory latency with one warp per CTA.
+        tile, warps, layout = min(BLOCK_SIZE, 16), 1, _SMALL_LAYOUT
     else:
         tile, warps, layout = min(2 * BLOCK_SIZE, 64), 4, _WIDE_LAYOUT
     out = torch.empty((b, h * d), dtype=q.dtype, device=q.device)

@@ -296,3 +296,76 @@ def test_prefix_graph_reads_current_operands(t, d, has_initial):
         )
         assert_relative(y, expected, 0.0025)
         assert_relative(history, states, 0.0025)
+
+
+@pytest.mark.parametrize("decode", [False, True])
+def test_tensor_device_with_another_current_device(decode):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible Hopper devices")
+    device = torch.device("cuda", 1)
+    t = 1 if decode else 257
+    torch.manual_seed(935)
+    q, k, v = [torch.randn(1, 4, t, 128, device=device).mul_(0.125) for _ in range(3)]
+    state = torch.randn(1, 4, 128, 128, device=device).mul_(0.125)
+    slope = torch.linspace(0.002, 0.1, 4, device=device)
+    with torch.cuda.device(0):
+        if decode:
+            expected = state.clone()
+            slots = torch.zeros(1, dtype=torch.int64, device=device)
+            reference = decode_reference(
+                q, k, v, expected, slope, slots, dtype=torch.float64
+            )
+            actual = flaggems_vllm.lightning_attention_decode(
+                q, k, v, state, slope, slots
+            )
+            assert_relative(actual, reference, 2e-6)
+            assert_relative(state, expected, 2e-6)
+        else:
+            reference, expected = prefix_reference(
+                q.cpu(), k.cpu(), v.cpu(), slope.cpu(), state.cpu()
+            )
+            actual, history = flaggems_vllm.lightning_attention(
+                q, k, v, slope, kv_history=state
+            )
+            assert_relative(actual, reference, 0.0025)
+            assert_relative(history, expected, 0.0025)
+        assert actual.device == device
+        assert torch.cuda.current_device() == 0
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.parametrize("sm_multiplier", [1.0, 1.5])
+def test_decode_sm_boundary(offset, sm_multiplier):
+    device = torch.device(flaggems_vllm.device)
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    b = int(sms * sm_multiplier) + offset
+    torch.manual_seed(936)
+    q, k, v = [torch.randn(b, 1, 1, 128, device=device).mul_(0.125) for _ in range(3)]
+    cache = torch.randn(b, 1, 128, 128, device=device).mul_(0.125)
+    expected = cache.clone()
+    slots = torch.arange(b, device=device).flip(0)
+    slope = torch.tensor([0.01], device=device)
+    reference = decode_reference(q, k, v, expected, slope, slots, dtype=torch.float64)
+    actual = flaggems_vllm.lightning_attention_decode(q, k, v, cache, slope, slots)
+    assert_relative(actual, reference, 2e-6)
+    assert_relative(cache, expected, 2e-6)
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_prefix_sm_boundary(offset):
+    device = torch.device(flaggems_vllm.device)
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    # At T=129 and E=128, a 64-column value tile launches six CTAs per head.
+    h = (sms + 3) // 4 + offset
+    torch.manual_seed(937)
+    q, k, v = [torch.randn(1, h, 129, 128, device=device).mul_(0.125) for _ in range(3)]
+    initial = torch.randn(1, h, 128, 128, device=device).mul_(0.125)
+    slope = torch.linspace(0.002, 0.12, h, device=device)
+    reference, expected = prefix_reference(
+        q.cpu(), k.cpu(), v.cpu(), slope.cpu(), initial.cpu()
+    )
+    actual, history = flaggems_vllm.lightning_attention(
+        q, k, v, slope, kv_history=initial
+    )
+    assert_relative(actual, reference, 0.0025)
+    assert_relative(history, expected, 0.0025)
