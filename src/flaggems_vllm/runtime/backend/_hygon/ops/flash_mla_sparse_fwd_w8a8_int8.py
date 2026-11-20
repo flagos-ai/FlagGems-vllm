@@ -661,7 +661,9 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
     lse = torch.empty((batch, heads, sq), dtype=torch.float32, device=device)
     if rows == 0:
         return lambda: (output, lse)
-    if rope == 64 and rows >= 4096 and heads >= 64 and topk == 2048:
+    # Staging exposes parallel KV tiles for batched H128 decode as well as prefill.
+    use_staged_v32 = (heads == 128 and rows >= 32) or (heads == 64 and rows >= 4096)
+    if rope == 64 and topk == 2048 and use_staged_v32:
         return _prepare_v32_prefill(
             q_nope,
             q_rope,
