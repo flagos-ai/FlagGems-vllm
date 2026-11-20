@@ -1706,7 +1706,19 @@ def test_fused_marlin_moe_w8a16_projection_tiles_ppu(
     with monkeypatch.context() as full_projection:
         full_projection.setattr(backend, "run_dense_wna16", _run_full_projection)
         reference = flaggems_vllm.fused_marlin_moe(**kwargs)
+    flaggems_vllm.fused_marlin_moe(**kwargs)
+    torch_device_fn.synchronize()
+    initial_bytes = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
     actual = flaggems_vllm.fused_marlin_moe(**kwargs, inplace=inplace)
+    torch_device_fn.synchronize()
+    output_bytes = 0 if inplace else actual.numel() * actual.element_size()
+    # Even all temporaries together should be smaller than one full down projection.
+    full_down_bytes = ti.numel() * hs.shape[1] * hs.element_size()
+    assert (
+        torch.cuda.max_memory_allocated() - initial_bytes
+        < full_down_bytes + output_bytes
+    )
     gems_assert_equal(actual, reference)
 
 
@@ -1736,7 +1748,14 @@ def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 graph replay"
 )
-@pytest.mark.parametrize("config", [(1, 16, 1024, 128, 6), (88, 64, 1024, 128, 4)])
+@pytest.mark.parametrize(
+    "config",
+    [
+        (1, 16, 1024, 128, 6),
+        (1, 16, 1152, 1024, 8),  # Grouped decode with scales too large for one CTA.
+        (88, 64, 1024, 128, 4),
+    ],
+)
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
     config, apply_router_weight_on_input
