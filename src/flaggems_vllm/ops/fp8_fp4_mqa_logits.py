@@ -107,6 +107,7 @@ def _fp8_fp4_mqa_logits_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
+    BF16_DOT: tl.constexpr = False,
 ):
     """Fused FP8 MQA logits with head-batched tiled dot products.
 
@@ -157,7 +158,12 @@ def _fp8_fp4_mqa_logits_kernel(
         q_2d = tl.reshape(q, [BLOCK_M * HEAD_BLOCK, D])
 
         # Dot product: [BLOCK_M * HEAD_BLOCK, BLOCK_N]
-        dot = tl.dot(q_2d, tl.trans(k))
+        if BF16_DOT:
+            # C550 cannot lower an FP8 dot. E4M3FN operands are exactly
+            # representable in BF16 and the accumulation stays FP32.
+            dot = tl.dot(q_2d.to(tl.bfloat16), tl.trans(k).to(tl.bfloat16))
+        else:
+            dot = tl.dot(q_2d, tl.trans(k))
 
         # Fused k_scale + ReLU activation
         dot = tl.maximum(dot * k_scale[None, :], 0.0)
@@ -642,7 +648,8 @@ def fp8_fp4_mqa_logits(
     else:
         M, H, D = q_values.shape
         N = k_values.shape[0]
-        use_tle = _can_use_tle(M, N, H, D)
+        use_bf16_dot = runtime.device.vendor_name == "metax"
+        use_tle = not use_bf16_dot and _can_use_tle(M, N, H, D)
         if use_tle:
             _launch_tle_kernel(
                 q_values, k_values, k_scales, weights, logits, M, N, H, D
@@ -667,6 +674,7 @@ def fp8_fp4_mqa_logits(
                 logits.stride(1),
                 weights.stride(0),
                 weights.stride(1),
+                BF16_DOT=use_bf16_dot,
             )
 
     if clean_logits:

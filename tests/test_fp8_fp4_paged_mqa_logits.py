@@ -23,6 +23,40 @@ from .test_fp8_fp4_mqa_logits import quantize_to_mxfp4, reference_fp4_mqa_logits
 
 device = flaggems_vllm.device
 
+
+@pytest.mark.fp8_fp4_paged_mqa_logits
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="requires MetaX")
+def test_fp8_paged_mqa_logits_metax():
+    generator = torch.Generator().manual_seed(42)
+    q = torch.randn(2, 1, 32, 128, generator=generator).to(torch.float8_e4m3fn)
+    keys = torch.randn(3, 64, 128, generator=generator).to(torch.float8_e4m3fn)
+    scales = torch.rand(3, 64, generator=generator) + 0.25
+    packed = torch.cat(
+        (keys.view(torch.uint8).reshape(3, -1), scales.view(torch.uint8)), dim=1
+    ).reshape(3, 64, 1, 132)
+    weights = torch.rand(2, 32, generator=generator)
+    lengths = torch.tensor([[5], [67]], dtype=torch.int32)
+    pages = torch.tensor([[1, 0], [2, 0]], dtype=torch.int32)
+    expected = torch.full((2, 128), -torch.inf)
+    for row, length in enumerate(lengths.flatten().tolist()):
+        k = keys.float()[pages[row]].reshape(-1, 128)[:length]
+        scale = scales[pages[row]].flatten()[:length]
+        dots = q[row, 0].float() @ k.T
+        expected[row, :length] = ((dots * scale).relu() * weights[row, :, None]).sum(0)
+
+    actual = fp8_fp4_paged_mqa_logits(
+        (q.to(device), None),
+        packed.to(device),
+        weights.to(device),
+        lengths.to(device),
+        pages.to(device),
+        schedule_metadata=None,
+        max_model_len=128,
+        clean_logits=True,
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
 # DeepSeek-V4 model parameters
 NUM_HEADS = 64
 HEAD_DIM = 128
