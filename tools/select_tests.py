@@ -89,30 +89,6 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_metadata.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_native.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_v32.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_v32_pipeline.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_k128.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_scheduling.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_pipeline.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_short_pipeline.py": [
-        "tests/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
     "conftest.py": ["tests/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "tests/test_fused_matmul_reduce_scatter.py"
@@ -316,30 +292,6 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_metadata.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_native.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_v32.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_v32_pipeline.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_k128.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_scheduling.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_pipeline.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
-    "src/flaggems_vllm/runtime/backend/_mthreads/_sparse_fp8_short_pipeline.py": [
-        "benchmark/test_flash_mla_sparse_fwd_w8a8.py"
-    ],
     "conftest.py": ["benchmark/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "benchmark/test_fused_matmul_reduce_scatter.py"

@@ -747,17 +747,6 @@ flash_mla_sparse_fwd_w8a8:
     - [12, 64, 512, 1114624, 1, 640, 512, false, false, 17]
     - [12, 64, 512, 98816, 1, 8320, 512, false, false, 18]
     - [4112, 64, 512, 66048, 1, 128, 512, false, false, 19]
-    # GLM-5.2 V32 exports at FlagOSTune 7173d21a, ordered by call count.
-    - [64, 64, 576, 361344, 1, 2048, 512, false, false, 20]
-    - [193, 64, 576, 361344, 1, 2048, 512, false, false, 21]
-    - [449, 64, 576, 361344, 1, 2048, 512, false, false, 22]
-    - [4033, 64, 576, 361344, 1, 2048, 512, false, false, 23]
-    - [16384, 64, 576, 361344, 1, 2048, 512, false, false, 24]
-    - [512, 64, 576, 361344, 1, 2048, 512, false, false, 25]
-    - [3586, 64, 576, 361344, 1, 2048, 512, false, false, 26]
-    - [132, 64, 576, 361344, 1, 2048, 512, false, false, 27]
-    - [1280, 64, 576, 361344, 1, 2048, 512, false, false, 28]
-    - [2048, 64, 576, 361344, 1, 2048, 512, false, false, 29]
 qsa_sparse_paged_attention:
   shapes:
     # From Qwen3.8-Flash-Next-FP8 production captures.

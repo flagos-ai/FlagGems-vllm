@@ -41,6 +41,13 @@ MTHREADS_FP8_MLA = flaggems_vllm.vendor_name == "mthreads" and (
 )
 HAS_FP8_MLA = HAS_CUDA_FP8_MLA or MTHREADS_FP8_MLA
 
+if MTHREADS_FP8_MLA:
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_sparse_fwd_w8a8 import (
+        prepare_flash_mla_sparse_fwd_w8a8,
+    )
+else:
+    prepare_flash_mla_sparse_fwd_w8a8 = None
+
 
 @lru_cache(maxsize=1)
 def flashmla_reference() -> ModuleType:
@@ -183,6 +190,13 @@ def assert_sparse_fixture_close(output, lse, reference, reference_lse):
     )
 
 
+def dequantize_sparse_rows(content, rope, scale):
+    values = content.float()
+    if rope.shape[-1]:
+        values = torch.cat((values, rope.float()), -1)
+    return values * scale
+
+
 def _mthreads_quantize(tensor, *, dequantize=True):
     scale = (
         tensor[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448.0
@@ -197,10 +211,9 @@ def _mthreads_quantize(tensor, *, dequantize=True):
     chunk = max(1, (1 << 23) // max(1, row_elements))
     for first in range(0, tensor.shape[0], chunk):
         last = min(first + chunk, tensor.shape[0])
-        values = content[first:last].float()
-        if rope.shape[-1]:
-            values = torch.cat((values, rope[first:last].float()), -1)
-        native[first:last] = (values * scale[first:last]).to(torch.bfloat16)
+        native[first:last] = dequantize_sparse_rows(
+            content[first:last], rope[first:last], scale[first:last]
+        ).to(torch.bfloat16)
     return content, rope, scale, native
 
 
@@ -261,10 +274,9 @@ def mthreads_sparse_reference(
     # Keep FP8 casts bounded: large unary datacast launches fail in muDNN.
     for first in range(0, tokens, 16384):
         last = min(first + 16384, tokens)
-        values = kv[first:last].float()
-        if dims > 512:
-            values = torch.cat((values, kr[first:last].float()), -1)
-        cache[first:last] = values * ks[first:last]
+        cache[first:last] = dequantize_sparse_rows(
+            kv[first:last], kr[first:last], ks[first:last]
+        )
     selected = indices.view(rows, 1, -1)
     output = torch.empty(
         (batch * queries, heads, 512), dtype=torch.float32, device=reference_device
@@ -274,10 +286,7 @@ def mthreads_sparse_reference(
     )
     for begin in range(0, batch * queries, chunk_rows):
         end = min(begin + chunk_rows, batch * queries)
-        query = q[begin:end].float()
-        if dims > 512:
-            query = torch.cat((query, qr[begin:end].float()), -1)
-        query = query * qs[begin:end]
+        query = dequantize_sparse_rows(q[begin:end], qr[begin:end], qs[begin:end])
         output[begin:end], _, lse[begin:end] = (
             FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
                 end - begin,
@@ -359,10 +368,6 @@ def test_flash_mla_sparse_flashmla(shape):
 @pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mthreads_k128_prepared_row_update(dtype):
-    from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_sparse_fwd_w8a8 import (
-        prepare_flash_mla_sparse_fwd_w8a8,
-    )
-
     packed, _ = make_mthreads_sparse_inputs(129, 64, 128, 4096, dtype, 0, seed=42)
     run, _ = prepare_flash_mla_sparse_fwd_w8a8(*packed)
     # One CTA can own both rejected and accepted queries in the same call.
@@ -376,10 +381,6 @@ def test_mthreads_k128_prepared_row_update(dtype):
 @pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mthreads_v32_prepared_scale_update(dtype):
-    from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_sparse_fwd_w8a8 import (
-        prepare_flash_mla_sparse_fwd_w8a8,
-    )
-
     packed, _ = make_mthreads_sparse_inputs(4, 64, 2048, 4096, dtype, 64, seed=42)
     packed[6][0].fill_(-1)
     run, actual = prepare_flash_mla_sparse_fwd_w8a8(*packed)
@@ -397,10 +398,6 @@ def test_mthreads_v32_prepared_scale_update(dtype):
 @pytest.mark.skipif(not MTHREADS_FP8_MLA, reason="Requires MThreads sparse FP8 MLA")
 @pytest.mark.parametrize("rows, first_row", ((64, 0), (132, 130), (193, 191), (512, 0)))
 def test_mthreads_v32_prepared_rope_update(rows, first_row):
-    from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_sparse_fwd_w8a8 import (
-        prepare_flash_mla_sparse_fwd_w8a8,
-    )
-
     packed, _ = make_mthreads_sparse_inputs(
         rows, 64, 2048, 4096, torch.bfloat16, 64, seed=42
     )
@@ -441,10 +438,6 @@ def test_mthreads_v32_prepared_rope_update(rows, first_row):
     ),
 )
 def test_mthreads_v32_nan_in_unselected_sentinel(rows, cache_component):
-    from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_sparse_fwd_w8a8 import (
-        prepare_flash_mla_sparse_fwd_w8a8,
-    )
-
     packed, _ = make_mthreads_sparse_inputs(
         rows, 64, 2048, 4096, torch.bfloat16, 64, seed=42
     )

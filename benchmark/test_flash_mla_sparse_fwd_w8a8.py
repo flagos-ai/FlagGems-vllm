@@ -29,6 +29,7 @@ from tests.test_flash_mla_sparse_fwd_w8a8 import (
     make_mthreads_sparse_inputs,
     make_sparse_inputs,
     mthreads_sparse_reference,
+    prepare_flash_mla_sparse_fwd_w8a8,
     quantize_sparse_fp8_fixture,
 )
 
@@ -36,12 +37,129 @@ from . import base, conftest, consts
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 
-def run_prepared_baseline(handle):
-    return handle()
+def prepare_mate_baseline(inputs, query, *, attn_sink=None, topk_length=None):
+    """Prepare native MODEL1 D512 or V3.2 D576 MATE FP8 cache.
 
+    Power-of-two fixture scales preserve the dequantized FP8 mathematical input
+    in BF16 query and tail storage. MODEL1 pages place all 576-byte token
+    payloads before the 8-byte exponent records. The seven 64-element groups
+    use the original token scale. Packing and metadata are outside timing.
+    """
+    from mate.flashmla import flash_mla_with_kvcache, get_mla_metadata
 
-def run_prepared_gems(handle):
-    return handle()
+    _, qrope, kv, krope, _, ks, indices = inputs
+    batch, queries, heads, _ = query.shape
+    pages = kv.shape[0]
+    raw = kv.view(pages, 64, 1, 512)
+    token_scale = ks.view(pages, 64, 1, 1)
+    if qrope.shape[-1] == 0:
+        packed = torch.empty((pages, 64, 1, 584), dtype=torch.uint8, device=kv.device)
+        page = packed.view(pages, -1)
+        payload = page[:, : 64 * 576].view(pages, 64, 1, 576)
+        exponents = page[:, 64 * 576 :].view(pages, 64, 1, 8)
+        for first in range(0, pages, 256):
+            last = min(first + 256, pages)
+            values = raw[first:last]
+            scales = token_scale[first:last]
+            payload[first:last, ..., :448].copy_(values[..., :448].view(torch.uint8))
+            payload[first:last, ..., 448:].copy_(
+                (values[..., 448:].float() * scales)
+                .to(torch.bfloat16)
+                .view(torch.uint8)
+            )
+            exponent = ((scales.view(torch.int32) >> 23) & 255).to(torch.uint8)
+            exponents[first:last, ..., :7].copy_(
+                exponent.expand(last - first, 64, 1, 7)
+            )
+            exponents[first:last, ..., 7:].zero_()
+    else:
+        rope = krope.view(pages, 64, 1, 64)
+        packed = torch.empty((pages, 64, 1, 656), dtype=torch.uint8, device=kv.device)
+        for first in range(0, pages, 256):
+            last = min(first + 256, pages)
+            scales = token_scale[first:last]
+            packed[first:last, ..., :512].copy_(raw[first:last].view(torch.uint8))
+            packed[first:last, ..., 512:528].copy_(
+                scales.expand(last - first, 64, 1, 4).contiguous().view(torch.uint8)
+            )
+            packed[first:last, ..., 528:].copy_(
+                (rope[first:last].float() * scales).to(torch.bfloat16).view(torch.uint8)
+            )
+    scale = (512 + qrope.shape[-1]) ** -0.5
+    # muDNN FillOp fails for some real batch sizes. Prepare the equivalent
+    # explicit lengths by host-to-device copy before either path is timed.
+    if topk_length is None:
+        topk_length = torch.full(
+            (batch,), indices.shape[-1], dtype=torch.int32, device="cpu"
+        ).to(query.device)
+    if qrope.shape[-1] == 0:
+        extra_topk_length = torch.zeros((batch,), dtype=torch.int32, device="cpu").to(
+            query.device
+        )
+        extra_cache, extra_indices = packed, indices[..., :0]
+    else:
+        extra_topk_length = None
+        extra_cache, extra_indices = None, None
+    plans = []
+    # The installed MODEL1 fails at batch 16384. Time every original query
+    # through bounded native calls, including copies of the complete outputs.
+    for first in range(0, batch, 8192):
+        last = min(first + 8192, batch)
+        metadata, splits = get_mla_metadata(
+            None,
+            queries * heads,
+            1,
+            num_heads_q=heads,
+            is_fp8_kvcache=True,
+            topk=indices.shape[-1],
+            q=query[first:last],
+            bs=last - first,
+            topk_length=topk_length[first:last],
+            extra_topk_length=(
+                None if extra_topk_length is None else extra_topk_length[first:last]
+            ),
+        )
+        plans.append((first, last, metadata, splits))
+    if len(plans) == 1:
+        output, lse = None, None
+    else:
+        output = torch.empty(
+            (batch, queries, heads, 512), dtype=query.dtype, device=query.device
+        )
+        lse = torch.empty(
+            (batch, heads, queries), dtype=torch.float32, device=query.device
+        )
+
+    def run():
+        for first, last, metadata, splits in plans:
+            values, logsum = flash_mla_with_kvcache(
+                query[first:last],
+                packed,
+                None,
+                None,
+                512,
+                metadata,
+                splits,
+                softmax_scale=scale,
+                attn_sink=attn_sink,
+                is_fp8_kvcache=True,
+                indices=indices[first:last],
+                topk_length=topk_length[first:last],
+                extra_topk_length=(
+                    None if extra_topk_length is None else extra_topk_length[first:last]
+                ),
+                extra_k_cache=extra_cache,
+                extra_indices_in_kvcache=(
+                    None if extra_indices is None else extra_indices[first:last]
+                ),
+            )
+            if len(plans) == 1:
+                return values, logsum
+            output[first:last].copy_(values)
+            lse[first:last].copy_(logsum)
+        return output, lse
+
+    return run
 
 
 class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
@@ -51,14 +169,14 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
         super().__init__(
             "flash_mla_sparse_fwd_w8a8",
             (
-                run_prepared_baseline
+                prepare_mate_baseline
                 if MTHREADS_FP8_MLA
                 else flashmla_reference().flash_mla_sparse_fwd
             ),
             [torch.bfloat16],
         )
         self.set_gems(
-            run_prepared_gems
+            prepare_flash_mla_sparse_fwd_w8a8
             if MTHREADS_FP8_MLA
             else flaggems_vllm.flash_mla_sparse_fwd_w8a8
         )
@@ -83,33 +201,44 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             yield inputs, packed, shape
 
     @staticmethod
-    def _workload_shapes():
+    @lru_cache(maxsize=1)
+    def workload_records():
         path = Path(__file__).with_name("flash_mla_sparse_fwd_w8a8_shapes.json")
         with path.open() as stream:
-            return [tuple(row["shape"]) for row in json.load(stream)["records"]]
+            return json.load(stream)["records"]
 
-    def set_more_shapes(self):
+    def set_shapes(self, shape_file_path):
+        super().set_shapes(shape_file_path)
         if (
-            MTHREADS_FP8_MLA
-            and Path(conftest.Config.shape_file).resolve()
-            == Path(__file__).with_name("core_shapes.yaml").resolve()
+            not MTHREADS_FP8_MLA
+            or Path(shape_file_path).resolve()
+            != Path(__file__).with_name("core_shapes.yaml").resolve()
         ):
-            # Match the seven-field export keys and their seed-42 fixtures.
-            self.shapes = [shape[:7] for shape in self.shapes]
-            return self._workload_shapes()
-        return []
+            return
+        records = self.workload_records()
+        config = conftest.Config
+        if config.bench_level == consts.BenchLevel.COMPREHENSIVE and not config.query:
+            shapes = [shape[:7] for shape in self.shapes]
+            shapes.extend(tuple(row["shape"]) for row in records)
+            self.shapes = list(dict.fromkeys(shapes))
+            self.shape_desc = self.shape_desc.split(", sink", 1)[0]
+        else:
+            v32 = sorted(
+                (row for row in records if row["shape"][2] == 576),
+                key=lambda row: row["count"],
+                reverse=True,
+            )[:10]
+            self.shapes.extend(
+                (*row["shape"], False, False, seed)
+                for seed, row in enumerate(v32, start=len(self.shapes))
+            )
 
     def _get_mthreads_inputs(self, dtype):
-        from flaggems_vllm.runtime.backend._mthreads.ops.flash_mla_sparse_fwd_w8a8 import (
-            prepare_flash_mla_sparse_fwd_w8a8,
-        )
-        from flaggems_vllm.runtime.backend._mthreads.testing.flash_mla_sparse_fwd_w8a8 import (
-            prepare_baseline,
-        )
-
         fixture_shapes = self.shapes
         if conftest.Config.bench_level == consts.BenchLevel.COMPREHENSIVE:
-            fixture_shapes = self.shapes + self._workload_shapes()
+            fixture_shapes = self.shapes + [
+                tuple(row["shape"]) for row in self.workload_records()
+            ]
 
         def shape_key(shape):
             _, heads, dims, tokens, h_kv, topk, value_dim = shape[:7]
@@ -152,11 +281,11 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             expected = mthreads_sparse_reference(
                 packed, reference_device=query.device, **kwargs
             )
-            gems, actual = prepare_flash_mla_sparse_fwd_w8a8(*packed, **kwargs)
+            gems, actual = self.gems_op(*packed, **kwargs)
             assert_mthreads_sparse_accuracy(actual, expected, output_atol=2e-3)
-            native = prepare_baseline(packed, query[:batch], **kwargs)
+            native = self.torch_op(packed, query[:batch], **kwargs)
             assert_mthreads_sparse_accuracy(native(), expected, output_atol=2e-3)
-            yield (native,), (gems,), shape
+            yield native, gems, shape
 
     def unpack_to_args_kwargs(self, input_tuple):
         return [input_tuple], {}
@@ -167,6 +296,8 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
     def get_latency(self, op, *args, **kwargs):
         original, packed, _ = args[0]
         selected = packed if op is self.gems_op else original
+        if MTHREADS_FP8_MLA:
+            return super().get_latency(selected)
         return super().get_latency(op, *selected)
 
 
