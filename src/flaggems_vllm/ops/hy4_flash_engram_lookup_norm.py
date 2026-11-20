@@ -11,7 +11,7 @@ from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 
 _ENGRAM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
-_FP32_EPS = 1.1920928955078125e-07
+_FP32_EPS = tl.constexpr(1.1920928955078125e-07)
 
 
 def _check_engram_tensors(anchor, *tensors):
@@ -42,7 +42,7 @@ def _lookup_norm(
     col = tl.arange(0, BLOCK)
     in_dim = col < N
     valid = tl.load(Hashes + token * HASH_S0 + head * HASH_S1) >= 0
-    x = tl.load(Rows + i * N + col, in_dim & valid, other=0).to(tl.float32)
+    x = tl.load(Rows + i * N + col, in_dim & valid, other=0.0).to(tl.float32)
     if FP8:
         scale = tl.load(Scale + i, valid, other=0).to(tl.float32)
         x = x * scale

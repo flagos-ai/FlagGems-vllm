@@ -19,9 +19,10 @@ Port of the generic Triton ``mhc_pre`` variants (copied from
 untouched), with two deliberate deltas:
 
 * **Model contract ``clamp(-30, 30)`` before Sinkhorn** - the kernels in this
-  module take ``clamp_logits`` as a compile-time flag and are always called
-  with ``True``, and the ``hc_mult == 4`` TLE path clamps as well, so every
-  path satisfies the contract. Provenance:
+  module take ``clamp_logits`` as a compile-time flag and the operator always
+  enables it: both the ``hc_mult == 4`` TLE fast path and the generic clamped
+  kernel that every other case (other ``hc_mult`` values, or a build without
+  TLE) falls back to satisfy the contract. Provenance:
   XingChen4-29B-A4B checkpoint contract (formal_issues/OP-ACC-003,
   REVIEW.md: "Model contract requires clamp(-30, 30) before Sinkhorn").
 * **Dynamic Sinkhorn loop** - ``sinkhorn_repeat`` is a runtime argument
@@ -422,6 +423,17 @@ def _tle_row(t, r, BLOCK_T: tl.constexpr):
 
 
 @triton.jit
+def _tle_comb_logit(
+    t, r, rms_inv, scale, base, CLAMP_LOGITS: tl.constexpr, BLOCK_T: tl.constexpr
+):
+    """One comb logit over the token axis, clamped when the model requires it."""
+    v = _tle_row(t, r, BLOCK_T) * rms_inv * scale + base
+    if CLAMP_LOGITS:
+        v = tl.clamp(v, -30.0, 30.0)
+    return v
+
+
+@triton.jit
 def mhc_pre_ascend_tle_proj_kernel(
     a_ptr,  # (num_tokens, hc_hidden_size) bfloat16
     bt_ptr,  # (hc_hidden_size, NC) bfloat16, fn^T zero padded to NC columns
@@ -507,6 +519,7 @@ def mhc_pre_ascend_tle_mix_kernel(
     sinkhorn_repeat,
     NC: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    CLAMP_LOGITS: tl.constexpr,
 ):
     """Gates + Sinkhorn for a tile of ``BLOCK_T`` tokens, one row per mix column.
 
@@ -578,23 +591,23 @@ def mhc_pre_ascend_tle_mix_kernel(
     q2 = tl.sigmoid(_tle_row(mt, 6, BLOCK_T) * rms_inv * s1 + b6) * hc_post_mult_value
     q3 = tl.sigmoid(_tle_row(mt, 7, BLOCK_T) * rms_inv * s1 + b7) * hc_post_mult_value
 
-    # Model contract: clamp the comb logits before Sinkhorn.
-    c00 = tl.clamp(_tle_row(mt, 8, BLOCK_T) * rms_inv * s2 + b8, -30.0, 30.0)
-    c01 = tl.clamp(_tle_row(mt, 9, BLOCK_T) * rms_inv * s2 + b9, -30.0, 30.0)
-    c02 = tl.clamp(_tle_row(mt, 10, BLOCK_T) * rms_inv * s2 + b10, -30.0, 30.0)
-    c03 = tl.clamp(_tle_row(mt, 11, BLOCK_T) * rms_inv * s2 + b11, -30.0, 30.0)
-    c10 = tl.clamp(_tle_row(mt, 12, BLOCK_T) * rms_inv * s2 + b12, -30.0, 30.0)
-    c11 = tl.clamp(_tle_row(mt, 13, BLOCK_T) * rms_inv * s2 + b13, -30.0, 30.0)
-    c12 = tl.clamp(_tle_row(mt, 14, BLOCK_T) * rms_inv * s2 + b14, -30.0, 30.0)
-    c13 = tl.clamp(_tle_row(mt, 15, BLOCK_T) * rms_inv * s2 + b15, -30.0, 30.0)
-    c20 = tl.clamp(_tle_row(mt, 16, BLOCK_T) * rms_inv * s2 + b16, -30.0, 30.0)
-    c21 = tl.clamp(_tle_row(mt, 17, BLOCK_T) * rms_inv * s2 + b17, -30.0, 30.0)
-    c22 = tl.clamp(_tle_row(mt, 18, BLOCK_T) * rms_inv * s2 + b18, -30.0, 30.0)
-    c23 = tl.clamp(_tle_row(mt, 19, BLOCK_T) * rms_inv * s2 + b19, -30.0, 30.0)
-    c30 = tl.clamp(_tle_row(mt, 20, BLOCK_T) * rms_inv * s2 + b20, -30.0, 30.0)
-    c31 = tl.clamp(_tle_row(mt, 21, BLOCK_T) * rms_inv * s2 + b21, -30.0, 30.0)
-    c32 = tl.clamp(_tle_row(mt, 22, BLOCK_T) * rms_inv * s2 + b22, -30.0, 30.0)
-    c33 = tl.clamp(_tle_row(mt, 23, BLOCK_T) * rms_inv * s2 + b23, -30.0, 30.0)
+    # Model contract: clamp the comb logits before Sinkhorn (CLAMP_LOGITS).
+    c00 = _tle_comb_logit(mt, 8, rms_inv, s2, b8, CLAMP_LOGITS, BLOCK_T)
+    c01 = _tle_comb_logit(mt, 9, rms_inv, s2, b9, CLAMP_LOGITS, BLOCK_T)
+    c02 = _tle_comb_logit(mt, 10, rms_inv, s2, b10, CLAMP_LOGITS, BLOCK_T)
+    c03 = _tle_comb_logit(mt, 11, rms_inv, s2, b11, CLAMP_LOGITS, BLOCK_T)
+    c10 = _tle_comb_logit(mt, 12, rms_inv, s2, b12, CLAMP_LOGITS, BLOCK_T)
+    c11 = _tle_comb_logit(mt, 13, rms_inv, s2, b13, CLAMP_LOGITS, BLOCK_T)
+    c12 = _tle_comb_logit(mt, 14, rms_inv, s2, b14, CLAMP_LOGITS, BLOCK_T)
+    c13 = _tle_comb_logit(mt, 15, rms_inv, s2, b15, CLAMP_LOGITS, BLOCK_T)
+    c20 = _tle_comb_logit(mt, 16, rms_inv, s2, b16, CLAMP_LOGITS, BLOCK_T)
+    c21 = _tle_comb_logit(mt, 17, rms_inv, s2, b17, CLAMP_LOGITS, BLOCK_T)
+    c22 = _tle_comb_logit(mt, 18, rms_inv, s2, b18, CLAMP_LOGITS, BLOCK_T)
+    c23 = _tle_comb_logit(mt, 19, rms_inv, s2, b19, CLAMP_LOGITS, BLOCK_T)
+    c30 = _tle_comb_logit(mt, 20, rms_inv, s2, b20, CLAMP_LOGITS, BLOCK_T)
+    c31 = _tle_comb_logit(mt, 21, rms_inv, s2, b21, CLAMP_LOGITS, BLOCK_T)
+    c32 = _tle_comb_logit(mt, 22, rms_inv, s2, b22, CLAMP_LOGITS, BLOCK_T)
+    c33 = _tle_comb_logit(mt, 23, rms_inv, s2, b23, CLAMP_LOGITS, BLOCK_T)
 
     # row softmax over j, then the first column normalisation
     m0 = tl.maximum(tl.maximum(c00, c01), tl.maximum(c02, c03))
@@ -810,8 +823,22 @@ def _mhc_pre_tle_4(
     hc_sinkhorn_eps,
     hc_post_mult_value,
     sinkhorn_repeat,
+    clamp_logits=True,
+    post_out=None,
+    comb_out=None,
+    hin_out=None,
 ):
-    """Run proj -> mix -> reduce on the transposed (mix-major) layout."""
+    """Run proj -> mix -> reduce on the transposed (mix-major) layout.
+
+    ``clamp_logits`` is the model-contract switch: ``npu_mhc_pre_clamp_sinkhorn``
+    passes ``True`` (clamp(-30, 30) before Sinkhorn), the generic ``mhc_pre``
+    passes ``False`` so it keeps the reference math.  It is a compile-time flag,
+    so the two callers compile one artifact each and share nothing else.
+
+    ``post_out`` / ``comb_out`` / ``hin_out`` let a caller hand in the
+    already-allocated public outputs; the kernel layouts are token-major and
+    match them exactly, so no copy is needed.
+    """
     num_tokens = residual_flat.shape[0]
     hidden_size = residual_flat.shape[-1]
     hc_hidden_size = 4 * hidden_size
@@ -846,16 +873,18 @@ def _mhc_pre_tle_4(
     )
 
     pre_t = torch.empty(4, mix_stride, dtype=torch.float32, device=device)
-    post_t = torch.empty(num_tokens, 4, dtype=torch.float32, device=device)
-    comb_t = torch.empty(num_tokens, 16, dtype=torch.float32, device=device)
+    if post_out is None:
+        post_out = torch.empty(num_tokens, 4, dtype=torch.float32, device=device)
+    if comb_out is None:
+        comb_out = torch.empty(num_tokens, 16, dtype=torch.float32, device=device)
     mhc_pre_ascend_tle_mix_kernel[(t_pad // block_t,)](
         mix_t,
         sq,
         hc_scale,
         hc_base,
         pre_t,
-        post_t,
-        comb_t,
+        post_out,
+        comb_out,
         num_tokens,
         hc_hidden_size,
         mix_stride,
@@ -866,16 +895,18 @@ def _mhc_pre_tle_4(
         sinkhorn_repeat=sinkhorn_repeat,
         NC=_TLE_NC,
         BLOCK_T=block_t,
+        CLAMP_LOGITS=clamp_logits,
     )
 
-    layer_input = torch.empty(
-        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
-    )
+    if hin_out is None:
+        hin_out = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        )
     reduce_block_t = _tle_reduce_block_t(num_tokens)
     mhc_pre_ascend_tle_reduce_kernel[(triton.cdiv(num_tokens, reduce_block_t),)](
         pre_t,
         residual_flat,
-        layer_input,
+        hin_out,
         num_tokens,
         hidden_size,
         mix_stride,
@@ -885,7 +916,7 @@ def _mhc_pre_tle_4(
         BLOCK_D=_TLE_REDUCE_BLOCK_D,
     )
 
-    return post_t, comb_t, layer_input
+    return post_out, comb_out, hin_out
 
 
 def npu_mhc_pre_clamp_sinkhorn(
@@ -921,9 +952,9 @@ def npu_mhc_pre_clamp_sinkhorn(
 
     Execution:
         ``hc_mult == 4`` runs the TLE path below (``proj -> mix -> reduce`` on a
-        transposed, mix-major layout); other ``hc_mult`` values keep the generic
-        clamped kernel, and a Triton build without TLE falls back to the tiled
-        epilogue the generic op dispatches to on Ascend.
+        transposed, mix-major layout) when TLE is available; every other case
+        (other ``hc_mult`` values, or a Triton build without TLE) runs the
+        clamped generic kernel, which also applies ``clamp(-30, 30)``.
     """
     if residual.device.type != "npu":
         raise NotImplementedError("npu_mhc_pre_clamp_sinkhorn requires NPU tensors")
@@ -933,30 +964,11 @@ def npu_mhc_pre_clamp_sinkhorn(
     residual_flat = residual.reshape(-1, hc_mult, hidden_size).contiguous()
 
     # hc==4: TLE fast path on the transposed (mix-major) layout. Without TLE
-    # (stock Triton) fall back to the tiled epilogue the generic op dispatches
-    # to on Ascend.
-    if hc_mult == 4:
-        if _HAS_TLE:
-            post_mix, comb_mix, layer_input = _mhc_pre_tle_4(
-                residual_flat,
-                fn,
-                hc_scale,
-                hc_base,
-                rms_eps,
-                hc_pre_eps,
-                hc_sinkhorn_eps,
-                hc_post_mult_value,
-                sinkhorn_repeat,
-            )
-            post_mix = post_mix.view(*outer_shape, hc_mult, 1)
-            comb_mix = comb_mix.view(*outer_shape, hc_mult, hc_mult)
-            layer_input = layer_input.view(*outer_shape, hidden_size)
-            return post_mix, comb_mix, layer_input
-
-        from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre as _tiled_mhc_pre
-
-        return _tiled_mhc_pre(
-            residual,
+    # (stock Triton) fall through to the clamped generic kernel below -- do NOT
+    # delegate to the generic ``mhc_pre``, whose Ascend paths do not clamp.
+    if hc_mult == 4 and _HAS_TLE:
+        post_mix, comb_mix, layer_input = _mhc_pre_tle_4(
+            residual_flat,
             fn,
             hc_scale,
             hc_base,
@@ -965,8 +977,12 @@ def npu_mhc_pre_clamp_sinkhorn(
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
-            n_splits,
+            clamp_logits=True,
         )
+        post_mix = post_mix.view(*outer_shape, hc_mult, 1)
+        comb_mix = comb_mix.view(*outer_shape, hc_mult, hc_mult)
+        layer_input = layer_input.view(*outer_shape, hidden_size)
+        return post_mix, comb_mix, layer_input
 
     num_tokens = residual_flat.shape[0]
     hc_hidden_size = hc_mult * hidden_size

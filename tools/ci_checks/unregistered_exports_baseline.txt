@@ -24,7 +24,6 @@ hadamard128
 ihc_post
 ihc_post_ref
 ihc_pre
-ihc_pre_ref
 invoke_fused_moe_triton_kernel
 kpool_compress_and_write_cache
 kpool_decode_update_and_maybe_write_cache_batched

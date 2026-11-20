@@ -62,5 +62,6 @@ __all__ = [
     "hy4_flash_write_pool",
     "hy4_flash_write_tails",
     "SUPPORTED_FP8_DTYPE",
+    "gumbel_sample",
     "use_symm_mem",
 ]
