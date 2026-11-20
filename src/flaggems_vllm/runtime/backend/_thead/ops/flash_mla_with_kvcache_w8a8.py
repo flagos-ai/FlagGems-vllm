@@ -504,6 +504,12 @@ def dense_int8_mla_kernel(
         else:
             batch = _sorted_mla_request(request_ids, request_lengths, batch, B)
     heads = head_tile * BH + tl.arange(0, BH)
+    # The launch grid covers ceil_div(H, BH) head tiles.
+    valid_heads = (
+        tl.full((BH,), True, tl.int1)
+        if H % BH == 0 and HEADS_PER_QUERY >= 32
+        else heads < H
+    )
     query_index = heads // HEADS_PER_QUERY
     query_head = heads % HEADS_PER_QUERY
     dims = tl.arange(0, 512)
@@ -519,7 +525,7 @@ def dense_int8_mla_kernel(
         + query_index[:, None] * Q_STRIDES[1]
         + query_head[:, None] * Q_STRIDES[2]
         + dims[None, :],
-        heads[:, None] < H,
+        valid_heads[:, None],
         0,
     )
     if QK_SPLITS == 4:
@@ -532,7 +538,7 @@ def dense_int8_mla_kernel(
         + query_index[:, None] * QR_STRIDES[1]
         + query_head[:, None] * QR_STRIDES[2]
         + rope_dims[None, :],
-        heads[:, None] < H,
+        valid_heads[:, None],
         0,
     )
     qs = tl.load(
@@ -540,7 +546,7 @@ def dense_int8_mla_kernel(
         + batch * QS_STRIDES[0]
         + query_index * QS_STRIDES[1]
         + query_head * QS_STRIDES[2],
-        heads < H,
+        valid_heads,
         0,
     )
     if not reuse_length:
@@ -748,23 +754,23 @@ def dense_int8_mla_kernel(
         tl.store(
             Output + (batch * H + heads[:, None]) * 512 + dims[None, :],
             normalized,
-            heads[:, None] < H,
+            valid_heads[:, None],
         )
         logsum = tl.where(
             denominator > 0,
             maximum * 0.6931471805599453 + tl.log(denominator),
             float("inf"),
         )
-        tl.store(LSE + heads * B + batch, logsum, heads < H)
+        tl.store(LSE + heads * B + batch, logsum, valid_heads)
     else:
         tl.store(
             Partial + ((split * B + batch) * H + heads[:, None]) * 512 + dims[None, :],
             accumulator,
-            heads[:, None] < H,
+            valid_heads[:, None],
         )
-        tl.store(Stats + (split * 2 * H + heads) * B + batch, maximum, heads < H)
+        tl.store(Stats + (split * 2 * H + heads) * B + batch, maximum, valid_heads)
         tl.store(
-            Stats + ((split * 2 + 1) * H + heads) * B + batch, denominator, heads < H
+            Stats + ((split * 2 + 1) * H + heads) * B + batch, denominator, valid_heads
         )
         if head_tile == 0 and split == 0:
             tl.store(Offsets + batch, batch)
