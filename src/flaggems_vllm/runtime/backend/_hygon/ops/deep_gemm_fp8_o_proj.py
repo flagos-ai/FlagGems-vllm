@@ -679,68 +679,6 @@ def _quant_buffers_cached(
 
 
 # ---------------------------------------------------------------------------
-# Group-major -> token-major output reorder
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _reorder_groups_kernel(
-    src_ptr,
-    dst_ptr,
-    num_tokens,
-    inner: tl.constexpr,
-    groups: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Copy ``[groups, tokens, inner]`` into contiguous ``[tokens, groups, inner]``.
-
-    One program per (token, group) moves ``inner`` contiguous elements, so both
-    sides issue full-width vector accesses; ``permute().reshape()`` in torch
-    gathers the same rows at roughly half the bandwidth.
-    """
-    token = tl.program_id(0)
-    group = tl.program_id(1)
-    cols = tl.arange(0, BLOCK)
-    src_base = (group * num_tokens + token) * inner
-    dst_base = (token * groups + group) * inner
-    for chunk in tl.static_range(inner // BLOCK):
-        offsets = chunk * BLOCK + cols
-        tl.store(dst_ptr + dst_base + offsets, tl.load(src_ptr + src_base + offsets))
-
-
-def _reorder_groups(
-    src: torch.Tensor, num_tokens: int, n_groups: int, inner: int
-) -> torch.Tensor:
-    dst = _scratch(
-        (num_tokens, n_groups * inner), src.dtype, src.device
-    )
-    if dst.numel() == 0:
-        return dst
-    block = 1024
-    while block > 1 and inner % block:
-        block //= 2
-    grid = (num_tokens, n_groups)
-    args = (src, dst, num_tokens, inner, n_groups, block)
-    key_extra = (
-        _tensor_key(src),
-        _tensor_key(dst),
-        (num_tokens == 1, num_tokens % 16 == 0),
-        inner,
-        n_groups,
-        block,
-    )
-    _launch(
-        "reorder_groups",
-        _reorder_groups_kernel,
-        grid,
-        args,
-        key_extra,
-        {"num_warps": 4, "num_stages": 1},
-    )
-    return dst
-
-
-# ---------------------------------------------------------------------------
 # FP8 -> INT8 conversion kernels
 # ---------------------------------------------------------------------------
 
@@ -1131,23 +1069,14 @@ def deep_gemm_fp8_o_proj(
                     block_t,
                 )
         weight_i8, weight_scale_i8 = _cached_weight(owner, weight, weight_scale)
-        # The kernel stores tiles of one group at a time, so the caller's
-        # ``[tokens, groups, o_lora_rank]`` order strides consecutive rows by
-        # ``n_groups * o_lora_rank`` (16 KiB for g=8, which measured 24% slower
-        # at prefill). Producing the dense ``[groups, tokens, o_lora_rank]``
-        # buffer and reordering afterwards only pays off once the tiles are
-        # large: below ~512 tokens the extra launch costs more than the stride.
-        dense = num_tokens >= 512 and n_groups * o_lora_rank <= 8192
-        if dense:
-            out = _scratch(
-                (n_groups, num_tokens, o_lora_rank), torch.bfloat16, device
-            )
-            z = out
-        else:
-            out = _scratch(
-                (num_tokens, n_groups, o_lora_rank), torch.bfloat16, device
-            )
-            z = out.permute(1, 0, 2)
+        # Write straight into the caller's ``[tokens, groups, o_lora_rank]``
+        # order. The strided store used to cost 24% with the 256-row tile, but
+        # with 128x128 it matches the dense tile (1.049 vs 1.047 ms at 4096
+        # tokens) and saves the 0.11 ms group->token reorder pass.
+        out = _scratch(
+            (num_tokens, n_groups, o_lora_rank), torch.bfloat16, device
+        )
+        z = out.permute(1, 0, 2)
         try:
             _lean_bmm(act_i8, weight_i8, act_scale_i8, weight_scale_i8, z)
         except Exception:  # pragma: no cover - defensive fallback
@@ -1165,8 +1094,5 @@ def deep_gemm_fp8_o_proj(
             )
 
     assert callable(wo_b), "`wo_b` must be a callable linear layer"
-    if dense:
-        flat = _reorder_groups(out, num_tokens, n_groups, o_lora_rank)
-    else:
-        flat = out.reshape(num_tokens, n_groups * o_lora_rank)
+    flat = out.reshape(num_tokens, n_groups * o_lora_rank)
     return wo_b(flat)
