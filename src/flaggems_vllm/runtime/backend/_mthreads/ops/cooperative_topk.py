@@ -271,6 +271,34 @@ if HAS_TLE:
         q = tl.minimum(tl.maximum(values * 32.0 + 128.0, 0.0), 255.0).to(tl.int32)
         return tl.where(mag > 2139095040, 255, q)
 
+    @triton.jit
+    def _store_partition_histogram(
+        Row, Dst, begin, end, BLOCK: tl.constexpr, SUFFIX: tl.constexpr
+    ):
+        shared = tle.gpu.alloc(
+            [256],
+            dtype=tl.int32,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
+        )
+        bins = tl.arange(0, 256)
+        hist = tle.gpu.local_ptr(shared, (bins,))
+        tl.store(hist, 0)
+        tl.debug_barrier()
+        for start in range(begin, end, BLOCK):
+            i = start + tl.arange(0, BLOCK)
+            valid = i < end
+            v = tl.load(Row + i, valid, other=0.0)
+            q = _cooperative_topk_wide_bucket(v)
+            ptr = tle.gpu.local_ptr(shared, (q,))
+            tl.atomic_add(ptr, 1, mask=valid, sem="relaxed", scope="cta")
+        tl.debug_barrier()
+        counts = tl.load(hist)
+        if SUFFIX:
+            counts = tl.cumsum(counts, reverse=True)
+        tl.store(Dst + bins, counts)
+
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("cooperative_topk_mthreads_wide_histogram"),
@@ -291,29 +319,16 @@ if HAS_TLE:
         p = tl.program_id(0).to(tl.int64)
         r = tl.program_id(1).to(tl.int64)
         n = tl.minimum(tl.maximum(tl.load(Lengths + r), 0), WIDTH)
-        shared = tle.gpu.alloc(
-            [256],
-            dtype=tl.int32,
-            layout=None,
-            scope=tle.gpu.smem,
-            nv_mma_shared_layout=False,
-        )
-        bins = tl.arange(0, 256)
-        hist = tle.gpu.local_ptr(shared, (bins,))
-        tl.store(hist, 0)
-        tl.debug_barrier()
         chunk: tl.constexpr = triton.cdiv(WIDTH, PARTS)
         end = tl.minimum((p + 1) * chunk, n)
-        for start in range(p * chunk, end, BLOCK):
-            i = start + tl.arange(0, BLOCK)
-            valid = i < end
-            v = tl.load(Logits + r * STRIDE + i, valid, other=0.0)
-            q = _cooperative_topk_wide_bucket(v)
-            ptr = tle.gpu.local_ptr(shared, (q,))
-            tl.atomic_add(ptr, 1, mask=valid, sem="relaxed", scope="cta")
-        tl.debug_barrier()
-        count = tl.load(hist)
-        tl.store(Histograms + (r * PARTS + p) * 256 + bins, count)
+        _store_partition_histogram(
+            Logits + r * STRIDE,
+            Histograms + (r * PARTS + p) * 256,
+            p * chunk,
+            end,
+            BLOCK,
+            False,
+        )
 
     @triton.jit
     def _sum_matches(digit1, above1, equal1, digit2, above2, equal2):
@@ -473,6 +488,17 @@ if HAS_TLE:
             elif ne == K - na:
                 tl.store(Output + r * K + na + eo + er, i, e)
 
+    @triton.jit
+    def _suffix_workspace(
+        Workspace, ROWS: tl.constexpr, PARTS: tl.constexpr, CAPACITY: tl.constexpr
+    ):
+        # The caller provides 16 KiB per row. Store the complete batch's uint16
+        # suffix histograms first, then the state triples, keys, and indices.
+        tl.static_assert(PARTS * 256 * 2 + (3 + 2 * CAPACITY) * 4 <= 16384)
+        state = Workspace.to(tl.pointer_type(tl.int32)) + ROWS * PARTS * 128
+        keys = (state + ROWS * 3).to(tl.pointer_type(tl.uint32))
+        return state, keys, state + ROWS * (3 + CAPACITY)
+
     @libentry()
     @libtuner(
         configs=runtime.get_tuned_config("cooperative_topk_mthreads_wide_finish"),
@@ -500,6 +526,10 @@ if HAS_TLE:
         part = tl.program_id(0)
         r = tl.program_id(1).to(tl.int64)
         n = tl.minimum(tl.maximum(tl.load(Lengths + r), 0), WIDTH)
+        if CandidateKeys is None:
+            State, CandidateKeys, CandidateIndices = _suffix_workspace(
+                State, ROWS, PARTS, CAPACITY
+            )
         base = State + r * (STATE_STRIDE if STATE_STRIDE else 2 * PARTS + 3)
         d = tl.load(base)
         na = tl.load(base + 1)
@@ -566,8 +596,156 @@ if HAS_TLE:
                     ties += tl.sum(eq.to(tl.int32))
                     pos += tl.sum(sel.to(tl.int32))
 
+    @libentry()
+    @triton.jit
+    def _cooperative_topk_suffix_histogram(
+        Logits,
+        Lengths,
+        Workspace,
+        WIDTH: tl.constexpr,
+        STRIDE: tl.constexpr,
+        PARTS: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        part = tl.program_id(0)
+        row = tl.program_id(1).to(tl.int64)
+        n = tl.minimum(tl.maximum(tl.load(Lengths + row), 0), WIDTH)
+        chunk: tl.constexpr = WIDTH // PARTS
+        # The last partition also owns the remainder. All of its suffix counts
+        # must fit the uint16 histograms at the start of the workspace.
+        tl.static_assert(chunk + WIDTH % PARTS < 65536)
+        end = tl.minimum(tl.where(part == PARTS - 1, WIDTH, (part + 1) * chunk), n)
+        hist = Workspace.to(tl.pointer_type(tl.uint16))
+        _store_partition_histogram(
+            Logits + row * STRIDE,
+            hist + (row * PARTS + part) * 256,
+            part * chunk,
+            end,
+            BLOCK,
+            True,
+        )
+
+    @libentry()
+    @triton.jit
+    def _cooperative_topk_suffix_compact(
+        Logits,
+        Lengths,
+        Output,
+        Workspace,
+        WIDTH: tl.constexpr,
+        STRIDE: tl.constexpr,
+        K: tl.constexpr,
+        ROWS: tl.constexpr,
+        PARTS: tl.constexpr,
+        BLOCK: tl.constexpr,
+        CAPACITY: tl.constexpr,
+    ):
+        part = tl.program_id(0)
+        row = tl.program_id(1).to(tl.int64)
+        n = tl.minimum(tl.maximum(tl.load(Lengths + row), 0), WIDTH)
+        state, keys, indices = _suffix_workspace(Workspace, ROWS, PARTS, CAPACITY)
+        state += row * 3
+        if n <= K:
+            if part == 0:
+                i = tl.arange(0, K)
+                tl.store(Output + row * K + i, tl.where(i < n, i, -1))
+                tl.store(state, 0)
+                tl.store(state + 1, 0)
+                tl.store(state + 2, 0)
+        else:
+            # Each CTA reads this row's suffixes. It can derive both the global
+            # threshold and its disjoint output ranges without a threshold launch.
+            hist = Workspace.to(tl.pointer_type(tl.uint16)) + row * PARTS * 256
+            parts = tl.arange(0, PARTS)
+            bins = tl.arange(0, 256)
+            per_part = tl.load(hist + parts[:, None] * 256 + bins[None, :]).to(tl.int32)
+            suffix = tl.sum(per_part, 0)
+            digit = tl.max(tl.where(suffix >= K, bins, 0), 0)
+            above = tl.load(hist + parts * 256 + digit + 1, digit < 255, other=0).to(
+                tl.int32
+            )
+            equal = tl.load(hist + parts * 256 + digit).to(tl.int32) - above
+            num_above = tl.sum(above)
+            num_equal = tl.sum(equal)
+            above_offset = tl.sum(tl.where(parts < part, above, 0))
+            equal_offset = tl.sum(tl.where(parts < part, equal, 0))
+            if part == 0:
+                tl.store(state, digit)
+                tl.store(state + 1, num_above)
+                tl.store(state + 2, num_equal)
+            chunk: tl.constexpr = WIDTH // PARTS
+            end = tl.minimum(tl.where(part == PARTS - 1, WIDTH, (part + 1) * chunk), n)
+            for start in range(part * chunk, end, BLOCK):
+                i = start + tl.arange(0, BLOCK)
+                values = tl.load(Logits + row * STRIDE + i, i < end, other=0.0)
+                bucket = _cooperative_topk_wide_bucket(values)
+                is_above = (i < end) & (bucket > digit)
+                is_equal = (i < end) & (bucket == digit)
+                # Two exclusive ranks in one int32 scan. At most BLOCK lanes
+                # contribute to either half, so there is no carry or sign bit.
+                tl.static_assert(BLOCK < 32768)
+                ranks, counts = tle.cumsum(
+                    is_above.to(tl.int32) + (is_equal.to(tl.int32) << 16)
+                )
+                above_rank = above_offset + (ranks & 65535)
+                equal_rank = equal_offset + (ranks >> 16)
+                tl.store(Output + row * K + above_rank, i, is_above)
+                if num_equal <= CAPACITY:
+                    tl.store(
+                        keys + row * CAPACITY + equal_rank,
+                        _ordered_key(values),
+                        is_equal,
+                    )
+                    tl.store(indices + row * CAPACITY + equal_rank, i, is_equal)
+                elif num_equal == K - num_above:
+                    tl.store(Output + row * K + num_above + equal_rank, i, is_equal)
+                above_offset += counts & 65535
+                equal_offset += counts >> 16
+
     def _cooperative_topk_wide(logits, lengths, output, workspace, k, max_seq_len):
         rows, width = logits.shape
+        # With at most four tiles per partition (plus the final remainder),
+        # replicating the threshold reduction saves a separate launch on S5000.
+        parts = 16
+        block = 1024
+        if rows <= 4 and k == 2048 and width // parts <= 4 * block:
+            capacity = 256
+            stride = logits.stride(0)
+            options = {"llc_options": "-mtgpu-opt-level=1", "num_warps": 8}
+            _cooperative_topk_suffix_histogram[parts, rows](
+                logits, lengths, workspace, width, stride, parts, block, **options
+            )
+            _cooperative_topk_suffix_compact[parts, rows](
+                logits,
+                lengths,
+                output,
+                workspace,
+                width,
+                stride,
+                k,
+                rows,
+                parts,
+                block,
+                capacity,
+                **options,
+            )
+            _cooperative_topk_wide_finish[triton.cdiv(capacity, 8), rows](
+                logits,
+                lengths,
+                output,
+                workspace,
+                None,
+                None,
+                width,
+                stride,
+                k,
+                parts,
+                rows,
+                capacity,
+                block,
+                STATE_STRIDE=3,
+            )
+            return
         sparse = width >= 262144
         parts = 32 if sparse else 64
         capacity = 256

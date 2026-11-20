@@ -263,6 +263,9 @@ def test_arbitrary_fp32_bit_patterns(width, k):
         (65539, 255, 512),
         (65539, 256, 512),
         (65539, 257, 512),
+        (65539, 255, 2048),
+        (65539, 256, 2048),
+        (65539, 257, 2048),
         (262147, 255, 512),
         (262147, 256, 512),
         (262147, 257, 512),
@@ -350,8 +353,9 @@ def test_single_row_partitioned_threshold_candidates(width, candidate_count):
 @gpu
 @pytest.mark.parametrize("workspace_shape", [(4, 16384), (2, 2, 16384), (65537,)])
 @pytest.mark.parametrize("guard_size", [4, 32])
-def test_multidimensional_workspace_reuse(workspace_shape, guard_size):
-    rows, width, k = 4, 16384, 1024
+@pytest.mark.parametrize("width,k", [(16384, 1024), (65539, 2048)])
+def test_multidimensional_workspace_reuse(workspace_shape, guard_size, width, k):
+    rows = 4
     logits = torch.randn(rows, width, device=device)
     lengths, output, _ = _buffers(logits, [0, k, k + 1, width], k)
     workspace_numel = 1
