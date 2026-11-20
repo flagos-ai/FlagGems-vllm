@@ -1687,6 +1687,17 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: mamba_mixer
+  description: Triton implementation of the Mamba mixer operator for vLLM inference.
+  for:
+  - mamba_mixer
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: marlin_gemm
   description: 'Marlin quantized GEMM supporting W4A16 chunked quantization for efficient
     inference with quantized weights and FP16/BF16 activations.
