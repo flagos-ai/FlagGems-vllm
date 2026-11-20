@@ -32,11 +32,13 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import device as _device
 from flaggems_vllm.runtime import get_tuned_config
-from flaggems_vllm.utils import libentry
+from flaggems_vllm.runtime.backend import BackendArchEvent
+from flaggems_vllm.utils import libentry, libtuner
 
 _MHC_PRE_MIX_PAD = tl.constexpr(32)
 
 _VENDOR = _device.vendor_name
+_IS_HOPPER = _VENDOR == "nvidia" and BackendArchEvent().arch == "hopper"
 
 
 if _VENDOR == "mthreads":
@@ -1148,6 +1150,10 @@ def _mhc_pre_reader_s4(num_tokens, block_m, block_k, hc_hidden_size, target_ctas
     else:
         s = max(_capped(180, 0, 8), _capped(480, 4096, 8))
 
+    if _IS_HOPPER and num_tokens >= 2048:
+        # Increase occupancy for the one-stage Hopper reader tiles.
+        s = max(s, _capped(256, 0, 8))
+
     _bytes, _from_n, _upto_n, _cap = 0, 0, 0, 8
     if _VENDOR == "mthreads":
         _bytes, _upto_n, _cap = 1024, 1024, 20
@@ -1162,7 +1168,10 @@ def _mhc_pre_reader_s4(num_tokens, block_m, block_k, hc_hidden_size, target_ctas
     return s
 
 
-@triton.autotune(
+_reader_autotune = libtuner if _IS_HOPPER else triton.autotune
+
+
+@_reader_autotune(
     configs=get_tuned_config("mhc_pre_packed_reader")
     or [
         triton.Config({"BLOCK_M": 32, "BLOCK_K": 32}, num_warps=4, num_stages=2),
