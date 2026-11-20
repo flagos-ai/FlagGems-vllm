@@ -21,9 +21,13 @@ from flaggems_vllm.runtime.backend._ascend.a5.ops.causal_conv1d_update import (
 from flaggems_vllm.runtime.backend._ascend.a5.ops.flash_attention_bnsd import (
     flash_attention_fwd,
 )
+from flaggems_vllm.runtime.backend._ascend.a5.ops.recurrent_gated_delta_rule import (
+    recurrent_gated_delta_rule,
+)
 
 __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "flash_attention_fwd",
+    "recurrent_gated_delta_rule",
 ]

@@ -853,3 +853,10 @@ matmul_persistent:
     - [2, 32, 64, 5, 1, 2, 2, 64, 16]
     - [5, 1, 2, 2, 32, 64, 2, 64, 16]
     - [5, 1, 2, 4, 32, 64, 5, 1, 2, 4, 64, 16]
+
+recurrent_gated_delta_rule:
+  shapes:
+    - [16, 16]
+    - [32, 16]
+    - [8, 8]
+  shape_desc: "model dimensions"
