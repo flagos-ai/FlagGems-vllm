@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 from functools import lru_cache
 from pathlib import Path
 
@@ -33,7 +32,7 @@ from tests.test_flash_mla_sparse_fwd_w8a8 import (
     quantize_sparse_fp8_fixture,
 )
 
-from . import base, conftest, consts
+from . import base
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 
@@ -200,46 +199,21 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             )
             yield inputs, packed, shape
 
-    @staticmethod
-    @lru_cache(maxsize=1)
-    def workload_records():
-        path = Path(__file__).with_name("flash_mla_sparse_fwd_w8a8_shapes.json")
-        with path.open() as stream:
-            return json.load(stream)["records"]
-
     def set_shapes(self, shape_file_path):
         super().set_shapes(shape_file_path)
         if (
-            not MTHREADS_FP8_MLA
-            or Path(shape_file_path).resolve()
-            != Path(__file__).with_name("core_shapes.yaml").resolve()
+            MTHREADS_FP8_MLA
+            and Path(shape_file_path).resolve()
+            == Path(__file__).with_name("core_shapes.yaml").resolve()
         ):
-            return
-        records = self.workload_records()
-        config = conftest.Config
-        if config.bench_level == consts.BenchLevel.COMPREHENSIVE and not config.query:
-            shapes = [shape[:7] for shape in self.shapes]
-            shapes.extend(tuple(row["shape"]) for row in records)
-            self.shapes = list(dict.fromkeys(shapes))
-            self.shape_desc = self.shape_desc.split(", sink", 1)[0]
-        else:
-            v32 = sorted(
-                (row for row in records if row["shape"][2] == 576),
-                key=lambda row: row["count"],
-                reverse=True,
-            )[:10]
+            # GLM-5.2 V32 batches, ordered by FlagOSTune call count (7173d21a).
+            batches = (64, 193, 449, 4033, 16384, 512, 3586, 132, 1280, 2048)
             self.shapes.extend(
-                (*row["shape"], False, False, seed)
-                for seed, row in enumerate(v32, start=len(self.shapes))
+                (batch, 64, 576, 361344, 1, 2048, 512, False, False, seed)
+                for seed, batch in enumerate(batches, start=len(self.shapes))
             )
 
     def _get_mthreads_inputs(self, dtype):
-        fixture_shapes = self.shapes
-        if conftest.Config.bench_level == consts.BenchLevel.COMPREHENSIVE:
-            fixture_shapes = self.shapes + [
-                tuple(row["shape"]) for row in self.workload_records()
-            ]
-
         def shape_key(shape):
             _, heads, dims, tokens, h_kv, topk, value_dim = shape[:7]
             if len(shape) not in (7, 10) or h_kv != 1 or value_dim != 512:
@@ -253,7 +227,7 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
         @lru_cache(maxsize=3)
         def fixture(key):
             heads, dims, tokens, topk, seed = key
-            batch = max(shape[0] for shape in fixture_shapes if shape_key(shape) == key)
+            batch = max(shape[0] for shape in self.shapes if shape_key(shape) == key)
             return make_mthreads_sparse_inputs(
                 batch, heads, topk, tokens, dtype, dims - 512, seed
             )

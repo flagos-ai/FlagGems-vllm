@@ -114,7 +114,6 @@ class FlashmlaSparseTestKit:
         d_v: int,
         attn_sink: Optional[torch.Tensor],  # [h_q]
         topk_length: Optional[torch.Tensor],  # [s_q]
-        output_dtype: torch.dtype = torch.bfloat16,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -141,21 +140,21 @@ class FlashmlaSparseTestKit:
         P *= sm_scale
         P[invalid_mask.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
 
-        empty = invalid_mask.all(dim=-1, keepdim=True)
-        orig_lse = torch.logsumexp(P.masked_fill(empty[..., None], 0.0), dim=-1)
-        orig_lse = orig_lse.masked_fill(empty, -torch.inf)
+        orig_lse = torch.logsumexp(P, dim=-1)
         max_logits = P.max(dim=-1).values
 
         lse_for_o = FlashmlaSparseTestKit._merge_two_lse(orig_lse, attn_sink, s_q, h_q)
-        if attn_sink is not None:
-            lse_for_o = torch.where(torch.isneginf(attn_sink), orig_lse, lse_for_o)
-            lse_for_o = lse_for_o.masked_fill(torch.isposinf(attn_sink), torch.inf)
-        lse_for_o = lse_for_o.masked_fill(empty, torch.inf)
+        if not torch.is_inference_mode_enabled():
+            lse_for_o = lse_for_o.clone()
+        lse_for_o[lse_for_o == float("-inf")] = float(
+            "+inf"
+        )  # So that corresponding O will be 0
         s_for_o = torch.exp(P - lse_for_o.unsqueeze(-1))
         out = s_for_o @ gathered_kv[..., :d_v]
 
-        orig_lse = orig_lse.masked_fill(empty, torch.inf)
-        return (out.to(output_dtype), max_logits, orig_lse)
+        lonely_q_mask = orig_lse == float("-inf")
+        orig_lse[lonely_q_mask] = float("+inf")
+        return (out.to(torch.bfloat16), max_logits, orig_lse)
 
     @staticmethod
     def get_correctness_test_params():
@@ -273,17 +272,12 @@ class FlashmlaSparseTestKit:
         assert not torch.are_deterministic_algorithms_enabled()
         torch.use_deterministic_algorithms(True)
         perm_range_max = max(int(torch.max(perm_range).item()), perm_size)
-        # Large query counts must not allocate a query-by-cache score matrix.
-        chunk_rows = max(1, (1 << 25) // perm_range_max)
-        res = torch.empty((batch_size, perm_size), dtype=torch.int32)
-        columns = torch.arange(0, perm_range_max)
-        for begin in range(0, batch_size, chunk_rows):
-            end = min(begin + chunk_rows, batch_size)
-            rand = torch.rand(end - begin, perm_range_max, dtype=torch.float32)
-            rand[columns[None, :] >= perm_range[begin:end, None]] = float("-inf")
-            res[begin:end] = rand.topk(perm_size, dim=-1, sorted=True).indices.to(
-                torch.int32
-            )
+        rand = torch.rand(batch_size, perm_range_max, dtype=torch.float32)
+        rand[
+            torch.arange(0, perm_range_max).broadcast_to(batch_size, perm_range_max)
+            >= perm_range.view(batch_size, 1)
+        ] = float("-inf")
+        res = rand.topk(perm_size, dim=-1, sorted=True).indices.to(torch.int32)
         if len(paddings) == 1:
             res[res >= perm_range.view(batch_size, 1)] = paddings[0]
         else:
@@ -296,9 +290,7 @@ class FlashmlaSparseTestKit:
         return res
 
     @staticmethod
-    def make_input_flashmla(
-        param: Flashmla_Sparse_Test_Param, *, seed: Optional[int] = None
-    ):
+    def make_input_flashmla(param: Flashmla_Sparse_Test_Param):
         """Create input data for sparse MLA operator by referring to the FlashMLA examples"""
         s_q = param.s_q
         s_kv = param.s_kv
@@ -313,11 +305,8 @@ class FlashmlaSparseTestKit:
         device = param.device
 
         global _flashmla_sparse_counter
-        if seed is None:
-            FlashmlaSparseTestKit._init_seed(_flashmla_sparse_counter)
-            _flashmla_sparse_counter = _flashmla_sparse_counter + 1
-        else:
-            FlashmlaSparseTestKit._init_seed(seed)
+        FlashmlaSparseTestKit._init_seed(_flashmla_sparse_counter)
+        _flashmla_sparse_counter = _flashmla_sparse_counter + 1
 
         q = (
             torch.randn((s_q, h_q, d_qk), dtype=dtype, device=device) / 10

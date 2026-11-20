@@ -26,10 +26,6 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_flash_mla_sparse_fwd import (
-    Flashmla_Sparse_Test_Param,
-    FlashmlaSparseTestKit,
-)
 from tests.test_flash_mla_with_kvcache_w8a8 import SUPPORTED as HAS_CUDA_FP8_MLA
 from tests.test_flash_mla_with_kvcache_w8a8 import quantize_dense_fp8
 
@@ -219,10 +215,8 @@ def _mthreads_quantize(tensor, *, dequantize=True):
 
 def make_mthreads_sparse_inputs(batch, heads, topk, tokens, dtype, rope_dim, seed):
     pages = math.ceil(tokens / 64)
-    param = Flashmla_Sparse_Test_Param(batch, tokens, topk, heads, d_qk=576)
-    query, cache, indices, _, _ = FlashmlaSparseTestKit.make_input_flashmla(
-        param, seed=seed
-    )
+    shape = (batch, heads, 576, tokens, 1, topk, 512, False, False, seed)
+    query, cache, indices, *_ = make_sparse_inputs(shape)
     q, qr, qs, native_q = _mthreads_quantize(query.view(batch, 1, heads, 576))
     if tokens % 64:
         padded = torch.zeros(
@@ -277,34 +271,39 @@ def mthreads_sparse_reference(
         cache[first:last] = dequantize_sparse_rows(
             kv[first:last], kr[first:last], ks[first:last]
         )
-    selected = indices.view(rows, 1, -1)
+    selected = indices.view(rows, -1)
+    scale = dims**-0.5 if softmax_scale is None else softmax_scale
     output = torch.empty(
-        (batch * queries, heads, 512), dtype=torch.float32, device=reference_device
+        (rows, heads, 512), dtype=torch.float32, device=reference_device
     )
-    lse = torch.empty(
-        (batch * queries, heads), dtype=torch.float32, device=reference_device
-    )
-    for begin in range(0, batch * queries, chunk_rows):
-        end = min(begin + chunk_rows, batch * queries)
+    lse = torch.empty((rows, heads), dtype=torch.float32, device=reference_device)
+    if topk_length is not None:
+        positions = torch.arange(selected.shape[-1], device=reference_device)
+    for begin in range(0, rows, chunk_rows):
+        end = min(begin + chunk_rows, rows)
         query = dequantize_sparse_rows(q[begin:end], qr[begin:end], qs[begin:end])
-        output[begin:end], _, lse[begin:end] = (
-            FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
-                end - begin,
-                cache.shape[0],
-                heads,
-                1,
-                dims,
-                indices.shape[-1],
-                query,
-                cache,
-                selected[begin:end],
-                dims**-0.5 if softmax_scale is None else softmax_scale,
-                512,
-                attn_sink,
-                None if topk_length is None else topk_length[begin:end],
-                output_dtype=torch.float32,
-            )
+        ids = selected[begin:end]
+        valid = (ids >= 0) & (ids < tokens)
+        if topk_length is not None:
+            valid &= positions < topk_length[begin:end, None]
+        keys = cache.index_select(0, ids.masked_fill(~valid, 0).flatten()).view(
+            end - begin, selected.shape[-1], dims
         )
+        scores = (query @ keys.transpose(1, 2)) * scale
+        scores = scores.masked_fill(~valid[:, None, :], -torch.inf)
+        empty = ~valid.any(dim=-1, keepdim=True)
+        # muDNN logsumexp can produce NaN on rows filled with -inf.
+        logsum = torch.logsumexp(scores.masked_fill(empty[..., None], 0.0), dim=-1)
+        logsum = logsum.masked_fill(empty, -torch.inf)
+        normalizer = logsum
+        if attn_sink is not None:
+            sink = attn_sink.expand_as(logsum)
+            normalizer = torch.logsumexp(torch.stack((logsum, sink)), dim=0)
+            normalizer = torch.where(torch.isneginf(sink), logsum, normalizer)
+            normalizer = normalizer.masked_fill(torch.isposinf(sink), torch.inf)
+        normalizer = normalizer.masked_fill(empty, torch.inf)
+        output[begin:end] = torch.exp(scores - normalizer[..., None]) @ keys[..., :512]
+        lse[begin:end] = logsum.masked_fill(empty, torch.inf)
     return output.view(batch, queries, heads, 512), lse.view(
         batch, queries, heads
     ).transpose(1, 2)
