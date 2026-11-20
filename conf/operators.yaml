@@ -204,8 +204,8 @@ ops:
   stages:
   - beta: '5.3'
 - id: cast_sigmoid
-  description: 'Element-wise sigmoid with explicit output and compute dtype, used for
-    vLLM grouped-topk gating scores. Precisions: FP16, BF16 and FP32.'
+  description: 'Element-wise sigmoid with explicit output and compute dtype, used
+    for vLLM grouped-topk gating scores. Precisions: FP16, BF16 and FP32.'
   for:
   - None
   labels:
@@ -1048,12 +1048,18 @@ ops:
   stages:
   - alpha: '5.4'
 - id: fused_matmul_reduce_scatter
-  description: |
-    Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
+  description: 'Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
+
     Matches the symm_mem argument signature; currently inference-only, NVIDIA SM90+
-    or an experimental HCU descriptor-lowering path (BF16 sum validated on two BW nodes),
+
+    or an experimental HCU descriptor-lowering path (BF16 sum validated on two BW
+    nodes),
+
     FP16/BF16 2D inputs, sum/avg, scatter_dim=0, aligned shapes, eager execution.
+
     Uses process-group-scoped communication resources and explicit configuration.
+
+    '
   for:
   - symm_mem.fused_matmul_reduce_scatter
   labels:
@@ -1310,13 +1316,13 @@ ops:
 - id: get_num_sampled_and_rejected
   description: Update sampled and rejected token counts per request.
   for:
-    - get_num_sampled_and_rejected
+  - get_num_sampled_and_rejected
   labels:
-    - fused
+  - fused
   kind:
-    - Sampling
+  - Sampling
   stages:
-    - beta: '0.3'
+  - beta: '0.3'
 - id: group_list_cumsum
   description: 'Computes expert token-count offsets (cumsum) for expert-parallel MoE
 
@@ -1681,6 +1687,21 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: marlin_gemm
+  description: 'Marlin quantized GEMM supporting W4A16 chunked quantization for efficient
+    inference with quantized weights and FP16/BF16 activations.
+
+    '
+  for:
+  - marlin_gemm
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  kind:
+  - BLAS
+  stages:
+  - alpha: '5.5'
 - id: matmul_persistent
   description: vLLM batch-invariant matmul with bounded NVIDIA small-matrix optimization.
   for:
@@ -2162,12 +2183,17 @@ ops:
   - stable: '4.1'
   cpp: '4.0'
 - id: select_candidate_blocks_cooperative
-  description: |
-    DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM's
+  description: 'DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM''s
+
     select_candidate_blocks_cooperative: per-block NaN-propagating max with
-    the newest block pinned, top-k over each row's valid block prefix (the
+
+    the newest block pinned, top-k over each row''s valid block prefix (the
+
     Triton persistent_topk / cooperative_topk in place of the CUDA
+
     cooperative_topk), then -inf / out-of-range ids dropped to -1.
+
+    '
   for:
   - vllm.models.deepseek_v41.nvidia.specialized_decode.attention.candidate_topk.select_candidate_blocks_cooperative
   labels:
@@ -2420,7 +2446,8 @@ ops:
   - alpha: '5.4'
 - id: topk_sigmoid
   description: Selects MoE experts using sigmoid scores and optional correction bias.
-    Returns uncorrected weights with optional normalization and scaling and marks padded experts.
+    Returns uncorrected weights with optional normalization and scaling and marks
+    padded experts.
   for:
   - _moe_C.topk_sigmoid
   labels:

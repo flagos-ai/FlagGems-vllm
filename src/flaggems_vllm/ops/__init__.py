@@ -187,6 +187,7 @@ from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size_triton,
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
+from flaggems_vllm.ops.marlin_gemm import marlin_gemm
 from flaggems_vllm.ops.mrope import mrope
 from flaggems_vllm.ops.mul import mul, mul_
 from flaggems_vllm.ops.mv import mv
@@ -400,6 +401,7 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "marlin_gemm",
     "matmul_persistent",
     "mhc_bwd",
     "mhc_fused_post_pre_with_norm",
