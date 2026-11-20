@@ -20,7 +20,7 @@ from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_r
     fused_q_kv_rmsnorm,
 )
 from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache import (
-    sparse_decode_thead,
+    flash_mla_with_kvcache,
 )
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
@@ -57,6 +57,7 @@ from flaggems_vllm.runtime.backend._thead.ops.w8a8_block_matmul import w8a8_bloc
 __all__ = [
     "chunk_gated_delta_rule_w8a16_int8",
     "cooperative_topk",
+    "flash_mla_with_kvcache",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
@@ -72,7 +73,6 @@ __all__ = [
     "qsa_prepare",
     "quantize_gdn_state_int8",
     "qwen4_hc_inject_combine",
-    "sparse_decode_thead",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_int8_bmm",

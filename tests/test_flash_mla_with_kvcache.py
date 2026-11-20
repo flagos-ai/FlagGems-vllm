@@ -38,13 +38,14 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 # Triton implementation under test
+import flaggems_vllm
 from flaggems_vllm.ops.flash_mla_with_kvcache import FlashMLASchedMeta
-from flaggems_vllm.ops.flash_mla_with_kvcache import (
-    flash_mla_with_kvcache as triton_flash_mla,
-)
 from flaggems_vllm.ops.flash_mla_with_kvcache import (
     get_mla_metadata as triton_get_mla_metadata,
 )
+
+# The operator as registered, so a backend that replaces it is what is tested.
+triton_flash_mla = flaggems_vllm.flash_mla_with_kvcache
 
 DEVICE = "cuda"
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -52,9 +53,20 @@ FP8_MAX = 448.0
 
 
 def generate_v32_fp8_kv_cache(
-    num_pages, page_block_size, h_k=1, d_nope=512, d_rope=64, device=DEVICE
+    num_pages,
+    page_block_size,
+    h_k=1,
+    d_nope=512,
+    d_rope=64,
+    device=DEVICE,
+    scale_fmt=None,
 ):
-    """Generate V32 FP8 KV cache: 512 FP8 + 4 FP32 scales + 64 BF16."""
+    """Generate V32 FP8 KV cache: 512 FP8 + 4 FP32 scales + 64 BF16.
+
+    scale_fmt "ue8m0" rounds every scale up to a power of two, the way
+    indexer_k_quant_and_cache does, so that the format the caller promises
+    matches the cache.
+    """
     total_tokens = num_pages * page_block_size
 
     nope_data = (
@@ -65,6 +77,8 @@ def generate_v32_fp8_kv_cache(
     groups = nope_flat.reshape(-1, 4, 128)
     scales = groups.float().abs().amax(dim=-1) / FP8_MAX
     scales = scales.clamp(min=1e-12)
+    if scale_fmt == "ue8m0":
+        scales = torch.exp2(torch.ceil(torch.log2(scales)))
     quantized = (groups.float() / scales[:, :, None]).clamp(-FP8_MAX, FP8_MAX)
     fp8_data = quantized.reshape(-1, d_nope).to(torch.float8_e4m3fn)
 
@@ -237,16 +251,24 @@ if cfg.QUICK_MODE:
 
 
 @pytest.mark.flash_mla_with_kvcache
+@pytest.mark.parametrize("scale_fmt", [None, "ue8m0"])
 @pytest.mark.parametrize("batch,h_q,topk,page_block_size,num_pages", V32_SHAPES)
-def test_sparse_decode_v32_fp8(batch, h_q, topk, page_block_size, num_pages):
-    """V32 sparse decode uses 656-byte FP8 cache and no dynamic topk."""
+def test_sparse_decode_v32_fp8(batch, h_q, topk, page_block_size, num_pages, scale_fmt):
+    """V32 sparse decode uses 656-byte FP8 cache and no dynamic topk.
+
+    Both scale formats are run: the cache is quantized the way scale_fmt says
+    and scale_fmt is passed along, so a backend that dequantizes a power of two
+    differently is checked against the same reference.
+    """
     print("\n=== test_sparse_decode_v32_fp8 ===")
     seq_q, d_qk = 1, 576
     head_dim_v = 512
 
     torch.manual_seed(42)
     q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device=DEVICE)
-    kv_cache = generate_v32_fp8_kv_cache(num_pages, page_block_size)
+    kv_cache = generate_v32_fp8_kv_cache(
+        num_pages, page_block_size, scale_fmt=scale_fmt
+    )
     total_tokens = num_pages * page_block_size
     indices = torch.randint(
         0, total_tokens, (batch, seq_q, topk), dtype=torch.int32, device=DEVICE
@@ -278,6 +300,7 @@ def test_sparse_decode_v32_fp8(batch, h_q, topk, page_block_size, num_pages):
         indices=indices,
         attn_sink=attn_sink,
         out=triton_out_buf,
+        scale_fmt=scale_fmt,
     )
 
     assert cuda_out.data_ptr() == cuda_out_buf.data_ptr()

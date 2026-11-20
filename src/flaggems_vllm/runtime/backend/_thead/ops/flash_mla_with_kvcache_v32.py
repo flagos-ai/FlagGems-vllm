@@ -162,41 +162,29 @@ def _spread(value):
 
 
 @triton.jit
-def _dequant(raw, scales, POW2_SCALES: tl.constexpr):
-    """[64, 512] BF16 NoPE tile: e4m3 values times their 128-wide group's scale.
+def _convert(raw, biased, epsilon):
+    """[64, 512] e4m3 bytes to BF16, scaled by the BF16 pattern in biased.
 
-    Each scale is split into its power of two, which the exponent arithmetic
-    below carries for nothing, and its significand in [1, 2), which needs a
-    real multiply over the tile. A ue8m0 scale -- rounded to a power of two,
-    what indexer_k_quant_and_cache writes with scale_fmt="ue8m0" -- leaves
-    every significand at 1, and POW2_SCALES then drops the multiply, worth 2.7%
-    of the call. That has to be a compile-time choice: deciding per tile from
-    the tile's own scales either does not compile (make_ttgir rejects the loop)
-    or, written so that it does, costs 4.9x by breaking the pipeline, and a
-    device-side probe over the scales this call reads costs 7-11% of it.
+    An e4m3 byte is s.eeee.mmm, and BF16 wants the exponent at bits 14..7 and
+    the mantissa at 6..0, so *both* fields move left by exactly 4: masking
+    bits 6..0 and shifting once places them together. Adding a power of two's
+    BF16 pattern then raises the exponent by (its exponent + 120), which is
+    the 120 bias e4m3 needs and the scaling by that power of two at once --
+    hence the callers' scale * 2**-7, 127 - 7 being the bias difference.
+
+    A subnormal comes out of that as 2**-7 * (1 + m/8) where it should be
+    2**-6 * m/8, and the second is exactly twice the first less 2**-6, so
+    min(2x - 2**-6, x) picks the right one either way: for a normal value
+    2x - 2**-6 is above x, for a subnormal below it. epsilon carries that
+    bound, scaled like the values.
+
+    The backend's own e4m3 conversion is a long software sequence on this
+    target (capability 8.0), and the e4m3x2 cvt instruction is rejected on
+    ppu1.0. All four values of a pack share one scale, so $3 and $5 serve
+    both halves. x ends up holding the pack's bytes 0 and 2 and y bytes 1 and
+    3, so the two permutes at the end restore the column order.
     """
-    bits = scales.to(tl.uint32, bitcast=True)
-    pow2 = (bits & 0xFF800000).to(tl.float32, bitcast=True)
-    significand = ((bits & 0x007FFFFF) | 0x3F800000).to(tl.float32, bitcast=True)
-    # An e4m3 byte is s.eeee.mmm, and BF16 wants the exponent at bits 14..7 and
-    # the mantissa at 6..0, so *both* fields move left by exactly 4: masking
-    # bits 6..0 and shifting once places them together. Adding the BF16 pattern
-    # of the power of two then raises the exponent by (its exponent + 120),
-    # which is the 120 bias e4m3 needs and the scaling by it at once -- hence
-    # pow2 * 2**-7 below, 127 - 7 being the bias difference.
-    biased = _spread(pow2 * 0.0078125)
-    # A subnormal comes out of that as 2**-7 * (1 + m/8) where it should be
-    # 2**-6 * m/8, and the second is exactly twice the first less 2**-6, so
-    # min(2x - 2**-6, x) picks the right one either way: for a normal value
-    # 2x - 2**-6 is above x, for a subnormal below it. The bound is scaled like
-    # the values.
-    epsilon = _spread(pow2 * -0.015625)
-    # The backend's own e4m3 conversion is a long software sequence on this
-    # target (capability 8.0), and the e4m3x2 cvt instruction is rejected on
-    # ppu1.0. All four values of a pack share one scale, so $3 and $5 serve
-    # both halves. x ends up holding the pack's bytes 0 and 2 and y bytes 1 and
-    # 3, so the two permutes at the end restore the column order.
-    tile = tl.inline_asm_elementwise(
+    return tl.inline_asm_elementwise(
         """{
         .reg .b32 t0, t1, x, y, s0, s1, two, t;
         ppu.mov.b32 two, 0x40004000;
@@ -224,8 +212,38 @@ def _dequant(raw, scales, POW2_SCALES: tl.constexpr):
         is_pure=True,
         pack=4,
     )
+
+
+@triton.jit
+def _dequant(raw, scales, POW2_SCALES: tl.constexpr):
+    """[64, 512] BF16 NoPE tile: e4m3 values times their 128-wide group's scale.
+
+    POW2_SCALES is the caller's promise that every scale is a power of two --
+    a ue8m0 scale, what indexer_k_quant_and_cache writes with
+    scale_fmt="ue8m0". The scale's own BF16 pattern then carries the whole
+    scaling through the exponent arithmetic in _convert, and this is a
+    straight-line conversion.
+
+    Without the promise each scale is split into its power of two, which that
+    arithmetic carries for nothing, and its significand in [1, 2), which needs
+    a real multiply over the tile. The two together cost 2.6% of the call, and
+    most of that is the split rather than the multiply: dropping only the
+    multiply leaves this 2.5% slower still, the dot layout and pipeline the
+    backend picks being that sensitive to the shape of the dequantization. So
+    the promise selects this straight-line path rather than a cheaper variant
+    of the general one.
+
+    Which path to take has to be a compile-time choice: deciding per tile from
+    the tile's own scales either does not compile (make_ttgir rejects the loop)
+    or, written so that it does, costs 4.9x by breaking the pipeline, and a
+    device-side probe over the scales this call reads costs 7-11% of it.
+    """
     if POW2_SCALES:
-        return tile
+        return _convert(raw, _spread(scales * 0.0078125), _spread(scales * -0.015625))
+    bits = scales.to(tl.uint32, bitcast=True)
+    pow2 = (bits & 0xFF800000).to(tl.float32, bitcast=True)
+    significand = ((bits & 0x007FFFFF) | 0x3F800000).to(tl.float32, bitcast=True)
+    tile = _convert(raw, _spread(pow2 * 0.0078125), _spread(pow2 * -0.015625))
     return tile * _spread(significand)
 
 
@@ -477,11 +495,11 @@ def sparse_decode_v32_thead(
     """Writes out [B, 1, 64, 512] and lse [B, 64, 1].
 
     pow2_kv_scales says the cache's scales are all powers of two, as they are
-    when the producer quantized with scale_fmt="ue8m0"; it drops a multiply
-    worth 2.7% of the call. It defaults to off because the interface carries no
-    such promise -- FlagGems-vllm's own generate_v32_fp8_kv_cache writes
-    amax / 448 -- and a caller that passes it wrongly gets wrong results, not a
-    slower kernel.
+    when the producer quantized with scale_fmt="ue8m0"; dequantization is then
+    a straight exponent add, worth 2.6% of the call. It defaults to off because
+    the interface carries no such promise -- FlagGems-vllm's own
+    generate_v32_fp8_kv_cache writes amax / 448 -- and a caller that passes it
+    wrongly gets wrong results, not a slower kernel.
 
     The tile schedule is kept in sched_meta.tile_scheduler_metadata /
     num_splits and reused while set, which is sound here because without

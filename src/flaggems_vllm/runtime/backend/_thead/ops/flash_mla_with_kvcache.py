@@ -12,19 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sparse decode with an FP8 KV cache for T-Head PPU, one entry for both layouts.
+"""flash_mla_with_kvcache for T-Head PPU: sparse decode with an FP8 KV cache.
 
-The two FP8 cache layouts are different enough to be separate kernels and the
-caller does not say which one it has, so this picks by ``head_dim_k``:
+This is the backend's registered flash_mla_with_kvcache. It serves the two
+sparse FP8 cache layouts with their own kernels and hands everything else --
+dense decode, a cache neither kernel handles, a build without the TLE
+primitives they need -- to the generic implementation, whose argument checks
+and output allocation it reuses so the operator's contract lives in one place.
+
+The two layouts are different enough to be separate kernels and the caller does
+not say which one it has, so this picks by ``head_dim_k``:
 ``flash_mla_with_kvcache_model1`` for 512 (584 bytes per token) and
 ``flash_mla_with_kvcache_v32`` for 576 (656 bytes per token, the V3.2 layout).
 """
 import functools
 
-import triton
 import triton.experimental.tle as tle_api
 import triton.experimental.tle.language as tle
 
+from flaggems_vllm.ops.flash_mla_with_kvcache import _sparse_decode_dispatch
+from flaggems_vllm.ops.flash_mla_with_kvcache import (
+    flash_mla_with_kvcache as flash_mla_with_kvcache_generic,
+)
+from flaggems_vllm.ops.flash_mla_with_kvcache import prepare_call, validate_sparse_args
 from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_model1 import (
     can_use_model1_thead,
     sparse_decode_model1_thead,
@@ -33,6 +43,8 @@ from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_v32 import 
     can_use_v32_thead,
     sparse_decode_v32_thead,
 )
+
+_PRIMITIVES = (tle.gpu.alloc, tle.gpu.local_ptr)
 
 
 @functools.lru_cache(maxsize=1)
@@ -47,88 +59,170 @@ def _usable():
 
         if runtime.device.vendor_name != "thead":
             return False
-        # GPUTarget.backend reads "cuda" on this device; the whitelist is keyed
-        # by the backend package the active driver comes from.
+        is_tle_supported = getattr(tle_api, "is_tle_supported", None)
+        if is_tle_supported is not None:
+            return is_tle_supported(_PRIMITIVES)
+        # FlagTree before the is_tle_supported/require_tle rework asked per
+        # primitive and per backend, and named the backend after the package
+        # the active driver comes from, since GPUTarget.backend reads "cuda"
+        # on this device.
+        import triton
+
         backend = type(triton.runtime.driver.active).__module__.split(".")[2]
         return all(
             tle_api.is_primitive_supported(backend, primitive)
-            for primitive in (tle.gpu.alloc, tle.gpu.local_ptr)
+            for primitive in _PRIMITIVES
         )
     except Exception:
         return False
 
 
-def sparse_decode_thead(
+def flash_mla_with_kvcache(
     q,
-    kv,
-    indices,
-    *,
+    k_cache,
+    block_table,
+    cache_seqlens,
+    head_dim_v,
+    tile_scheduler_metadata,
+    num_splits=None,
+    softmax_scale=None,
+    causal=False,
+    is_fp8_kvcache=False,
+    indices=None,
     attn_sink=None,
+    extra_k_cache=None,
+    extra_indices_in_kvcache=None,
     topk_length=None,
-    extra_kv=None,
-    extra_indices=None,
     extra_topk_length=None,
-    out,
-    lse,
-    sm_scale,
-    sched_meta=None,
-    pow2_kv_scales=False,
+    out=None,
+    scale_fmt=None,
 ):
-    """Runs the kernel for whichever layout q and kv are in and returns True.
+    """Sparse decode on PPU, falling back to the generic operator otherwise.
 
-    Returns False, having written nothing, when this path cannot serve the call
-    -- another device, another dtype, a layout neither kernel handles -- so the
-    caller falls back to its portable kernel. Writes out [B, 1, 64, 512] and
-    lse [B, 64, 1].
-
-    pow2_kv_scales is the V32 layout's optional promise that every cache scale
-    is a power of two, which buys 2.7% there; MODEL1 ignores it, since its
-    scales are ue8m0 exponent bytes by layout and never anything else.
+    scale_fmt is the format the cache scales were quantized in, as passed to
+    indexer_k_quant_and_cache. "ue8m0" promises every scale is a power of two,
+    which lets the V32 kernel fold the scale into the FP8 exponent and skip a
+    multiply per tile; any other value, None included, takes the path that
+    reads the scales as written. MODEL1 does not look at it: its scales are
+    ue8m0 exponent bytes by layout and never anything else.
     """
-    if not _usable():
-        return False
-    head_dim_k = q.shape[-1]
-    if head_dim_k == 512:
-        if not can_use_model1_thead(
+    if indices is None or not _usable():
+        return flash_mla_with_kvcache_generic(
             q,
-            kv,
+            k_cache,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            tile_scheduler_metadata,
+            num_splits,
+            softmax_scale,
+            causal,
+            is_fp8_kvcache,
             indices,
-            out,
-            lse,
-            extra_kv,
-            extra_indices,
+            attn_sink,
+            extra_k_cache,
+            extra_indices_in_kvcache,
             topk_length,
             extra_topk_length,
-        ):
-            return False
+            out,
+            scale_fmt,
+        )
+
+    sched_meta = tile_scheduler_metadata
+    out, lse, softmax_scale, topk = prepare_call(
+        q,
+        k_cache,
+        head_dim_v,
+        sched_meta,
+        num_splits,
+        softmax_scale,
+        causal,
+        is_fp8_kvcache,
+        indices,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        out,
+    )
+    validate_sparse_args(
+        q,
+        k_cache,
+        indices,
+        attn_sink,
+        topk_length,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        extra_topk_length,
+        head_dim_v,
+        topk,
+        causal,
+        is_fp8_kvcache,
+    )
+
+    head_dim_k = q.shape[3]
+    if head_dim_k == 512 and can_use_model1_thead(
+        q,
+        k_cache,
+        indices,
+        out,
+        lse,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        topk_length,
+        extra_topk_length,
+    ):
+        # The tile schedule is kept in sched_meta and reused on later calls.
         sparse_decode_model1_thead(
             q,
-            kv,
+            k_cache,
             indices,
             attn_sink=attn_sink,
             topk_length=topk_length,
-            extra_kv=extra_kv,
-            extra_indices=extra_indices,
+            extra_kv=extra_k_cache,
+            extra_indices=extra_indices_in_kvcache,
             extra_topk_length=extra_topk_length,
             out=out,
             lse=lse,
-            sm_scale=sm_scale,
+            sm_scale=softmax_scale,
             sched_meta=sched_meta,
         )
-        return True
-    if head_dim_k == 576:
-        if not can_use_v32_thead(q, kv, indices, out, lse, topk_length):
-            return False
+        return out, lse
+    if head_dim_k == 576 and can_use_v32_thead(
+        q, k_cache, indices, out, lse, topk_length
+    ):
         sparse_decode_v32_thead(
             q,
-            kv,
+            k_cache,
             indices,
             attn_sink=attn_sink,
             out=out,
             lse=lse,
-            sm_scale=sm_scale,
+            sm_scale=softmax_scale,
             sched_meta=sched_meta,
-            pow2_kv_scales=pow2_kv_scales,
+            pow2_kv_scales=scale_fmt == "ue8m0",
         )
-        return True
-    return False
+        return out, lse
+
+    # A sparse layout neither kernel handles; the portable one reads it.
+    _sparse_decode_dispatch(
+        q,
+        k_cache,
+        indices,
+        out,
+        lse,
+        attn_sink,
+        topk_length,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        extra_topk_length,
+        q.shape[0],
+        q.shape[1],
+        q.shape[2],
+        head_dim_k,
+        head_dim_v,
+        topk,
+        k_cache.shape[1],
+        softmax_scale,
+        is_fp8_kvcache,
+        sched_meta,
+    )
+    return out, lse
