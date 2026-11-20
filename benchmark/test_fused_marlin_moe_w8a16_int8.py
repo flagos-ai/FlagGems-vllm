@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 import torch
 
@@ -19,9 +21,15 @@ import torch
 # the entire benchmark is skipped via the skipif marker below.
 try:
     import vllm._custom_ops as vllm_ops
-    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
-        fused_marlin_moe as vllm_fused_marlin_moe,
-    )
+
+    try:
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+            fused_marlin_moe as vllm_fused_marlin_moe,
+        )
+    except ModuleNotFoundError:
+        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+            fused_marlin_moe as vllm_fused_marlin_moe,
+        )
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
         marlin_permute_scales,
     )
@@ -287,9 +295,18 @@ def _marlin_repack_per_expert_int8(w_q, scales):
     qweight_l, scales_l = [], []
     E, out_dim, in_dim = w_q.shape
     perm = torch.empty(0, dtype=torch.int, device=w_q.device)
+    repack_kwargs = (
+        {"perm": perm}
+        if "perm" in inspect.signature(vllm_ops.gptq_marlin_repack).parameters
+        else {}
+    )
     for e in range(E):
         qw = vllm_ops.gptq_marlin_repack(
-            w_q[e].view(torch.int32).T.contiguous(), perm, in_dim, out_dim, 8
+            b_q_weight=w_q[e].view(torch.int32).T.contiguous(),
+            size_k=in_dim,
+            size_n=out_dim,
+            num_bits=8,
+            **repack_kwargs,
         )
         sc = marlin_permute_scales(
             scales[e].T.contiguous(), in_dim, out_dim, GROUP_SIZE
