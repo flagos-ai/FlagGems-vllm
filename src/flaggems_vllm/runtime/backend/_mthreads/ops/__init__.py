@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
+    cooperative_topk,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
@@ -73,6 +76,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.watermark import (
 
 __all__ = [
     "chunk_gated_delta_rule_w8a16_fp8",
+    "cooperative_topk",
     "dequantize_and_gather_k_cache",
     "draft_watermarking_mask",
     "flash_attn_varlen_func_w8a8_fp8",

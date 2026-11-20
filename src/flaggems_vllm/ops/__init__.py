@@ -91,6 +91,7 @@ from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
     fp8_fp4_paged_mqa_logits_graph,
 )
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
+from flaggems_vllm.ops.fused_q import fused_q
 from flaggems_vllm.ops.fused_allreduce_rms_norm import (
     fused_allreduce_rms_norm,
 )
@@ -365,6 +366,7 @@ __all__ = [
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
+    "fused_q",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
