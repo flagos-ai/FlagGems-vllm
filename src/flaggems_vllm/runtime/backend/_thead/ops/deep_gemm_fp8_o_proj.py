@@ -70,11 +70,14 @@ _DECODE_MAX_T = 16
 _DECODE_BLOCK_N = 128
 _DECODE_K_BLOCKS = 2
 _DECODE_WARPS = 4
-# G=16 decode is weight-read bound with only 128 CTAs (2 waves); splitting K
-# gives 512 CTAs and measured 80.6 -> 77.4 us at T=1 (neutral at T>=16).
-_DECODE_SPLIT = 4
+# G=16 decode is weight-read bound with only 128 CTAs (2 waves), so splitting K
+# raises the CTA count; SPLIT=8 measured 74.9 us at T=1 against 77.9 for 4 and
+# 81.8 for the plain lean kernel (pure read of the 67 MB weight is 69 us).
+_DECODE_SPLIT = 8
 _DECODE_SPLIT_BN = 64
-_DECODE_SPLIT_MAX_T = 8
+# T=16 measured 80.8 us split against 82.4 for the lean kernel, so the split
+# path covers the whole decode range; above 16 it loses to the lean tile.
+_DECODE_SPLIT_MAX_T = 16
 
 
 @triton.jit
