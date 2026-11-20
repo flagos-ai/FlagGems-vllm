@@ -134,11 +134,10 @@ def _tile(m):
         return 64, 128, 4, 2, 8, 128, 1
     if m <= 128:
         return 128, 128, 8, 1, 8, 128, 1
-    if m < 2048:
-        return 256, 128, 8, 1, 8, 128, 2
-    # From 2048 tokens the L2 swizzle with 4 row groups measured 0.5-0.9%
-    # faster than 8; below that it is a wash or slightly worse.
-    return 256, 128, 8, 1, 4, 128, 2
+    # 128x128 with unroll 2 wins every m >= 256 bucket once the scales are
+    # block-major: 0.100 vs 0.111 ms at 256 tokens and 1.058 vs 1.321 ms at
+    # 4096 (259 vs 208 TFLOPS).
+    return 128, 128, 8, 1, 8, 128, 2
 
 
 def _lean_bmm(act, weight, act_scale, weight_scale, out):
@@ -305,7 +304,8 @@ def _inv_rope_quant_int8_kernel(
         qi = tl.where(qi >= 0, qi + 0.5, qi - 0.5).to(tl.int32).to(tl.int8)
         tl.store(
             scale_base + (head_in_group * CHUNKS_PER_HEAD + ci) * scale_stride_k,
-            tl.where(rows_valid, scale_i, 0.0),
+            scale_i,
+            mask=rows_valid,
         )
         tl.store(
             out_base + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
@@ -350,7 +350,8 @@ def _inv_rope_quant_int8_kernel(
     tl.store(
         scale_base
         + (head_in_group * CHUNKS_PER_HEAD + CHUNKS_PER_HEAD - 1) * scale_stride_k,
-        tl.where(rows_valid, scale_last, 0.0),
+        scale_last,
+        mask=rows_valid,
     )
 
     q_lo = _round_to_e4m3_grid(lo * rscale_last[:, None]) * (int8_max / fp8_max)
@@ -392,6 +393,7 @@ def _inv_rope_quant_int8_rows_kernel(
     out_stride_token,
     scale_stride_group,
     scale_stride_token,
+    scale_stride_k,
     fp8_max: tl.constexpr,
     int8_max: tl.constexpr,
     eps: tl.constexpr,
@@ -455,8 +457,9 @@ def _inv_rope_quant_int8_rows_kernel(
                 eps,
             )
             tl.store(
-                scale_base + ci,
-                tl.where(rows_valid, absmax * (1.0 / int8_max), 0.0),
+                scale_base + ci * scale_stride_k,
+                absmax * (1.0 / int8_max),
+                mask=rows_valid,
             )
             tl.store(
                 out_base + ci * QUANT_GROUP_SIZE + lo_cols[None, :],
@@ -474,8 +477,9 @@ def _inv_rope_quant_int8_rows_kernel(
             ).to(tl.float32)
             absmax = tl.maximum(tl.max(tl.abs(x), axis=1), eps)
             tl.store(
-                scale_base + ci,
-                tl.where(rows_valid, absmax * (1.0 / int8_max), 0.0),
+                scale_base + ci * scale_stride_k,
+                absmax * (1.0 / int8_max),
+                mask=rows_valid,
             )
             tl.store(
                 out_base + ci * QUANT_GROUP_SIZE + chunk_cols[None, :],
@@ -513,6 +517,7 @@ def _launch_quant_rows(
         out.stride(1),
         scale.stride(0),
         scale.stride(1),
+        scale.stride(2),
         _FP8_MAX,
         _INT8_MAX,
         _EPS,
@@ -526,7 +531,7 @@ def _launch_quant_rows(
     )
     key_extra = (
         tuple(_tensor_key(t) for t in (o, positions, cos_sin_cache, out, scale)),
-        args[6:23],
+        args[6:24],
         num_tokens == 1,
         num_tokens % 16 == 0,
     )
@@ -607,21 +612,33 @@ def _launch_quant_int8(
     )
 
 
+def _scale_buffer(n_groups: int, group_dim: int, num_tokens: int, device):
+    """Block-major ``[G, K/128, T]`` scales, exposed as a ``[G, T, K/128]`` view.
+
+    The BMM loads one scale per row for every K block; with the token-major
+    layout those loads stride 128 B apart and measured 20% slower at 4096
+    tokens (1.665 -> 1.326 ms). Keeping the K block contiguous makes both the
+    GEMM reads and the quantization stores coalesced, while the view keeps the
+    logical ``[G, T, K/128]`` shape every caller (and the shared fallback entry)
+    expects. Both kernels index scales through the strides they are given.
+    """
+    return torch.empty(
+        (n_groups, group_dim // _QUANT_BLOCK, num_tokens),
+        dtype=torch.float32,
+        device=device,
+    ).transpose(1, 2)
+
+
 def _quant_buffers(
     o: torch.Tensor, n_groups: int, heads_per_group: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Allocate the ``[G, T, K]`` INT8 activation and its ``[G, T, K/128]`` scales."""
+    """Allocate the ``[G, T, K]`` INT8 activation and its block-major scales."""
     num_tokens, _, head_dim = o.shape
     group_dim = heads_per_group * head_dim
     out = torch.empty(
         (n_groups, num_tokens, group_dim), dtype=torch.int8, device=o.device
     )
-    scale = torch.empty(
-        (n_groups, num_tokens, group_dim // _QUANT_BLOCK),
-        dtype=torch.float32,
-        device=o.device,
-    )
-    return out, scale
+    return out, _scale_buffer(n_groups, group_dim, num_tokens, o.device)
 
 
 _SCRATCH: dict = {}
@@ -654,10 +671,10 @@ def _quant_buffers_cached(
     return (
         _scratch((n_groups, num_tokens, group_dim), torch.int8, o.device),
         _scratch(
-            (n_groups, num_tokens, group_dim // _QUANT_BLOCK),
+            (n_groups, group_dim // _QUANT_BLOCK, num_tokens),
             torch.float32,
             o.device,
-        ),
+        ).transpose(1, 2),
     )
 
 
