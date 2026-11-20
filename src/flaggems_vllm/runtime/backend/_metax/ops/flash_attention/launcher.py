@@ -695,74 +695,80 @@ def flash_attn_varlen_func_w8a8_int8(
             )
         else:
             kernel_out, kernel_stats = out, lse
-        flash_varlen_int8_fwd_kernel[grid](
-            q,
-            k,
-            v,
-            kernel_out,
-            kernel_stats,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_k,
-            block_table,
-            q_descale,
-            k_descale,
-            v_descale,
-            alibi_slopes,
-            q.stride(0),
-            q.stride(1),
-            k.stride(-3),
-            k.stride(-2),
-            k.stride(0) if paged else 0,
-            v.stride(-3),
-            v.stride(-2),
-            v.stride(0) if paged else 0,
-            kernel_out.stride(-3),
-            kernel_out.stride(-2),
-            *q_descale.stride(),
-            *k_descale.stride(),
-            *v_descale.stride(),
-            block_table.stride(0) if paged else 0,
-            (
-                alibi_slopes.stride(0)
-                if alibi_slopes is not None and alibi_slopes.ndim == 2
-                else 0
-            ),
-            total,
-            group,
-            dim,
-            triton.next_power_of_2(max(dim, 64)),
-            page_size,
-            paged,
-            causal,
-            left,
-            right,
-            softcap,
-            softmax_scale,
-            alibi_slopes is not None,
-            return_softmax_lse or split_kv,
-            KV_SPLITS=splits,
-            OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
-            LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
-            LOGICAL_KV=logical_kv,
-            BATCH=batch,
-            COMPACT=compact,
-            FOLD=fold,
-            # Keep the original schedule for short dense KV and multi-query
-            # tiles; the extra runtime branches can increase register pressure.
-            DECODE_FASTPATH=(
-                dim == 256
-                and max_seqlen_q == 1
-                and (max_seqlen_k == 1 or max_seqlen_k > block_n)
-            ),
-            BM=block_m,
-            BN=block_n,
-            num_warps=num_warps,
-            num_stages=2 if dim == 256 and logical_kv else 1,
-            pipeline="basic",
-            # Restore the opt-in layout used by the published D128 benchmark.
-            scenario="attention-query-warps" if dim == 128 and logical_kv else "",
-        )
+        # Keep short-query launch overhead small. Long queries with uniform
+        # V scales select their precision path entirely on the device.
+        select_residual = max_seqlen_q >= 128 and v_descale.stride(2) == 0
+        for residual_path in (False, True) if select_residual else (True,):
+            flash_varlen_int8_fwd_kernel[grid](
+                q,
+                k,
+                v,
+                kernel_out,
+                kernel_stats,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_k,
+                block_table,
+                q_descale,
+                k_descale,
+                v_descale,
+                alibi_slopes,
+                q.stride(0),
+                q.stride(1),
+                k.stride(-3),
+                k.stride(-2),
+                k.stride(0) if paged else 0,
+                v.stride(-3),
+                v.stride(-2),
+                v.stride(0) if paged else 0,
+                kernel_out.stride(-3),
+                kernel_out.stride(-2),
+                *q_descale.stride(),
+                *k_descale.stride(),
+                *v_descale.stride(),
+                block_table.stride(0) if paged else 0,
+                (
+                    alibi_slopes.stride(0)
+                    if alibi_slopes is not None and alibi_slopes.ndim == 2
+                    else 0
+                ),
+                total,
+                group,
+                dim,
+                triton.next_power_of_2(max(dim, 64)),
+                page_size,
+                paged,
+                causal,
+                left,
+                right,
+                softcap,
+                softmax_scale,
+                alibi_slopes is not None,
+                return_softmax_lse or split_kv,
+                KV_SPLITS=splits,
+                OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
+                LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
+                LOGICAL_KV=logical_kv,
+                BATCH=batch,
+                COMPACT=compact,
+                FOLD=fold,
+                # Keep the original schedule for short dense KV and multi-query
+                # tiles; the extra runtime branches can increase register pressure.
+                DECODE_FASTPATH=(
+                    dim == 256
+                    and max_seqlen_q == 1
+                    and (max_seqlen_k == 1 or max_seqlen_k > block_n)
+                ),
+                RESIDUAL_PATH=residual_path,
+                SELECT_RESIDUAL=select_residual,
+                BM=block_m,
+                BN=block_n,
+                num_warps=num_warps,
+                num_stages=2 if dim == 256 and logical_kv else 1,
+                pipeline="basic",
+                # Restore the opt-in layout used by the published D128 benchmark.
+                scenario="attention-query-warps" if dim == 128 and logical_kv else "",
+            )
         if split_kv:
             _flash_int8_merge_splits[(total, heads)](
                 kernel_out,
