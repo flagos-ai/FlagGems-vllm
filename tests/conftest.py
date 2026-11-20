@@ -34,13 +34,13 @@ import flaggems_vllm
 # subsequent device call, even a simple torch.randint, then raises, making it
 # look as if hundreds of unrelated tests have failed.
 #
-# _CUDA_CONTEXT_DEAD is set to True the first time a probe through
+# _DEVICE_CONTEXT_DEAD is set to True the first time a probe through
 # flaggems_vllm.runtime.torch_device_fn fails in pytest_runtest_teardown.
 # pytest_runtest_setup then skips every remaining test so they are reported
 # as "skipped" rather than "failed", keeping the failure list focused on the
 # actual culprit.
 # ---------------------------------------------------------------------------
-_CUDA_CONTEXT_DEAD = False
+_DEVICE_CONTEXT_DEAD = False
 
 # On platforms without a native CUDA backend, torchada redirects
 # torch.cuda.* entry points (e.g. torch.cuda.synchronize) to the vendor
@@ -157,8 +157,8 @@ def pytest_configure(config):
         )
 
 
-def _probe_cuda_context() -> bool:
-    """Return True when the CUDA context is healthy, False when it is dead.
+def _probe_device_context() -> bool:
+    """Return True when the device context is healthy, False when it is dead.
 
     A hardware-level kernel fault (cudaErrorIllegalInstruction and similar)
     poisons the device context permanently: every subsequent device call
@@ -178,22 +178,22 @@ def _probe_cuda_context() -> bool:
 
 
 def pytest_runtest_setup(item):
-    """Stop scheduling tests once the CUDA context has been poisoned.
+    """Stop scheduling tests once the device context has been poisoned.
 
     Once a kernel faults, the context cannot recover inside this process, so
     every remaining test would fail with the same AcceleratorError regardless
     of the operator under test.  Skip them so the failure list reflects only
     the real culprit.
     """
-    global _CUDA_CONTEXT_DEAD
-    if _CUDA_CONTEXT_DEAD:
+    global _DEVICE_CONTEXT_DEAD
+    if _DEVICE_CONTEXT_DEAD:
         pytest.skip("device context poisoned by an earlier test failure")
 
 
 def pytest_runtest_teardown(item, nextitem):
-    global _CUDA_CONTEXT_DEAD
-    if not _CUDA_CONTEXT_DEAD and not _probe_cuda_context():
-        _CUDA_CONTEXT_DEAD = True
+    global _DEVICE_CONTEXT_DEAD
+    if not _DEVICE_CONTEXT_DEAD and not _probe_device_context():
+        _DEVICE_CONTEXT_DEAD = True
         logging.warning(
             "device context poisoned after %s, remaining tests will be skipped",
             item.nodeid,
