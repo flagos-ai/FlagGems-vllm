@@ -814,9 +814,7 @@ cast_sigmoid:
     - [4096, 4096]    # large 2D (16M)
   shape_desc: "small: [1], [1,256]; medium: [128,256], [4096,256]; large: [1048576], [4096,4096]"
 
-# Qwen3.6-35B-A3B capture: real_shapes_20261012, INT8 FlashAttention.
-# Top 10 by merged count; ties retain capture index order.
-# Full capture JSON can be supplied with --level comprehensive --shape_file.
+# Qwen3.6-35B-A3B capture: INT8 FlashAttention.
 FlashAttnVarlenInt8Benchmark:
   captured_shapes:
     - labels: &int8_attn_labels_1 "q_dim0,q_dim1,q_dim2,k_dim0,k_dim1,k_dim2,k_dim3,v_dim0,v_dim1,v_dim2,v_dim3,\
