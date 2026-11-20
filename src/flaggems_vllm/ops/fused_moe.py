@@ -21,7 +21,6 @@ from enum import Enum
 from typing import Any, Optional
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 import yaml
@@ -29,10 +28,11 @@ import yaml
 from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.runtime import device, torch_device_fn
-from flaggems_vllm.utils import pointwise_dynamic
+from flaggems_vllm.utils import pointwise_dynamic, tl_extra_shim
 from flaggems_vllm.utils.triton_version_utils import pipeline_options
 
 logger = logging.getLogger(__name__)
+_moe_erf = tl_extra_shim.erf
 
 # OCP MX quantization helpers (requires amd-quark)
 
@@ -773,6 +773,55 @@ def _swigluoai_uninterleave_kernel(
     )
 
 
+@triton.jit
+def _moe_activation_kernel(
+    input_ptr,
+    output_ptr,
+    rows,
+    cols,
+    stride_im,
+    stride_in,
+    stride_om,
+    stride_on,
+    ACTIVATION: tl.constexpr,
+    GATED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    flat = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = flat < rows * cols
+    row, col = flat // cols, flat % cols
+    input_offset = row * stride_im + col * stride_in
+    x = tl.load(input_ptr + input_offset, mask=mask, other=0)
+    dtype: tl.constexpr = input_ptr.dtype.element_ty
+    compute_dtype: tl.constexpr = tl.float64 if dtype == tl.float64 else tl.float32
+    x_fp = x.to(compute_dtype)
+    if ACTIVATION == "gelu":
+        activated = 0.5 * x_fp * (1.0 + _moe_erf(x_fp * 0.7071067811865476))
+    elif ACTIVATION == "swiglustep":
+        activated = tl.sigmoid(x_fp)
+    elif ACTIVATION == "silu":
+        activated = x_fp * tl.sigmoid(x_fp)
+    else:
+        tl.static_assert(ACTIVATION == "relu2")
+        relu = tl.where(x_fp < 0.0, 0.0, x_fp)
+        if not GATED:
+            # Preserve the existing in-place rectification of input.
+            tl.store(input_ptr + input_offset, relu.to(dtype), mask=mask)
+        activated = relu * relu
+
+    # The previous activation (and ReLU square) rounded before multiplying
+    # by up, so round here too, even though this is now a single kernel.
+    activated = activated.to(dtype)
+    if GATED:
+        up = tl.load(input_ptr + input_offset + cols * stride_in, mask=mask, other=0)
+        activated = (activated.to(compute_dtype) * up.to(compute_dtype)).to(dtype)
+    tl.store(
+        output_ptr + row * stride_om + col * stride_on,
+        activated.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
 def apply_moe_activation(
     activation: MoEActivation,
     output: torch.Tensor,
@@ -782,7 +831,7 @@ def apply_moe_activation(
     gemm1_beta: float | None = None,
     gemm1_clamp_limit: float | None = None,
 ) -> torch.Tensor:
-    """Apply MoE activation (pure PyTorch / FlagGems Triton)."""
+    """Apply MoE activation using FlagGems Triton kernels."""
     assert input.dim() == 2, "Input must be 2D"
     assert output.dim() == 2, "Output must be 2D"
     if activation.is_gated:
@@ -824,26 +873,33 @@ def apply_moe_activation(
             limit,
             BLOCK_I=block_i,
         )
-    elif activation == MoEActivation.GELU:
-        N = output.size(-1)
-        gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.gelu(gate) * up)
-    elif activation == MoEActivation.SWIGLUSTEP:
-        N = output.size(-1)
-        gate, up = input[:, :N], input[:, N:]
-        output.copy_(torch.sigmoid(gate) * up)
-    elif activation == MoEActivation.RELU2:
-        N = output.size(-1)
-        gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.relu(gate).square() * up)
-
-    elif activation == MoEActivation.SILU_NO_MUL:
-        output.copy_(F.silu(input))
-    elif activation == MoEActivation.GELU_NO_MUL:
-        output.copy_(F.gelu(input))
-    elif activation == MoEActivation.RELU2_NO_MUL:
-        F.relu(input, inplace=True)
-        torch.square(input, out=output)
+    elif activation in (
+        MoEActivation.GELU,
+        MoEActivation.SWIGLUSTEP,
+        MoEActivation.RELU2,
+        MoEActivation.SILU_NO_MUL,
+        MoEActivation.GELU_NO_MUL,
+        MoEActivation.RELU2_NO_MUL,
+    ):
+        assert input.size(0) == output.size(0)
+        if output.numel() == 0:
+            return output
+        # This pointwise compatibility path is bandwidth-bound and uses a
+        # fixed block to avoid a first-call autotune during graph capture.
+        block = 256
+        _moe_activation_kernel[(triton.cdiv(output.numel(), block),)](
+            input,
+            output,
+            output.size(0),
+            output.size(1),
+            input.stride(0),
+            input.stride(1),
+            output.stride(0),
+            output.stride(1),
+            ACTIVATION=activation.value.split("_no_mul")[0],
+            GATED=activation.is_gated,
+            BLOCK=block,
+        )
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
