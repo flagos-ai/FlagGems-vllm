@@ -55,7 +55,6 @@ jobs:
     outputs:
       mode: ${{ steps.select.outputs.mode }}
       targets: ${{ steps.select.outputs.targets }}
-      clang_artifact_id: ${{ steps.upload-h20-clang.outputs.artifact-id }}
       should_run: ${{ steps.select.outputs.should_run }}
       pr_id: ${{ steps.get-pr-id.outputs.PR_ID }}
       labels: ${{ steps.get-labels.outputs.labels }}
@@ -275,28 +274,6 @@ jobs:
           fi
           python tools/select_ci_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
-      - name: Fetch the pinned H20 Clang packages
-        id: fetch-h20-clang
-        if: >-
-          steps.select.outputs.should_run == 'true'
-          && (github.event_name != 'pull_request'
-              || (github.event.pull_request.user.login != 'dependabot[bot]'
-                  && (github.event.pull_request.head.repo.full_name == github.repository
-                      || contains(fromJSON(steps.get-labels.outputs.labels), 'ci/nvidia'))))
-        shell: bash
-        run: bash tools/setup-tle-clang.sh download "${RUNNER_TEMP}/h20-clang-packages"
-
-      - name: Upload the H20 Clang packages
-        id: upload-h20-clang
-        if: steps.fetch-h20-clang.outcome == 'success'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: h20-clang-packages-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/h20-clang-packages/*.deb
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-
   python-op:
     name: python-op (nvidia tests and benchmarks)
     needs: preprocess
@@ -316,8 +293,7 @@ jobs:
       gpu_check_script: tools/gpu_check_nvidia.sh
       changed_files: ${{ needs.preprocess.outputs.targets }}
       pr_id: ${{ needs.preprocess.outputs.pr_id }}
-      timeout_minutes: 90
-      clang_artifact_id: ${{ needs.preprocess.outputs.clang_artifact_id }}
+      timeout_minutes: 60
       # h20 is a persistent, non-ephemeral runner (see backend-test.yaml).
       uv_refresh: "1"
 

@@ -25,16 +25,12 @@ import enum
 import os
 import warnings
 import weakref
-from copy import copy
-from functools import cache
-from importlib.metadata import PackageNotFoundError, version
 
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import device as _device
-from flaggems_vllm.utils.triton_version_utils import HAS_TLE
 
 _MHC_PRE_MIX_PAD = tl.constexpr(32)
 
@@ -53,9 +49,6 @@ def _mhc_fn_cache(fn: torch.Tensor) -> dict:
     """Store for the weight copies this op derives, validated by identity plus
     _version and data_ptr so that an in-place edit invalidates them.
     """
-    if fn.is_inference():
-        # Inference tensors can change without updating a version counter.
-        return {}
     key = id(fn)
     version = fn._version
     ptr = fn.data_ptr()
@@ -996,7 +989,7 @@ def _mhc_residual_mix(ptr, pid_n, j, num_tokens, N_SPLITS: tl.constexpr):
             + pid_n * _MHC_PRE_MIX_PAD
             + j
         )
-    return acc.to(tl.bfloat16).to(tl.float32)
+    return acc
 
 
 @triton.jit
@@ -1164,33 +1157,6 @@ def _mhc_pre_reader_s4(num_tokens, block_m, block_k, hc_hidden_size, target_ctas
     return s
 
 
-@cache
-def _has_flagtree_070():
-    try:
-        return version("flagtree") == "0.7.0"
-    except PackageNotFoundError:
-        return False
-
-
-def _mhc_packed_reader_configs(configs, named_args, **kwargs):
-    if _VENDOR != "nvidia" or not HAS_TLE or not _has_flagtree_070():
-        return configs
-    activation = named_args.get("A_ptr", kwargs.get("A_ptr"))
-    if torch.cuda.get_device_capability(activation.device) != (9, 0):
-        return configs
-
-    # FlagTree 0.7.0 can corrupt the projection with pipelined large-M tiles.
-    # Keep their tiles and warp counts, and use the valid single-stage launch.
-    available = {}
-    for config in configs:
-        if config.kwargs["BLOCK_M"] >= 64 and config.num_stages > 1:
-            config = copy(config)
-            config.num_stages = 1
-        key = (config.num_warps, config.num_stages, tuple(config.kwargs.items()))
-        available[key] = config
-    return list(available.values())
-
-
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": 32, "BLOCK_K": 32}, num_warps=4, num_stages=2),
@@ -1211,7 +1177,6 @@ def _mhc_packed_reader_configs(configs, named_args, **kwargs):
         triton.Config({"BLOCK_M": 16, "BLOCK_K": 128}, num_warps=8, num_stages=3),
     ],
     key=["M", "stride_am"],
-    prune_configs_by={"early_config_prune": _mhc_packed_reader_configs},
 )
 @triton.jit
 def mhc_pre_packed_reader_kernel(
@@ -1642,8 +1607,6 @@ def _sinkhorn_fuse_body(
                 mask=mix_offs < HC_MULT3,
                 other=0.0,
             )
-        # Materialize the projection only after summing the FP32 split results.
-        mix_row = mix_row.to(tl.bfloat16).to(tl.float32)
         m0 = _mhc_row_get(mix_row, 0, 32)
         m1 = _mhc_row_get(mix_row, 1, 32)
         m2 = _mhc_row_get(mix_row, 2, 32)
@@ -1840,6 +1803,7 @@ class _MhcVariant(enum.IntEnum):
     SPLIT_PASS = 7
     MM_FUSE_TILED = 10
     ASCEND_TILED = 12
+    ASCEND_TLE = 13
     PACKED_READER = 21
 
 
@@ -1862,8 +1826,15 @@ def _mhc_pre_default_variant(num_tokens, hidden_size, hc_hidden_size):
     if _VENDOR == "ascend":
         # Only hc_mult == 4 reaches the dispatch; flagtree crashes on the
         # packed-reader / mm-fuse kernels and mm-fuse-tiled costs ~13us/token.
-        _MHC_PRE_VARIANT_CACHE[key] = _MhcVariant.ASCEND_TILED
-        return _MhcVariant.ASCEND_TILED
+        # TLE (when the Triton build ships it) runs the mix-major layout from
+        # the standalone Ascend operator, measured ~2.3x the tiled epilogue at
+        # 910B4 (the mix stage, 20 Sinkhorn rounds, drops ~12x); without TLE
+        # fall back to the tiled kernels. Neither path clamps: this operator
+        # must keep the reference math, the model-contract clamp belongs to
+        # npu_mhc_pre_clamp_sinkhorn.
+        variant = _MhcVariant.ASCEND_TLE if _HAS_TLE else _MhcVariant.ASCEND_TILED
+        _MHC_PRE_VARIANT_CACHE[key] = variant
+        return variant
 
     reader_ok = (
         num_tokens % 128 == 0
@@ -2073,6 +2044,26 @@ def mhc_pre(
                 TOKEN_TILE=tile7,
                 BLOCK_H=bh7,
             )
+        elif variant == _MhcVariant.ASCEND_TLE:
+
+            # Mix-major TLE path, shared with npu_mhc_pre_clamp_sinkhorn.
+            # ``clamp_logits=False`` keeps this operator's reference math: the
+            # model-contract clamp is opt-in and belongs to the standalone op.
+            _mhc_pre_tle_4(
+                residual_flat,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                clamp_logits=False,
+                post_out=post_mix,
+                comb_out=comb_mix,
+                hin_out=layer_input,
+            )
         elif variant == _MhcVariant.ASCEND_TILED:
 
             # The projection also emits the row sum of squares.
@@ -2247,6 +2238,8 @@ def mhc_pre(
 # Imported last: the hygon companion imports this module's kernels (circular otherwise).
 if _VENDOR == "ascend":
     from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import (
+        _HAS_TLE,
+        _mhc_pre_tle_4,
         mhc_pre_ascend_mix_kernel,
         mhc_pre_ascend_proj_kernel,
         mhc_pre_ascend_reduce_kernel,

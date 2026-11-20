@@ -432,11 +432,11 @@ def _flat_tile_elems_cap(block: int) -> int:
 
 # Tile geometry for the wide-group slice kernel, measured on Ascend910B4:
 # the UB cost of a tile is driven by its row width, not its element count,
-# so narrow rows admit much larger tiles.  A (128, 32) tile (NGROUPS=8 at
-# GROUP_SIZE=512) measures ~1.3x over the widest UB-safe (NGROUPS*4, 128)
-# tile; wider rows (SUB=64/128) or more rows (NGROUPS=16) raise
-# MLIRCompilationError: ub overflow against the 192KB UB budget.
-_SLICE_TILE_ELEMS_CAP = 4096
+# so narrow rows admit much larger tiles.  Keep fused tiles at or below
+# (64, 32): a (128, 32) tile needs 1900800 bits, exceeding the 1572864-bit
+# UB budget once the bit-trick fp8 conversion's temporaries are included.
+_SLICE_TILE_ELEMS_CAP = 2048
+_SLICE_MAX_GROUP_SIZE = 4096
 _SLICE_SUB = 32
 
 # Persistent grid size as a multiple of the vector core count.  Measured on
@@ -469,7 +469,7 @@ def _vector_core_num() -> int:
 def _slice_supported(group_size: int) -> bool:
     split = group_size // _SLICE_SUB
     return (
-        512 <= group_size <= _SLICE_TILE_ELEMS_CAP
+        512 <= group_size <= _SLICE_MAX_GROUP_SIZE
         and group_size % _SLICE_SUB == 0
         and split & (split - 1) == 0
     )

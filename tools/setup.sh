@@ -450,7 +450,95 @@ uninstall_packages() {
   done
 }
 
-# Verify that the installed Triton/FlagTree package is complete and importable.
+# Report which compiler the current environment actually provides, and whether
+# it can run the TLE (warp-specialized) kernels. COMPILER=keep is the default
+# in --no-venv mode, so without this the user is told only "compiler left
+# untouched" and has no way to tell that they are on stock Triton and losing
+# the TLE fast paths (for example sparse FlashMLA prefill is roughly 2x slower
+# on stock Triton than on FlagTree).
+report_compiler_state() {
+  local want_flagtree="$1"
+
+  if [ "${DRY_RUN}" = "1" ]; then
+    [ -z "${want_flagtree}" ] || printf "  backend pins %s for the TLE fast paths\n" "${want_flagtree}"
+    return 0
+  fi
+
+  local state
+  state="$("${PYTHON_BIN}" - <<'PY' 2>/dev/null || true
+import importlib
+
+
+def _probe():
+    try:
+        triton = importlib.import_module("triton")
+    except Exception as error:  # noqa: BLE001 - report, never fail setup
+        return f"none|-|{type(error).__name__}"
+
+    version = getattr(triton, "__version__", "unknown")
+    try:
+        importlib.import_module("flagtree")
+        flavour = "flagtree"
+    except Exception:  # noqa: BLE001
+        flavour = "triton"
+
+    # Import the TLE language the way the ops do: a present module can still
+    # fail to load (for example FlagTree's flagcx wrapper dlopens a CUDA 12
+    # libcudart on a CUDA 13 host), which is what actually decides whether the
+    # warp-specialized kernels are reachable.
+    try:
+        importlib.import_module("triton.experimental.tle.language")
+    except ModuleNotFoundError:
+        return f"{flavour}|{version}|absent"
+    except Exception as error:  # noqa: BLE001
+        return f"{flavour}|{version}|broken:{type(error).__name__}"
+    return f"{flavour}|{version}|ok"
+
+
+print(_probe())
+PY
+)"
+
+  local flavour version tle
+  flavour="${state%%|*}"
+  version="${state#*|}"
+  version="${version%%|*}"
+  tle="${state##*|}"
+
+  case "${flavour}" in
+    none)
+      printf "  compiler: ${RED}no importable triton${NC}\n"
+      ;;
+    flagtree)
+      printf "  compiler: ${GREEN}FlagTree${NC} (triton %s)\n" "${version}"
+      ;;
+    *)
+      printf "  compiler: stock Triton %s\n" "${version}"
+      ;;
+  esac
+
+  case "${tle}" in
+    ok)
+      printf "  TLE kernels: ${GREEN}available${NC}\n"
+      ;;
+    absent)
+      printf "  TLE kernels: ${YELLOW}unavailable${NC} (triton.experimental.tle is missing)\n"
+      if [ -n "${want_flagtree}" ]; then
+        printf "    %s provides them; install it with:\n" "${want_flagtree}"
+        printf "      COMPILER=flagtree bash tools/setup.sh %s --no-venv\n" "${BACKEND}"
+      fi
+      ;;
+    broken:*)
+      printf "  TLE kernels: ${YELLOW}present but failing to import${NC} (%s)\n" "${tle#broken:}"
+      printf "    On a CUDA 13 host FlagTree's flagcx wrapper looks for a CUDA 12\n"
+      printf "    libcudart. Export USE_FLAGCX=OFF to skip it (only the\n"
+      printf "    distributed TLE ops need flagcx):\n"
+      printf "      export USE_FLAGCX=OFF\n"
+      ;;
+  esac
+}
+
+
 # uv's exit code only says the dist-info was written; it does not catch a
 # truncated install whose RECORD files never landed on disk. That leaves
 # `import triton` degraded to an empty namespace package (no triton.Config).
@@ -1040,6 +1128,7 @@ main() {
   case "${COMPILER}" in
     keep)
       warn "compiler left untouched (COMPILER=keep); FLAGGEMS_VENDOR=${BACKEND_VENDOR}"
+      report_compiler_state "${flagtree_pkgs}"
       ;;
     flagtree)
       [ -n "${flagtree_pkgs}" ] \
