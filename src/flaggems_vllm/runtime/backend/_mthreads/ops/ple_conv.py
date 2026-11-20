@@ -58,6 +58,7 @@ def _ple_conv_kernel(
     HAS_INIT: tl.constexpr,
     NULL_STATE_ID: tl.constexpr,
     FUSE_RESIDUAL: tl.constexpr,
+    WRITE_TAIL: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     t = tl.program_id(0)
@@ -123,24 +124,27 @@ def _ple_conv_kernel(
     acc = tl.zeros([BLOCK_C], tl.float32)
     for k in tl.static_range(0, KERNEL_SIZE):
         h = j + DILATION * k
+        # from_state is a scalar. Loading both taps and selecting with
+        # tl.where still issues the masked-off gather, which dominates on MUSA.
         from_state = h <= STATE_LEN - 1
-        state_tap = tl.load(
-            base_state + (h + slot_off) * state_ws + c_offs * state_cs,
-            mask=c_mask & read_state & from_state,
-            other=0.0,
-        )
-        input_t = q_start + h - STATE_LEN
-        input_t = tl.load(
-            token_idx_ptr + input_t,
-            mask=has_token_map & out_ok & (~from_state),
-            other=input_t,
-        ).to(tl.int64)
-        input_tap = tl.load(
-            x_ptr + input_t * C + c_offs,
-            mask=c_mask & out_ok & (~from_state),
-            other=0.0,
-        )
-        tap = tl.where(from_state, state_tap, input_tap).to(tl.float32)
+        if from_state:
+            tap = tl.load(
+                base_state + (h + slot_off) * state_ws + c_offs * state_cs,
+                mask=c_mask & read_state,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            input_t = q_start + h - STATE_LEN
+            input_t = tl.load(
+                token_idx_ptr + input_t,
+                mask=has_token_map & out_ok,
+                other=input_t,
+            ).to(tl.int64)
+            tap = tl.load(
+                x_ptr + input_t * C + c_offs,
+                mask=c_mask & out_ok,
+                other=0.0,
+            ).to(tl.float32)
         weight = tl.load(
             w_ptr + c_offs * KERNEL_SIZE + k,
             mask=c_mask,
@@ -179,6 +183,25 @@ def _ple_conv_kernel(
         mask=c_mask,
     )
 
+    if WRITE_TAIL:
+        # One long request: the last STATE_LEN tokens are the new window, and
+        # each token program writes its own column. No second launch.
+        q_end = tl.load(qsl_ptr + r + 1)
+        qlen = (q_end - q_start).to(tl.int32)
+        col = j - (qlen - STATE_LEN)
+        in_tail = (col >= 0) & (col < STATE_LEN) & state_ok
+        col_safe = tl.maximum(col, 0)
+        tail = tl.load(
+            x_ptr + output_t * C + c_offs,
+            mask=c_mask & in_tail,
+            other=0.0,
+        )
+        tl.store(
+            base_state + col_safe * state_ws + c_offs * state_cs,
+            tail,
+            mask=c_mask & in_tail,
+        )
+
     if MODE == "decode":
         # Decode has one program per request and channel block, so no peer can
         # still be reading this state slice when it is updated.
@@ -201,6 +224,158 @@ def _ple_conv_kernel(
                 next_state,
                 mask=c_mask & state_ok,
             )
+
+
+# Contiguous [channel, window] writeback. Threads walk the flattened slot so
+# the shift is coalesced; the channel-strided loop is much slower on MUSA.
+# A split channel reads a later column another program stores, so any launch
+# that still needs the old window reads a clone and writes the live cache.
+@triton.jit
+def _ple_conv_writeback_linear_kernel(
+    x_ptr,
+    state_ptr,
+    out_ptr,
+    state_idx_ptr,
+    qsl_ptr,
+    num_acc_ptr,
+    has_init_ptr,
+    token_idx_ptr,
+    has_token_map: tl.constexpr,
+    state_idx_stride,
+    state_bs,
+    out_bs,
+    C: tl.constexpr,
+    BLOCK: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
+    STATE_WIDTH: tl.constexpr,
+    MODE: tl.constexpr,
+    HAS_INIT: tl.constexpr,
+    NULL_STATE_ID: tl.constexpr,
+    READ_STATE: tl.constexpr,
+):
+    r = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    width = STATE_WIDTH
+    in_slot = offs < C * width
+    channel = offs // width
+    w = offs - channel * width
+
+    sid = tl.load(state_idx_ptr + r * state_idx_stride).to(tl.int64)
+    state_ok = sid != NULL_STATE_ID
+    sid_safe = tl.where(state_ok, sid, 0)
+    q_start = tl.load(qsl_ptr + r)
+    q_end = tl.load(qsl_ptr + r + 1)
+    qlen = (q_end - q_start).to(tl.int32)
+    if MODE == "spec":
+        num_acc = tl.load(num_acc_ptr + r)
+        slot_off = tl.minimum(tl.maximum(num_acc - 1, 0), SPEC_QUERY_LEN - 1).to(
+            tl.int32
+        )
+        shift = 1
+        # qlen 0 still rewrites the first STATE_LEN-1 columns and keeps the tail.
+        do_write = w < STATE_LEN + qlen - 1
+        alive = state_ok
+    else:
+        slot_off = tl.full([], 0, tl.int32)
+        shift = qlen
+        do_write = w < STATE_LEN
+        alive = state_ok & (qlen > 0)
+    has_init = tl.load(has_init_ptr + r) != 0 if HAS_INIT else True
+    src_ok = state_ok if MODE == "spec" else state_ok & has_init
+    m = shift + w
+    from_state = m <= STATE_LEN - 1
+    if READ_STATE:
+        state_index = tl.minimum(slot_off + m, width - 1)
+        state_value = tl.load(
+            state_ptr + sid_safe * state_bs + channel * width + state_index,
+            mask=in_slot & src_ok & do_write & from_state & alive,
+            other=0.0,
+        )
+    input_t = q_start + m - STATE_LEN
+    if has_token_map:
+        input_t = tl.load(
+            token_idx_ptr + input_t,
+            mask=in_slot & do_write & (~from_state) & alive,
+            other=input_t,
+        ).to(tl.int64)
+    input_value = tl.load(
+        x_ptr + input_t * C + channel,
+        mask=in_slot & do_write & (~from_state) & alive,
+        other=0.0,
+    )
+    if READ_STATE:
+        value = tl.where(from_state, state_value, input_value)
+    else:
+        value = input_value
+    tl.store(
+        out_ptr + sid_safe * out_bs + channel * width + w,
+        value,
+        mask=in_slot & do_write & alive,
+    )
+
+
+# Few spec requests are dominated by Triton's host-side enqueue, so the
+# shift stays on one program per channel tile. The flattened kernel is
+# faster per byte once there are enough requests to hide that enqueue.
+@triton.jit
+def _ple_conv_spec_shift_kernel(
+    x_ptr,
+    state_ptr,
+    state_idx_ptr,
+    qsl_ptr,
+    num_acc_ptr,
+    token_idx_ptr,
+    has_token_map: tl.constexpr,
+    state_idx_stride,
+    state_bs,
+    C: tl.constexpr,
+    BLOCK: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
+    STATE_WIDTH: tl.constexpr,
+    NULL_STATE_ID: tl.constexpr,
+):
+    r = tl.program_id(0)
+    c_offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    c_mask = c_offs < C
+    sid = tl.load(state_idx_ptr + r * state_idx_stride).to(tl.int64)
+    alive = sid != NULL_STATE_ID
+    q_start = tl.load(qsl_ptr + r)
+    q_end = tl.load(qsl_ptr + r + 1)
+    qlen = (q_end - q_start).to(tl.int32)
+    num_acc = tl.load(num_acc_ptr + r)
+    slot_off = tl.minimum(tl.maximum(num_acc - 1, 0), SPEC_QUERY_LEN - 1).to(tl.int32)
+    base = state_ptr + sid * state_bs
+    for w in tl.static_range(STATE_WIDTH):
+        # shift is 1, so this comparison is constexpr and only one tap is issued.
+        m = 1 + w
+        do_write = alive & (w < STATE_LEN + qlen - 1)
+        if m <= STATE_LEN - 1:
+            state_index = tl.minimum(slot_off + m, STATE_WIDTH - 1)
+            value = tl.load(
+                base + c_offs * STATE_WIDTH + state_index,
+                mask=c_mask & do_write,
+                other=0.0,
+            )
+        else:
+            input_t = q_start + m - STATE_LEN
+            if has_token_map:
+                input_t = tl.load(
+                    token_idx_ptr + input_t,
+                    mask=do_write,
+                    other=input_t,
+                ).to(tl.int64)
+            value = tl.load(
+                x_ptr + input_t * C + c_offs,
+                mask=c_mask & do_write,
+                other=0.0,
+            )
+        tl.store(
+            base + c_offs * STATE_WIDTH + w,
+            value,
+            mask=c_mask & do_write,
+        )
 
 
 # Prefill and spec write back separately so every token reads the old state.
@@ -263,23 +438,24 @@ def _ple_conv_writeback_kernel(
         from_state = m <= STATE_LEN - 1
         # Short or graph-padded spec chunks preserve the unused state tail.
         do_write = i < STATE_LEN + qlen - 1 if MODE == "spec" else True
-        state_value = tl.load(
-            base_state + (slot_off + m) * state_ws + c_offs * state_cs,
-            mask=c_mask & from_state & src_ok,
-            other=0.0,
-        )
-        input_t = q_start + m - STATE_LEN
-        input_t = tl.load(
-            token_idx_ptr + input_t,
-            mask=has_token_map & (~from_state) & do_write,
-            other=input_t,
-        ).to(tl.int64)
-        input_value = tl.load(
-            x_ptr + input_t * C + c_offs,
-            mask=c_mask & (~from_state) & do_write,
-            other=0.0,
-        )
-        value = tl.where(from_state, state_value, input_value)
+        if from_state:
+            value = tl.load(
+                base_state + (slot_off + m) * state_ws + c_offs * state_cs,
+                mask=c_mask & src_ok & do_write,
+                other=0.0,
+            )
+        else:
+            input_t = q_start + m - STATE_LEN
+            input_t = tl.load(
+                token_idx_ptr + input_t,
+                mask=has_token_map & do_write,
+                other=input_t,
+            ).to(tl.int64)
+            value = tl.load(
+                x_ptr + input_t * C + c_offs,
+                mask=c_mask & do_write,
+                other=0.0,
+            )
         tl.store(
             base_state + i * state_ws + c_offs * state_cs,
             value,
@@ -306,7 +482,6 @@ def ple_conv(
     """Update state and write activated convolution into residual.
     A non-None outer_residual enables both fused residual additions.
     """
-    BLOCK_C = 512
     kernel_spec_query_len = spec_query_len if mode == "spec" else 1
     T, C = inputs.shape
     K = conv_weights.shape[1]
@@ -344,16 +519,39 @@ def ple_conv(
     else:
         raise ValueError(f"Unsupported short-conv mode: {mode}")
 
-    num_warps = 4 if mode == "prefill" else 8
+    # Tiles are chosen from S5000 sweeps of the nine baseline shapes. A
+    # 512-wide tile leaves decode and spec latency-bound; short prefill and
+    # long prefill want different widths, and spec warps flip with the
+    # request count.
+    if mode == "decode":
+        block_c = 64
+        num_warps = 4
+    elif mode == "spec":
+        block_c = 128
+        num_warps = 4 if num_reqs <= 16 else 2
+    elif T < 128:
+        block_c, num_warps = 512, 4
+    else:
+        block_c, num_warps = 256, 2
+
     # MUSA has no programmatic dependent launch.
     launch_pdl = False
     # Pure-prefill indices can be a strided block-table column view.
     state_idx_stride = state_indices.stride(0)
+    contiguous_window = state_ws == 1 and state_cs == state_width
+    # Fuse the window copy into the main kernel when a second launch would
+    # dominate. Each of the last STATE_LEN token programs writes one column.
+    write_tail = (
+        contiguous_window
+        and mode == "prefill"
+        and num_reqs == 1
+        and state_len <= T < 128
+    )
 
     # Constexpr flags eliminate accesses to optional None arguments. Absent
     # pointers reuse a device-resident dummy so Triton always receives an address.
     dummy = inputs
-    _ple_conv_kernel[(T, triton.cdiv(C, BLOCK_C))](
+    _ple_conv_kernel[(T, triton.cdiv(C, block_c))](
         inputs,
         conv_state,
         conv_weights,
@@ -372,7 +570,7 @@ def ple_conv(
         state_ws,
         state_cs,
         C=C,
-        BLOCK_C=BLOCK_C,
+        BLOCK_C=block_c,
         STATE_LEN=state_len,
         DILATION=dilation,
         KERNEL_SIZE=K,
@@ -381,34 +579,113 @@ def ple_conv(
         HAS_INIT=has_initial_states_arg,
         FUSE_RESIDUAL=outer_residual is not None,
         NULL_STATE_ID=NULL_BLOCK_ID,
+        WRITE_TAIL=write_tail,
         launch_pdl=launch_pdl,
         num_warps=num_warps,
     )
     # conv state update is fused with the kernel above for decode
-    if mode != "decode":
-        _ple_conv_writeback_kernel[(num_reqs, triton.cdiv(C, BLOCK_C))](
-            inputs,
-            conv_state,
-            state_indices,
-            query_start_loc if query_start_loc is not None else dummy,
-            num_accepted_tokens if num_accepted_tokens is not None else dummy,
-            has_initial_states if has_initial_states is not None else dummy,
-            token_indices if token_indices is not None else state_indices,
-            token_indices is not None,
-            state_idx_stride,
-            state_bs,
-            state_ws,
-            state_cs,
-            C=C,
-            BLOCK_C=BLOCK_C,
-            STATE_LEN=state_len,
-            SPEC_QUERY_LEN=kernel_spec_query_len,
-            STATE_WIDTH=state_width,
-            MODE=mode,
-            HAS_INIT=has_initial_states_arg,
-            NULL_STATE_ID=NULL_BLOCK_ID,
-            num_warps=num_warps,
-        )
+    if mode != "decode" and not write_tail:
+        if contiguous_window and mode == "prefill" and num_reqs == 1 and T >= state_len:
+            _ple_conv_writeback_linear_kernel[
+                (num_reqs, triton.cdiv(C * state_width, 128))
+            ](
+                inputs,
+                conv_state,
+                conv_state,
+                state_indices,
+                query_start_loc if query_start_loc is not None else dummy,
+                num_accepted_tokens if num_accepted_tokens is not None else dummy,
+                has_initial_states if has_initial_states is not None else dummy,
+                token_indices if token_indices is not None else state_indices,
+                token_indices is not None,
+                state_idx_stride,
+                state_bs,
+                state_bs,
+                C=C,
+                BLOCK=128,
+                STATE_LEN=state_len,
+                SPEC_QUERY_LEN=kernel_spec_query_len,
+                STATE_WIDTH=state_width,
+                MODE=mode,
+                HAS_INIT=has_initial_states_arg,
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                READ_STATE=False,
+                num_warps=4,
+            )
+        elif contiguous_window and mode == "spec" and num_reqs <= 16:
+            _ple_conv_spec_shift_kernel[(num_reqs, triton.cdiv(C, 128))](
+                inputs,
+                conv_state,
+                state_indices,
+                query_start_loc if query_start_loc is not None else dummy,
+                num_accepted_tokens if num_accepted_tokens is not None else dummy,
+                token_indices if token_indices is not None else state_indices,
+                token_indices is not None,
+                state_idx_stride,
+                state_bs,
+                C=C,
+                BLOCK=128,
+                STATE_LEN=state_len,
+                SPEC_QUERY_LEN=kernel_spec_query_len,
+                STATE_WIDTH=state_width,
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                num_warps=4,
+            )
+        elif contiguous_window and mode == "spec":
+            # Many requests hide the flattened kernel's enqueue cost, and
+            # that kernel is much faster per byte than the channel loop.
+            # It reads a clone so a split channel cannot race the store.
+            read_state = conv_state.clone()
+            _ple_conv_writeback_linear_kernel[
+                (num_reqs, triton.cdiv(C * state_width, 128))
+            ](
+                inputs,
+                read_state,
+                conv_state,
+                state_indices,
+                query_start_loc if query_start_loc is not None else dummy,
+                num_accepted_tokens if num_accepted_tokens is not None else dummy,
+                has_initial_states if has_initial_states is not None else dummy,
+                token_indices if token_indices is not None else state_indices,
+                token_indices is not None,
+                state_idx_stride,
+                read_state.stride(0),
+                state_bs,
+                C=C,
+                BLOCK=128,
+                STATE_LEN=state_len,
+                SPEC_QUERY_LEN=kernel_spec_query_len,
+                STATE_WIDTH=state_width,
+                MODE=mode,
+                HAS_INIT=has_initial_states_arg,
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                READ_STATE=True,
+                num_warps=4,
+            )
+        else:
+            _ple_conv_writeback_kernel[(num_reqs, triton.cdiv(C, block_c))](
+                inputs,
+                conv_state,
+                state_indices,
+                query_start_loc if query_start_loc is not None else dummy,
+                num_accepted_tokens if num_accepted_tokens is not None else dummy,
+                has_initial_states if has_initial_states is not None else dummy,
+                token_indices if token_indices is not None else state_indices,
+                token_indices is not None,
+                state_idx_stride,
+                state_bs,
+                state_ws,
+                state_cs,
+                C=C,
+                BLOCK_C=block_c,
+                STATE_LEN=state_len,
+                SPEC_QUERY_LEN=kernel_spec_query_len,
+                STATE_WIDTH=state_width,
+                MODE=mode,
+                HAS_INIT=has_initial_states_arg,
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                num_warps=num_warps,
+            )
 
 
 __all__ = ["NULL_BLOCK_ID", "ple_conv"]
