@@ -282,6 +282,12 @@ def _decode_raw_mxfp4_bf16(b, scale):
 
 
 @triton.jit
+def e8m0_to_bf16_bits(byte):
+    bits = tl.where(byte == 0, 0x0040, byte << 7)
+    return tl.where(byte == 255, 0x7FC0, bits)
+
+
+@triton.jit
 def _dequant_mxfp4(
     b,
     s_ptr,
@@ -302,8 +308,7 @@ def _dequant_mxfp4(
         other=127,
     ).to(tl.uint32)
     if compute_type == tl.bfloat16:
-        sbits = tl.where(byte == 0, 0x0040, byte << 7)
-        sbits = tl.where(byte == 255, 0x7FC0, sbits)
+        sbits = e8m0_to_bf16_bits(byte)
         scale = sbits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
         scale = tl.reshape(
             tl.broadcast_to(scale[:, None, :], (b.shape[0] * 2 // 32, 16, b.shape[1])),
@@ -422,14 +427,10 @@ def _dequant_weight(
 
 @triton.jit
 def is_fp8_scale_fold_overflow(scale):
-    if scale.dtype == tl.bfloat16:
-        # Finite BF16 scales in [256, Inf) overflow the exact 2**120 fold.
-        magnitude = scale.to(tl.uint16, bitcast=True).to(tl.uint32) & 0x7FFF
-        return (magnitude - 0x4380).to(tl.uint32) < 0x3C00
-    else:
-        scale = scale.to(tl.float32)
-        folded = scale * (2.0**120)
-        return (tl.abs(folded) == float("inf")) & (tl.abs(scale) != float("inf"))
+    tl.static_assert(scale.dtype == tl.bfloat16)
+    # Only finite magnitudes >= 256 overflow the exact 2**120 fold.
+    magnitude = scale.to(tl.uint16, bitcast=True).to(tl.uint32) & 0x7FFF
+    return (magnitude - 0x4380).to(tl.uint32) < 0x3C00
 
 
 @triton.jit
@@ -462,52 +463,6 @@ def _decode_int8_fragment_bf16(q, s0, s1):
                 " ppu.lop3.b32 h2,h0,0xff80ff80,0x00800080,0x6a;\nppu.sub.bf16x2 v0,l1,l2;"
                 " ppu.sub.bf16x2 v1,h1,h2;\nppu.mul.rn.bf16x2 v0,v0,$3;"
                 " ppu.mul.rn.bf16x2 v1,v1,$4;\nppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
-            )
-        ),
-        "=r,=r,r,r,r",
-        [q, s0, s1],
-        dtype=(tl.uint32, tl.uint32),
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _decode_fp8_fragment_bf16(q, s0, s1):
-    return tl.inline_asm_elementwise(
-        (
-            (
-                "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
-                "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
-                "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
-                "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
-                "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
-                "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mov.b32 bias,0x7b807b80;"
-                " ppu.mul.rn.bf16x2 v0,v0,bias; ppu.mul.rn.bf16x2 v1,v1,bias;"
-                "\nppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0;"
-                " ppu.mov.b32 $1,v1; }"
-            )
-        ),
-        "=r,=r,r,r,r",
-        [q, s0, s1],
-        dtype=(tl.uint32, tl.uint32),
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _decode_fp8_fragment_bf16_folded(q, s0, s1):
-    return tl.inline_asm_elementwise(
-        (
-            (
-                "{ .reg .b32 mag,inc,mask,hi,lo,tmp,v0,v1,bias;\nppu.and.b32 mag,$2,0x7f7f7f7f;"
-                "\nppu.add.u32 inc,mag,0x01010101;\nppu.prmt.b32 mask,inc,0,0xba98;"
-                "\nppu.lop3.b32 hi,$2,mask,0x80808080,0xe4;\nppu.shr.b32 tmp,$2,4;"
-                "\nppu.lop3.b32 hi,hi,tmp,0x07070707,0xf8;\nppu.shl.b32 lo,$2,4;"
-                "\nppu.and.b32 lo,lo,0xf0f0f0f0;\nppu.prmt.b32 v0,lo,hi,0x5140;"
-                "\nppu.prmt.b32 v1,lo,hi,0x7362;\nppu.mul.rn.bf16x2 v0,v0,$3;"
-                " ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
             )
         ),
         "=r,=r,r,r,r",
@@ -624,6 +579,29 @@ def _fold_fp8_scale_fragment(s):
         is_pure=True,
         pack=1,
     )
+
+
+@triton.jit
+def load_w8_packed_scales(ptr, stride_n, FOLD: tl.constexpr):
+    words = ptr.to(tl.pointer_type(tl.uint32))
+    first = tl.load(words)
+    second = tl.load(words + 4 * stride_n)
+    if FOLD:
+        first = _fold_fp8_scale_fragment(first)
+        second = _fold_fp8_scale_fragment(second)
+    return first, second
+
+
+@triton.jit
+def w8_scale_fragment(scale, kg, PACKED: tl.constexpr, FOLD: tl.constexpr):
+    if PACKED:
+        bits = (scale >> (16 * kg)) & 0xFFFF
+    else:
+        bits = scale.to(tl.uint16, bitcast=True).to(tl.uint32)
+    fragment = bits | (bits << 16)
+    if FOLD and not PACKED:
+        fragment = _fold_fp8_scale_fragment(fragment)
+    return fragment
 
 
 @triton.jit
@@ -786,12 +764,7 @@ def _square_accumulate(
     c7 = c0
     if SCALE_PAIR:
         tl.static_assert(FP8 and K == 256)
-        words = (S + expert * SE + n0 * SN).to(tl.pointer_type(tl.uint32))
-        packed0 = tl.load(words)
-        packed1 = tl.load(words + 4 * SN)
-        if FAST:
-            packed0 = _fold_fp8_scale_fragment(packed0)
-            packed1 = _fold_fp8_scale_fragment(packed1)
+        scale0, scale1 = load_w8_packed_scales(S + expert * SE + n0 * SN, SN, FAST)
     unroll: tl.constexpr = 2 if FP8 and K % 256 == 0 else 1
     for kg in tl.range(K // 128, loop_unroll_factor=unroll):
         if not SCALE_PAIR:
@@ -812,19 +785,8 @@ def _square_accumulate(
             dep = _wait_w8_tile(dep, True)
         else:
             dep = _wait_w8_tile(dep, False)
-        if SCALE_PAIR:
-            lo0 = (packed0 >> (16 * kg)) & 0xFFFF
-            lo1 = (packed1 >> (16 * kg)) & 0xFFFF
-            s0 = lo0 | (lo0 << 16)
-            s1 = lo1 | (lo1 << 16)
-        else:
-            s0 = scale0.to(tl.uint16, bitcast=True).to(tl.uint32)
-            s1 = scale1.to(tl.uint16, bitcast=True).to(tl.uint32)
-            s0 = s0 | s0 << 16
-            s1 = s1 | s1 << 16
-            if FP8 and FAST:
-                s0 = _fold_fp8_scale_fragment(s0)
-                s1 = _fold_fp8_scale_fragment(s1)
+        s0 = w8_scale_fragment(scale0, kg, SCALE_PAIR, FP8 and FAST)
+        s1 = w8_scale_fragment(scale1, kg, SCALE_PAIR, FP8 and FAST)
         qhere = qs + kg % 2 * 16384
         ahere = aa + kg % 2 * 4096
         for group in tl.static_range(4):
@@ -956,8 +918,6 @@ def _marlin_moe_gemm_grouped_square_kernel(
                     expert,
                     n0,
                     inner_n,
-                    g,
-                    t,
                     SE,
                     SG,
                     SN,
@@ -980,8 +940,6 @@ def _marlin_moe_gemm_grouped_square_kernel(
                     expert,
                     n0,
                     inner_n,
-                    g,
-                    t,
                     SE,
                     SG,
                     SN,
@@ -1004,8 +962,6 @@ def _marlin_moe_gemm_grouped_square_kernel(
                 expert,
                 n0,
                 inner_n,
-                g,
-                t,
                 SE,
                 SG,
                 SN,
@@ -1171,8 +1127,7 @@ def _store_k32(k):
 
 @triton.jit
 def _dup_mx_scale(byte):
-    bits = tl.where(byte == 0, 0x40, byte << 7)
-    bits = tl.where(byte == 255, 0x7FC0, bits)
+    bits = e8m0_to_bf16_bits(byte)
     return bits | (bits << 16)
 
 
@@ -1427,8 +1382,6 @@ def _w8_narrow_accumulate(
     expert,
     n0,
     inner_n,
-    g,
-    t,
     SE,
     SG,
     SN,
@@ -1452,12 +1405,7 @@ def _w8_narrow_accumulate(
     c3 = c0
     if SCALE_PAIR:
         tl.static_assert(FP8 and K == 256)
-        words = (S + expert * SE + n0 * SN).to(tl.pointer_type(tl.uint32))
-        packed0 = tl.load(words)
-        packed1 = tl.load(words + 4 * SN)
-        if FAST:
-            packed0 = _fold_fp8_scale_fragment(packed0)
-            packed1 = _fold_fp8_scale_fragment(packed1)
+        scale0, scale1 = load_w8_packed_scales(S + expert * SE + n0 * SN, SN, FAST)
     unroll: tl.constexpr = 2 if FP8 and K % 256 == 0 else 1
     for kg in tl.range(K // 128, loop_unroll_factor=unroll):
         if not SCALE_PAIR:
@@ -1479,19 +1427,8 @@ def _w8_narrow_accumulate(
             dep = _wait_w8_tile(dep, True)
         else:
             dep = _wait_w8_tile(dep, False)
-        if SCALE_PAIR:
-            lo0 = (packed0 >> (16 * kg)) & 0xFFFF
-            lo1 = (packed1 >> (16 * kg)) & 0xFFFF
-            s0 = lo0 | (lo0 << 16)
-            s1 = lo1 | (lo1 << 16)
-        else:
-            s0 = scale0.to(tl.uint16, bitcast=True).to(tl.uint32)
-            s1 = scale1.to(tl.uint16, bitcast=True).to(tl.uint32)
-            s0 = s0 | s0 << 16
-            s1 = s1 | s1 << 16
-            if FP8 and FAST:
-                s0 = _fold_fp8_scale_fragment(s0)
-                s1 = _fold_fp8_scale_fragment(s1)
+        s0 = w8_scale_fragment(scale0, kg, SCALE_PAIR, FP8 and FAST)
+        s1 = w8_scale_fragment(scale1, kg, SCALE_PAIR, FP8 and FAST)
         here = shared + kg % 2 * 16384
         ahere = ashared + kg % 2 * 2048
         warp = inner_n // 16
@@ -1610,8 +1547,6 @@ def _marlin_moe_gemm_grouped_narrow_kernel(
                 expert,
                 n0,
                 inner_n,
-                g,
-                t,
                 SE,
                 SG,
                 SN,
@@ -1633,8 +1568,6 @@ def _marlin_moe_gemm_grouped_narrow_kernel(
                 expert,
                 n0,
                 inner_n,
-                g,
-                t,
                 SE,
                 SG,
                 SN,
@@ -1656,8 +1589,6 @@ def _marlin_moe_gemm_grouped_narrow_kernel(
             expert,
             n0,
             inner_n,
-            g,
-            t,
             SE,
             SG,
             SN,
@@ -1751,8 +1682,7 @@ if tle_async is not None:
                     (ns[None, :] < N) & (gs[:, None] * 32 < K),
                     other=127,
                 ).to(tl.uint32)
-                bits = tl.where(byte == 0, 0x40, byte << 7)
-                bits = tl.where(byte == 255, 0x7FC0, bits)
+                bits = e8m0_to_bf16_bits(byte)
                 scale = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
                 scale = tl.reshape(
                     tl.broadcast_to(scale[:, None, :], (BK // 32, 16, BN)),
@@ -2518,16 +2448,9 @@ if tle_async is not None:
         num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
         pid = tl.program_id(0)
-        if GROUP_SIZE_M == 1:
-            pid_m = pid // num_pid_n
-            pid_n = pid % num_pid_n
-        else:
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            group_id = pid // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-            pid_n = (pid % num_pid_in_group) // group_size_m
+        pid_m, pid_n = tl.swizzle2d(
+            pid // num_pid_n, pid % num_pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M
+        )
 
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
         if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
@@ -2995,7 +2918,6 @@ def _invoke_marlin_moe_gemm_direct(
     quant_type_id: int,
     use_matvec: bool = False,
     fuse_silu: bool = False,
-    silu_output: Optional[torch.Tensor] = None,
     split_k: int = 1,
     pipeline_stages: Optional[int] = None,
     use_wide_gate: bool = False,
@@ -3007,7 +2929,6 @@ def _invoke_marlin_moe_gemm_direct(
     K = A.size(1)
     N = C.size(-1) if fuse_silu else B.size(2)
     routes = topk_ids.numel()
-    stride_cm, stride_cn = C.stride(-2), C.stride(-1)
     if fuse_silu:
         block_n = 32 if routes >= 12 else _select_direct_block_n(N)
         # Fill more of the 64 PPU compute units for sparse decode batches.
@@ -3062,11 +2983,8 @@ def _invoke_marlin_moe_gemm_direct(
 
     target = C
     if split_k > 1:
-        assert use_matvec and silu_output is not None
-        partials = torch.empty(
-            (split_k, routes, N), device=C.device, dtype=torch.float32
-        )
-        target = partials
+        assert use_matvec and not fuse_silu
+        target = torch.empty((split_k, routes, N), device=C.device, dtype=torch.float32)
         grid = (*grid, split_k)
         pipeline_stages = min(
             pipeline_stages, triton.cdiv(triton.cdiv(K, 128), split_k)
@@ -3086,8 +3004,8 @@ def _invoke_marlin_moe_gemm_direct(
         B.stride(0),
         B.stride(1),
         B.stride(2),
-        stride_cm,
-        stride_cn,
+        target.stride(-2),
+        target.stride(-1),
         B_scale.stride(0),
         B_scale.stride(1),
         B_scale.stride(2),
@@ -3104,8 +3022,8 @@ def _invoke_marlin_moe_gemm_direct(
 
     if split_k > 1:
         _reduce_split_silu_kernel[(routes, triton.cdiv(N // 2, 128))](
-            partials,
-            silu_output,
+            target,
+            C,
             topk_weights,
             N // 2,
             routes,
@@ -3386,13 +3304,8 @@ def accumulate_fp8_wide_tile(
             dep = _wait_w8_tile(dep, True)
         else:
             dep = _wait_w8_tile(dep, False)
-        s0 = scale0.to(tl.uint16, bitcast=True).to(tl.uint32)
-        s1 = scale1.to(tl.uint16, bitcast=True).to(tl.uint32)
-        s0 |= s0 << 16
-        s1 |= s1 << 16
-        if FAST:
-            s0 = _fold_fp8_scale_fragment(s0)
-            s1 = _fold_fp8_scale_fragment(s1)
+        s0 = w8_scale_fragment(scale0, kg, False, FAST)
+        s1 = w8_scale_fragment(scale1, kg, False, FAST)
         current_offset = kg % 2 * 16384
         qhere = qs + current_offset
         ahere = aa + current_offset
@@ -3654,7 +3567,7 @@ def fp8_wide_grouped_kernel(
 
 
 def _invoke_marlin_moe_gemm_grouped(
-    A: torch.Tensor,
+    routed_a: torch.Tensor,
     C: torch.Tensor,
     stage: _QuantizedStage,
     topk_weights: Optional[torch.Tensor],
@@ -3668,7 +3581,7 @@ def _invoke_marlin_moe_gemm_grouped(
     group_size: int,
     compute_type,
     quant_type_id: int,
-    input_is_routed: bool = False,
+    is_down_projection: bool = False,
     raw_w8: bool = False,
     raw_w4: bool = False,
     packed_width: bool = False,
@@ -3677,31 +3590,7 @@ def _invoke_marlin_moe_gemm_grouped(
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
     B, B_scale = stage.weight, stage.scale
     em = sorted_token_ids.size(0)
-    num_valid_tokens = C.size(0) * C.size(1) if C.ndim == 3 else A.size(0) * top_k
-    if input_is_routed:
-        routed_a = A
-    else:
-        routed_a = _stage_grouped_activations(
-            A,
-            sorted_token_ids,
-            num_tokens_post_padded,
-            em=em,
-            num_valid_tokens=num_valid_tokens,
-            top_k=top_k,
-            block_m=block_m,
-            deinterleave_k=quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
-            and compute_type == tl.bfloat16
-            and block_m <= 32
-            and not raw_w4,
-            permute_k16=raw_w8,
-            permute_k32=raw_w4,
-            should_skip_inactive=raw_w8
-            or raw_w4
-            or quant_type_id == QUANT_TYPE_FP8_E4M3,
-            use_packed_gather=raw_w4
-            or (raw_w8 and quant_type_id == QUANT_TYPE_FP8_E4M3),
-        )
-
+    num_valid_tokens = C.numel() // C.size(-1)
     n = B.size(2)
     use32 = False
     if raw_w4 or (raw_w8 and quant_type_id == QUANT_TYPE_FP8_E4M3):
@@ -3725,7 +3614,7 @@ def _invoke_marlin_moe_gemm_grouped(
             expert_ids,
             num_tokens_post_padded,
             n,
-            A.size(1),
+            routed_a.size(1),
             num_valid_tokens,
             B.stride(0),
             B.stride(2),
@@ -3758,7 +3647,7 @@ def _invoke_marlin_moe_gemm_grouped(
             expert_ids,
             num_tokens_post_padded,
             n,
-            A.size(1),
+            routed_a.size(1),
             num_valid_tokens,
             B.stride(0),
             B.stride(2),
@@ -3777,8 +3666,8 @@ def _invoke_marlin_moe_gemm_grouped(
     # The first down-projection tile is shared by both FP8 scale paths.
     prefetch_before_scale = (
         quant_type_id == QUANT_TYPE_FP8_E4M3
-        and input_is_routed
-        and A.size(1) == 256
+        and is_down_projection
+        and routed_a.size(1) == 256
         and n == 4096
     )
     # The two adjacent BF16 scale groups can be loaded and folded together.
@@ -3803,7 +3692,7 @@ def _invoke_marlin_moe_gemm_grouped(
             expert_ids,
             num_tokens_post_padded,
             n,
-            A.size(1),
+            routed_a.size(1),
             num_valid_tokens,
             B.stride(0),
             B.stride(2),
@@ -3816,9 +3705,9 @@ def _invoke_marlin_moe_gemm_grouped(
             stage.scale_safe,
             quant_type_id == QUANT_TYPE_FP8_E4M3,
             PREFETCH_ROUTES=(
-                input_is_routed
+                is_down_projection
                 and quant_type_id == QUANT_TYPE_FP8_E4M3
-                and A.size(1) == 256
+                and routed_a.size(1) == 256
                 and num_valid_tokens >= (3 if prefetch_before_scale else 9) * B.size(0)
             ),
             USE32=use32,
@@ -3842,7 +3731,7 @@ def _invoke_marlin_moe_gemm_grouped(
             expert_ids,
             num_tokens_post_padded,
             n,
-            A.size(1),
+            routed_a.size(1),
             num_valid_tokens,
             B.stride(0),
             B.stride(2),
@@ -3861,9 +3750,9 @@ def _invoke_marlin_moe_gemm_grouped(
             num_stages=1,
         )
         return
-    batch_m = C.size(0) if C.ndim == 3 else A.size(0)
+    batch_m = C.size(0) if is_down_projection else C.size(0) // top_k
     block_n, group_m, num_warps, pipeline_stages = _select_grouped_config(
-        batch_m, A.size(1), n, block_m, quant_type_id
+        batch_m, routed_a.size(1), n, block_m, quant_type_id
     )
     # A 64-K tile bounds decoded-weight state; FP8 can then use a wider down tile.
     if quant_type_id == QUANT_TYPE_FP8_E4M3 and group_size == 128 and block_m <= 32:
@@ -3874,7 +3763,7 @@ def _invoke_marlin_moe_gemm_grouped(
         and 1024 <= batch_m < _PPU_DENSE_MIN_TOKENS
         and group_size == 128
         and block_m == 64
-        and input_is_routed
+        and is_down_projection
     ):
         block_n, num_warps = 128, 4
     stride_cm, stride_cn = C.stride(-2), C.stride(-1)
@@ -3889,7 +3778,7 @@ def _invoke_marlin_moe_gemm_grouped(
         expert_ids,
         num_tokens_post_padded,
         N=n,
-        K=A.size(1),
+        K=routed_a.size(1),
         EM=em,
         num_valid_tokens=num_valid_tokens,
         stride_be=B.stride(0),
@@ -4149,8 +4038,7 @@ def decode_bank(
                 (ns[:, None] < N) & (gs[None, :] * 32 < K),
                 other=127,
             ).to(tl.uint32)
-            bits = tl.where(byte == 0, 0x0040, byte << 7)
-            bits = tl.where(byte == 255, 0x7FC0, bits)
+            bits = e8m0_to_bf16_bits(byte)
             scale = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
             scale = tl.reshape(
                 tl.broadcast_to(scale[:, :, None], (BN, BK // 32, 16)), (BN, BK // 2)
@@ -4290,11 +4178,7 @@ def dense_w8_bf16_kernel(
     pid = tl.program_id(0)
     num_m = tl.cdiv(EM, BM)
     num_n = tl.cdiv(N, BN)
-    group = pid // (GM * num_n)
-    first = group * GM
-    size = tl.minimum(num_m - first, GM)
-    pm = first + (pid % (GM * num_n)) % size
-    pn = (pid % (GM * num_n)) // size
+    pm, pn = tl.swizzle2d(pid // num_n, pid % num_n, num_m, num_n, GM)
     live_rows = tl.load(Post)
     if pm * BM >= live_rows:
         return
@@ -4368,11 +4252,7 @@ def dense_w8_bf16_expert_window(
     num_n = tl.cdiv(N, BN)
     # Reuse CTAs for overflow tiles when routes concentrate in one window.
     for pid in range(tl.program_id(0), num_m * num_n, tl.num_programs(0)):
-        group = pid // (GM * num_n)
-        first = group * GM
-        size = tl.minimum(num_m - first, GM)
-        pm = first + (pid % (GM * num_n)) % size
-        pn = (pid % (GM * num_n)) // size
+        pm, pn = tl.swizzle2d(pid // num_n, pid % num_n, num_m, num_n, GM)
         pm = end // BM - 1 - pm
         _dense_w8_bf16_tile(
             A,
@@ -4412,14 +4292,11 @@ def dense_align_count_histogram(
     Count,
     Prefix,
     Sorted,
-    Experts,
     R: tl.constexpr,
     E: tl.constexpr,
     EM: tl.constexpr,
-    MB: tl.constexpr,
     RB: tl.constexpr,
     ID_BLOCK: tl.constexpr,
-    EX_BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     expert = tl.arange(0, E)
@@ -4433,22 +4310,11 @@ def dense_align_count_histogram(
         tl.store(Count + expert, 0)
     o = pid * ID_BLOCK + tl.arange(0, ID_BLOCK)
     tl.store(Sorted + o, R, o < EM)
-    ex = pid * EX_BLOCK + tl.arange(0, EX_BLOCK)
-    tl.store(Experts + ex, -1, ex < MB)
-
-
-@triton.jit
-def dense_align_scan_experts(Count, E: tl.constexpr, BX: tl.constexpr):
-    r = tl.arange(0, E) + 1
-    x = tl.program_id(0) * BX + tl.arange(0, BX)
-    offset = r[:, None] * E + x[None, :]
-    value = tl.load(Count + offset)
-    prefix = tl.cumsum(value, axis=0)
-    tl.store(Count + offset, prefix)
 
 
 def align_dense_fp8_histogram(ids, num_experts, split_at):
     from flaggems_vllm.ops.moe_align_block_size import (
+        moe_align_block_size_stage2_vec,
         moe_align_block_size_stage3,
         moe_align_block_size_stage4,
     )
@@ -4468,17 +4334,14 @@ def align_dense_fp8_histogram(ids, num_experts, split_at):
         count,
         prefix,
         sorted_ids,
-        experts,
         r,
         e,
         em,
-        mb,
         rb,
         triton.next_power_of_2(triton.cdiv(em, e)),
-        triton.next_power_of_2(triton.cdiv(mb, e)),
         num_warps=4,
     )
-    dense_align_scan_experts[(e // 16,)](count, e, 16, num_warps=8)
+    moe_align_block_size_stage2_vec[(e,)](count, e)
     moe_align_block_size_stage3[(1,)](post, count, prefix, e, e, 64)
 
     def scatter(first_expert, last_expert):
@@ -4514,7 +4377,10 @@ def run_fp8_ordered_overlap(
     output: torch.Tensor,
     ids: torch.Tensor,
     input_mul: bool,
-    down_tile: int,
+    banks: torch.Tensor,
+    gateup: torch.Tensor,
+    middle: torch.Tensor,
+    down: torch.Tensor,
 ) -> torch.Tensor:
     m, k = hidden.shape
     experts_count, n2, _ = w1.shape
@@ -4523,15 +4389,9 @@ def run_fp8_ordered_overlap(
     routes = m * topk
     half = experts_count // 2
     # Each bank holds one gate/up expert window or one down-projection column tile.
-    bank_size = half * k * n
-    banks = torch.empty((2, bank_size), device=hidden.device, dtype=hidden.dtype)
-    gate_bank, up_bank = banks[0], banks[1]
-    projection = torch.empty(
-        (routes * max(n2, down_tile),), device=hidden.device, dtype=hidden.dtype
-    )
-    gateup = projection[: routes * n2].view(routes, n2)
-    middle = torch.empty((routes, n), device=hidden.device, dtype=hidden.dtype)
-    down = projection[: routes * down_tile].view(m, topk, down_tile)
+    gate_bank, up_bank = banks.chunk(2)
+    gateup = gateup.view(routes, n2)
+    down_tile = down.size(-1)
 
     main = torch.cuda.current_stream(hidden.device)
     side = torch.cuda.Stream(device=hidden.device, priority=-1)
@@ -4623,7 +4483,8 @@ def run_fp8_ordered_overlap(
     silu_and_mul_out(gate_output, up_output, middle)
     for col in range(0, k, down_tile):
         end = col + down_tile
-        side.wait_stream(main)
+        if end < k:
+            side.wait_stream(main)
         dense_w8_bf16_kernel[(row_tiles * (down_tile // 256),)](
             middle,
             gate_bank,
@@ -4682,6 +4543,8 @@ def run_dense_wna16(
     *,
     gate_tile: int,
     down_tile: int,
+    decode_elements: int,
+    projection_width: int,
 ) -> torch.Tensor:
     from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
         get_default_config,
@@ -4693,6 +4556,15 @@ def run_dense_wna16(
     n, topk = n2 // 2, topk_ids.shape[1]
     is_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
     is_w4 = quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+    routes = m * topk
+    scratch = torch.empty(
+        decode_elements, device=hidden_states.device, dtype=torch.bfloat16
+    )
+    # Gate/up and down do not overlap in time; only the activation survives both GEMMs.
+    cache = hidden_states.new_empty((routes * projection_width,))
+    gateup = cache[: routes * n2].view(m, topk, n2)
+    intermediate = hidden_states.new_empty((routes, n))
+    down = cache[: routes * down_tile].view(m, topk, down_tile)
     if (
         is_fp8
         and m >= 8192
@@ -4708,10 +4580,9 @@ def run_dense_wna16(
         and topk_ids.is_contiguous()
         and topk_weights.is_contiguous()
     ):
-        routes = m * topk
         workspace = (
-            2 * e * k * n
-            + 2 * routes * (max(n2, down_tile) + n)
+            2 * decode_elements
+            + 2 * routes * (projection_width + n)
             + 4 * (e + 1) ** 2
             + 16 * (routes + 63 * e)
             + 8
@@ -4727,25 +4598,11 @@ def run_dense_wna16(
                 output,
                 topk_ids,
                 apply_router_weight_on_input,
-                down_tile,
+                scratch,
+                gateup,
+                intermediate,
+                down,
             )
-    tile = gate_tile
-    scratch = torch.empty(
-        (e * max(min(n2, tile) * k, min(k, down_tile) * n),),
-        device=hidden_states.device,
-        dtype=torch.bfloat16,
-    )
-    # Reuse projection storage after every gate/up value has fed SiLU.
-    cache = torch.empty(
-        (m * topk * max(n2, min(k, down_tile)),),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    gateup = cache[: m * topk * n2].view(m, topk, n2)
-    intermediate = torch.empty(
-        (m * topk, n), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-    down = cache[: m * topk * min(k, down_tile)].view(m, topk, min(k, down_tile))
     sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, 64, e)
     for index, (weight, scales) in enumerate(((w1, w1_scale), (w2, w2_scale))):
         first = index == 0
@@ -4958,12 +4815,15 @@ def _fused_marlin_moe_impl(
             == w2_scale.dtype
             == torch.bfloat16
         )
-        use_fp8_wide_tile = (
+        wide_fp8_gate_shape = (
             packed_fp8
             and group_size == 128
             and k == 4096
             and n == 256
             and 4 <= topk <= 8
+        )
+        use_fp8_wide_tile = (
+            wide_fp8_gate_shape
             and 1024 <= m < _PPU_DENSE_MIN_TOKENS
             and 32 * e < m * topk <= 64 * e
             and torch.cuda.get_device_properties(
@@ -5039,13 +4899,6 @@ def _fused_marlin_moe_impl(
             and m * topk * triton.cdiv(2 * n, 128) >= 64
             and sparse_bytes <= _PPU_DENSE_MAX_WORKSPACE_BYTES
         )
-        wide_fp8_gate_shape = (
-            packed_fp8
-            and group_size == 128
-            and k == 4096
-            and n == 256
-            and 4 <= topk <= 8
-        )
         small_fp8_gate = wide_fp8_gate_shape and m in (1, 2, 4)
         decode_fp8_gate = (
             wide_fp8_gate_shape
@@ -5082,19 +4935,12 @@ def _fused_marlin_moe_impl(
             * (4 if quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1) else 2)
             <= _PPU_DENSE_MAX_DECODE_BYTES
         ):
-            gate_tile = _PPU_DENSE_GATE_TILE
-            down_tile = _PPU_DENSE_DOWN_TILE
-            decode_bytes = (
-                e
-                * max(
-                    min(2 * n, gate_tile) * k,
-                    min(k, down_tile) * n,
-                )
-                * 2
-            )
-            fixed_bytes = decode_bytes + 4 * (e + 1) ** 2 + 16 * 63 * e + 8
-            # Column tiles share projection storage; the activation survives both GEMMs.
-            bytes_per_token = topk * (2 * (max(2 * n, min(k, down_tile)) + n) + 12)
+            gate_tile = min(2 * n, _PPU_DENSE_GATE_TILE)
+            down_tile = min(k, _PPU_DENSE_DOWN_TILE)
+            decode_elements = e * max(gate_tile * k, down_tile * n)
+            projection_width = max(2 * n, down_tile)
+            fixed_bytes = 2 * decode_elements + 4 * (e + 1) ** 2 + 16 * 63 * e + 8
+            bytes_per_token = topk * (2 * (projection_width + n) + 12)
             batch_tokens = min(
                 m, (_PPU_DENSE_MAX_WORKSPACE_BYTES - fixed_bytes) // bytes_per_token
             )
@@ -5115,6 +4961,8 @@ def _fused_marlin_moe_impl(
                     apply_router_weight_on_input,
                     gate_tile=gate_tile,
                     down_tile=down_tile,
+                    decode_elements=decode_elements,
+                    projection_width=projection_width,
                 )
             return out
         stage1, stage2 = _prepare_quantized_weights(
@@ -5171,7 +5019,7 @@ def _fused_marlin_moe_impl(
         )
         c1 = (
             torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
-            if split_silu
+            if split_silu and gemv_split_k == 1
             else None
         )
         c3 = (
@@ -5183,7 +5031,7 @@ def _fused_marlin_moe_impl(
             if split_silu:
                 _invoke_marlin_moe_gemm_direct(
                     A=hidden_states,
-                    C=c1,
+                    C=c1 if gemv_split_k == 1 else c2,
                     stage=stage1,
                     topk_weights=stage1_topk_weights,
                     topk_ids=topk_ids,
@@ -5194,7 +5042,6 @@ def _fused_marlin_moe_impl(
                     quant_type_id=quant_type_id,
                     use_matvec=use_matvec,
                     split_k=gemv_split_k,
-                    silu_output=c2 if gemv_split_k > 1 else None,
                     pipeline_stages=(
                         2
                         if small_fp8_gate
@@ -5338,8 +5185,30 @@ def _fused_marlin_moe_impl(
                         is_one_cta=is_one_cta,
                     )
             c1 = torch.empty((m * topk, 2 * n), device=out.device, dtype=out.dtype)
+            staging = dict(
+                em=sorted_ids.numel(),
+                num_valid_tokens=m * topk,
+                block_m=bm,
+                deinterleave_k=quant_type_id
+                in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+                and compute_type == tl.bfloat16
+                and bm <= 32
+                and not raw_w4,
+                permute_k16=raw_w8,
+                permute_k32=raw_w4,
+                should_skip_inactive=raw_w8
+                or raw_w4
+                or quant_type_id == QUANT_TYPE_FP8_E4M3,
+            )
             _invoke_marlin_moe_gemm_grouped(
-                A=hidden_states,
+                routed_a=_stage_grouped_activations(
+                    hidden_states,
+                    sorted_ids,
+                    padded,
+                    top_k=topk,
+                    use_packed_gather=raw_w4 or (raw_w8 and packed_fp8),
+                    **staging,
+                ),
                 C=c1,
                 stage=stage1,
                 topk_weights=stage1_topk_weights,
@@ -5360,25 +5229,13 @@ def _fused_marlin_moe_impl(
                 c1,
                 sorted_ids,
                 padded,
-                em=sorted_ids.numel(),
-                num_valid_tokens=m * topk,
-                block_m=bm,
-                deinterleave_k=quant_type_id
-                in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
-                and compute_type == tl.bfloat16
-                and bm <= 32
-                and not raw_w4,
-                permute_k16=raw_w8,
-                permute_k32=raw_w4,
-                should_skip_inactive=raw_w8
-                or raw_w4
-                or quant_type_id == QUANT_TYPE_FP8_E4M3,
+                **staging,
                 skip_unused_upper_rows=(
                     raw_w8 and quant_type_id == QUANT_TYPE_FP8_E4M3 and bm == 16
                 ),
             )
             _invoke_marlin_moe_gemm_grouped(
-                A=routed_c2,
+                routed_a=routed_c2,
                 C=c3,
                 stage=stage2,
                 topk_weights=stage2_topk_weights,
@@ -5391,7 +5248,7 @@ def _fused_marlin_moe_impl(
                 group_size=group_size,
                 compute_type=compute_type,
                 quant_type_id=quant_type_id,
-                input_is_routed=True,
+                is_down_projection=True,
                 raw_w8=raw_w8,
                 raw_w4=raw_w4,
                 packed_width=packed_width,
