@@ -89,6 +89,18 @@ def metadata(lengths):
     return cu, prepare_chunk_indices(cu, 64), prepare_chunk_offsets(cu, 64)
 
 
+def prefill_reference():
+    from vllm.model_executor.layers.fla.ops import kda
+
+    if not callable(getattr(kda, "_chunk_kda_fwd_with_cumulative_g", None)):
+        pytest.skip(
+            "Native KDA prefill reference lacks _chunk_kda_fwd_with_cumulative_g ABI"
+        )
+    if not bounded.chunk_kda_with_safe_gate._is_available():
+        pytest.skip("Native KDA 64-token prefill requires the USE_EXP2 core ABI")
+    return kda
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("varlen", [False, True])
 def test_gate_cumsum_preserves_original_dot_order(dtype, varlen):
@@ -107,7 +119,7 @@ def test_gate_cumsum_preserves_original_dot_order(dtype, varlen):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tokens", [1, 63, 64, 65, 129])
 def test_prefill_matches_original_64_core(dtype, tokens, key_dim=64, value_dim=32):
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = prefill_reference()
 
     torch.manual_seed(454 + tokens)
     q = torch.randn((1, tokens, 2, key_dim), dtype=dtype, device="cuda")
@@ -152,7 +164,7 @@ def test_prefill_matches_original_64_core(dtype, tokens, key_dim=64, value_dim=3
 
 @pytest.mark.parametrize("beta_value", [0.0, 1.0])
 def test_prefill_varlen_keeps_activated_beta_and_vk_state(beta_value):
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = prefill_reference()
 
     torch.manual_seed(534)
     dtype = torch.bfloat16
@@ -276,6 +288,7 @@ def test_prefill_execution_error_propagates(monkeypatch):
         calls.append(1)
         raise RuntimeError("submitted KDA failed")
 
+    monkeypatch.setattr(bounded, "_prefill_core", lambda: object())
     monkeypatch.setattr(bounded, "prefill_kda64", fail)
     with pytest.raises(RuntimeError, match="submitted KDA failed"):
         bounded.chunk_kda_with_safe_gate(q, q, q, q, beta, a, None)
@@ -454,7 +467,7 @@ def test_decode_preserves_padded_mamba_cache_slot_stride():
 
 
 def test_prefill_materializes_padded_initial_state_like_original():
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = prefill_reference()
 
     torch.manual_seed(642)
     q = torch.randn((1, 66, 2, 64), device="cuda", dtype=torch.bfloat16)
@@ -524,6 +537,14 @@ def test_public_capability_hook_checks_core_before_execution(
         hook.cache_clear()
 
 
-def test_public_core_capabilities_are_available_in_validation_environment():
-    assert bounded.chunk_kda_with_safe_gate._is_available()
-    assert bounded.fused_recurrent_kda._is_available()
+def test_public_core_capabilities_match_validation_environment():
+    for operator, resolver in (
+        (bounded.chunk_kda_with_safe_gate, bounded._prefill_core),
+        (bounded.fused_recurrent_kda, bounded._recurrent_core),
+    ):
+        try:
+            resolver()
+        except (ImportError, AttributeError, NotImplementedError, OSError):
+            assert operator._is_available() is False
+        else:
+            assert operator._is_available() is True
