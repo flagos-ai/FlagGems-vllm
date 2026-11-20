@@ -80,6 +80,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 
+import flag_gems
 import torch
 import triton
 import triton.language as tl
@@ -344,34 +345,56 @@ _SCALE_PACK_CACHE_E8M0: WeakTensorKeyDictionary = WeakTensorKeyDictionary()
 _SCALE_PACK_CACHE_E8M0_FOLD: WeakTensorKeyDictionary = WeakTensorKeyDictionary()
 
 
+@triton.jit
+def _pack_w_interleave_kernel(
+    W,
+    OUT,
+    n_elements,
+    N: tl.constexpr,
+    K8: tl.constexpr,
+    B: tl.constexpr,
+    stride_e,
+    stride_n,
+    stride_k,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    n = offsets % N
+    k8 = offsets // N % K8
+    e = offsets // (N * K8)
+    base_k = k8 // B * (8 * B) + k8 % B
+    packed = tl.zeros((BLOCK,), tl.uint32)
+    for j in tl.static_range(8):
+        k = base_k + j * B
+        byte = tl.load(
+            W + e * stride_e + n * stride_n + k // 2 * stride_k,
+            mask=offsets < n_elements,
+            other=0,
+        ).to(tl.uint32)
+        shift = (4 * (k % 2)).to(tl.uint32)
+        nibble = (byte >> shift) & 0xF
+        # Logical nibble order maps to bit positions (0,4,1,5,2,6,3,7).
+        packed |= nibble << (4 * (j // 2 + 4 * (j % 2)))
+    tl.store(OUT + offsets, packed.to(tl.int32, bitcast=True), offsets < n_elements)
+
+
 def _pack_w_interleave(w: torch.Tensor, block_size_k: int) -> torch.Tensor:
     assert w.dtype == torch.uint8
     assert w.ndim == 3
     assert (
-        block_size_k % 8 == 0
+        block_size_k > 0 and block_size_k % 8 == 0
     ), f"BLOCK_SIZE_K={block_size_k} must be multiple of 8 (8 logical K per int32)"
     E, N_out, K_half = w.shape
     K = K_half * 2
     B = block_size_k // 8
     assert K % (8 * B) == 0, f"K={K} must be divisible by BLOCK_SIZE_K={block_size_k}"
-    num_groups = K // (8 * B)
-
-    _NIBBLE_PERM = (0, 4, 1, 5, 2, 6, 3, 7)
-    _BIT_SHIFTS = tuple(4 * p for p in _NIBBLE_PERM)
-    shifts = torch.tensor(_BIT_SHIFTS, dtype=torch.int32, device=w.device)
     out = torch.empty(E, K // 8, N_out, dtype=torch.int32, device=w.device)
-
-    for e in range(E):
-        we = w[e]  # (N_out, K//2) uint8
-        low = (we & 0xF).to(torch.uint8)
-        high = ((we >> 4) & 0xF).to(torch.uint8)
-        unpacked = torch.stack([low, high], dim=-1).reshape(N_out, K)
-        tiled = unpacked.reshape(N_out, num_groups, 8, B).transpose(-1, -2)
-        # (N_out, num_groups, B, 8)
-        packed = (tiled.to(torch.int32) << shifts).sum(dim=-1, dtype=torch.int32)
-        # (N_out, num_groups, B) -> (N_out, K//8)
-        packed = packed.reshape(N_out, K // 8)
-        out[e].copy_(packed.transpose(0, 1))
+    if out.numel():
+        # Fixed one-pass cached prepacking; no compute-kernel autotune is needed.
+        with runtime.torch_device_fn.device(w.device):
+            _pack_w_interleave_kernel[(triton.cdiv(out.numel(), 256),)](
+                w, out, out.numel(), N_out, K // 8, B, *w.stride(), BLOCK=256
+            )
     return out  # (E, K//8, N_out)
 
 
@@ -429,11 +452,85 @@ def w4a16_int4_pack(
     return w1_packed, w2_packed, w1_scale_packed, w2_scale_packed
 
 
+# FP4 dequant bias applied before the scale (bf16 2^126, fp16 2^14; see _dequant_fp4_*).
+_FP4_BIAS_EXP = {torch.bfloat16: 126, torch.float16: 14}
+
+
+@triton.jit
+def _pack_scale_e8m0_kernel(
+    S,
+    OUT,
+    n_elements,
+    N: tl.constexpr,
+    GROUPS: tl.constexpr,
+    stride_e,
+    stride_n,
+    stride_g,
+    BIAS_EXP: tl.constexpr,
+    IS_BF16: tl.constexpr,
+    FOLD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    n = offsets % N
+    g = offsets // N % GROUPS
+    e = offsets // (N * GROUPS)
+    byte = tl.load(
+        S + e * stride_e + n * stride_n + g * stride_g,
+        mask=offsets < n_elements,
+        other=0,
+    ).to(tl.int32)
+    # Construct IEEE bits directly: exp2's FTZ would lose BF16 2^-127 (byte 0).
+    if IS_BF16:
+        exponent = byte + BIAS_EXP
+        bits = tl.minimum(exponent, 255) << 7
+        bits = tl.where(exponent == 0, 0x0040, bits)
+    else:
+        exponent = byte - 127 + BIAS_EXP
+        normal = tl.minimum(tl.maximum(exponent + 15, 0), 31) << 10
+        subnormal = 1 << tl.minimum(tl.maximum(exponent + 24, 0), 9)
+        bits = tl.where(
+            exponent >= -14, normal, tl.where(exponent >= -24, subnormal, 0)
+        )
+    if FOLD:
+        word = bits.to(tl.uint32)
+        value = (word | (word << 16)).to(tl.int32, bitcast=True)
+    elif IS_BF16:
+        value = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    else:
+        value = bits.to(tl.uint16).to(tl.float16, bitcast=True)
+    tl.store(OUT + offsets, value, offsets < n_elements)
+
+
+def _pack_scale_e8m0_impl(s, compute_dtype, *, fold):
+    assert s.ndim == 3
+    assert compute_dtype in _FP4_BIAS_EXP
+    s_u8 = s.view(torch.uint8) if s.dtype != torch.uint8 else s
+    E, N, groups = s_u8.shape
+    out = torch.empty(
+        (E, groups, N), dtype=torch.int32 if fold else compute_dtype, device=s.device
+    )
+    if out.numel():
+        # Fixed one-pass transpose/conversion, shared by plain and folded scales.
+        with runtime.torch_device_fn.device(s.device):
+            _pack_scale_e8m0_kernel[(triton.cdiv(out.numel(), 256),)](
+                s_u8,
+                out,
+                out.numel(),
+                N,
+                groups,
+                *s_u8.stride(),
+                BIAS_EXP=_FP4_BIAS_EXP[compute_dtype] if fold else 0,
+                IS_BF16=compute_dtype == torch.bfloat16,
+                FOLD=fold,
+                BLOCK=256,
+            )
+    return out
+
+
 def _pack_scale_e8m0(s: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
     # E8M0 (value = 2^(byte-127)) -> compute_dtype, transposed to (E, K/gs, N).
-    s_u8 = s.view(torch.uint8) if s.dtype != torch.uint8 else s
-    scale = torch.exp2((s_u8.to(torch.int32) - 127).to(torch.float32)).to(compute_dtype)
-    return scale.transpose(-2, -1).contiguous()
+    return _pack_scale_e8m0_impl(s, compute_dtype, fold=False)
 
 
 def _cached_pack_scale_e8m0(s, compute_dtype, cached: bool) -> torch.Tensor:
@@ -446,21 +543,11 @@ def _cached_pack_scale_e8m0(s, compute_dtype, cached: bool) -> torch.Tensor:
     return packed
 
 
-# FP4 dequant bias applied before the scale (bf16 2^126, fp16 2^14; see _dequant_fp4_*).
-_FP4_BIAS_EXP = {torch.bfloat16: 126, torch.float16: 14}
-
-
 def _pack_scale_e8m0_fold(s: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
     # E8M0 with the dequant bias folded in (combined = 2^(byte-127+bias_exp)), packed
     # (cs,cs) int32 so the kernel scales with one mul.bf16x2/group. Exact only while
     # combined is finite in compute_dtype -- callers must gate on _e8m0_fold_safe().
-    bias_exp = _FP4_BIAS_EXP[compute_dtype]
-    s_u8 = s.view(torch.uint8) if s.dtype != torch.uint8 else s
-    exp = s_u8.to(torch.int32) - 127 + bias_exp
-    combined = torch.exp2(exp.to(torch.float32)).to(compute_dtype)
-    combined = combined.transpose(-2, -1).contiguous()
-    bits = combined.view(torch.int16).to(torch.int32) & 0xFFFF
-    return ((bits << 16) | bits).contiguous()
+    return _pack_scale_e8m0_impl(s, compute_dtype, fold=True)
 
 
 # Largest finite binary exponent per compute dtype (bf16 2^127, fp16 2^15).
@@ -480,7 +567,7 @@ def _e8m0_fold_safe(s: torch.Tensor, compute_dtype: torch.dtype) -> bool:
     verdict = _E8M0_FOLD_SAFE_CACHE.get(s)
     if verdict is None:
         s_u8 = s.view(torch.uint8) if s.dtype != torch.uint8 else s
-        max_byte = int(s_u8.max().item())
+        max_byte = int(flag_gems.max(s_u8).item())
         verdict = max_byte <= _e8m0_fold_max_byte(compute_dtype)
         _E8M0_FOLD_SAFE_CACHE[s] = verdict
     return verdict
