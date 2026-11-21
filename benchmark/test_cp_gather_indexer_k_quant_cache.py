@@ -65,6 +65,9 @@ def load_vllm_op_and_fp8_dtype():
 
     Return (None, fp8_dtype) when the vLLM custom op is unavailable.
     """
+    if flaggems_vllm.vendor_name == "ascend":
+        return None, _default_fp8_dtype()
+
     os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
     try:
         import vllm._custom_ops as ops
@@ -239,6 +242,8 @@ def test_cp_gather_indexer_k_quant_cache_benchmark():
     vllm_op, fp8_dtype = load_vllm_op_and_fp8_dtype()
     if vllm_op is not None:
         run_vllm_benchmark(CpGatherIndexerKQuantCacheBenchmark(vllm_op, fp8_dtype))
+    elif flaggems_vllm.vendor_name == "ascend":
+        CpGatherIndexerKQuantCacheBenchmark(None, fp8_dtype).run()
     else:
         # No vLLM custom op in this environment: use the torch baseline.
         CpGatherIndexerKQuantCacheBenchmark(torch_gather, fp8_dtype).run()
