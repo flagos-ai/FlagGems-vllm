@@ -16,913 +16,627 @@ import torch
 import triton
 import triton.language as tl
 
-# ---------------------------------------------------------------------------
-# Rounding without a slow float->int conversion: this Kunlunxin Triton fork
-# has no tl.round and no linkable libdevice, and a bitcast of a COMPUTED
-# register value costs ~2.4ms per 16.8M elements (~7 Gelem/s wall), while a
-# bitcast folded into a global LOAD is free.  The magic-number trick
-# (f + 1.5*2^23 rounds to nearest-even in float; the bit pattern of the sum,
-# minus 0x4B400000 = 1262485504, is the IEEE round-half-to-even integer for
-# |f| <= 2^22) is therefore split across two kernels on large tensors:
-#   stage A:  clamp(x*inv) + 1.5*2^23  -> f32 temp   (pure float, fast)
-#   stage B:  load temp, fold bitcast, sub, clamp, int8 store (load-fold is
-#             free, so the expensive register bitcast never executes)
-# Small tensors stay in one fused kernel (launch-bound).
-#
-# Other backend quirks discovered empirically:
-#  * a kernel containing BOTH a tl.max and a tl.min reduction miscompiles the
-#    min result, so every kernel uses at most one reduction kind;
-#  * an inner `for c in range(NCHUNKS)` loop over 2D masked tiles is ~10x
-#    slower than a single-chunk tile, so wide rows use a simple 2D grid;
-#  * 1D grids with runtime divmod are pathological; use clean 2D grids;
-#  * redundant element masks (offs < C when the tile exactly covers the
-#    tensor, or offs < N when N % BLOCK == 0) cost 12-24% on this backend,
-#    so "nomask" kernel variants are used whenever the access is provably
-#    in-bounds (C == BLOCK and R % RT == 0, or N % BLOCK == 0).
-# ---------------------------------------------------------------------------
+# ── static: flat pointwise, int32 rounding+saturation path ───────────────────
 
 
 @triton.jit
-def _magic_i32(xf):
-    f = tl.minimum(tl.maximum(xf, -4194304.0), 4194304.0)
-    s = f + 12582912.0
-    return s.to(tl.int32, bitcast=True) - 1262485504
+def _static_sym_full(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    n_full,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    src = tl.load(x_ptr + offs).to(tl.float32)
+    scale = tl.load(scale_ptr)
+    inv_s = 1.0 / scale
+    q = (src * inv_s).to(tl.int32)
+    q = tl.minimum(tl.maximum(q, -128), 127)
+    tl.store(y_ptr + offs, q.to(tl.int8))
 
 
 @triton.jit
-def _quant_mul_i8(xf, inv):
-    i = _magic_i32(xf * inv)
-    i = tl.minimum(tl.maximum(i, -128), 127)
-    return i.to(tl.int8)
+def _static_sym_tail(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    base,
+    tail,
+    BLOCK: tl.constexpr,
+):
+    offs = base + tl.arange(0, BLOCK)
+    mask = tl.arange(0, BLOCK) < tail
+    src = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.load(scale_ptr)
+    inv_s = 1.0 / scale
+    q = (src * inv_s).to(tl.int32)
+    q = tl.minimum(tl.maximum(q, -128), 127)
+    tl.store(y_ptr + offs, q.to(tl.int8), mask=mask)
 
 
 @triton.jit
-def _quant_div_i8(xf, s):
-    i = _magic_i32(xf / s)
-    i = tl.minimum(tl.maximum(i, -128), 127)
-    return i.to(tl.int8)
+def _static_asym_full(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    azp_ptr,
+    n_full,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    src = tl.load(x_ptr + offs).to(tl.float32)
+    scale = tl.load(scale_ptr)
+    inv_s = 1.0 / scale
+    azp = tl.load(azp_ptr).to(tl.int32)
+    q = (src * inv_s).to(tl.int32) + azp
+    q = tl.minimum(tl.maximum(q, -128), 127)
+    tl.store(y_ptr + offs, q.to(tl.int8))
 
 
 @triton.jit
-def _quant_div_azp_i8(xf, s, azp):
-    i = _magic_i32(xf / s) + azp
-    i = tl.minimum(tl.maximum(i, -128), 127)
-    return i.to(tl.int8)
+def _static_asym_tail(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    azp_ptr,
+    base,
+    tail,
+    BLOCK: tl.constexpr,
+):
+    offs = base + tl.arange(0, BLOCK)
+    mask = tl.arange(0, BLOCK) < tail
+    src = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.load(scale_ptr)
+    inv_s = 1.0 / scale
+    azp = tl.load(azp_ptr).to(tl.int32)
+    q = (src * inv_s).to(tl.int32) + azp
+    q = tl.minimum(tl.maximum(q, -128), 127)
+    tl.store(y_ptr + offs, q.to(tl.int8), mask=mask)
+
+
+# ── dynamic stats: unmasked 2D tile for full chunks ──────────────────────────
 
 
 @triton.jit
-def _round_even_any(x):
-    # Floor-based round-half-to-even, exact at any magnitude (per-row use only).
-    xp = x + 0.5
-    r = tl.floor(xp)
-    tie = xp == r
-    odd = (r - 2.0 * tl.floor(r * 0.5)) != 0.0
-    return tl.where(tie, tl.where(odd, r - 1.0, r), r)
-
-
-# ---------------------------------------------------------------------------
-# Partial per-row reductions (stage 1).  Single reduction kind per kernel.
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _partial_absmax_tile(
-    in_ptr,
+def _stats_sym_full(
+    x_ptr,
     part_ptr,
-    R,
-    C,
-    RT: tl.constexpr,
+    hidden,
+    cpr,
+    R: tl.constexpr,
     BLOCK: tl.constexpr,
+    SPLIT: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    rows = pid * RT + tl.arange(0, RT)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK)
-    mmask = rmask[:, None] & (offs < C)[None, :]
-    ptrs = in_ptr + rows[:, None] * C + offs[None, :]
-    t = tl.load(ptrs, mask=mmask, other=0.0)
-    m = tl.max(tl.abs(t.to(tl.float32)), axis=1)
-    tl.store(part_ptr + rows, m, mask=rmask)
+    m0 = tl.program_id(0) * R + tl.arange(0, R)
+    n = tl.program_id(1)
+    if SPLIT:
+        # 4-way split reduction: four BLOCK/4-wide axis-1 maxes accumulated.
+        # Validated ~35% faster than one BLOCK-wide reduction on wide tiles
+        # with enough programs to hide the 4 serialized sub-reductions.
+        Q: tl.constexpr = BLOCK // 4
+        acc = tl.zeros((R,), dtype=tl.float32)
+        for k in tl.static_range(4):
+            cols = n * BLOCK + k * Q + tl.arange(0, Q)
+            offs = m0[:, None] * hidden + cols[None, :]
+            src = tl.load(x_ptr + offs).to(tl.float32)
+            acc = tl.maximum(acc, tl.max(tl.abs(src), axis=1))
+        v = acc
+    else:
+        cols = n * BLOCK + tl.arange(0, BLOCK)
+        offs = m0[:, None] * hidden + cols[None, :]
+        src = tl.load(x_ptr + offs).to(tl.float32)
+        v = tl.max(tl.abs(src), axis=1)
+    tl.store(part_ptr + m0 * cpr + n, v)
 
 
 @triton.jit
-def _partial_absmax_tile_nomask(
-    in_ptr,
+def _stats_asym_full(
+    x_ptr,
+    part_max_ptr,
+    part_min_ptr,
+    hidden,
+    cpr,
+    R: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    m0 = tl.program_id(0) * R + tl.arange(0, R)
+    n = tl.program_id(1)
+    cols = n * BLOCK + tl.arange(0, BLOCK)
+    offs = m0[:, None] * hidden + cols[None, :]
+    src = tl.load(x_ptr + offs).to(tl.float32)
+    vmax = tl.max(src, axis=1)
+    vmin = -tl.max(-src, axis=1)
+    tl.store(part_max_ptr + m0 * cpr + n, vmax)
+    tl.store(part_min_ptr + m0 * cpr + n, vmin)
+
+
+@triton.jit
+def _stats_sym_tail_tile(
+    x_ptr,
     part_ptr,
-    R,
-    C,
-    RT: tl.constexpr,
+    hidden,
+    base,
+    cpr,
+    R: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # Safe only when C == BLOCK and R % RT == 0 (tile exactly covers input).
-    pid = tl.program_id(0)
-    rows = pid * RT + tl.arange(0, RT)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK)
-    ptrs = in_ptr + rows[:, None] * C + offs[None, :]
-    t = tl.load(ptrs)
-    m = tl.max(tl.abs(t.to(tl.float32)), axis=1)
-    tl.store(part_ptr + rows, m, mask=rmask)
+    m0 = tl.program_id(0) * R + tl.arange(0, R)
+    cols = base + tl.arange(0, BLOCK)
+    offs = m0[:, None] * hidden + cols[None, :]
+    src = tl.load(x_ptr + offs).to(tl.float32)
+    v = tl.max(tl.abs(src), axis=1)
+    tl.store(part_ptr + m0 * cpr + (cpr - 1), v)
 
 
 @triton.jit
-def _partial_absmax_inv_tile(
-    in_ptr,
-    scale_out_ptr,
-    inv_ptr,
-    R,
-    C,
-    RT: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    # k2 folded into k1: computes the final row absmax and writes scale/inv
-    # directly, eliminating the k2 launch.  For small R the k2 grid was
-    # 25-75% idle-lane waste, so this fold wins there.
-    pid = tl.program_id(0)
-    rows = pid * RT + tl.arange(0, RT)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK)
-    mmask = rmask[:, None] & (offs < C)[None, :]
-    ptrs = in_ptr + rows[:, None] * C + offs[None, :]
-    t = tl.load(ptrs, mask=mmask, other=0.0)
-    m = tl.max(tl.abs(t.to(tl.float32)), axis=1)
-    scale = m / 127.0
-    inv = tl.where(m == 0.0, 0.0, 127.0 / m)
-    tl.store(scale_out_ptr + rows, scale, mask=rmask)
-    tl.store(inv_ptr + rows, inv, mask=rmask)
-
-
-@triton.jit
-def _partial_absmax_inv_tile_nomask(
-    in_ptr,
-    scale_out_ptr,
-    inv_ptr,
-    R,
-    C,
-    RT: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    # Safe only when C == BLOCK and R % RT == 0.
-    pid = tl.program_id(0)
-    rows = pid * RT + tl.arange(0, RT)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK)
-    ptrs = in_ptr + rows[:, None] * C + offs[None, :]
-    t = tl.load(ptrs)
-    m = tl.max(tl.abs(t.to(tl.float32)), axis=1)
-    scale = m / 127.0
-    inv = tl.where(m == 0.0, 0.0, 127.0 / m)
-    tl.store(scale_out_ptr + rows, scale, mask=rmask)
-    tl.store(inv_ptr + rows, inv, mask=rmask)
-
-
-@triton.jit
-def _partial_max_tile(
-    in_ptr,
+def _stats_sym_tail(
+    x_ptr,
     part_ptr,
-    R,
-    C,
-    RT: tl.constexpr,
+    hidden,
+    base,
+    tail,
+    cpr,
     BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    rows = pid * RT + tl.arange(0, RT)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK)
-    mmask = rmask[:, None] & (offs < C)[None, :]
-    ptrs = in_ptr + rows[:, None] * C + offs[None, :]
-    t = tl.load(ptrs, mask=mmask, other=0.0)
-    mx = tl.max(tl.where(mmask, t.to(tl.float32), float("-inf")), axis=1)
-    tl.store(part_ptr + rows, mx, mask=rmask)
+    row = tl.program_id(0)
+    offs = base + tl.arange(0, BLOCK)
+    mask = tl.arange(0, BLOCK) < tail
+    src = tl.load(x_ptr + row * hidden + offs, mask=mask, other=0.0).to(tl.float32)
+    v = tl.max(tl.abs(src))
+    tl.store(part_ptr + row * cpr + (cpr - 1), v)
 
 
 @triton.jit
-def _partial_min_tile(
-    in_ptr,
-    part_ptr,
-    R,
-    C,
-    RT: tl.constexpr,
+def _stats_asym_tail(
+    x_ptr,
+    part_max_ptr,
+    part_min_ptr,
+    hidden,
+    base,
+    tail,
+    cpr,
     BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    rows = pid * RT + tl.arange(0, RT)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK)
-    mmask = rmask[:, None] & (offs < C)[None, :]
-    ptrs = in_ptr + rows[:, None] * C + offs[None, :]
-    t = tl.load(ptrs, mask=mmask, other=0.0)
-    mn = tl.min(tl.where(mmask, t.to(tl.float32), float("inf")), axis=1)
-    tl.store(part_ptr + rows, mn, mask=rmask)
+    row = tl.program_id(0)
+    offs = base + tl.arange(0, BLOCK)
+    mask = tl.arange(0, BLOCK) < tail
+    src = tl.load(x_ptr + row * hidden + offs, mask=mask, other=0.0).to(tl.float32)
+    vmax = tl.max(tl.where(mask, src, -1e30))
+    vmin = -tl.max(tl.where(mask, -src, -1e30))
+    tl.store(part_max_ptr + row * cpr + (cpr - 1), vmax)
+    tl.store(part_min_ptr + row * cpr + (cpr - 1), vmin)
+
+
+# ── dynamic fold ─────────────────────────────────────────────────────────────
 
 
 @triton.jit
-def _partial_absmax_2d(in_ptr, part_ptr, C, nchunks, BLOCK: tl.constexpr):
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    x = tl.load(in_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    m = tl.max(tl.abs(x.to(tl.float32)), axis=0)
-    tl.store(part_ptr + pid_r * nchunks + pid_c, m)
-
-
-@triton.jit
-def _partial_absmax_head_tile(
-    in_ptr,
-    part_ptr,
-    R,
-    C,
-    COL: tl.constexpr,
-    RT: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    # cols [0, BLOCK) of each row (row stride C).  Safe when BLOCK <= C and
-    # BLOCK is a power of 2 (the 8192-lane masked reduction tree is ~3x
-    # slower per element than this 4096-lane one).  Writes partial into
-    # part[row, COL] of a (R, 2) buffer.
-    pid = tl.program_id(0)
-    rows = pid * RT + tl.arange(0, RT)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK)
-    ptrs = in_ptr + rows[:, None] * C + offs[None, :]
-    t = tl.load(ptrs)
-    m = tl.max(tl.abs(t.to(tl.float32)), axis=1)
-    tl.store(part_ptr + rows * 2 + COL, m, mask=rmask)
-
-
-@triton.jit
-def _partial_absmax_tail_tile(
-    in_ptr,
-    part_ptr,
-    R,
-    C,
-    BASE: tl.constexpr,
-    COL: tl.constexpr,
-    RT: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    # cols [BASE, BASE+BLOCK) of each row.  Safe when BASE+BLOCK <= C and
-    # BLOCK is a power of 2.  Writes partial into part[row, COL].
-    pid = tl.program_id(0)
-    rows = pid * RT + tl.arange(0, RT)
-    rmask = rows < R
-    offs = BASE + tl.arange(0, BLOCK)
-    ptrs = in_ptr + rows[:, None] * C + offs[None, :]
-    t = tl.load(ptrs)
-    m = tl.max(tl.abs(t.to(tl.float32)), axis=1)
-    tl.store(part_ptr + rows * 2 + COL, m, mask=rmask)
-
-
-@triton.jit
-def _partial_max_2d(in_ptr, part_ptr, C, nchunks, BLOCK: tl.constexpr):
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    x = tl.load(in_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    mx = tl.max(tl.where(mask, x.to(tl.float32), float("-inf")), axis=0)
-    tl.store(part_ptr + pid_r * nchunks + pid_c, mx)
-
-
-@triton.jit
-def _partial_min_2d(in_ptr, part_ptr, C, nchunks, BLOCK: tl.constexpr):
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    x = tl.load(in_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    mn = tl.min(tl.where(mask, x.to(tl.float32), float("inf")), axis=0)
-    tl.store(part_ptr + pid_r * nchunks + pid_c, mn)
-
-
-# ---------------------------------------------------------------------------
-# Row reduce (stage 2): scale / inverse / azp.  Max-only reductions.
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _reduce_sym_tile(
+def _fold_sym(
     part_ptr,
     scale_out_ptr,
-    inv_ptr,
-    R,
-    nchunks,
-    RPR: tl.constexpr,
-    BLOCK_R: tl.constexpr,
+    inv_out_ptr,
+    rows,
+    cpr,
+    C: tl.constexpr,
+    R: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    rows = pid * RPR + tl.arange(0, RPR)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK_R)
-    cmask = offs < nchunks
-    p = tl.load(
-        part_ptr + rows[:, None] * nchunks + offs[None, :],
-        mask=rmask[:, None] & cmask[None, :],
-        other=float("-inf"),
-    )
-    amax = tl.max(p, axis=1)
-    scale = amax / 127.0
-    inv = tl.where(amax == 0.0, 0.0, 127.0 / amax)
-    tl.store(scale_out_ptr + rows, scale, mask=rmask)
-    tl.store(inv_ptr + rows, inv, mask=rmask)
+    m0 = tl.program_id(0) * R + tl.arange(0, R)
+    maskr = m0 < rows
+    idx = m0[:, None] * cpr + tl.arange(0, C)[None, :]
+    mask = tl.arange(0, C)[None, :] < cpr
+    acc = tl.max(tl.load(part_ptr + idx, mask=mask, other=0.0), axis=1)
+    scale = acc / 127.0
+    inv_s = tl.where(acc == 0.0, 0.0, 127.0 / acc)
+    tl.store(scale_out_ptr + m0, scale, mask=maskr)
+    tl.store(inv_out_ptr + m0, inv_s, mask=maskr)
 
 
 @triton.jit
-def _reduce_asym_tile(
+def _fold_asym(
     part_max_ptr,
     part_min_ptr,
     scale_out_ptr,
     azp_out_ptr,
-    R,
-    nchunks,
-    RPR: tl.constexpr,
-    BLOCK_R: tl.constexpr,
+    inv_out_ptr,
+    rows,
+    cpr,
+    C: tl.constexpr,
+    R: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    rows = pid * RPR + tl.arange(0, RPR)
-    rmask = rows < R
-    offs = tl.arange(0, BLOCK_R)
-    cmask = offs < nchunks
-    mm = rmask[:, None] & cmask[None, :]
-    pm = tl.load(
-        part_max_ptr + rows[:, None] * nchunks + offs[None, :],
-        mask=mm,
-        other=float("-inf"),
-    )
-    pn = tl.load(
-        part_min_ptr + rows[:, None] * nchunks + offs[None, :],
-        mask=mm,
-        other=float("inf"),
-    )
-    rmax = tl.max(pm, axis=1)
-    rmin = -tl.max(-pn, axis=1)
+    m0 = tl.program_id(0) * R + tl.arange(0, R)
+    maskr = m0 < rows
+    idx = m0[:, None] * cpr + tl.arange(0, C)[None, :]
+    mask = tl.arange(0, C)[None, :] < cpr
+    rmax = tl.max(tl.load(part_max_ptr + idx, mask=mask, other=-1e30), axis=1)
+    rmin = -tl.max(-tl.load(part_min_ptr + idx, mask=mask, other=1e30), axis=1)
     scale = (rmax - rmin) / 255.0
-    azpf = _round_even_any(-128.0 - rmin / scale)
-    azpf = tl.minimum(tl.maximum(azpf, -2147483648.0), 2147483647.0)
-    tl.store(scale_out_ptr + rows, scale, mask=rmask)
-    tl.store(azp_out_ptr + rows, azpf.to(tl.int32), mask=rmask)
+    inv_s = 1.0 / scale
+    azp = (-128.0 - rmin * inv_s).to(tl.int32)
+    tl.store(scale_out_ptr + m0, scale, mask=maskr)
+    tl.store(azp_out_ptr + m0, azp, mask=maskr)
+    tl.store(inv_out_ptr + m0, inv_s, mask=maskr)
 
 
-# ---------------------------------------------------------------------------
-# Quantize (stage 3): single fused kernel (small tensors) or two-pass staged
-# kernels (large tensors) that dodge the expensive register bitcast.
-# ---------------------------------------------------------------------------
+# ── dynamic quantize ─────────────────────────────────────────────────────────
 
 
 @triton.jit
-def _quant_sym_kernel(
-    in_ptr,
-    out_ptr,
+def _quant_sym_flat(
+    x_ptr,
+    y_ptr,
     inv_ptr,
-    C,
-    nchunks,
-    BLOCK: tl.constexpr,
-):
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    inv = tl.load(inv_ptr + pid_r)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    x = tl.load(in_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    q = _quant_mul_i8(x.to(tl.float32), inv)
-    tl.store(out_ptr + pid_r * C + offs, q, mask=mask)
-
-
-@triton.jit
-def _quant_sym_kernel_nomask(
-    in_ptr,
-    out_ptr,
-    inv_ptr,
-    C,
-    nchunks,
-    BLOCK: tl.constexpr,
-):
-    # Safe only when C == BLOCK (single chunk, grid covers exactly R rows).
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    inv = tl.load(inv_ptr + pid_r)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(in_ptr + pid_r * C + offs)
-    q = _quant_mul_i8(x.to(tl.float32), inv)
-    tl.store(out_ptr + pid_r * C + offs, q)
-
-
-@triton.jit
-def _quant_asym_kernel(
-    in_ptr,
-    out_ptr,
-    scale_out_ptr,
-    azp_out_ptr,
-    C,
-    nchunks,
-    BLOCK: tl.constexpr,
-):
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    s = tl.load(scale_out_ptr + pid_r)
-    azp = tl.load(azp_out_ptr + pid_r)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    x = tl.load(in_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    q = _quant_div_azp_i8(x.to(tl.float32), s, azp)
-    tl.store(out_ptr + pid_r * C + offs, q, mask=mask)
-
-
-@triton.jit
-def _quant_a_mul(
-    in_ptr,
-    t_ptr,
-    inv_ptr,
-    C,
-    nchunks,
-    BLOCK: tl.constexpr,
-):
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    inv = tl.load(inv_ptr + pid_r)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    x = tl.load(in_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    # Tight pre-clamp: round(clamp(f, -128.49, 127.49)) == clamp(round(f)),
-    # so the magic-sum range keeps stage B inside [-128,127] and stage B can
-    # drop its int clamp entirely.
-    f = tl.minimum(tl.maximum(x.to(tl.float32) * inv, -128.49), 127.49)
-    tl.store(t_ptr + pid_r * C + offs, f + 12582912.0, mask=mask)
-
-
-@triton.jit
-def _quant_a_mul_nomask(
-    in_ptr,
-    t_ptr,
-    inv_ptr,
-    C,
-    nchunks,
-    BLOCK: tl.constexpr,
-):
-    # Safe only when C == BLOCK (grid covers exactly R rows).
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    inv = tl.load(inv_ptr + pid_r)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(in_ptr + pid_r * C + offs)
-    f = tl.minimum(tl.maximum(x.to(tl.float32) * inv, -128.49), 127.49)
-    tl.store(t_ptr + pid_r * C + offs, f + 12582912.0)
-
-
-@triton.jit
-def _quant_a_div(
-    in_ptr,
-    t_ptr,
-    scale_out_ptr,
-    C,
-    nchunks,
-    BLOCK: tl.constexpr,
-):
-    # Loose clamp: the azp shift in stage B_azp moves the result out of the
-    # int8 range again, so the wide clamp (magic-exact for |f|<=2^22) is
-    # required here; stage B_azp keeps its own int clamp.
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    s = tl.load(scale_out_ptr + pid_r)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    x = tl.load(in_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    f = tl.minimum(tl.maximum(x.to(tl.float32) / s, -4194304.0), 4194304.0)
-    tl.store(t_ptr + pid_r * C + offs, f + 12582912.0, mask=mask)
-
-
-@triton.jit
-def _quant_b(t_ptr, out_ptr, C, nchunks, BLOCK: tl.constexpr):
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    s = tl.load(t_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    i = s.to(tl.int32, bitcast=True) - 1262485504
-    tl.store(out_ptr + pid_r * C + offs, i.to(tl.int8), mask=mask)
-
-
-@triton.jit
-def _quant_b_nomask(t_ptr, out_ptr, C, nchunks, BLOCK: tl.constexpr):
-    # Safe only when C == BLOCK (grid covers exactly R rows).  Stage A's
-    # tight clamp guarantees i is already inside [-128, 127].
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    s = tl.load(t_ptr + pid_r * C + offs)
-    i = s.to(tl.int32, bitcast=True) - 1262485504
-    tl.store(out_ptr + pid_r * C + offs, i.to(tl.int8))
-
-
-@triton.jit
-def _quant_b_azp(t_ptr, out_ptr, azp_out_ptr, C, nchunks, BLOCK: tl.constexpr):
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    azp = tl.load(azp_out_ptr + pid_r)
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < C
-    s = tl.load(t_ptr + pid_r * C + offs, mask=mask, other=0.0)
-    i = s.to(tl.int32, bitcast=True) - 1262485504 + azp
-    i = tl.minimum(tl.maximum(i, -128), 127)
-    tl.store(out_ptr + pid_r * C + offs, i.to(tl.int8), mask=mask)
-
-
-# ---------------------------------------------------------------------------
-# Static (scale given): pure pointwise quantization.
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _static_sym_kernel(
-    in_ptr,
-    out_ptr,
-    scale_ptr,
-    scale_out_ptr,
-    N,
+    CPR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    s = tl.load(scale_ptr)
+    row = pid // CPR
+    inv_s = tl.load(inv_ptr + row)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-    x = tl.load(in_ptr + offs, mask=mask, other=0.0)
-    q = _quant_div_i8(x.to(tl.float32), s)
-    tl.store(out_ptr + offs, q, mask=mask)
-    if pid == 0:
-        tl.store(scale_out_ptr, s)
+    src = tl.load(x_ptr + offs).to(tl.float32)
+    q = (src * inv_s).to(tl.int8)
+    tl.store(y_ptr + offs, q)
 
 
 @triton.jit
-def _static_sym_kernel_nomask(
-    in_ptr,
-    out_ptr,
-    scale_ptr,
-    scale_out_ptr,
-    N,
+def _quant_sym_full(
+    x_ptr,
+    y_ptr,
+    inv_ptr,
+    hidden,
     BLOCK: tl.constexpr,
 ):
-    # Safe only when N % BLOCK == 0.
-    pid = tl.program_id(0)
-    s = tl.load(scale_ptr)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(in_ptr + offs)
-    q = _quant_div_i8(x.to(tl.float32), s)
-    tl.store(out_ptr + offs, q)
-    if pid == 0:
-        tl.store(scale_out_ptr, s)
+    m = tl.program_id(0)
+    n = tl.program_id(1)
+    inv_s = tl.load(inv_ptr + m)
+    offs = m * hidden + n * BLOCK + tl.arange(0, BLOCK)
+    src = tl.load(x_ptr + offs).to(tl.float32)
+    q = (src * inv_s).to(tl.int8)
+    tl.store(y_ptr + offs, q)
 
 
 @triton.jit
-def _static_asym_kernel(
-    in_ptr,
-    out_ptr,
-    scale_ptr,
+def _quant_sym_tail(
+    x_ptr,
+    y_ptr,
+    inv_ptr,
+    hidden,
+    base,
+    tail,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    inv_s = tl.load(inv_ptr + row)
+    offs = base + tl.arange(0, BLOCK)
+    mask = tl.arange(0, BLOCK) < tail
+    src = tl.load(x_ptr + row * hidden + offs, mask=mask, other=0.0).to(tl.float32)
+    q = (src * inv_s).to(tl.int8)
+    tl.store(y_ptr + row * hidden + offs, q, mask=mask)
+
+
+@triton.jit
+def _quant_sym_tail_flat(
+    x_ptr,
+    y_ptr,
+    inv_ptr,
+    hidden,
+    base,
+    total,
+    TAIL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # one flat pass over the tail region (rows x TAIL), row = idx // TAIL
+    pid = tl.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < total
+    row = idx // TAIL
+    col = idx - row * TAIL
+    inv_s = tl.load(inv_ptr + row, mask=mask, other=0.0)
+    offs = row * hidden + base + col
+    src = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    q = (src * inv_s).to(tl.int8)
+    tl.store(y_ptr + offs, q, mask=mask)
+
+
+@triton.jit
+def _quant_asym_full(
+    x_ptr,
+    y_ptr,
+    inv_ptr,
     azp_ptr,
-    scale_out_ptr,
-    azp_out_ptr,
-    N,
+    hidden,
     BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    s = tl.load(scale_ptr)
-    azp = tl.load(azp_ptr)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-    x = tl.load(in_ptr + offs, mask=mask, other=0.0)
-    q = _quant_div_azp_i8(x.to(tl.float32), s, azp)
-    tl.store(out_ptr + offs, q, mask=mask)
-    if pid == 0:
-        tl.store(scale_out_ptr, s)
-        tl.store(azp_out_ptr, azp)
+    m = tl.program_id(0)
+    n = tl.program_id(1)
+    inv_s = tl.load(inv_ptr + m)
+    azp = tl.load(azp_ptr + m).to(tl.float32)
+    offs = m * hidden + n * BLOCK + tl.arange(0, BLOCK)
+    src = tl.load(x_ptr + offs).to(tl.float32)
+    q = (src * inv_s + azp).to(tl.int8)
+    tl.store(y_ptr + offs, q)
 
 
 @triton.jit
-def _static_a_sym(in_ptr, t_ptr, scale_ptr, N, BLOCK: tl.constexpr):
-    # Tight clamp for the symmetric path: stage B can then drop its int
-    # clamp (round(clamp(f,-128.49,127.49)) == clamp(round(f))).
-    pid = tl.program_id(0)
-    s = tl.load(scale_ptr)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-    x = tl.load(in_ptr + offs, mask=mask, other=0.0)
-    f = tl.minimum(tl.maximum(x.to(tl.float32) / s, -128.49), 127.49)
-    tl.store(t_ptr + offs, f + 12582912.0, mask=mask)
-
-
-@triton.jit
-def _static_a_sym_nomask(in_ptr, t_ptr, scale_ptr, N, BLOCK: tl.constexpr):
-    # Safe only when N % BLOCK == 0.
-    pid = tl.program_id(0)
-    s = tl.load(scale_ptr)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(in_ptr + offs)
-    f = tl.minimum(tl.maximum(x.to(tl.float32) / s, -128.49), 127.49)
-    tl.store(t_ptr + offs, f + 12582912.0)
-
-
-@triton.jit
-def _static_a(in_ptr, t_ptr, scale_ptr, N, BLOCK: tl.constexpr):
-    # Loose clamp for the asymmetric path (azp shifts the result out of the
-    # int8 range again); stage B_azp keeps its own int clamp.
-    pid = tl.program_id(0)
-    s = tl.load(scale_ptr)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-    x = tl.load(in_ptr + offs, mask=mask, other=0.0)
-    f = tl.minimum(tl.maximum(x.to(tl.float32) / s, -4194304.0), 4194304.0)
-    tl.store(t_ptr + offs, f + 12582912.0, mask=mask)
-
-
-@triton.jit
-def _static_a_nomask(in_ptr, t_ptr, scale_ptr, N, BLOCK: tl.constexpr):
-    # Safe only when N % BLOCK == 0.
-    pid = tl.program_id(0)
-    s = tl.load(scale_ptr)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(in_ptr + offs)
-    f = tl.minimum(tl.maximum(x.to(tl.float32) / s, -4194304.0), 4194304.0)
-    tl.store(t_ptr + offs, f + 12582912.0)
-
-
-@triton.jit
-def _static_b(t_ptr, out_ptr, scale_ptr, scale_out_ptr, N, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-    s = tl.load(t_ptr + offs, mask=mask, other=0.0)
-    i = s.to(tl.int32, bitcast=True) - 1262485504
-    tl.store(out_ptr + offs, i.to(tl.int8), mask=mask)
-    if pid == 0:
-        tl.store(scale_out_ptr, tl.load(scale_ptr))
-
-
-@triton.jit
-def _static_b_nomask(t_ptr, out_ptr, scale_ptr, scale_out_ptr, N, BLOCK: tl.constexpr):
-    # Safe only when N % BLOCK == 0.  Stage A's tight clamp guarantees the
-    # magic result is already inside [-128, 127].
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    s = tl.load(t_ptr + offs)
-    i = s.to(tl.int32, bitcast=True) - 1262485504
-    tl.store(out_ptr + offs, i.to(tl.int8))
-    if pid == 0:
-        tl.store(scale_out_ptr, tl.load(scale_ptr))
-
-
-@triton.jit
-def _static_b_azp(
-    t_ptr,
-    out_ptr,
-    scale_ptr,
+def _quant_asym_tail(
+    x_ptr,
+    y_ptr,
+    inv_ptr,
     azp_ptr,
-    scale_out_ptr,
-    azp_out_ptr,
-    N,
+    hidden,
+    base,
+    tail,
     BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    azp = tl.load(azp_ptr)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-    s = tl.load(t_ptr + offs, mask=mask, other=0.0)
-    i = s.to(tl.int32, bitcast=True) - 1262485504 + azp
-    i = tl.minimum(tl.maximum(i, -128), 127)
-    tl.store(out_ptr + offs, i.to(tl.int8), mask=mask)
-    if pid == 0:
-        tl.store(scale_out_ptr, tl.load(scale_ptr))
-        tl.store(azp_out_ptr, azp)
+    row = tl.program_id(0)
+    inv_s = tl.load(inv_ptr + row)
+    azp = tl.load(azp_ptr + row).to(tl.float32)
+    offs = base + tl.arange(0, BLOCK)
+    mask = tl.arange(0, BLOCK) < tail
+    src = tl.load(x_ptr + row * hidden + offs, mask=mask, other=0.0).to(tl.float32)
+    q = (src * inv_s + azp).to(tl.int8)
+    tl.store(y_ptr + row * hidden + offs, q, mask=mask)
 
 
-def _next_pow2(v):
+def _pow2_part(hidden):
     p = 1
-    while p < v:
+    while hidden % (p * 2) == 0:
         p *= 2
     return p
 
 
-_RPR = 256
-_K1_BLOCK_CAP = 8192
-_K2_BLOCK_R = 16
-_2PASS_N_DYN = 512 * 1024
-# Static two-pass wins even at small N: the staged sa+sb kernels dodge the
-# expensive register bitcast entirely, and two light launches (measured
-# 0.0143ms at N=13824 vs 0.0192ms single-pass) beat one heavy fused kernel.
-_2PASS_N_STAT = 4096
-
-
-def _stage1_plan(R, C):
-    """k1 (per-row absmax) plan.  Returns (kind, nchunks, params):
-      - ('tile', 1, (RT, BLOCK)): single-chunk (RT, BLOCK) tile
-      - ('split', 2, (RT, TAIL)): 4096-lane head + exact power-of-2 tail
-      - ('grid2d', nchunks, (None, BLOCK)): simple 2D grid for wide rows
-    The 8192-lane masked reduction tree is ~3x slower per element than the
-    4096-lane one, so rows with 4096 < C < 8192 are split instead of masked.
-    """
-    BLOCK = min(_K1_BLOCK_CAP, _next_pow2(max(C, 1)))
-    nchunks = (C + BLOCK - 1) // BLOCK
-    if nchunks == 1 and BLOCK <= 4096:
-        RT = 32 if R >= 2048 else 16
-        RT = min(RT, _next_pow2(max(R, 1)))
-        return ("tile", 1, (RT, BLOCK))
-    if nchunks == 1 and BLOCK == 8192 and C > 4096:
-        tail = C - 4096
-        if tail & (tail - 1) == 0:  # power of 2 -> exact unmasked tail
-            return ("split", 2, (16, tail))
-    return ("grid2d", nchunks, (None, BLOCK))
-
-
-def _quant_block3(C):
-    p = _next_pow2(max(C, 1))
-    return 2048 if p > 4096 else min(4096, p)
-
-
-def _quant_block3_2p(C):
-    # memory-bound two-pass stages: widest single-chunk block (4096 lanes for
-    # C<=4096, 8192 for wider rows measured fastest)
-    return min(8192, _next_pow2(max(C, 1)))
+def _R(rows, blk):
+    if rows % 8 == 0 and 8 * blk <= 32768:
+        return 8
+    if rows % 4 == 0 and 4 * blk <= 16384:
+        return 4
+    if rows % 2 == 0 and 2 * blk <= 16384:
+        return 2
+    return 1
 
 
 def scaled_int8_quant(input, scale, azp, symmetric):
-    dev = input.device
-    shape = input.shape
-    C = shape[-1]
-    R = 1 if len(shape) == 1 else input.numel() // C
-    N = R * C
-    out = torch.empty(shape, dtype=torch.int8, device=dev)
+    input_2d = input.reshape(-1, input.shape[-1])
+    num_tokens, hidden = input_2d.shape
+    device = input.device
 
-    if scale is None:
-        # dynamic: per-row statistics
-        kind, nchunks, p = _stage1_plan(R, C)
-        grid2 = ((R + _RPR - 1) // _RPR,)
-        BLOCK3 = _quant_block3_2p(C) if N >= _2PASS_N_DYN else _quant_block3(C)
-        nchunks3 = (C + BLOCK3 - 1) // BLOCK3
-        two_pass = N >= _2PASS_N_DYN
+    if scale is not None:
+        output = torch.empty_like(input_2d, dtype=torch.int8)
+        n = input_2d.numel()
+        blk = 8192
+        n_full = n // blk * blk
+        tail = n - n_full
         if symmetric:
-            inv = torch.empty((R,), dtype=torch.float32, device=dev)
-            scale_out = torch.empty((R, 1), dtype=torch.float32, device=dev)
-            if kind == "tile" and R < 1024:
-                # Small-R k2 grids waste 25-75% of their lanes (RPR=256 tile
-                # on few rows); folding k2 into k1 removes the launch and the
-                # waste (measured: 512x4096 0.126->0.109ms, 64x1024
-                # 0.030->0.018ms).  Identical amax/scale/inv chain.
-                RT, BLOCK1 = p
-                grid1 = ((R + RT - 1) // RT,)
-                if C == BLOCK1 and R % RT == 0:
-                    _partial_absmax_inv_tile_nomask[grid1](
-                        input, scale_out, inv, R, C, RT=RT, BLOCK=BLOCK1
-                    )
-                else:
-                    _partial_absmax_inv_tile[grid1](
-                        input, scale_out, inv, R, C, RT=RT, BLOCK=BLOCK1
-                    )
-            else:
-                part = torch.empty((R, nchunks), dtype=torch.float32, device=dev)
-                if kind == "tile":
-                    RT, BLOCK1 = p
-                    grid1 = ((R + RT - 1) // RT,)
-                    if C == BLOCK1 and R % RT == 0:
-                        _partial_absmax_tile_nomask[grid1](
-                            input, part, R, C, RT=RT, BLOCK=BLOCK1
-                        )
-                    else:
-                        _partial_absmax_tile[grid1](
-                            input, part, R, C, RT=RT, BLOCK=BLOCK1
-                        )
-                elif kind == "split":
-                    RT, TAIL = p
-                    grid1 = ((R + RT - 1) // RT,)
-                    _partial_absmax_head_tile[grid1](
-                        input, part, R, C, COL=0, RT=RT, BLOCK=4096
-                    )
-                    _partial_absmax_tail_tile[grid1](
-                        input, part, R, C, BASE=4096, COL=1, RT=RT, BLOCK=TAIL
-                    )
-                else:
-                    BLOCK1 = p[1]
-                    _partial_absmax_2d[(R, nchunks)](
-                        input, part, C, nchunks, BLOCK=BLOCK1
-                    )
-                _reduce_sym_tile[grid2](
-                    part, scale_out, inv, R, nchunks, RPR=_RPR, BLOCK_R=_K2_BLOCK_R
+            if n_full:
+                _static_sym_full[(n_full // blk,)](
+                    input_2d, output, scale, n_full, BLOCK=blk, num_warps=8
                 )
-            if two_pass:
-                tmp = torch.empty(shape, dtype=torch.float32, device=dev)
-                if C == BLOCK3:
-                    _quant_a_mul_nomask[(R, nchunks3)](
-                        input, tmp, inv, C, nchunks3, BLOCK=BLOCK3
-                    )
-                    _quant_b_nomask[(R, nchunks3)](tmp, out, C, nchunks3, BLOCK=BLOCK3)
-                else:
-                    _quant_a_mul[(R, nchunks3)](
-                        input, tmp, inv, C, nchunks3, BLOCK=BLOCK3
-                    )
-                    _quant_b[(R, nchunks3)](tmp, out, C, nchunks3, BLOCK=BLOCK3)
-            else:
-                if C == BLOCK3:
-                    _quant_sym_kernel_nomask[(R, nchunks3)](
-                        input, out, inv, C, nchunks3, BLOCK=BLOCK3
-                    )
-                else:
-                    _quant_sym_kernel[(R, nchunks3)](
-                        input, out, inv, C, nchunks3, BLOCK=BLOCK3
-                    )
-            return out, scale_out, None
+            if tail:
+                _static_sym_tail[(1,)](
+                    input_2d, output, scale, n_full, tail, BLOCK=blk, num_warps=8
+                )
         else:
-            # asymmetric (correctness-only workloads): single-reduction
-            # max/min partial kernels + max-only merge reduce.
-            if kind == "tile":
-                RT, BLOCK1 = p
-                grid1 = ((R + RT - 1) // RT,)
-                use_tile = True
+            if n_full:
+                _static_asym_full[(n_full // blk,)](
+                    input_2d, output, scale, azp, n_full, BLOCK=blk, num_warps=8
+                )
+            if tail:
+                _static_asym_tail[(1,)](
+                    input_2d, output, scale, azp, n_full, tail, BLOCK=blk, num_warps=8
+                )
+        return output.view(input.shape), scale, azp
+
+    output = torch.empty_like(input_2d, dtype=torch.int8)
+    scale_out = torch.empty((num_tokens, 1), dtype=torch.float32, device=device)
+    inv_buf = torch.empty((num_tokens,), dtype=torch.float32, device=device)
+
+    p2 = _pow2_part(hidden)
+    use_flat = symmetric and p2 >= 64
+
+    if use_flat:
+        # Stats and quant both use BLOCK=4096 for wide rows with a small tail pass;
+        # flat quant with constexpr CPR covers the full chunks of every row.
+        qblk = 4096 if hidden >= 4096 else p2
+        cpr_q = hidden // qblk
+        q_tail = hidden % qblk
+        sblk = 4096 if hidden >= 4096 else qblk
+        cpr_full = hidden // sblk
+        s_tail = hidden % sblk
+        cpr = cpr_full + (1 if s_tail else 0)
+        C = 4
+        while C < cpr:
+            C *= 2
+        R = _R(num_tokens, sblk)
+        Rf = 1
+        for r_ in (64, 32, 16, 8, 4, 2, 1):
+            if num_tokens % r_ == 0:
+                Rf = r_
+                break
+        part = torch.empty((num_tokens, C), dtype=torch.float32, device=device)
+        use_split = sblk >= 2048 and num_tokens * cpr_full >= 256
+        _stats_sym_full[(num_tokens // R, cpr_full)](
+            input_2d,
+            part,
+            hidden,
+            cpr,
+            R=R,
+            BLOCK=sblk,
+            SPLIT=use_split,
+            num_warps=8,
+        )
+        if s_tail:
+            tb = 1
+            while tb * 2 <= s_tail:
+                tb *= 2
+            if s_tail == tb:
+                _stats_sym_tail_tile[(num_tokens // R, 1)](
+                    input_2d,
+                    part,
+                    hidden,
+                    cpr_full * sblk,
+                    cpr,
+                    R=R,
+                    BLOCK=tb,
+                    num_warps=8,
+                )
             else:
-                BLOCK1 = 8192 if kind == "split" else p[1]
-                grid1 = (R, nchunks if kind == "grid2d" else 1)
-                use_tile = False
-            part_max = torch.empty((R, nchunks), dtype=torch.float32, device=dev)
-            part_min = torch.empty((R, nchunks), dtype=torch.float32, device=dev)
-            scale_out = torch.empty((R, 1), dtype=torch.float32, device=dev)
-            azp_out = torch.empty((R, 1), dtype=torch.int32, device=dev)
-            if use_tile:
-                _partial_max_tile[grid1](input, part_max, R, C, RT=RT, BLOCK=BLOCK1)
-                _partial_min_tile[grid1](input, part_min, R, C, RT=RT, BLOCK=BLOCK1)
+                tb2 = 1
+                while tb2 < s_tail:
+                    tb2 *= 2
+                _stats_sym_tail[(num_tokens,)](
+                    input_2d,
+                    part,
+                    hidden,
+                    cpr_full * sblk,
+                    s_tail,
+                    cpr,
+                    BLOCK=max(tb2, 32),
+                    num_warps=8,
+                )
+        _fold_sym[((num_tokens + Rf - 1) // Rf,)](
+            part, scale_out, inv_buf, num_tokens, cpr, C=C, R=Rf, num_warps=4
+        )
+        if q_tail:
+            if cpr_q == 1:
+                # flat pass over the whole tail region: few wide programs
+                total = num_tokens * q_tail
+                _quant_sym_tail_flat[(triton.cdiv(total, 4096),)](
+                    input_2d,
+                    output,
+                    inv_buf,
+                    hidden,
+                    qblk,
+                    total,
+                    TAIL=q_tail,
+                    BLOCK=4096,
+                    num_warps=8,
+                )
             else:
-                _partial_max_2d[grid1](input, part_max, C, nchunks, BLOCK=BLOCK1)
-                _partial_min_2d[grid1](input, part_min, C, nchunks, BLOCK=BLOCK1)
-            _reduce_asym_tile[grid2](
-                part_max,
-                part_min,
-                scale_out,
-                azp_out,
-                R,
-                nchunks,
-                RPR=_RPR,
-                BLOCK_R=_K2_BLOCK_R,
+                tb = 1
+                while tb < q_tail:
+                    tb *= 2
+                _quant_sym_tail[(num_tokens,)](
+                    input_2d,
+                    output,
+                    inv_buf,
+                    hidden,
+                    cpr_q * qblk,
+                    q_tail,
+                    BLOCK=max(tb, 32),
+                    num_warps=4,
+                )
+        else:
+            _quant_sym_flat[(num_tokens * cpr_q,)](
+                input_2d, output, inv_buf, CPR=cpr_q, BLOCK=qblk, num_warps=8
             )
-            if two_pass:
-                tmp = torch.empty(shape, dtype=torch.float32, device=dev)
-                _quant_a_div[(R, nchunks3)](
-                    input, tmp, scale_out, C, nchunks3, BLOCK=BLOCK3
-                )
-                _quant_b_azp[(R, nchunks3)](
-                    tmp, out, azp_out, C, nchunks3, BLOCK=BLOCK3
-                )
-            else:
-                _quant_asym_kernel[(R, nchunks3)](
-                    input, out, scale_out, azp_out, C, nchunks3, BLOCK=BLOCK3
-                )
-            return out, scale_out, azp_out
+        return output.view(input.shape), scale_out, None
 
-    # static: scale given
-    if N < _2PASS_N_STAT:
-        if N <= 65536:
-            cap = 2048
-        elif N <= 1048576:
-            cap = 4096
-        else:
-            cap = 8192
-        BLOCK = min(cap, _next_pow2(max(N, 1)))
-        grid = ((N + BLOCK - 1) // BLOCK,)
-        scale_out = torch.empty((1,), dtype=torch.float32, device=dev)
-        if symmetric:
-            if N % BLOCK == 0:
-                _static_sym_kernel_nomask[grid](
-                    input, out, scale, scale_out, N, BLOCK=BLOCK
-                )
-            else:
-                _static_sym_kernel[grid](input, out, scale, scale_out, N, BLOCK=BLOCK)
-            return out, scale_out, None
-        else:
-            azp_out = torch.empty((1,), dtype=torch.int32, device=dev)
-            _static_asym_kernel[grid](
-                input, out, scale, azp, scale_out, azp_out, N, BLOCK=BLOCK
-            )
-            return out, scale_out, azp_out
+    # fallback: non-power-of-2-divisible hidden (correctness shapes like 17, 1025, 8193)
+    blk = 4096
+    while blk > hidden:
+        blk //= 2
+    cpr_full = hidden // blk
+    tail = hidden % blk
+    cpr = cpr_full + (1 if tail else 0)
+    C = 4
+    R = _R(num_tokens, blk)
+    Rf = 1
+    for r_ in (64, 32, 16, 8, 4, 2, 1):
+        if num_tokens % r_ == 0:
+            Rf = r_
+            break
+    tail_blk = max(32, _pow2_part(tail) if tail else 0)
 
-    # large static: two-pass staged quantization.  8192-lane blocks stream
-    # the f32 temp faster for every two-pass size (sa/sb: 0.056->0.043ms at
-    # N=524288, 0.215->0.139ms at N=2M).
-    BLOCK = min(8192, _next_pow2(max(N, 1)))
-    grid = ((N + BLOCK - 1) // BLOCK,)
-    tmp = torch.empty(N, dtype=torch.float32, device=dev)
-    scale_out = torch.empty((1,), dtype=torch.float32, device=dev)
-    if N % BLOCK == 0:
-        if symmetric:
-            _static_a_sym_nomask[grid](input, tmp, scale, N, BLOCK=BLOCK)
-        else:
-            _static_a_nomask[grid](input, tmp, scale, N, BLOCK=BLOCK)
-    else:
-        if symmetric:
-            _static_a_sym[grid](input, tmp, scale, N, BLOCK=BLOCK)
-        else:
-            _static_a[grid](input, tmp, scale, N, BLOCK=BLOCK)
     if symmetric:
-        if N % BLOCK == 0:
-            _static_b_nomask[grid](tmp, out, scale, scale_out, N, BLOCK=BLOCK)
-        else:
-            _static_b[grid](tmp, out, scale, scale_out, N, BLOCK=BLOCK)
-        return out, scale_out, None
-    else:
-        azp_out = torch.empty((1,), dtype=torch.int32, device=dev)
-        _static_b_azp[grid](tmp, out, scale, azp, scale_out, azp_out, N, BLOCK=BLOCK)
-        return out, scale_out, azp_out
+        part = torch.empty((num_tokens, C), dtype=torch.float32, device=device)
+        use_split = blk >= 2048 and num_tokens * cpr_full >= 256
+        _stats_sym_full[(num_tokens // R, cpr_full)](
+            input_2d,
+            part,
+            hidden,
+            cpr,
+            R=R,
+            BLOCK=blk,
+            SPLIT=use_split,
+            num_warps=8,
+        )
+        if tail:
+            _stats_sym_tail[(num_tokens,)](
+                input_2d,
+                part,
+                hidden,
+                cpr_full * blk,
+                tail,
+                cpr,
+                BLOCK=tail_blk,
+                num_warps=8,
+            )
+        _fold_sym[((num_tokens + Rf - 1) // Rf,)](
+            part, scale_out, inv_buf, num_tokens, cpr, C=C, R=Rf, num_warps=4
+        )
+        if cpr_full:
+            _quant_sym_full[(num_tokens, cpr_full)](
+                input_2d, output, inv_buf, hidden, BLOCK=blk, num_warps=8
+            )
+        if tail:
+            _quant_sym_tail[(num_tokens,)](
+                input_2d,
+                output,
+                inv_buf,
+                hidden,
+                cpr_full * blk,
+                tail,
+                BLOCK=tail_blk,
+                num_warps=8,
+            )
+        return output.view(input.shape), scale_out, None
+
+    part_max = torch.empty((num_tokens, C), dtype=torch.float32, device=device)
+    part_min = torch.empty((num_tokens, C), dtype=torch.float32, device=device)
+    azp_out = torch.empty((num_tokens, 1), dtype=torch.int32, device=device)
+    _stats_asym_full[(num_tokens // R, cpr_full)](
+        input_2d, part_max, part_min, hidden, cpr, R=R, BLOCK=blk, num_warps=8
+    )
+    if tail:
+        _stats_asym_tail[(num_tokens,)](
+            input_2d,
+            part_max,
+            part_min,
+            hidden,
+            cpr_full * blk,
+            tail,
+            cpr,
+            BLOCK=tail_blk,
+            num_warps=8,
+        )
+    _fold_asym[((num_tokens + Rf - 1) // Rf,)](
+        part_max,
+        part_min,
+        scale_out,
+        azp_out,
+        inv_buf,
+        num_tokens,
+        cpr,
+        C=C,
+        R=Rf,
+        num_warps=4,
+    )
+    if cpr_full:
+        _quant_asym_full[(num_tokens, cpr_full)](
+            input_2d, output, inv_buf, azp_out, hidden, BLOCK=blk, num_warps=8
+        )
+    if tail:
+        _quant_asym_tail[(num_tokens,)](
+            input_2d,
+            output,
+            inv_buf,
+            azp_out,
+            hidden,
+            cpr_full * blk,
+            tail,
+            BLOCK=tail_blk,
+            num_warps=8,
+        )
+    return output.view(input.shape), scale_out, azp_out
