@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import math
 
 import pytest
@@ -872,3 +873,76 @@ def test_prefill_head_tail_and_strides():
     assert relative_error.mean().item() < 0.15
     padded_scale = scale.as_strided((132, 2, scale.shape[-1]), scale.stride())
     assert torch.count_nonzero(padded_scale[129:]).item() == 0
+
+
+_reorder_mod = importlib.import_module("flaggems_vllm.ops.fused_inv_rope_fp8_quant")
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT or not _reorder_mod._HAS_LOAD_REORDER,
+    reason="requires FP8 and compiler load reorder support",
+)
+@pytest.mark.skipif(
+    flaggems_vllm.fused_inv_rope_fp8_quant is not _reorder_mod.fused_inv_rope_fp8_quant,
+    reason="backend uses its own fused inverse RoPE implementation",
+)
+@pytest.mark.parametrize(
+    "tokens,heads,groups",
+    [(256, 32, 4), (256, 64, 8), (260, 128, 8), (257, 128, 8)],
+)
+@pytest.mark.parametrize("packed", [False, True])
+def test_public_shapes(monkeypatch, tokens, heads, groups, packed):
+    monkeypatch.setattr(_reorder_mod, "_HAS_LOAD_REORDER", False)
+    before = _run_case(tokens, heads, groups, packed, seed=42)
+    monkeypatch.setattr(_reorder_mod, "_HAS_LOAD_REORDER", True)
+    after = _run_case(tokens, heads, groups, packed, seed=42)
+    assert (
+        after["out"].shape == before["out"].shape
+        and after["out"].stride() == before["out"].stride()
+    )
+    assert (
+        after["scale"].shape == before["scale"].shape
+        and after["scale"].stride() == before["scale"].stride()
+    )
+    _assert_dequant_close(
+        after["out"], after["scale"], before["out"], before["scale"], heads // groups
+    )
+    _assert_dequant_close(
+        after["out"],
+        after["scale"],
+        after["ref_out"],
+        after["ref_scale"],
+        heads // groups,
+    )
+
+
+@pytest.mark.fused_inv_rope_fp8_quant
+@pytest.mark.skipif(
+    not HAS_FP8_QUANT or not _reorder_mod._HAS_LOAD_REORDER,
+    reason="requires FP8 and compiler load reorder support",
+)
+@pytest.mark.skipif(
+    flaggems_vllm.fused_inv_rope_fp8_quant is not _reorder_mod.fused_inv_rope_fp8_quant,
+    reason="backend uses its own fused inverse RoPE implementation",
+)
+@pytest.mark.parametrize("packed", [False, True])
+def test_special_values_against_upstream(monkeypatch, packed):
+    torch.manual_seed(123)
+    o = torch.randn((256, 128, 512), dtype=torch.bfloat16, device=flaggems_vllm.device)
+    o[0, 0, 0] = float("nan")
+    o[1, 0, 0] = float("inf")
+    o[2, 0, 0] = float("-inf")
+    pos = torch.arange(256, dtype=torch.int64, device=flaggems_vllm.device)
+    cache = _make_cos_sin_cache(4096, 64, torch.device(flaggems_vllm.device))
+    monkeypatch.setattr(_reorder_mod, "_HAS_LOAD_REORDER", False)
+    baseline = flaggems_vllm.fused_inv_rope_fp8_quant(
+        o, pos, cache, 8, 16, tma_aligned_scales=packed
+    )
+    monkeypatch.setattr(_reorder_mod, "_HAS_LOAD_REORDER", True)
+    actual = flaggems_vllm.fused_inv_rope_fp8_quant(
+        o, pos, cache, 8, 16, tma_aligned_scales=packed
+    )
+    flaggems_vllm.runtime.torch_device_fn.synchronize()
+    assert torch.equal(actual[0].view(torch.uint8), baseline[0].view(torch.uint8))
+    torch.testing.assert_close(actual[1], baseline[1], rtol=0, atol=0, equal_nan=True)
