@@ -9,7 +9,7 @@ import torch
 
 import flaggems_vllm
 from benchmark.conftest import update_result
-from tests.lightning_attention_cases import (
+from tests.test_linear_attention import (
     DECODE_CASES,
     PREFIX_CASES,
     PrefixCase,
@@ -21,8 +21,8 @@ from tests.lightning_attention_cases import (
     make_state,
     native_decode_reason,
     native_prefix_reason,
+    prefix_reference,
 )
-from tests.lightning_attention_reference import prefix_reference
 
 pytestmark = pytest.mark.skipif(
     not hasattr(flaggems_vllm, "lightning_attention_decode"),
@@ -119,7 +119,7 @@ def benchmark_case(case, native, candidates, include_torch=True):
                 ks = k.index_select(0, rows)[:, :, 0, :, None].float()
                 vs = v.index_select(0, rows)[:, :, 0, None, :].float()
                 state = torch.exp(-slope.reshape(1, -1, 1, 1)) * state + ks * vs
-                cache.index_copy_(0, ids, state)
+                cache.index_copy_(0, ids, state.to(cache.dtype))
                 product = q.index_select(0, rows).float() @ state
                 y = q.new_zeros((case.b, case.h * case.d))
                 y.index_copy_(
@@ -152,10 +152,10 @@ def benchmark_case(case, native, candidates, include_torch=True):
 
 
 _CORE = {
-    "p-history-b1h8t257d64e64",
-    "p-long-b1h8t4096d128e128",
-    "d-small-b1h8t1d64e64",
-    "d-throughput-b32h16t1d128e128",
+    "p-minimax-tp8-b1h8t128d128e128",
+    "p-minimax-tp8-b1h8t1024d128e128",
+    "d-minimax-tp8-b1h8t1d128e128",
+    "d-minimax-tp8-b8h8t1d128e128",
 }
 
 

@@ -111,7 +111,7 @@ def _scan_chunks(
             + e[None, :] * SI[3],
             mask,
             0,
-        )
+        ).to(tl.float32)
     else:
         state = tl.full((BK, BV), 0, tl.float32)
     slope = tl.load(Slope + head * SS)
@@ -265,7 +265,7 @@ def _chunk_output(
                 + e[None, :] * SI[3],
                 mask,
                 0,
-            )
+            ).to(tl.float32)
         else:
             state = tl.full((BK, BV), 0, tl.float32)
         hist = History + bh * 2 * D * E + elem
@@ -422,9 +422,10 @@ def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
     b, h, t, d = q.shape
     e = v.shape[-1]
     if initial is not None and (
-        initial.shape != (b, h, d, e) or initial.dtype != torch.float32
+        initial.shape != (b, h, d, e)
+        or initial.dtype not in (torch.float32, torch.bfloat16)
     ):
-        raise ValueError("kv_history must have shape [B,H,D,E] and dtype float32")
+        raise ValueError("kv_history must be [B,H,D,E] with dtype float32 or bfloat16")
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     wide_ctas = b * h * triton.cdiv(t, 64) * triton.cdiv(e, 64)
     wide_values = e >= 128 and 2 * wide_ctas >= 3 * num_sms
@@ -595,12 +596,12 @@ def lightning_attention_decode(q, k, v, kv_caches, slope_rate, slot_idx, BLOCK_S
             "decode expects one token, square state and [slots,H,D,D] cache"
         )
     if (
-        kv_caches.dtype != torch.float32
+        kv_caches.dtype not in (torch.float32, torch.bfloat16)
         or slot_idx.shape != (b,)
         or slot_idx.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError(
-            "decode expects an FP32 cache and one integer slot per batch row"
+            "decode expects a float32 or bfloat16 cache and one integer slot per row"
         )
     if BLOCK_SIZE < 1 or BLOCK_SIZE & (BLOCK_SIZE - 1):
         raise ValueError("BLOCK_SIZE must be a positive power of two")
