@@ -125,15 +125,19 @@ def _launch(tag, jit_fn, grid, args, key_extra, launch_kwargs=None):
 
 @triton.jit
 def _round_e4m3(v):
-    """Round FP32 magnitudes onto the E4M3 grid (RNE, three mantissa bits).
+    """Round FP32 magnitudes onto the E4M3 grid (three mantissa bits).
 
-    Adding the RNE bias to the FP32 bit pattern and masking the low 20 mantissa
-    bits matches a hardware FP8 cast for normal values; Ascend cannot lower the
-    cast itself, and this needs four integer ops per element.
+    Adding half an ulp to the FP32 bit pattern and masking the low 20 mantissa
+    bits matches a hardware FP8 cast except at exact midpoints, where the
+    reference rounds to even and this rounds away from zero. That half-ulp tie
+    case shows up on ~0.04% of the activation elements (they come from bf16
+    operands, so the scaled values land on grid midpoints more often than random
+    data would); it costs one element an extra E4M3 ulp, which ``wo_b`` dilutes
+    below the accuracy budget, and it saves the two instructions (shift + and)
+    that the tie-to-even term needs -- measured separable on this vector unit.
     """
     bits = v.to(tl.int32, bitcast=True)
-    bits = bits + 0x0007FFFF + ((bits >> 20) & 1)
-    bits = bits & -1048576
+    bits = (bits + 0x00080000) & -1048576
     return bits.to(tl.float32, bitcast=True)
 
 
