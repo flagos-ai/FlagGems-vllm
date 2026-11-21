@@ -522,20 +522,24 @@ def test_mega_gate_v4_routes(mode):
     graph.reset()
 
 
-def test_mega_gate_v4_fp32_cutoff():
+@pytest.mark.parametrize("tokens", [2, 65])
+def test_mega_gate_v4_fp32_cutoff(tokens):
     from vllm_ascend.utils import enable_custom_op
 
     assert enable_custom_op()
-    case = GateCase("v4-flash", 2, 4096, 256, 6, "sqrtsoftplus", scale=1.5)
-    x = torch.zeros((2, case.hidden), device="npu")
+    case = GateCase("v4-flash", tokens, 4096, 256, 6, "sqrtsoftplus", scale=1.5)
+    x = torch.zeros((tokens, case.hidden), device="npu")
     weight = torch.zeros((case.experts, case.hidden), device="npu")
     # Experts 5 and 6 straddle K. Their activation difference vanishes in BF16.
-    x[:, :2] = torch.tensor([[1.0, 1.001], [1.001, 1.0]], device=x.device)
+    # Place the competing values in opposite halves of a split projection.
+    x[:, 0] = x[:, case.hidden // 2] = 1.0
+    x[1::2, 0] = 1.001
+    x[::2, case.hidden // 2] = 1.001
     weight[:5, 0] = torch.arange(2, 7, device=x.device)
-    weight[5, 0] = weight[6, 1] = 1
+    weight[5, 0] = weight[6, case.hidden // 2] = 1
     actual = flaggems_vllm.mega_gate(x, weight, **gate_kwargs(case))
     expected = gate_baseline(case, x, weight, None)
-    assert expected[0][:, -1].tolist() == [6, 5]
+    assert expected[0][:, -1].tolist() == ([6, 5] * ((tokens + 1) // 2))[:tokens]
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1], rtol=2e-4, atol=2e-5)
 
@@ -578,21 +582,31 @@ def test_mega_gate_group_cutoff_tie():
     assert not _valid_group_tie(case, ranking, torch.tensor([4, 5]))
 
 
-def test_mega_gate_qwen_logits_rounding():
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        GateCase("qwen-35b", 2, 128, 16, 2, "softmax"),
+        GateCase("qwen-35b", 32, 2048, 256, 8, "softmax"),
+        GateCase("qwen-397b", 432, 4096, 512, 10, "softmax"),
+    ],
+    ids=["minimal", "256-experts", "512-experts"],
+)
+def test_mega_gate_qwen_logits_rounding(geometry):
     from vllm_ascend.utils import enable_custom_op
 
     from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import prepare_mega_gate
 
     assert enable_custom_op()
-    case = GateCase("qwen-35b", 2, 128, 16, 2, "softmax")
-    x = torch.zeros((2, 128), dtype=torch.bfloat16, device="npu")
-    weight = torch.zeros((16, 128), dtype=x.dtype, device=x.device)
+    case = geometry
+    x = torch.zeros((case.tokens, case.hidden), dtype=torch.bfloat16, device="npu")
+    weight = torch.zeros((case.experts, case.hidden), dtype=x.dtype, device=x.device)
     # 1 and 1 + 2**-10 are distinct FP32 dot products but the same BF16 logit.
     x[:, 0] = 1
-    x[:, 1] = torch.tensor([2**-10, -(2**-10)], dtype=x.dtype, device=x.device)
-    weight[0, 0] = 2
-    weight[1:3, 0] = 1
-    weight[2, 1] = 1
+    x[::2, case.hidden // 2] = 2**-10
+    x[1::2, case.hidden // 2] = -(2**-10)
+    weight[: case.topk - 1, 0] = torch.arange(case.topk, 1, -1, device=x.device)
+    weight[case.topk - 1 : case.topk + 1, 0] = 1
+    weight[case.topk, case.hidden // 2] = 1
     kwargs = gate_kwargs(case)
     native_ids, native_weights = gate_baseline(case, x, weight, None)
     handle = prepare_mega_gate(x, weight, **kwargs)
@@ -602,7 +616,7 @@ def test_mega_gate_qwen_logits_rounding():
         torch.testing.assert_close(weights.bfloat16(), native_weights)
     fp32 = dict(kwargs, logits_dtype=torch.float32)
     ids, _ = flaggems_vllm.mega_gate(x, weight, **fp32)
-    assert ids[:, -1].tolist() == [2, 1]
+    assert ids[:, -1].tolist() == [case.topk, case.topk - 1] * (case.tokens // 2)
     assert native_ids[0, -1].item() == native_ids[1, -1].item()
     with pytest.raises(AssertionError, match="routing parameters"):
         flaggems_vllm.mega_gate(x, weight, prepared=handle, **fp32)
@@ -626,12 +640,19 @@ def test_mega_gate_direct_outputs(weight_out):
         flaggems_vllm.mega_gate(*args, prepared=handle, **gate_kwargs(case))
 
 
-def test_mega_gate_long_prepared_replay():
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        GateCase("v32", 16385, 4096, 256, 8, "sigmoid", 8, 4, 2.5),
+        GateCase("v4-flash", 8193, 4096, 256, 6, "sqrtsoftplus", scale=1.5),
+    ],
+    ids=["bf16", "fp32"],
+)
+def test_mega_gate_long_prepared_replay(geometry):
     from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import prepare_mega_gate
 
-    # Leave a tail tile on just one core pair and reuse the ready flags
-    # over several waves, including replay with changed inputs.
-    case = GateCase("v32", 16385, 4096, 256, 8, "sigmoid", 8, 4, 2.5)
+    # Exercise flag reuse and a tail tile with different input and weight values.
+    case = geometry
     kwargs = dict(**gate_kwargs(case), output_dtypes=(torch.int32, torch.float32))
     tensors = tuple(t.npu() for t in gate_inputs(case, 2026))
     stream = torch.npu.Stream()
@@ -707,3 +728,29 @@ def test_mega_gate_sigmoid_group_and_expert_ties(experts, tokens):
     expected_ids = torch.tensor(expected, dtype=torch.int32).expand(tokens, -1)
     torch.testing.assert_close(ids.cpu(), expected_ids, rtol=0, atol=0)
     torch.testing.assert_close(weights.cpu(), torch.full((tokens, 8), 0.125))
+
+
+def test_mega_gate_prepared_fp32_topk():
+    from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import prepare_mega_gate
+
+    geometry = GateCase("v4-flash", 64, 4096, 256, 6, "sqrtsoftplus", scale=1.5)
+    x = torch.zeros((64, 4096), device="npu")
+    weight = x.new_zeros((256, 4096))
+    bias = torch.zeros(256)
+    bias[31::32] = 1
+    bias = bias.npu()
+    kw = gate_kwargs(geometry)
+    h = prepare_mega_gate(x, weight, bias, **kw)
+    fn = partial(flaggems_vllm.mega_gate, prepared=h, **kw)
+    ids, weights = fn(x, weight, bias)
+    expected = torch.arange(31, 192, 32, dtype=torch.int32).expand(64, -1)
+    torch.testing.assert_close(ids.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(weights.cpu(), torch.full((64, 6), 0.25))
+    second = fn(x, weight, bias)
+    for first, other in zip((ids, weights), second):
+        assert first.is_contiguous() and other.is_contiguous()
+        assert first.data_ptr() != other.data_ptr()
+    with pytest.raises(AssertionError, match="contiguous"):
+        fn(x.new_empty((64, 8192))[:, ::2], weight, bias)
+    with pytest.raises(AssertionError, match="bias"):
+        fn(x, weight, bias[:-1])

@@ -99,6 +99,7 @@ def _mega_gate_kernel(
     USE_BOTH_SUBCORES: tl.constexpr,
     PROJECTION_SPLITS: tl.constexpr,
     TAIL_WINDOW: tl.constexpr,
+    ROUND_SPLIT_LOGITS: tl.constexpr,
 ):
     block = tl.program_id(0)
     workers = tl.num_programs(0)
@@ -179,6 +180,7 @@ def _mega_gate_kernel(
             PROJECTION_SPLITS,
             plane_stride,
             TAIL_WINDOW if PROJECTION_SPLITS == 1 else 0,
+            ROUND_SPLIT_LOGITS,
         )
 
 
@@ -370,6 +372,7 @@ def _route_rows(
     PROJECTION_SPLITS: tl.constexpr = 1,
     plane_stride=0,
     TAIL_WINDOW: tl.constexpr = 0,
+    ROUND_SPLIT_LOGITS: tl.constexpr = False,
 ):
     columns = tl.arange(0, PAD_EXPERTS)
     logit_rows = rows
@@ -395,6 +398,9 @@ def _route_rows(
             logits += tl.load(ptr)
         else:
             logits += tl.load(ptr, columns[None, :] < EXPERTS, other=0)
+    if ROUND_SPLIT_LOGITS:
+        # Match the model's BF16 linear result after summing both FP32 planes.
+        logits = logits.to(tl.bfloat16)
     logits = logits.to(tl.float32)
     RANK_LOGITS: tl.constexpr = (
         SCORING == "softmax" and not HAS_BIAS and TOP_GROUPS == GROUPS
@@ -751,7 +757,26 @@ def _gate_launch_args(
             or (experts == 384 and groups == top_groups == 1)
         )
     )
-    short_pipeline = wide_sigmoid and cube_cores * 64 <= tokens < 2 * cube_cores * 64
+    custom_ops = getattr(tle.dsa.ascend, "custom_ops", None)
+    split_group = (
+        wide_sigmoid
+        and grouped_route
+        and 16 < tokens < 2 * cube_cores * 64
+        and hasattr(custom_ops, "sort32")
+        and hasattr(custom_ops, "sort_1d_pack")
+    )
+    split_flat = (
+        wide_sigmoid
+        and not grouped_route
+        and (64 < tokens <= 128 or 512 < tokens < 2 * cube_cores * 64)
+        and hasattr(custom_ops, "sort_1d_pack")
+    )
+    split_sigmoid = split_group or split_flat
+    short_pipeline = (
+        wide_sigmoid
+        and not split_sigmoid
+        and cube_cores * 64 <= tokens < 2 * cube_cores * 64
+    )
     local_pipeline = (
         weight.dtype == torch.bfloat16
         and experts >= 256
@@ -765,7 +790,27 @@ def _gate_launch_args(
             or (scoring == "sigmoid" and (not grouped_route or experts == 256))
         )
     )
-    if local_pipeline:
+    fp32_router = (
+        weight.dtype == torch.float32
+        and logits_dtype == torch.float32
+        and hidden == 4096
+        and experts == 256
+        and topk == 6
+        and scoring == "sqrtsoftplus"
+        and groups == top_groups == 1
+    )
+    fp32_score = fp32_router and table is None and vision_bias is None
+    fp32_pipeline = fp32_router and tokens >= cube_cores * 64
+    if fp32_pipeline:
+        # Each Cube owns a full expert row. Its Vector subcores rank rows
+        # while the Cube projects the next tile.
+        block_m, block_n, block_k = 64, experts, 128
+        route_rows = 8 if vision_bias is None else (2 if table is not None else 4)
+        if fp32_score and 96 * triton.cdiv(tokens, 96 * cube_cores) < 64 * triton.cdiv(
+            tokens, 64 * cube_cores
+        ):
+            block_m, route_rows = 96, 16
+    elif local_pipeline:
         block_m = (
             128 if tokens >= 8 * cube_cores * 64 and experts != padded_experts else 64
         )
@@ -777,6 +822,8 @@ def _gate_launch_args(
             route_rows = 8
         if wide_sigmoid and experts == 384 and tokens < 8 * cube_cores * 64:
             padded_experts = experts
+    local_pipeline = local_pipeline or fp32_pipeline
+    if local_pipeline:
         row_tiles = triton.cdiv(tokens, block_m)
         workers = min(cube_cores, row_tiles)
         use_both_subcores = True
@@ -784,7 +831,6 @@ def _gate_launch_args(
     # small batch. The repeated reductions amortize better on longer runs.
     sort_min = 64 if experts == 256 else 24
     sort_max = 256 if experts == 256 else 2 * cube_cores * 32
-    custom_ops = getattr(tle.dsa.ascend, "custom_ops", None)
     flat_sort = (
         weight.dtype == torch.bfloat16
         and not grouped_route
@@ -804,19 +850,13 @@ def _gate_launch_args(
     hardware_topk = (flat_sort or group_sort) and hasattr(custom_ops, "sort_1d_pack")
     if hardware_topk:
         route_rows, use_both_subcores = 1, True
-        if group_sort and 4 < tokens <= 256:
-            if tokens <= 16:
-                block_m = 16
-            elif tokens <= 128:
-                block_m = 32
-            else:
-                block_m = 64
-            block_n = 32 if tokens <= 64 else 64
-            block_k = 1024
+        if group_sort and 4 < tokens <= 16:
+            block_m, block_n, block_k = 16, 32, 1024
     tail_window = 0
     if (
         wide_sigmoid
         and grouped_route
+        and not split_group
         and 320 < tokens <= 512
         and tokens % 64
         and tokens % 16 == 0
@@ -834,7 +874,7 @@ def _gate_launch_args(
             block_m = 128 if tokens % 128 else 64
             block_n, block_k, projection_splits = 128, 512, 2
             tail_window = block_m if tokens % block_m else 0
-    if wide_sigmoid and 512 < tokens < cube_cores * 64:
+    if wide_sigmoid and not split_group and 512 < tokens < cube_cores * 64:
         if grouped_route:
             block_m, block_n, block_k = 256, 64, 256
             hardware_topk = hasattr(custom_ops, "sort32") and hasattr(
@@ -870,16 +910,58 @@ def _gate_launch_args(
         block_k = 512 if grouped_route and tokens == 1 else 1024
         use_both_subcores = hardware_topk
         compile_options["multibuffer"] = False
+    if (
+        (fp32_score or split_sigmoid)
+        and not local_pipeline
+        and hasattr(custom_ops, "sort_1d_pack")
+    ):
+        hardware_topk = True
+        use_both_subcores = True
+        route_rows = 1 if tokens == 1 or 16 < tokens <= 64 else 2
+        if tokens > 16:
+            # Additional K partitions occupy otherwise idle Cubes on short
+            # projections. Larger row tiles already expose enough parallel work.
+            block_m, block_n = (32, 64) if tokens <= 64 else (64, 128)
+            block_k = 256
+            projection_splits = 2 if split_sigmoid or tokens <= 256 else 1
+            if (split_group and tokens > 256) or (split_flat and tokens > 512):
+                block_m, block_n, block_k = 128, 128, 512
+            tail_window = block_m if tokens >= block_m and tokens % block_m else 0
+    qwen_router = (
+        rank_logits
+        and weight.dtype == torch.bfloat16
+        and logits_dtype == torch.bfloat16
+        and (hidden, experts, topk) in ((2048, 256, 8), (4096, 512, 10))
+    )
+    if (
+        qwen_router
+        and not local_pipeline
+        and tokens <= 2048
+        and hasattr(custom_ops, "sort_1d_pack")
+    ):
+        hardware_topk = use_both_subcores = True
+        route_rows = min(2, block_m)
+        if tokens > 16:
+            wide_tile = experts == 512 and tokens > 256
+            block_m, block_n, block_k = (128, 128, 512) if wide_tile else (64, 128, 256)
+            short_limit = 128 if experts == 256 else 64
+            projection_splits = (
+                2 if tokens <= short_limit or wide_tile or tokens > 512 else 1
+            )
+            tail_window = block_m if tokens >= block_m and tokens % block_m else 0
     if not local_pipeline:
         row_tiles = triton.cdiv(tokens, block_m)
         workers = min(cube_cores, row_tiles * (experts // block_n) * projection_splits)
+        compile_options["ROUND_SPLIT_LOGITS"] = (
+            projection_splits > 1 and logits_dtype == torch.bfloat16
+        )
         compile_options["PROJECTION_SPLITS"] = projection_splits
         compile_options["TAIL_WINDOW"] = tail_window
     # BF16 logits round at this store. Split projections use FP32 planes,
     # which the Vector pass combines before scoring.
     workspace = torch.empty(
         (projection_splits * row_tiles * block_m, logit_stride),
-        dtype=logits_dtype,
+        dtype=torch.float32 if projection_splits > 1 else logits_dtype,
         device=x.device,
     )
     return (
@@ -913,6 +995,8 @@ def _gate_launch_args(
 
 class _PreparedMegaGate:
     def __init__(self, x, weight, bias, routing_inputs, config):
+        import torch_npu
+
         (
             topk,
             scoring,
@@ -925,13 +1009,28 @@ class _PreparedMegaGate:
         ) = config
         tokens = x.shape[0]
         self.output_dtypes = _resolve_output_dtypes(weight, output_dtypes)
+        # Expanded scalar templates describe the two fresh, contiguous outputs
+        # without retaining full-sized output buffers in a prepared handle.
+        self.output_templates = tuple(
+            x.new_empty((1,), dtype=dtype).expand(tokens, topk)
+            for dtype in self.output_dtypes
+        )
         self.config = config
         self.x_shape = x.shape
         self.weight_shape = weight.shape
+        self.bias_shape = None if bias is None else bias.shape
         tensors = (x, weight, bias, *routing_inputs)
         self.dtypes = tuple(t.dtype if t is not None else None for t in tensors)
+        self.input_dtypes = self.dtypes[:3]
+        self.routing_dtypes = self.dtypes[3:]
         self.device = x.device
-        self.stream = driver.active.get_current_stream(x.device.index)
+        # Resolve the same raw-stream accessor as the Ascend Triton driver once.
+        self.get_stream = getattr(
+            torch_npu._C,
+            "_npu_getCurrentRawStreamNoWait",
+            driver.active.get_current_stream,
+        )
+        self.stream = self.get_stream(x.device.index)
         self.aligned_inputs = tuple(
             tensor is not None and tensor.data_ptr() % 16 == 0 for tensor in tensors
         )
@@ -983,26 +1082,55 @@ class _PreparedMegaGate:
             and weight.shape == self.weight_shape
             and x.device == self.device
         ), "MegaGate inputs differ from the prepared shape or device"
-        tensors = (x, weight, bias, *routing_inputs)
         assert (
-            tuple(t.dtype if t is not None else None for t in tensors) == self.dtypes
-        ), "MegaGate input dtypes or routing mode differ from prepare"
-        _validate_gate_tensors(x, weight, bias)
-        _validate_v4_inputs(x, weight, *routing_inputs, config)
-        active_driver = driver.active
-        device = active_driver.get_current_device()
+            x.dtype,
+            weight.dtype,
+            None if bias is None else bias.dtype,
+        ) == self.input_dtypes, (
+            "MegaGate input dtypes or routing mode differ from prepare"
+        )
+        assert (
+            weight.device == self.device
+            and x.is_contiguous()
+            and weight.is_contiguous()
+        ), "x and weight must be contiguous on the prepared NPU"
+        if bias is not None:
+            assert (
+                bias.shape == self.bias_shape
+                and bias.device == self.device
+                and bias.is_contiguous()
+            ), "bias must be contiguous FP32 [E] on the same NPU"
+        input_ids, table, vision_bias = routing_inputs
+        if (
+            self.routing_dtypes[0] is not None
+            or input_ids is not None
+            or table is not None
+            or vision_bias is not None
+        ):
+            assert (
+                tuple(t.dtype if t is not None else None for t in routing_inputs)
+                == self.routing_dtypes
+            ), "MegaGate input dtypes or routing mode differ from prepare"
+            _validate_v4_inputs(x, weight, *routing_inputs, config)
+        tensors = (x, weight, bias, *routing_inputs)
+        device = torch.npu.current_device()
         assert (
             device == self.device.index
         ), "MegaGate current device differs from prepare"
         assert (
-            active_driver.get_current_stream(device) == self.stream
+            self.get_stream(device) == self.stream
         ), "Prepare MegaGate on the current stream before calling"
         # The compiled kernel may specialize on 16-byte pointer alignment.
         assert all(
             not aligned or tensor.data_ptr() % 16 == 0
             for aligned, tensor in zip(self.aligned_inputs, tensors)
         ), "MegaGate input alignment differs from prepare"
-        ids, weights = _gate_outputs(x, config[0], self.output_dtypes)
+        ids = torch.empty_like(
+            self.output_templates[0], memory_format=torch.contiguous_format
+        )
+        weights = torch.empty_like(
+            self.output_templates[1], memory_format=torch.contiguous_format
+        )
         if self.launcher is not None:
             if self.fp32_input is not None:
                 x = _promote_activation(x, self.fp32_input)
