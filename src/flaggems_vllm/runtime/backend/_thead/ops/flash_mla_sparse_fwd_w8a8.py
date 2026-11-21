@@ -112,9 +112,14 @@ def _sparse_decode(
     ROWS: tl.constexpr = 1,
     SPLITS: tl.constexpr = 1,
     REFINE: tl.constexpr = False,
+    row=None,
+    head_block=None,
 ):
-    row = tl.program_id(1)
-    heads = tl.program_id(0) * BH + tl.arange(0, BH)
+    if row is None:
+        row = tl.program_id(1)
+    if head_block is None:
+        head_block = tl.program_id(0)
+    heads = head_block * BH + tl.arange(0, BH)
     qrow = row.to(tl.int64) * H + heads
     dims = tl.arange(0, 512)
     q = tl.load(Q + qrow[:, None] * 512 + dims[None, :], heads[:, None] < H, 0)
@@ -343,13 +348,15 @@ def _sdk_clang():
 def _native_library(rope, splits, refine_last=False, short_local=False):
     compiler, version = _sdk_clang()
     source = Path(__file__).with_suffix(".cpp")
+    # LLVM IR size affects the register schedule produced by the PPU backend.
+    opt_level = "-O1" if refine_last else "-Os"
     flags = (
         "-target",
         "nvptx64-nvidia-cuda",
         "-x",
         "c++",
         "-std=c++17",
-        "-O3",
+        opt_level,
         "-ffreestanding",
         "-nostdinc",
         "-S",
@@ -508,36 +515,63 @@ def _repair_probability_error(
     T: tl.constexpr,
     R: tl.constexpr,
     SCALE: tl.constexpr,
+    B: tl.constexpr = 1,
+    ROWS: tl.constexpr = 1,
 ):
-    row = tl.program_id(1)
-    heads = tl.program_id(0) * 16 + tl.arange(0, 16)
-    bound = tl.load(Error + row * 64 + heads)
-    # NaN bounds, including inf/inf for an overflowing denominator, require rebasing.
-    if tl.sum((~(bound <= 0.0015)).to(tl.int32), 0) > 0:
-        _sparse_decode(
-            Q,
-            QR,
-            KV,
-            KR,
-            QS,
-            KS,
-            Ids,
-            None,
-            None,
-            Out,
-            LSE,
-            64,
-            1,
-            K,
-            T,
-            R,
-            SCALE,
-            False,
-            False,
-            16,
-            128,
-            REFINE=True,
+    first = tl.program_id(1) * ROWS
+    row_ids = first + tl.arange(0, ROWS)
+    head_groups: tl.constexpr = 1 if ROWS == 1 else 4
+    first_group = tl.program_id(0) * head_groups
+    heads = first_group * 16 + tl.arange(0, head_groups * 16)
+    if ROWS == 1:
+        bound = tl.load(Error + first * 64 + heads)
+        failures = tl.sum((~(bound <= 0.0015)).to(tl.int32), 0)
+    else:
+        bound = tl.load(
+            Error + row_ids[:, None] * 64 + heads[None, :],
+            row_ids[:, None] < B,
+            0.0,
         )
+        failures = tl.sum(tl.sum((~(bound <= 0.0015)).to(tl.int32), 1), 0)
+    # NaNs from overflow must also take the stable path.
+    if failures > 0:
+        for i in range(ROWS * head_groups):
+            row = first + i // head_groups
+            group = first_group + i % head_groups
+            if ROWS == 1:
+                repair = True
+            else:
+                selected = tl.load(
+                    Error + row * 64 + group * 16 + tl.arange(0, 16), row < B, 0.0
+                )
+                repair = tl.sum((~(selected <= 0.0015)).to(tl.int32), 0) > 0
+            if repair:
+                _sparse_decode(
+                    Q,
+                    QR,
+                    KV,
+                    KR,
+                    QS,
+                    KS,
+                    Ids,
+                    None,
+                    None,
+                    Out,
+                    LSE,
+                    64,
+                    1,
+                    K,
+                    T,
+                    R,
+                    SCALE,
+                    False,
+                    False,
+                    16,
+                    128,
+                    REFINE=True,
+                    row=row,
+                    head_block=group,
+                )
 
 
 def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
@@ -590,7 +624,9 @@ def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
         _merge_native_partitions[(64, batch)](
             partial, den, partial_error, out, lse, error, batch, splits, num_warps=4
         )
-    _repair_probability_error[(4, batch)](
+    repair_rows = 8 if batch >= 256 else 1
+    repair_grid = (1 if repair_rows > 1 else 4, triton.cdiv(batch, repair_rows))
+    _repair_probability_error[repair_grid](
         q,
         qr,
         kv,
@@ -605,6 +641,8 @@ def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
         tokens,
         rope,
         scale,
+        batch,
+        repair_rows,
         num_warps=8,
         num_stages=1,
     )
@@ -707,7 +745,7 @@ def flash_mla_sparse_fwd_w8a8(
         and q_rope.dtype == torch.bfloat16
         and (
             (0 < batch <= 16 and topk == 8320)
-            or (13 <= batch <= 16 and topk == 640)
+            or (12 <= batch <= 16 and topk == 640)
             or (
                 64 <= batch <= 16384
                 and (topk in (2048, 8320) or (rope == 0 and topk == 640))
@@ -733,6 +771,8 @@ def flash_mla_sparse_fwd_w8a8(
                 scale,
                 out,
             )
+    if full_heads and rope and topk == 128 and 12 <= batch <= 16:
+        bh = 64
     fixed = full_heads and rope == 0 and 512 <= topk <= 32768
     if full_heads and topk >= 512:
         bh, bn, warps = 64, 128, 16

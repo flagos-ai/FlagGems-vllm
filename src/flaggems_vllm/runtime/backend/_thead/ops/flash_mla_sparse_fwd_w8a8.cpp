@@ -3,7 +3,7 @@
 
 // Each warp computes 16x16 score fragments. Queries stay in registers while
 // asynchronous copies alternate between two KV tiles in shared memory.
-constexpr int BH = 64, BN = 128, W = 16, CUBE = 256;
+constexpr int BH = 64, BN = 128, W = 16, CUBE = REFINE_LAST ? 512 : 256;
 constexpr int GROUP = (ROPE || PARTS > 1) ? 32 : 16;
 constexpr bool LOCAL = SHORT_LOCAL || (PARTS > 1 && ROPE);
 constexpr float FACTOR = 224.0f;
@@ -70,6 +70,13 @@ INLINE u32 perm(u32 x, u32 y, u32 code) {
   asm("ppu.prmt.b32 %0,%1,%2,%3;" : "=r"(z) : "r"(x), "r"(y), "r"(code));
   return z;
 }
+INLINE int sum_bytes(u32 bytes) {
+  int sum;
+  asm("ppu.dp4a.s32.s32 %0, %1, %2, %3;"
+      : "=r"(sum)
+      : "r"(bytes), "r"(0x01010101), "r"(0));
+  return sum;
+}
 INLINE int round_nearest(float x) {
   int v;
   asm("ppu.cvt.rni.s32.f32 %0,%1;" : "=r"(v) : "f"(x));
@@ -97,8 +104,12 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
   constexpr int WM = BH / 16, WN = W / WM, NT = BN / 16 / WN,
                 NF = 512 / 16 / WN;
   static_assert(BN >= 16 * WN && NF > 0, "tile");
-  unsigned tid = tid_x(), lane = tid & 31, warp = tid >> 5, hm = warp / WN,
-           wn = warp % WN, lr = lane >> 2, quad = lane & 3;
+  unsigned tid = tid_x(), lane = tid & 31, warp = tid >> 5;
+  unsigned score_warp = ROPE          ? (warp % WM) * WN + warp / WM
+                        : REFINE_LAST ? (warp * 5) % W
+                                      : warp ^ (warp / WN);
+  unsigned hm = score_warp / WN, wn = score_warp % WN;
+  unsigned lr = lane >> 2, quad = lane & 3;
   int head = hm * 16 + lr;
   int requests = cta_count() / PARTS, split = row % PARTS;
   row /= PARTS;
@@ -124,6 +135,13 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
   if constexpr (LOCAL) {
     float z = 1.e-30f, scale_sum = 0.f;
     int count = 0;
+    float key_sum = 0.f, query_sum = 0.f;
+    if constexpr (REFINE_LAST) {
+      // Sample 32 channels per query head and four channels per selected key.
+      int h = tid / 8, col = (tid % 8) * 16 + h % 16;
+      u32 word = ((G<u32> *)qp)[(row * BH + h) * 128 + col];
+      query_sum = sum_bytes(word) * ((G<float> *)qsp)[row * BH + h];
+    }
     for (int i = tid; i < K; i += W * 32) {
       int idx = ids[i];
       if ((unsigned)idx < (unsigned)tokens) {
@@ -131,6 +149,7 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
         z = z > x ? z : x;
         if constexpr (REFINE_LAST) {
           scale_sum += x;
+          key_sum += sum_bytes(((G<u32> *)vp)[(u64)idx * 128 + i % 128]) * x;
           ++count;
         }
       }
@@ -145,6 +164,10 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
         scale_sum += __builtin_bit_cast(
             float, shfl(-1, __builtin_bit_cast(int, scale_sum), lane ^ a, 31));
         count += shfl(-1, count, lane ^ a, 31);
+        key_sum += __builtin_bit_cast(
+            float, shfl(-1, __builtin_bit_cast(int, key_sum), lane ^ a, 31));
+        query_sum += __builtin_bit_cast(
+            float, shfl(-1, __builtin_bit_cast(int, query_sum), lane ^ a, 31));
       }
     }
     if (lane == 0) {
@@ -152,24 +175,37 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
       if constexpr (REFINE_LAST) {
         sums[W + warp] = scale_sum;
         sums[2 * W + warp] = (float)count;
+        sums[3 * W + warp] = key_sum;
+        sums[4 * W + warp] = query_sum;
       }
     }
     sync();
     anchor = 1.e-30f;
     scale_sum = 0.f;
     float valid = 0.f;
+    key_sum = query_sum = 0.f;
     UNROLL for (int j = 0; j < W; ++j) {
       float x = sums[j];
       anchor = anchor > x ? anchor : x;
       if constexpr (REFINE_LAST) {
         scale_sum += sums[W + j];
         valid += sums[2 * W + j];
+        key_sum += sums[3 * W + j];
+        query_sum += sums[4 * W + j];
       }
     }
     if constexpr (REFINE_LAST) {
-      float typical = scale_sum / (124.f * (valid > 0 ? valid : 1.f));
-      float peak = anchor / 152.f;
-      anchor = FACTOR * (peak > typical ? peak : typical);
+      float n = valid > 0 ? valid : 1.f;
+      float typical = scale_sum / (140.f * n);
+      float peak = anchor / 168.f;
+      // Estimate a common logit offset from the channel means. This sets the
+      // encoding scale only. The exact logits still determine P, LSE and the
+      // bound.
+      float log2_center = (key_sum / (4.f * n)) *
+                          (query_sum / (W * 32.f * 4.f)) * 512.f * scale;
+      float center =
+          log2_center >= -2.f && log2_center <= 2.f ? ex2(log2_center) : 1.f;
+      anchor = FACTOR * (peak > typical ? peak : typical) * center;
     }
   } else
     anchor = ((G<float> *)anchors)[row];
@@ -193,19 +229,18 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
   constexpr int pv_feature_warps = W / pv_head_warps;
   constexpr int head_tiles = WM / pv_head_warps;
   constexpr int feature_tiles = 512 / (16 * pv_feature_warps);
-  const int pv_head = warp / pv_feature_warps,
-            pv_feature = warp % pv_feature_warps;
+  unsigned value_warp = (warp * 5) % W;
+  const int pv_head = value_warp / pv_feature_warps,
+            pv_feature = value_warp % pv_feature_warps;
   C value_acc[head_tiles][feature_tiles] = {};
-  float den[2] = {}, err[2] = {};
+  constexpr int lanes_per_sum = ROPE ? 1 : 2;
+  float den[2][lanes_per_sum] = {}, err[2][lanes_per_sum] = {};
   constexpr int PER = BN / W;
   auto index_for = [&](int start) {
     int pos = start + warp * PER + lane;
     return lane < PER && pos < K ? ids[pos] : -1;
   };
   auto copy = [&](int src, int slot, int ix) {
-    if (lane < PER)
-      allscales[slot * BN + warp * PER + lane] =
-          (unsigned)ix < (unsigned)tokens ? ks[ix] : 0.f;
     UNROLL for (int j = 0; j < PER / (32 / GROUP); ++j) {
       int ii = j * (32 / GROUP) + lane / GROUP;
       int id = shfl(-1, ix, ii, 31), t = warp * PER + ii;
@@ -232,6 +267,14 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
                      : "memory");
       }
     }
+    if (lane < PER) {
+      bool good = (unsigned)ix < (unsigned)tokens;
+      u32 dst = (u32)(u64)(allscales + slot * BN + warp * PER + lane);
+      u64 src_scale = (u64)(ks + (good ? ix : 0));
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst),
+                   "l"(src_scale), "r"(good ? 4 : 0)
+                   : "memory");
+    }
     commit();
   };
   copy(0, 0, index_for(0));
@@ -246,81 +289,89 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
     if (src + BN < K)
       copy(src + BN, 1 - slot, ahead);
     ahead = index_for(src + 2 * BN);
-    C scores[NT] = {};
-    UNROLL for (int k = 0; k < 16; ++k) {
-      UNROLL for (int j = 0; j < NT; ++j) {
-        int t = (wn + j * WN) * 16 + (lane & 7) + (lane & 16) / 2;
-        int col = k * 32 + (lane & 8) * 2;
-        u32 addr = smbase + sw(t, col);
-        F b;
-        asm("ppu.ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-            : "=r"(b.f[0]), "=r"(b.f[1]), "=r"(b.f[2]), "=r"(b.f[3])
-            : "r"(addr)
-            : "memory");
-        mma(scores[j], qfrag[k], b);
-      }
-    }
-    UNROLL for (int j = 0; j < NT; ++j) {
-      int nt = wn + j * WN;
-      FC rrscore = {};
-      if constexpr (ROPE) {
-        UNROLL for (int k = 0; k < 4; ++k) {
-          int tt = nt * 16 + (lane & 7) + (lane & 16) / 2;
+    constexpr int score_tiles = ROPE ? NT : 1;
+    UNROLL for (int base_tile = 0; base_tile < NT; base_tile += score_tiles) {
+      C scores[score_tiles] = {};
+      UNROLL for (int k = 0; k < 16; ++k) {
+        UNROLL for (int j = 0; j < score_tiles; ++j) {
+          int t =
+              (wn + (base_tile + j) * WN) * 16 + (lane & 7) + (lane & 16) / 2;
           int col = k * 32 + (lane & 8) * 2;
-          u32 addr = shared + 2 * BN * 512 + slot * BN * 128 + tt * 128 +
-                     (col ^ ((tt & 7) * 16));
-          F f;
+          u32 addr = smbase + sw(t, col);
+          F b;
           asm("ppu.ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, "
               "[%4];"
-              : "=r"(f.f[0]), "=r"(f.f[1]), "=r"(f.f[2]), "=r"(f.f[3])
+              : "=r"(b.f[0]), "=r"(b.f[1]), "=r"(b.f[2]), "=r"(b.f[3])
               : "r"(addr)
               : "memory");
-          fmma(rrscore, qrfrag[k], f);
+          mma(scores[j], qfrag[k], b);
         }
       }
-
-      UNROLL for (int rr = 0; rr < 2; ++rr) {
-        u32 z[4], low[4];
-        UNROLL for (int i = 0; i < 4; ++i) {
-          int t = nt * 16 + quad + i * 4;
-          float ksc = scales[t];
-          float score = (float)scores[j].c[rr * 4 + i] + rrscore.c[rr * 4 + i];
-          float log2_weight = score * qs[rr] * ksc * scale;
-          float p = ksc > 0.f ? ex2(log2_weight) : 0.f;
-          den[rr] += p;
-          float norm = p * (ksc * factor);
-          z[i] = round_nearest(norm < 255.f ? norm : 255.f);
-          float delta = norm - (float)z[i];
-          if constexpr (REFINE_LAST) {
-            if (src + BN >= K) {
-              // Reuse the resident V tile for a second, signed INT8 product.
-              float extra = delta * residual_radix;
-              float clipped =
-                  extra < 127.f ? (extra > -128.f ? extra : -128.f) : 127.f;
-              int code = round_nearest(clipped);
-              low[i] = (u32)code;
-              delta -= (float)code / residual_radix;
-            }
+      UNROLL for (int j = 0; j < score_tiles; ++j) {
+        int nt = wn + (base_tile + j) * WN;
+        FC rrscore = {};
+        if constexpr (ROPE) {
+          UNROLL for (int k = 0; k < 4; ++k) {
+            int tt = nt * 16 + (lane & 7) + (lane & 16) / 2;
+            int col = k * 32 + (lane & 8) * 2;
+            u32 addr = shared + 2 * BN * 512 + slot * BN * 128 + tt * 128 +
+                       (col ^ ((tt & 7) * 16));
+            F f;
+            asm("ppu.ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, "
+                "[%4];"
+                : "=r"(f.f[0]), "=r"(f.f[1]), "=r"(f.f[2]), "=r"(f.f[3])
+                : "r"(addr)
+                : "memory");
+            fmma(rrscore, qrfrag[k], f);
           }
-          float residual = __builtin_fabsf(delta);
-          bool unsafe = ksc > 0.f && !(p > 1.e-16f && p < 1.e16f);
-          err[rr] += unsafe ? __builtin_inff() : residual;
         }
-        u32 high_word = pack_probabilities(z);
-        int peer = (lane & 16) | (quad << 2) | (lr & 3);
-        int offset =
-            (hm * (BN / 32) + nt / 2) * 128 + (rr * 2 + (nt & 1)) * 32 + peer;
-        packed[offset] = trans8(shfl(-1, high_word, peer, 31));
-        if constexpr (REFINE_LAST) {
-          if (src + BN >= K)
-            low_packed[offset] =
-                trans8(shfl(-1, pack_probabilities(low), peer, 31));
+
+        UNROLL for (int rr = 0; rr < 2; ++rr) {
+          u32 z[4], low[4];
+          UNROLL for (int i = 0; i < 4; ++i) {
+            int t = nt * 16 + quad + i * 4;
+            float ksc = scales[t];
+            float score =
+                (float)scores[j].c[rr * 4 + i] + rrscore.c[rr * 4 + i];
+            float log2_weight = score * qs[rr] * ksc * scale;
+            float p = ksc > 0.f ? ex2(log2_weight) : 0.f;
+            den[rr][i % lanes_per_sum] += p;
+            float norm = p * (ksc * factor);
+            z[i] = round_nearest(norm < 255.f ? norm : 255.f);
+            float delta = norm - (float)z[i];
+            if constexpr (REFINE_LAST) {
+              if (src + BN >= K) {
+                // Reuse the resident V tile for a second, signed INT8 product.
+                float extra = delta * residual_radix;
+                float clipped =
+                    extra < 127.f ? (extra > -128.f ? extra : -128.f) : 127.f;
+                int code = round_nearest(clipped);
+                low[i] = (u32)code;
+                delta -= (float)code / residual_radix;
+              }
+            }
+            float residual = __builtin_fabsf(delta);
+            bool unsafe = ksc > 0.f && !(p > 1.e-16f && p < 1.e16f);
+            err[rr][i % lanes_per_sum] += unsafe ? __builtin_inff() : residual;
+          }
+          u32 high_word = pack_probabilities(z);
+          int peer = (lane & 16) | (quad << 2) | (lr & 3);
+          int offset =
+              (hm * (BN / 32) + nt / 2) * 128 + (rr * 2 + (nt & 1)) * 32 + peer;
+          packed[offset] = trans8(shfl(-1, high_word, peer, 31));
+          if constexpr (REFINE_LAST) {
+            if (src + BN >= K)
+              low_packed[offset] =
+                  trans8(shfl(-1, pack_probabilities(low), peer, 31));
+          }
         }
       }
     }
     sync();
     const int passes = REFINE_LAST && src + BN >= K ? 2 : 1;
-    for (int pass = 0; pass < passes; ++pass) {
+    UNROLL for (int pass = 0; pass < (REFINE_LAST ? 2 : 1); ++pass) {
+      if (pass >= passes)
+        continue;
       if (pass == 1) {
         UNROLL for (int m = 0; m < head_tiles; ++m) {
           UNROLL for (int j = 0; j < feature_tiles; ++j) {
@@ -354,12 +405,16 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
     }
   }
   UNROLL for (int r = 0; r < 2; ++r) {
-    float z = den[r];
+    float z = den[r][0];
+    if constexpr (lanes_per_sum == 2)
+      z += den[r][1];
     z += __builtin_bit_cast(float,
                             shfl(-1, __builtin_bit_cast(int, z), lane ^ 1, 31));
     z += __builtin_bit_cast(float,
                             shfl(-1, __builtin_bit_cast(int, z), lane ^ 2, 31));
-    float a = err[r];
+    float a = err[r][0];
+    if constexpr (lanes_per_sum == 2)
+      a += err[r][1];
     a += __builtin_bit_cast(float,
                             shfl(-1, __builtin_bit_cast(int, a), lane ^ 1, 31));
     a += __builtin_bit_cast(float,

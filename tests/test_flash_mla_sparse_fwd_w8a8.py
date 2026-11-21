@@ -431,6 +431,7 @@ def test_sparse_decode_ppu_mixed_partitions():
         (9, 8320, 0),
         (64, 2048, 64),
         (64, 640, 0),
+        (259, 640, 0),
         (16, 640, 0),
         (16, 640, 64),
     ],
@@ -443,6 +444,10 @@ def test_sparse_decode_ppu_replayed_scale_and_indices(batch, topk, rope):
     h, n, d = 64, 256, 512 + rope
     query = torch.randn((batch, 1, h, d), device=device, dtype=torch.bfloat16) * 0.1
     cache = torch.randn((n // 64, 64, d), device=device, dtype=torch.bfloat16) * 0.1
+    short_no_rope = topk == 640 and batch == 16 and rope == 0
+    if short_no_rope:
+        query += 0.04
+        cache -= 0.03
     q, qr, qs = quantize_sparse_int8(query, power_of_two=True)
     v, kr, ks = quantize_sparse_int8(cache, power_of_two=True)
     ids = torch.randint(n, (batch, 1, topk), device=device, dtype=torch.int32)
@@ -452,18 +457,36 @@ def test_sparse_decode_ppu_replayed_scale_and_indices(batch, topk, rope):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*args)
+    check = [0, 1, batch - 1]
     for update in (False, True):
         if update:
             # Force rebasing and change both invalid and duplicate IDs after capture.
+            if short_no_rope:
+                v.neg_()
             ks[0, 0] = 4.0
             ids[0, 0, :32] = 0
             ids[0, 0, 32:64] = n
             ids[1] = -1
+            ids[-1, 0, -32:] = 0
         graph.replay()
-        cpu_q = (torch.cat((q[:2, 0].float(), qr[:2, 0].float()), -1) * qs[:2, 0]).cpu()
+        cpu_q = (
+            torch.cat((q[check, 0].float(), qr[check, 0].float()), -1) * qs[check, 0]
+        ).cpu()
         cpu_k = (torch.cat((v.float(), kr.float()), -1) * ks).view(n, 1, d).cpu()
         expected, _, logsum = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
-            2, n, h, 1, d, topk, cpu_q, cpu_k, ids[:2].cpu(), scale, 512, None, None
+            len(check),
+            n,
+            h,
+            1,
+            d,
+            topk,
+            cpu_q,
+            cpu_k,
+            ids[check].cpu(),
+            scale,
+            512,
+            None,
+            None,
         )
-        gems_assert_close(out[:2, 0].cpu(), expected, out.dtype, atol=0.002)
-        gems_assert_close(lse[:2, :, 0].cpu(), logsum, torch.float32, atol=0.0002)
+        gems_assert_close(out[check, 0].cpu(), expected, out.dtype, atol=0.002)
+        gems_assert_close(lse[check, :, 0].cpu(), logsum, torch.float32, atol=0.0002)
