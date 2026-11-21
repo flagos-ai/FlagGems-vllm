@@ -49,29 +49,6 @@ class TestParam:
     h_q: int
     varlen: bool
 
-    def cache_lengths(self):
-        lengths = [self.seqlen] * self.batch
-        if self.varlen:
-            # Match the native reference's seeded length stream for each shape.
-            generator = random.Random(0)
-            for mean, heads, queries in product(
-                (4096, 8192, 16384), (16, 32, 64, 128), (1, 2)
-            ):
-                lengths = [
-                    max(int(generator.normalvariate(mean, mean / 2)), queries)
-                    for _ in range(128)
-                ]
-                if (self.batch, self.seqlen, self.h_q, self.seq_q) == (
-                    128,
-                    mean,
-                    heads,
-                    queries,
-                ):
-                    break
-            else:
-                raise ValueError("Variable-length shape must be from the native matrix")
-        return lengths
-
 
 def run_prepared(
     handle: FlashMLAFp8PreparedHandle | FlashMLAFp8PackedHandle,
@@ -123,7 +100,28 @@ class FlashMLAWithKVCacheW8A8Benchmark(base.Benchmark):
     @staticmethod
     def make_input(param: TestParam, dtype):
         torch.manual_seed(0)
-        lengths = param.cache_lengths()
+        lengths = [param.seqlen] * param.batch
+        if param.varlen:
+            # Match the native reference's seeded length stream for each shape.
+            generator = random.Random(0)
+            for mean, heads, queries in product(
+                (4096, 8192, 16384), (16, 32, 64, 128), (1, 2)
+            ):
+                lengths = [
+                    max(int(generator.normalvariate(mean, mean / 2)), queries)
+                    for _ in range(128)
+                ]
+                if (param.batch, param.seqlen, param.h_q, param.seq_q) == (
+                    128,
+                    mean,
+                    heads,
+                    queries,
+                ):
+                    break
+            else:
+                raise ValueError("Variable-length shape must be from the native matrix")
+        else:
+            pass
         padded_length = math.ceil(max(lengths) / 256) * 256
         device = flaggems_vllm.device
         cache_seqlens = torch.tensor(lengths, dtype=torch.int32, device=device)

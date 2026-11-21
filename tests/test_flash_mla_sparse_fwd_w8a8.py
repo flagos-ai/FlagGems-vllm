@@ -204,8 +204,12 @@ PPU_SPARSE_SUPPORTED = (
 )
 
 
-def quantize_sparse_int8(x):
-    scale = x[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127
+def quantize_sparse_int8(x, *, power_of_two=False):
+    scale = x[..., :512].float().abs().amax(-1, keepdim=True) / 127
+    if power_of_two:
+        scale = torch.where(scale > 0, torch.exp2(torch.ceil(torch.log2(scale))), 1.0)
+    else:
+        scale = scale.clamp_min(1e-12 / 127)
     content = (x[..., :512].float() / scale).round().clamp(-127, 127).to(torch.int8)
     rope = (x[..., 512:].float() / scale).to(x.dtype)
     return content, rope, scale
@@ -245,42 +249,48 @@ def make_sparse_decode_inputs(lengths, queries, heads, topk, dtype, rope_dim=64)
     return (q, qr, kv, kr, qs, ks, ids.to(device)), native_q, native_kv
 
 
-def check_sparse_decode_sample(inputs, native_q, native_cache, candidate, baseline):
+def check_sparse_decode_sample(
+    native_q, native_cache, indices, scale, sink, lengths, candidate, baseline
+):
     from tests.test_flash_mla_sparse_fwd import FlashmlaSparseTestKit
 
-    q, qr, kv, kr, qs, ks, indices = inputs
-    # Check both precisions against their own FP32 logits on one complete request.
-    ids = indices[0].long()
-    selected = ids.clamp_min(0)
-    sparse_q = torch.cat((q[0].float(), qr[0].float()), -1) * qs[0]
-    v = kv.view(-1, 512)[selected].float()
-    r = kr.view(-1, 64)[selected].float()
-    sparse_k = torch.cat((v, r), -1) * ks.view(-1)[selected].unsqueeze(-1)
-    native_k = native_cache.view(-1, 576)[selected]
-    for query, keys, (out, lse) in (
-        (sparse_q, sparse_k, candidate),
-        (native_q[0], native_k, baseline),
-    ):
-        for j in range(query.shape[0]):
-            topk = ids.shape[1]
-            local_ids = torch.arange(topk).masked_fill(ids[j].cpu() < 0, -1)
-            y, _, logsum = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
-                1,
-                topk,
-                query.shape[1],
-                1,
-                576,
-                topk,
-                query[j : j + 1].float().cpu(),
-                keys[j, :, None].float().cpu(),
-                local_ids.to(torch.int32).view(1, 1, topk),
-                576**-0.5,
-                512,
-                None,
-                None,
-            )
-            gems_assert_close(out[0, j].cpu(), y[0], torch.bfloat16, atol=0.004)
-            gems_assert_close(lse[0, :, j].cpu(), logsum[0], torch.float32, atol=2e-4)
+    # Power-of-two scales reconstruct the INT8 fixture exactly in BF16.
+    rows = (
+        torch.linspace(0, native_q.shape[0] - 1, min(native_q.shape[0], 16))
+        .long()
+        .tolist()
+    )
+    dim = native_q.shape[-1]
+    for i in rows:
+        ids = indices[i, 0].long()
+        topk = ids.numel()
+        cache = native_cache.view(-1, dim)[
+            ids.clamp(0, native_cache.numel() // dim - 1)
+        ].cpu()
+        valid = ((ids >= 0) & (ids < native_cache.numel() // dim)).cpu()
+        local_ids = (
+            torch.arange(topk, dtype=torch.int32)
+            .masked_fill(~valid, -1)
+            .view(1, 1, topk)
+        )
+        y, _, lse = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+            1,
+            topk,
+            native_q.shape[2],
+            1,
+            dim,
+            topk,
+            native_q[i].cpu(),
+            cache[:, None],
+            local_ids,
+            scale,
+            512,
+            None if sink is None else sink.cpu(),
+            None if lengths is None else lengths[i : i + 1].cpu(),
+        )
+        for out, logsum in (candidate, baseline):
+            gems_assert_close(out[i, 0].cpu(), y[0], out.dtype, atol=0.002)
+            gems_assert_close(logsum[i, :, 0].cpu(), lse[0], torch.float32, atol=2e-4)
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
@@ -381,3 +391,31 @@ def test_sparse_decode_ppu_empty(empty):
     assert output.shape == q.shape and lse.shape == (q.shape[0], 16, 2)
     gems_assert_equal(output, torch.zeros_like(output))
     gems_assert_equal(lse, torch.full_like(lse, torch.inf))
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not PPU_SPARSE_SUPPORTED, reason="Requires PPU INT8 sparse MLA")
+def test_sparse_decode_ppu_mixed_partitions():
+    batch, heads, topk = 2, 64, 640
+    device = flaggems_vllm.device
+    torch.manual_seed(7)
+    q = torch.randint(-32, 32, (batch, 1, heads, 512), device=device, dtype=torch.int8)
+    kv = torch.randint(-40, 40, (10, 64, 512), device=device, dtype=torch.int8)
+    qs = torch.full((batch, 1, heads, 1), 1 / 256, device=device)
+    ks = torch.full((10, 64, 1), 1 / 256, device=device)
+    ids = torch.arange(topk, device=device, dtype=torch.int32).repeat(batch, 1, 1)
+    ids[0, :, :128] = -1
+    ids[1] = -1
+    # One active partition must rebase its logits after a large key-scale change.
+    ks[4:6] = 4.0
+    qr = torch.empty((*q.shape[:-1], 0), dtype=torch.bfloat16, device=device)
+    kr = torch.empty((*kv.shape[:-1], 0), dtype=torch.bfloat16, device=device)
+    out, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(q, qr, kv, kr, qs, ks, ids)
+    keys = (kv.float() * ks).view(topk, 512).cpu()[128:]
+    scores = ((q[0, 0].float() * qs[0, 0]).cpu() @ keys.T) * 512**-0.5
+    gems_assert_close(out[0, 0].cpu(), scores.softmax(-1) @ keys, out.dtype, atol=0.002)
+    gems_assert_close(
+        lse[0, :, 0].cpu(), scores.logsumexp(-1), torch.float32, atol=2e-4
+    )
+    gems_assert_equal(out[1], torch.zeros_like(out[1]))
+    gems_assert_equal(lse[1], torch.full_like(lse[1], torch.inf))

@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from itertools import product
+import csv
+from functools import partial
 from pathlib import Path
 
 import pytest
 import torch
-import yaml
 
 import flaggems_vllm
 from tests.test_flash_mla_sparse_fwd_w8a8 import (
@@ -26,15 +26,14 @@ from tests.test_flash_mla_sparse_fwd_w8a8 import (
     assert_sparse_fixture_close,
     check_sparse_decode_sample,
     flashmla_reference,
-    make_sparse_decode_inputs,
     make_sparse_inputs,
     quantize_sparse_fp8_fixture,
+    quantize_sparse_int8,
 )
 
 from . import base, consts
 from .conftest import Config
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
-from .test_flash_mla_with_kvcache_w8a8 import TestParam
 
 
 class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
@@ -80,58 +79,82 @@ class PPUSparseBenchmark(FlashmlaSparseBenchmark):
     DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
 
     def __init__(self):
-        from flash_mla import flash_mla_with_kvcache
-
         base.Benchmark.__init__(
-            self, "flash_mla_sparse_fwd_w8a8", flash_mla_with_kvcache, [torch.bfloat16]
+            self, "flash_mla_sparse_fwd_w8a8", lambda run: run(), [torch.bfloat16]
         )
         self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
 
     def set_shapes(self, shape_file_path=None):
         if Path(shape_file_path).resolve() != Path(self.DEFAULT_SHAPE_FILES).resolve():
             return super().set_shapes(shape_file_path)
-        with open(shape_file_path) as f:
-            entry = yaml.safe_load(f)["flash_mla_with_kvcache_w8a8"]
-        self.shape_desc = entry["shape_desc"]
-        self.shapes = [tuple(shape) for shape in entry["shapes"]]
-        if Config.bench_level == consts.BenchLevel.COMPREHENSIVE and not Config.query:
-            self.shapes = [
-                (128, q, length, h, ragged)
-                for length, h, q, ragged in product(
-                    (4096, 8192, 16384), (16, 32, 64, 128), (1, 2), (False, True)
-                )
-            ]
+        # FlagGems-vllm #997, head 20ee2cbb, performance tables (including diagnostics).
+        path = Path(__file__).with_name("model_shapes") / "ppu_sparse_mla_997.csv"
+        with path.open() as f:
+            rows = list(csv.DictReader(f))
+        if Config.bench_level != consts.BenchLevel.COMPREHENSIVE or Config.query:
+            traces = [row for row in rows if row["group"] != "diagnostic"]
+            rows = sorted(traces, key=lambda row: int(row["count"]), reverse=True)[:10]
+        fields = ("sq", "hq", "d", "skv", "hkv", "topk", "dv")
+        self.shape_desc = "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
+        self.shapes = [tuple(int(row[field]) for field in fields) for row in rows]
 
     def get_input_iter(self, dtype):
-        from flash_mla import get_mla_metadata
+        from flash_mla import (
+            flash_mla_sparse_fwd,
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
 
         for shape in self.shapes:
-            param = TestParam(*shape)
-            # DeepSeek-V3.2 index_topk augments the dense PR #1241 matrix.
-            inputs, q, kv = make_sparse_decode_inputs(
-                param.cache_lengths(), param.seq_q, param.h_q, 2048, dtype
+            query, cache, ids, _, dv, sink, lengths = make_sparse_inputs(shape, dtype)
+            dim = query.shape[-1]
+            scale = 0.5 if dim == 512 else dim**-0.5
+            q, qr, qs = quantize_sparse_int8(query[:, None], power_of_two=True)
+            if cache.shape[0] % 64:
+                cache = torch.nn.functional.pad(
+                    cache, (0, 0, 0, 0, 0, 64 - cache.shape[0] % 64)
+                )
+            kv, kr, ks = quantize_sparse_int8(
+                cache.view(-1, 64, dim), power_of_two=True
             )
-            metadata, splits = get_mla_metadata()
-            native = (
-                q,
-                kv,
-                None,
-                None,
-                512,
-                metadata,
-                splits,
-                None,
-                False,
-                False,
-                inputs[-1],
+            inputs = (q, qr, kv, kr, qs, ks, ids, scale, sink, lengths)
+            native_q = (torch.cat((q.float(), qr.float()), -1) * qs).to(dtype)
+            native_k = (
+                (torch.cat((kv.float(), kr.float()), -1) * ks).to(dtype).unsqueeze(2)
             )
-            reference, ref_lse = self.torch_op(*native)
-            output, lse = self.gems_op(*inputs)
-            assert_sparse_fixture_close(output, lse, reference, ref_lse)
+            if query.shape[0] <= 1028:
+                native = partial(
+                    flash_mla_with_kvcache,
+                    native_q,
+                    native_k,
+                    None,
+                    None,
+                    dv,
+                    *get_mla_metadata(),
+                    indices=ids,
+                    softmax_scale=scale,
+                    attn_sink=sink,
+                    topk_length=lengths,
+                )
+                ref, ref_lse = native()
+            else:
+                native = partial(
+                    flash_mla_sparse_fwd,
+                    native_q[:, 0],
+                    native_k.view(-1, 1, dim),
+                    ids,
+                    scale,
+                    dv,
+                    sink,
+                    lengths,
+                )
+                ref, _, ref_lse = native()
+                ref, ref_lse = ref[:, None], ref_lse[:, :, None]
+            actual = self.gems_op(*inputs)
             check_sparse_decode_sample(
-                inputs, q, kv, (output, lse), (reference, ref_lse)
+                native_q, native_k, ids, scale, sink, lengths, actual, (ref, ref_lse)
             )
-            yield native, inputs, shape
+            yield (native,), inputs, shape
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8

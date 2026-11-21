@@ -8,6 +8,8 @@ import triton
 import triton.language as tl
 from triton.language import core
 
+from .flash_attention.decode import splitkv_merge_kernel
+
 
 @core.extern
 def _reciprocal(probability_scale, _semantic=None):
@@ -50,6 +52,27 @@ def _sum_and_max(sum_left, max_left, sum_right, max_right):
 
 
 @triton.jit
+def _store_partition(
+    Out,
+    Stats,
+    row,
+    heads,
+    dims,
+    acc,
+    maximum,
+    denom,
+    ROWS: tl.constexpr,
+    H: tl.constexpr,
+):
+    split = tl.program_id(2)
+    dst = ((split * ROWS + row).to(tl.int64) * H + heads) * 512
+    tl.store(Out + dst[:, None] + dims[None, :], acc, heads[:, None] < H)
+    stat = (split * 2 * H + heads) * ROWS + row
+    tl.store(Stats + stat, maximum, heads < H)
+    tl.store(Stats + stat + H * ROWS, denom, heads < H)
+
+
+@triton.jit
 def _sparse_decode(
     Q,
     QR,
@@ -72,6 +95,9 @@ def _sparse_decode(
     HAS_SINK: tl.constexpr,
     BH: tl.constexpr,
     BN: tl.constexpr,
+    ROWS: tl.constexpr = 1,
+    SPLITS: tl.constexpr = 1,
+    REFINE: tl.constexpr = False,
 ):
     row = tl.program_id(1)
     heads = tl.program_id(0) * BH + tl.arange(0, BH)
@@ -86,7 +112,14 @@ def _sparse_decode(
     maximum = tl.full((BH,), -float("inf"), tl.float32)
     denom = tl.full((BH,), 0.0, tl.float32)
     acc = tl.full((BH, 512), 0.0, tl.float32)
-    for start in range(0, length, BN):
+    if SPLITS == 1:
+        first, end = 0, length
+    else:
+        tiles = tl.cdiv(length, BN)
+        split = tl.program_id(2)
+        first = (tiles * split // SPLITS) * BN
+        end = (tiles * (split + 1) // SPLITS) * BN
+    for start in range(first, end, BN):
         col = start + tl.arange(0, BN)
         ids = tl.load(Indices + row.to(tl.int64) * K + col, col < length, -1)
         valid = (ids >= 0) & (ids < TOKENS)
@@ -129,9 +162,21 @@ def _sparse_decode(
         )
         hi_sum = tl.dot(tl.trans(hi), kv)
         pv = tl.dot(tl.trans(lo), kv, hi_sum * 256).to(tl.float32)
+        if REFINE:
+            # Large token scales can amplify a half-step P15 residual.
+            residual = (
+                norm - (hi.to(tl.float32) + lo.to(tl.float32) / 256.0)
+            ) * 65536.0
+            fine = tl.minimum(127.0, tl.maximum(-128.0, tl.floor(residual + 0.5))).to(
+                tl.int8
+            )
+            pv += tl.dot(tl.trans(fine), kv).to(tl.float32) / 256.0
         unit *= 1.0 / 256.0
         acc = acc * correction[:, None] + pv * unit[:, None]
         maximum = next_max
+    if SPLITS > 1:
+        _store_partition(Out, LSE, row, heads, dims, acc, maximum, denom, ROWS, H)
+        return
     logsum = tl.where(
         denom > 0, maximum * 0.6931471805599453 + tl.log(denom), float("inf")
     )
@@ -145,6 +190,131 @@ def _sparse_decode(
         heads[:, None] < H,
     )
     tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, logsum, heads < H)
+
+
+@triton.jit
+def _fixed_decode(
+    Q,
+    KV,
+    QS,
+    KS,
+    Ids,
+    Out,
+    Lse,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    TOKENS: tl.constexpr,
+    SCALE: tl.constexpr,
+    BH: tl.constexpr,
+    BN: tl.constexpr,
+    ROWS: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    row = tl.program_id(1)
+    heads = tl.program_id(0) * BH + tl.arange(0, BH)
+    dims = tl.arange(0, 512)
+    cols = tl.arange(0, BN)
+    qrow = row.to(tl.int64) * H + heads
+    q = tl.load(Q + qrow[:, None] * 512 + dims[None, :])
+    qs = tl.load(QS + qrow)
+    split = tl.program_id(2)
+    tiles = tl.cdiv(K, BN)
+    first, end = tiles * split // SPLITS, tiles * (split + 1) // SPLITS
+    ids_base = Ids + row.to(tl.int64) * K
+    initial = tl.load(ids_base + first * BN + cols, first * BN + cols < K, -1)
+    mask = (initial >= 0) & (initial < TOKENS)
+    initial_scale = tl.load(KS + tl.where(mask, initial, 0), mask, 0.0)
+    anchor = tl.maximum(tl.max(initial_scale, 0), 1.0e-30)
+    factor = 32.0 / anchor
+    high_sum = tl.full((BH, 512), 0, tl.int32)
+    low_sum = tl.full((BH, 512), 0, tl.int32)
+    denominator = tl.full((BN, BH), 0.0, tl.float32)
+    unsafe = tl.full((BN, BH), False, tl.int1)
+    for tile in range(first, end):
+        col = tile * BN + cols
+        ids = tl.load(ids_base + col, col < K, -1)
+        valid = (ids >= 0) & (ids < TOKENS)
+        idx = tl.where(valid, ids, 0)
+        if TOKENS > (1 << 31) // 512:
+            idx = idx.to(tl.int64)
+        values = tl.load(
+            KV + idx[:, None] * 512 + dims[None, :],
+            valid[:, None],
+            0,
+            cache_modifier=".cg",
+        )
+        dot = tl.dot(q, tl.trans(values)).to(tl.float32)
+        ks = tl.load(KS + idx, valid, 0.0)
+        logit = tl.trans(dot) * qs[None, :] * ks[:, None] * (SCALE * 1.4426950408889634)
+        prob = tl.where(valid[:, None], tl.exp2(logit), 0.0)
+        denominator += prob
+        normalized = prob * (ks * factor)[:, None]
+        unsafe |= valid[:, None] & ~(
+            (normalized <= 127.0)
+            & (normalized >= 1.0)
+            & (prob < 1.0e16)
+            & (prob > 1.0e-16)
+        )
+        hi, lo = tl.inline_asm_elementwise(
+            P15_NORMALIZED_PACKED_ASM,
+            "=r,=r,f,f,f,f",
+            [normalized],
+            dtype=(tl.int8, tl.int8),
+            is_pure=True,
+            pack=4,
+        )
+        high_sum = tl.dot(tl.trans(hi), values, high_sum)
+        low_sum = tl.dot(tl.trans(lo), values, low_sum)
+    total = tl.sum(denominator, 0)
+    # Half an encoding step times the largest INT8 magnitude bounds each output component.
+    bound = (anchor / 32.0) * (0.25 * BN) * (end - first)
+    bad_bound = tl.sum(((total > 0) & (bound > 0.0005 * total)).to(tl.int32), 0) > 0
+    if bad_bound or tl.sum(tl.sum(unsafe.to(tl.int32), 0), 0) > 0:
+        _sparse_decode(
+            Q,
+            None,
+            KV,
+            None,
+            QS,
+            KS,
+            Ids,
+            None,
+            None,
+            Out,
+            Lse,
+            H,
+            1,
+            K,
+            TOKENS,
+            0,
+            SCALE,
+            False,
+            False,
+            BH,
+            BN,
+            ROWS,
+            SPLITS,
+            REFINE=True,
+        )
+    else:
+        acc = high_sum.to(tl.float32) * 256.0 + low_sum.to(tl.float32)
+        if SPLITS > 1:
+            _store_partition(
+                Out,
+                Lse,
+                row,
+                heads,
+                dims,
+                acc * (anchor / (32.0 * 256.0)),
+                tl.where(total > 0, 0.0, -float("inf")),
+                total,
+                ROWS,
+                H,
+            )
+        else:
+            inv = (anchor / (32.0 * 256.0)) / tl.where(total > 0, total, 1.0)
+            tl.store(Out + qrow[:, None] * 512 + dims[None, :], acc * inv[:, None])
+            tl.store(Lse + qrow, tl.where(total > 0, tl.log(total), float("inf")))
 
 
 def flash_mla_sparse_fwd_w8a8(
@@ -225,22 +395,70 @@ def flash_mla_sparse_fwd_w8a8(
     ):
         raise ValueError("Expected contiguous tensors on one PPU")
     out = torch.empty_like(q_nope, dtype=q_rope.dtype)
-    lse = torch.empty(
-        (batch, heads, queries), device=q_nope.device, dtype=torch.float32
+    scale = (512 + rope) ** -0.5 if softmax_scale is None else float(softmax_scale)
+    topk = indices.shape[-1]
+    rows = batch * queries
+    bh = 64 if heads >= 128 else min(32, max(16, triton.next_power_of_2(heads)))
+    # The no-RoPE 32x256 lowering can exceed the shared-memory limit.
+    bn = 256 if bh == 32 and rope and topk > 128 else 128
+    short_no_rope = bh == 32 and rope == 0 and topk <= 128 and rows >= 16
+    warps = 8 if bh == 16 or short_no_rope else 16
+    splits = 1
+    full_heads = (
+        heads == 64 and queries == 1 and attn_sink is None and topk_length is None
     )
-    if batch:
-        bh = 64 if heads >= 128 else min(32, max(16, triton.next_power_of_2(heads)))
-        # The no-RoPE 32x256 lowering can exceed the 256 KiB shared-memory limit.
-        bn = 256 if bh == 32 and rope else 128
-        short_no_rope = (
-            bh == 32
-            and rope == 0
-            and indices.shape[-1] <= 128
-            and batch * queries >= 16
+    fixed = full_heads and rope == 0 and 512 <= topk <= 32768
+    if full_heads and topk >= 512:
+        bh, bn, warps = 64, 128, 16
+        if batch <= 16 and topk >= 4096:
+            splits = 4 if batch <= 12 else 6
+        elif fixed and batch <= 8:
+            splits = min(triton.cdiv(topk, bn), 5)
+    if splits > 1:
+        lse = torch.empty_strided(
+            (batch, heads, 1),
+            (1, batch, batch * heads),
+            device=q_nope.device,
+            dtype=torch.float32,
         )
-        scale = (512 + rope) ** -0.5 if softmax_scale is None else float(softmax_scale)
-        with torch.cuda.device(q_nope.device):
-            _sparse_decode[(triton.cdiv(heads, bh), batch * queries)](
+        partial = torch.empty(
+            (splits, rows, heads, 512), device=q_nope.device, dtype=torch.float32
+        )
+        stats = torch.empty(
+            (splits, 2, heads, rows), device=q_nope.device, dtype=torch.float32
+        )
+    else:
+        lse = torch.empty(
+            (batch, heads, queries), device=q_nope.device, dtype=torch.float32
+        )
+        partial, stats = out, lse
+    if not batch:
+        return out, lse
+    grid = (triton.cdiv(heads, bh), rows, splits)
+    with torch.cuda.device(q_nope.device):
+        if fixed:
+            # Both INT32 PV sums are bounded for at most 32768 signed INT8 products.
+            _fixed_decode[grid](
+                q_nope,
+                k_cache_lora,
+                q_scale,
+                k_scale,
+                indices,
+                partial,
+                stats,
+                heads,
+                topk,
+                pages * 64,
+                scale,
+                bh,
+                bn,
+                rows,
+                splits,
+                num_warps=warps,
+                num_stages=1,
+            )
+        else:
+            _sparse_decode[grid](
                 q_nope,
                 q_rope,
                 k_cache_lora,
@@ -250,11 +468,11 @@ def flash_mla_sparse_fwd_w8a8(
                 indices,
                 topk_length,
                 attn_sink,
-                out,
-                lse,
+                partial,
+                stats,
                 heads,
                 queries,
-                indices.shape[-1],
+                topk,
                 pages * 64,
                 rope,
                 scale,
@@ -262,7 +480,29 @@ def flash_mla_sparse_fwd_w8a8(
                 attn_sink is not None,
                 bh,
                 bn,
-                num_warps=8 if bh == 16 or short_no_rope else 16,
+                rows,
+                splits,
+                num_warps=warps,
                 num_stages=1,
+            )
+        if splits > 1:
+            splitkv_merge_kernel[(rows, heads, 1)](
+                partial,
+                stats,
+                out,
+                lse,
+                None,
+                None,
+                rows,
+                rows,
+                heads,
+                512,
+                heads * 512,
+                512,
+                splits,
+                triton.next_power_of_2(splits),
+                512,
+                0,
+                num_warps=4,
             )
     return out, lse
