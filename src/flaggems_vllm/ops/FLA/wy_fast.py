@@ -261,6 +261,7 @@ def recompute_w_u_fwd(
     cu_seqlens: torch.LongTensor | None,
     block_v: int | None = None,
     pipe_stages: int = 2,
+    use_tle: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
@@ -274,7 +275,9 @@ def recompute_w_u_fwd(
     BV = block_v or 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
-    if _use_tle_recompute_w_u(cu_seqlens):
+    # Backend callers can opt out before any optional TLE kernel launches.
+    # None preserves the existing environment/capability selection policy.
+    if use_tle is not False and _use_tle_recompute_w_u(cu_seqlens):
         recompute_w_u_fwd_tle_kernel[(NT, B * H)](
             k=k,
             v=v,
