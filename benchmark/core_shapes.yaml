@@ -457,6 +457,20 @@ UnaryPointwiseBenchmark:
     - [1024, 1024, 1024]
   shape_desc: "(B), M, N"
 
+QuantLightningIndexerBenchmark:
+  shapes:
+    - [1, 64, 128, 8, 32, 4, 32]
+    - [4, 64, 128, 40, 32, 32, 512]
+    - [4, 3, 33, 6, 8, 3, 7]
+    - [32, 64, 128, 40, 32, 8, 128]
+  shape_desc: "tokens, heads, dimension, pages, block, columns, topk"
+
+QuantLightningIndexerVllmAscendBenchmark:
+  shapes:
+    - [1]
+    - [16]
+  shape_desc: "(tokens), heads=64, head_dim=128, TopK=32"
+
 # the default shapes info
 Benchmark:
   shapes:
