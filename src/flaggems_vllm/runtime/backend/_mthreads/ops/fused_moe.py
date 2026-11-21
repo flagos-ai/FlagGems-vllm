@@ -15,6 +15,7 @@
 import functools
 import logging
 import os
+import weakref
 from enum import Enum
 from typing import Any, Optional
 
@@ -2866,6 +2867,56 @@ def _prune_dead_entries(cache):
             del cache[key]
 
 
+def _release_transposes_under_pressure():
+    """Drop cached weight transposes when the device is short on memory.
+
+    A caller can hold the weights of two MoE implementations at once (the
+    benchmark measures ours and the vendor entry on the same inputs). Keeping a
+    private transposed copy of every slab then leaves no room for the second
+    implementation on the widest shard, so give the cache up when the device is
+    close to full. Recomputation only costs one copy per call.
+    """
+    try:
+        free, total = torch.musa.mem_get_info()
+    except Exception:  # pragma: no cover - non-MUSA builds
+        return
+    # Keep the cache only while the device could still hold a second copy of
+    # the largest slab, which is what a caller comparing implementations, or
+    # a pipeline holding two weight sets, actually needs.
+    held = max(
+        [
+            t.numel() * t.element_size()
+            for cache in (_W1T_CACHE, _W2T_CACHE, _DENSE_TW_DENSE_CACHE)
+            for _, t in cache.values()
+        ]
+        or [0]
+    )
+    if held == 0 or free >= 2 * held:
+        return
+    _W1T_CACHE.clear()
+    _W2T_CACHE.clear()
+    _DENSE_TW_DENSE_CACHE.clear()
+
+
+def _evict_with_owner(owner, cache, key):
+    """Release the cached copy as soon as the owner tensor is collected.
+
+    A dead entry normally lingers until the next shape happens to call
+    _prune_dead_entries, which is too late when a caller walks many shapes:
+    the retained copy of the previous shape is what pushes the next one into
+    OOM (285B: 26 GiB of transposes held after the weights are gone).
+    """
+
+    # Do not capture the cached tensor here: a finalizer keeps its arguments
+    # alive until it runs, which would pin the copy even after the cache is
+    # cleared. Dropping by key can at worst evict a fresh entry (a recompute),
+    # never return a stale one, because every hit re-checks the owner.
+    def _drop(cache=cache, key=key):
+        cache.pop(key, None)
+
+    weakref.finalize(owner, _drop)
+
+
 def _transposed(w, cache):
     """Cache the k-major transpose (E, K, N) of a (E, N, K) weight."""
     key = (w.data_ptr(), w.shape, w.dtype)
@@ -2880,7 +2931,8 @@ def _transposed(w, cache):
     step = max(1, (1 << 30) // (n * k))
     for start in range(0, experts, step):
         t[start : start + step] = w[start : start + step].permute(0, 2, 1)
-    cache[key] = (__import__("weakref").ref(w), t)
+    cache[key] = (weakref.ref(w), t)
+    _evict_with_owner(w, cache, key)
     return t
 
 
@@ -3208,7 +3260,8 @@ def _dense_transpose_weights(w):
     step = max(1, (1 << 30) // (n * k))
     for start in range(0, experts, step):
         t[start : start + step] = w[start : start + step].permute(0, 2, 1)
-    _DENSE_TW_DENSE_CACHE[key] = (__import__("weakref").ref(w), t)
+    _DENSE_TW_DENSE_CACHE[key] = (weakref.ref(w), t)
+    _evict_with_owner(w, _DENSE_TW_DENSE_CACHE, key)
     return t
 
 
@@ -3372,6 +3425,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         topk=topk,
         BLOCK=512,
     )
+    _release_transposes_under_pressure()
     return out
 
 
@@ -3568,4 +3622,5 @@ def nopad_fused_moe(
     _unpermute_kernel[(M, triton.cdiv(H, _REDUCE_BLOCK))](
         cache3, out, inv_perm, topk_weights, M, H, topk=topk, BLOCK=_REDUCE_BLOCK
     )
+    _release_transposes_under_pressure()
     return out
