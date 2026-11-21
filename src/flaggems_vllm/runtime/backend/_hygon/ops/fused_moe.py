@@ -17,8 +17,8 @@ import logging
 from enum import Enum
 from typing import Any, Optional
 
+import flag_gems
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -156,6 +156,60 @@ def dequant_mxfp6(
 # Activation quantization helpers
 
 
+@functools.lru_cache(maxsize=2)
+def _qwen_w16a16_tuned_config(small_m: bool) -> dict[str, Any]:
+    """Load the measured Qwen W16A16 tiling from the Hygon tune config."""
+    from flaggems_vllm import runtime
+
+    name = "hygon_fused_moe_qwen_small" if small_m else "hygon_fused_moe_qwen_large"
+    configs = runtime.get_tuned_config(name)
+    if not configs:
+        raise RuntimeError(f"missing tuned config: {name}")
+    triton_config = configs[0]
+    tuned = dict(triton_config.kwargs)
+    tuned["num_warps"] = triton_config.num_warps
+    tuned["num_stages"] = triton_config.num_stages
+    return tuned
+
+
+def _apply_qwen_w16a16_tuning(
+    config: dict[str, Any],
+    w1_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
+    top_k: int,
+    dtype: str | None,
+    M: int,
+    gemm_stage: str,
+) -> dict[str, Any]:
+    """Use the measured Qwen3.6-35B-A3B W16A16 tiling heuristic.
+
+    These are prefill chunks (M >= 1024) with E=256, H=2048 and
+    moe_intermediate_size 128 or 512. gemm1 and gemm2 share the same block M
+    because moe_align_block_size builds one sorted layout for both stages.
+    """
+    if dtype not in ("bf16", "fp16") or M < 1024:
+        return config
+    if len(w1_shape) != 3 or len(w2_shape) != 3:
+        return config
+    E1, N1, K1 = w1_shape
+    E2, H, intermediate = w2_shape
+    if (
+        E1 != 256
+        or E2 != 256
+        or H != 2048
+        or K1 != 2048
+        or top_k != 8
+        or intermediate not in (128, 512)
+        or N1 != 2 * intermediate
+    ):
+        return config
+
+    tuned = dict(config)
+    tuned.update(_qwen_w16a16_tuned_config(M < 4096))
+    tuned.pop("PAIR_GATE_UP_DOT", None)
+    return tuned
+
+
 @functools.lru_cache(maxsize=1)
 def try_get_optimal_moe_config(
     w1_shape: tuple[int, ...],
@@ -185,6 +239,15 @@ def try_get_optimal_moe_config(
         block_shape,
         gemm_stage=gemm_stage,
         enable_gemm_fast_path=enable_gemm_fast_path,
+    )
+    config = _apply_qwen_w16a16_tuning(
+        config,
+        w1_shape,
+        w2_shape,
+        top_k,
+        dtype,
+        M,
+        gemm_stage,
     )
     if return_is_embedded:
         return config, False
@@ -680,23 +743,22 @@ def apply_moe_activation(
     elif activation == MoEActivation.GELU:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.gelu(gate) * up)
+        output.copy_(flag_gems.gelu(gate, approximate="none") * up)
     elif activation == MoEActivation.SWIGLUSTEP:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(torch.sigmoid(gate) * up)
+        output.copy_(flag_gems.sigmoid(gate) * up)
     elif activation == MoEActivation.RELU2:
         N = output.size(-1)
         gate, up = input[:, :N], input[:, N:]
-        output.copy_(F.relu(gate).square() * up)
+        output.copy_(flag_gems.relu(gate).square() * up)
 
     elif activation == MoEActivation.SILU_NO_MUL:
-        output.copy_(F.silu(input))
+        output.copy_(flag_gems.silu(input))
     elif activation == MoEActivation.GELU_NO_MUL:
-        output.copy_(F.gelu(input))
+        output.copy_(flag_gems.gelu(input, approximate="none"))
     elif activation == MoEActivation.RELU2_NO_MUL:
-        F.relu(input, inplace=True)
-        torch.square(input, out=output)
+        output.copy_(flag_gems.square(flag_gems.relu(input)))
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
@@ -1868,13 +1930,12 @@ def dispatch_fused_moe_kernel(
         )
 
 
-def fused_experts_impl(
+def _fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -1995,7 +2056,7 @@ def fused_experts_impl(
     else:
         raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
-    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+    out_hidden_states = torch.empty_like(hidden_states)
 
     if ocp_mx_scheme is not None:
         # Dequantize OCP MX weights (TODO: skip on platforms with native MX)
@@ -2256,7 +2317,7 @@ def fused_experts_impl(
     return out_hidden_states
 
 
-def inplace_fused_experts(
+def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -2268,91 +2329,44 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
-) -> None:
-    """
-    In-place fused MoE: writes output directly into ``hidden_states``.
-
-    Same semantics as ``fused_experts_impl(..., inplace=True)``.
-    Returns None (the result is stored in ``hidden_states``).
-    """
-    fused_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        inplace=True,
-        activation=activation,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        global_num_experts=global_num_experts,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_shape=block_shape,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-    )
-
-
-def outplace_fused_experts(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    per_channel_quant: bool = False,
-    global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
+    expert_map: torch.Tensor | None = None,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_shape: list[int] | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Out-of-place fused MoE: allocates and returns a new output tensor.
+    """Fused MoE forward with the vLLM fused_experts_impl signature.
 
-    Same semantics as ``fused_experts_impl(..., inplace=False)``.
+    Always allocates and returns a new output tensor.
     """
-    return fused_experts_impl(
+    return _fused_experts_impl(
         hidden_states,
         w1,
         w2,
         topk_weights,
         topk_ids,
-        inplace=False,
         activation=activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        ocp_mx_scheme=ocp_mx_scheme,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
+        expert_map=expert_map,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
