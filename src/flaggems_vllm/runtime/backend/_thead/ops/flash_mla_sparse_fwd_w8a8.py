@@ -453,7 +453,13 @@ def _selected_scale_max(
     ids = tl.load(Ids + row * K + n, n < K, -1)
     valid = (ids >= 0) & (ids < T)
     ks = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
-    tl.store(Anchor + row, tl.maximum(tl.max(ks, 0), 1.0e-30))
+    peak = tl.maximum(tl.max(ks, 0), 1.0e-30)
+    if K == 640:
+        # Rare large scales and typical scales both constrain the U8 step.
+        count = tl.maximum(tl.sum(valid.to(tl.int32), 0), 1)
+        mean = tl.sum(ks, 0) / count
+        peak = 224.0 * tl.maximum(peak / 176.0, mean / 136.0)
+    tl.store(Anchor + row, peak)
 
 
 @triton.jit
@@ -690,7 +696,10 @@ def flash_mla_sparse_fwd_w8a8(
         and q_rope.dtype == torch.bfloat16
         and (
             (0 < batch <= 16 and topk == 8320)
-            or (64 <= batch <= 16384 and topk in (2048, 8320))
+            or (
+                64 <= batch <= 16384
+                and (topk in (2048, 8320) or (rope == 0 and topk == 640))
+            )
         )
         and all(
             t.data_ptr() % 16 == 0 for t in (q_nope, q_rope, k_cache_lora, k_cache_rope)

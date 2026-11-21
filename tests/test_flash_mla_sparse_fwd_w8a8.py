@@ -424,7 +424,8 @@ def test_sparse_decode_ppu_mixed_partitions():
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @pytest.mark.skipif(not PPU_SPARSE_SUPPORTED, reason="Requires PPU INT8 sparse MLA")
 @pytest.mark.parametrize(
-    "batch,topk,rope", [(4, 8320, 0), (4, 8320, 64), (9, 8320, 0), (64, 2048, 64)]
+    "batch,topk,rope",
+    [(4, 8320, 0), (4, 8320, 64), (9, 8320, 0), (64, 2048, 64), (64, 640, 0)],
 )
 def test_sparse_decode_ppu_replayed_scale_and_indices(batch, topk, rope):
     from tests.test_flash_mla_sparse_fwd import FlashmlaSparseTestKit
