@@ -506,27 +506,20 @@ def moe_align_block_size_stage4(
     block_size: tl.constexpr,
     numel,
     tokens_per_thread: tl.constexpr,
-    FIRST_EXPERT: tl.constexpr = 0,
-    LAST_EXPERT: tl.constexpr = None,
 ):
     pid = tl.program_id(0)
-    in_window = True
-    if LAST_EXPERT is not None:
-        in_window = (pid >= FIRST_EXPERT) & (pid < LAST_EXPERT)
-    if in_window:
-        first_block = tl.load(cumsum_ptr + pid) // block_size
-        last_block = tl.load(cumsum_ptr + pid + 1) // block_size
-        for block in range(first_block, last_block):
-            tl.store(expert_ids_ptr + block, pid)
+    start_idx = tl.load(cumsum_ptr + pid)
+    end_idx = tl.load(cumsum_ptr + pid + 1)
+
+    for i in range(start_idx, end_idx, block_size):
+        tl.store(expert_ids_ptr + i // block_size, pid)
 
     start_idx = pid * tokens_per_thread
     off_t = pid * num_experts
 
     offset = tl.arange(0, tokens_per_thread) + start_idx
     mask = offset < numel
-    expert_id = tl.load(topk_ids_ptr + offset, mask=mask, other=0)
-    if LAST_EXPERT is not None:
-        mask = mask & (expert_id >= FIRST_EXPERT) & (expert_id < LAST_EXPERT)
+    expert_id = tl.load(topk_ids_ptr + offset, mask=mask)
     token_idx_in_expert = tl.atomic_add(
         tokens_cnts_ptr + off_t + expert_id, 1, mask=mask
     )
