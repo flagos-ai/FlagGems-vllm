@@ -913,6 +913,7 @@ def chunk_gated_delta_rule_fwd_h_vmajor(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
+    chunk_skew_bucket: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -935,7 +936,15 @@ def chunk_gated_delta_rule_fwd_h_vmajor(
     v_new = torch.empty_like(u) if save_new_value else None
 
     N_BUCKET = _n_bucket(N)
-    SKEW_BUCKET = _skew_bucket(chunk_offsets if cu_seqlens is not None else None, N)
+    if chunk_skew_bucket is not None and (
+        type(chunk_skew_bucket) is not int or not 0 <= chunk_skew_bucket <= 3
+    ):
+        raise ValueError("chunk_skew_bucket must be an integer from 0 through 3")
+    SKEW_BUCKET = (
+        _skew_bucket(chunk_offsets if cu_seqlens is not None else None, N)
+        if chunk_skew_bucket is None
+        else chunk_skew_bucket
+    )
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
@@ -1149,6 +1158,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
+    chunk_skew_bucket: int | None = None,
     **kwargs,
 ):
     logger.debug("METAX GDN CHUNK FWD (V-major, fused cumsum+kkt+solve_tril)")
@@ -1185,6 +1195,7 @@ def chunk_gated_delta_rule_fwd(
         A=A,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
     )
 
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h_vmajor(
@@ -1197,6 +1208,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        chunk_skew_bucket=chunk_skew_bucket,
     )
     o = chunk_fwd_o(
         q=q,

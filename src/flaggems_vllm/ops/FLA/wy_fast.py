@@ -261,14 +261,16 @@ def recompute_w_u_fwd(
     cu_seqlens: torch.LongTensor | None,
     block_v: int | None = None,
     pipe_stages: int = 2,
+    chunk_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A.shape[-1]
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if cu_seqlens is None:
+        chunk_indices = None
+    elif chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = block_v or 64
