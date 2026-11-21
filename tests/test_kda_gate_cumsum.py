@@ -104,7 +104,7 @@ def _make_inputs(lens, dtype=torch.bfloat16, H=4):
     return g, A_log, dt_bias, cu_dev, chunk_indices, cu_host
 
 
-def _load_ascendc_op() -> bool:
+def _load_ascendc_op():
     """Load the replaced AscendC operator when the vllm-ascend extension is
     available (CI/dev boxes with vllm_ascend installed); plain flaggems
     environments fall back to the torch-chain reference instead."""
@@ -118,22 +118,40 @@ def _load_ascendc_op() -> bool:
             "vllm_ascend_C.cpython-312-aarch64-linux-gnu.so",
         )
         if not os.path.exists(so):
-            return False
+            return None
         from vllm_ascend.utils import bootstrap_custom_op_env
 
         bootstrap_custom_op_env(include_vendor_lib=True)
         torch.ops.load_library(so)
-        return hasattr(torch.ops._C_ascend, "kda_gate_cumsum")
+
+        # v0.26.0rc ships ``kda_gate_cumsum``; v0.30.0 renamed it to
+        # ``kda_gate_cumsum_vllm`` with the same host contract;
+        # pick the name deterministically from the installed dist version.
+        from importlib.metadata import PackageNotFoundError, version
+
+        from packaging.version import InvalidVersion, Version
+
+        try:
+            vllm_ver = Version(version("vllm-ascend"))
+        except (PackageNotFoundError, InvalidVersion):
+            return None
+
+        return (
+            "kda_gate_cumsum_vllm"
+            if vllm_ver >= Version("0.30.0.dev0")
+            else "kda_gate_cumsum"
+        )
     except Exception:
-        return False
+        return None
 
 
-HAS_ASCENDC = _load_ascendc_op()
+ASCENDC_OP = _load_ascendc_op()
+HAS_ASCENDC = ASCENDC_OP is not None
 
 
 def _ascendc(g, A_log, dt_bias, cu_dev, chunk_indices, lower_bound, chunk):
     """The exact replaced operator (host contract included: host cu_seqlens)."""
-    return torch.ops._C_ascend.kda_gate_cumsum(
+    return getattr(torch.ops._C_ascend, ASCENDC_OP)(
         g.contiguous(),
         chunk,
         A_log=A_log.contiguous(),
@@ -152,7 +170,7 @@ def _ascendc(g, A_log, dt_bias, cu_dev, chunk_indices, lower_bound, chunk):
 # run); the ragged tuples are edge cases beyond the profiled set.
 
 
-@pytest.mark.kda_gate_cumsum
+@pytest.mark.kda_gate_cumsum_triton
 @pytest.mark.parametrize("lens", CASES)
 @pytest.mark.parametrize("H", HEAD_COUNTS)
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
@@ -166,7 +184,7 @@ def test_kda_gate_cumsum_accuracy(lens, H, dtype):
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
 
 
-@pytest.mark.kda_gate_cumsum
+@pytest.mark.kda_gate_cumsum_triton
 def test_kda_gate_cumsum_empty_batch():
     g, A_log, dt_bias, cu_dev, chunk_indices, cu_host = _make_inputs([0])
     out = flaggems_vllm.kda_gate_cumsum_triton(
@@ -175,7 +193,7 @@ def test_kda_gate_cumsum_empty_batch():
     assert out.shape == g.shape
 
 
-@pytest.mark.kda_gate_cumsum
+@pytest.mark.kda_gate_cumsum_triton
 @pytest.mark.skipif(not HAS_ASCENDC, reason="vllm_ascend extension not available")
 @pytest.mark.parametrize("lens", CASES)
 @pytest.mark.parametrize("H", HEAD_COUNTS)
