@@ -308,7 +308,7 @@ def flash_attn_varlen_func_ref(*args, **kwargs):
             q_descale,
             k_descale,
             v_descale,
-            fa_version,
+            fa_version=fa_version,
         )
     except NotImplementedError as exc:
         if "num_splits" not in str(exc):
