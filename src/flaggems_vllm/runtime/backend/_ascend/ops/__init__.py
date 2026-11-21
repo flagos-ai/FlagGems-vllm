@@ -71,6 +71,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.ihc_pre import ihc_pre, triton_ihc_pre
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_epilogue import indexer_epilogue
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
     indexer_gemm_score,
@@ -166,6 +167,7 @@ __all__ = [
     "group_list_cumsum",
     "grouped_topk",
     "hc_combine",
+    "ihc_pre",
     "indexer_epilogue",
     "indexer_gemm_score",
     "indexer_k_quant_and_cache",
@@ -202,5 +204,6 @@ __all__ = [
     "top_k_per_row_prefill",
     "top_k_top_p",
     "topk_softplus_sqrt",
+    "triton_ihc_pre",
     "unpack_seq_triton",
 ]

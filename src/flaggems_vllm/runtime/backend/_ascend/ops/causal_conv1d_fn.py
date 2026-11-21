@@ -582,6 +582,10 @@ def causal_conv1d_fn(
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
 
+    # Remember whether the caller handed us the operator's own [dim, tokens]
+    # channel-first layout: for that case the result must come back in the same
+    # layout *and* contiguous, which the token-major kernel buffer is not.
+    channel_first_in = x.stride(0) != 1
     x = x.transpose(0, 1).contiguous()  # (dim, seqlen) -> (seqlen, dim)
     weight = weight.transpose(0, 1).contiguous()  # (dim, width) -> (width, dim)
 
@@ -796,4 +800,9 @@ def causal_conv1d_fn(
         num_stages=2,
     )
 
-    return out.transpose(0, 1).to(original_x_dtype)
+    result = out.transpose(0, 1)
+    if channel_first_in:
+        # Materialise the transpose once so the caller gets a contiguous
+        # [dim, tokens] buffer, as the channel-first contract promises.
+        result = result.contiguous()
+    return result.to(original_x_dtype)
