@@ -36,6 +36,9 @@ moe_align_block_size
 moe_align_block_size_no_tle
 NULL_BLOCK_ID
 pad_attention_heads
+# Availability probe for optional vendor attention, not a numerical operator.
+is_paged_causal_attention_available
+is_paged_prefix_window_attention_available
 paged_mqa_logits
 parallel_nsa
 parallel_nsa_compression
