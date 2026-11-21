@@ -13,7 +13,10 @@
 # limitations under the License.
 
 
-import flag_gems
+try:
+    import flag_gems
+except ImportError:
+    flag_gems = None
 
 from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
@@ -43,6 +46,9 @@ from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
 )
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
 from flaggems_vllm.runtime.backend._thead.ops.qsa_prepare import qsa_prepare
+from flaggems_vllm.runtime.backend._thead.ops.qsa_select_paged_decode import (
+    qsa_select_paged_decode,
+)
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -67,6 +73,7 @@ __all__ = [
     "per_token_group_quant_fp8",
     "persistent_topk",
     "qsa_prepare",
+    "qsa_select_paged_decode",
     "quantize_gdn_state_int8",
     "qwen4_hc_inject_combine",
     "SUPPORTED_FP8_DTYPE",
@@ -76,7 +83,7 @@ __all__ = [
 ]
 
 # Older FlagGems CI pins do not export the shared PPU INT8 MM implementation.
-if "mm_w8a8_int8" in vars(flag_gems):
+if flag_gems is not None and "mm_w8a8_int8" in vars(flag_gems):
     from flaggems_vllm.runtime.backend._thead.ops.bmm_w8a8_int8 import bmm_w8a8_int8
 
     __all__ += ["bmm_w8a8_int8"]
