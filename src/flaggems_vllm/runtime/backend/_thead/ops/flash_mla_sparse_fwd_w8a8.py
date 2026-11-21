@@ -339,7 +339,7 @@ def _sdk_clang():
     return path, subprocess.check_output([str(path), "--version"])
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=None)
 def _native_library(rope, splits):
     compiler, version = _sdk_clang()
     source = Path(__file__).with_suffix(".cpp")
@@ -531,7 +531,9 @@ def _repair_probability_error(
 def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
     batch = q.shape[0]
     topk, rope, tokens = ids.shape[-1], qr.shape[-1], kv.shape[0] * 64
-    splits = 5 if batch <= 16 else 1
+    splits = 1
+    if batch <= 16:
+        splits = 2 if 9 <= batch <= 10 else 5
     lse = torch.empty((batch, 64, 1), device=q.device, dtype=torch.float32)
     error = torch.empty_like(lse)
     anchor = torch.empty((batch,), device=q.device, dtype=torch.float32)
