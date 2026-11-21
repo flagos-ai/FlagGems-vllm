@@ -75,10 +75,17 @@ _TL_QUANT_TYPE_FP8_E4M3 = tl.constexpr(QUANT_TYPE_FP8_E4M3)
 _VLLM_QUANT_TYPE_FP8_E4M3 = 2814749767172868
 
 
+class _ScaleLayout(NamedTuple):
+    # Kernel argument order: expert, quantization group, output channel.
+    strides: Tuple[int, int, int]
+    max_offset: int
+
+
 class _QuantizedStage(NamedTuple):
     weight: torch.Tensor
     scale: torch.Tensor
     scale_safe: Optional[torch.Tensor]
+    layout: _ScaleLayout
 
 
 # Packed conversion instructions are adapted from FlagTree's PPU backend.
@@ -2926,6 +2933,7 @@ def _invoke_marlin_moe_gemm_direct(
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
 
     B, B_scale = stage.weight, stage.scale
+    stride_se, stride_sg, stride_sn = stage.layout.strides
     K = A.size(1)
     N = C.size(-1) if fuse_silu else B.size(2)
     routes = topk_ids.numel()
@@ -3006,9 +3014,9 @@ def _invoke_marlin_moe_gemm_direct(
         B.stride(2),
         target.stride(-2),
         target.stride(-1),
-        B_scale.stride(0),
-        B_scale.stride(1),
-        B_scale.stride(2),
+        stride_se,
+        stride_sg,
+        stride_sn,
         A_ROUTE_DIVISOR=a_route_divisor,
         GROUP_SIZE_K=group_size,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
@@ -3050,6 +3058,7 @@ def _invoke_marlin_moe_gemm_reduce_direct(
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
 
     B, B_scale = stage.weight, stage.scale
+    stride_se, stride_sg, stride_sn = stage.layout.strides
     K = A.size(1)
     N = B.size(2)
     top_k = topk_ids.size(1)
@@ -3074,9 +3083,9 @@ def _invoke_marlin_moe_gemm_reduce_direct(
         B.stride(2),
         C.stride(0),
         C.stride(1),
-        B_scale.stride(0),
-        B_scale.stride(1),
-        B_scale.stride(2),
+        stride_se,
+        stride_sg,
+        stride_sn,
         TOP_K=top_k,
         GROUP_SIZE_K=group_size,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
@@ -3669,6 +3678,7 @@ def _invoke_marlin_moe_gemm_grouped(
     if tle_async is None:
         raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
     B, B_scale = stage.weight, stage.scale
+    stride_se, stride_sg, stride_sn = stage.layout.strides
     em = sorted_token_ids.size(0)
     num_valid_tokens = C.numel() // C.size(-1)
     n = B.size(2)
@@ -3676,19 +3686,16 @@ def _invoke_marlin_moe_gemm_grouped(
     if raw_w4 or (raw_w8 and quant_type_id == QUANT_TYPE_FP8_E4M3):
         largest_offset = max(
             sum((length - 1) * stride for length, stride in zip(B.shape, B.stride())),
-            sum(
-                (length - 1) * stride
-                for length, stride in zip(B_scale.shape, B_scale.stride())
-            ),
+            stage.layout.max_offset,
             num_valid_tokens * C.stride(-2) + n * C.stride(-1),
         )
         use32 = largest_offset < (1 << 31)
     packed_mx_scales = (
         raw_w4
         and quant_type_id == QUANT_TYPE_FP4_E2M1
-        and B_scale.stride(1) == 1
-        and B_scale.stride(0) % 4 == 0
-        and B_scale.stride(2) % 4 == 0
+        and stride_sg == 1
+        and stride_se % 4 == 0
+        and stride_sn % 4 == 0
         and B_scale.data_ptr() % 4 == 0
     )
     if (raw_w8 or raw_w4) and block_m == 64:
@@ -3706,9 +3713,9 @@ def _invoke_marlin_moe_gemm_grouped(
             num_valid_tokens,
             B.stride(0),
             B.stride(2),
-            B_scale.stride(0),
-            B_scale.stride(1),
-            B_scale.stride(2),
+            stride_se,
+            stride_sg,
+            stride_sn,
             C.stride(-2),
             C.stride(-1),
             mul_routed_weight,
@@ -3735,9 +3742,9 @@ def _invoke_marlin_moe_gemm_grouped(
             num_valid_tokens,
             B.stride(0),
             B.stride(2),
-            B_scale.stride(0),
-            B_scale.stride(1),
-            B_scale.stride(2),
+            stride_se,
+            stride_sg,
+            stride_sn,
             C.stride(-2),
             C.stride(-1),
             mul_routed_weight,
@@ -3760,9 +3767,9 @@ def _invoke_marlin_moe_gemm_grouped(
     scale_pair = (
         prefetch_before_scale
         and B_scale.dtype == torch.bfloat16
-        and B_scale.stride(1) == 1
-        and B_scale.stride(0) % 2 == 0
-        and B_scale.stride(2) % 2 == 0
+        and stride_sg == 1
+        and stride_se % 2 == 0
+        and stride_sn % 2 == 0
         and B_scale.data_ptr() % 4 == 0
     )
     if raw_w8 and block_m == 16:
@@ -3782,9 +3789,9 @@ def _invoke_marlin_moe_gemm_grouped(
             num_valid_tokens,
             B.stride(0),
             B.stride(2),
-            B_scale.stride(0),
-            B_scale.stride(1),
-            B_scale.stride(2),
+            stride_se,
+            stride_sg,
+            stride_sn,
             C.stride(-2),
             C.stride(-1),
             mul_routed_weight,
@@ -3821,9 +3828,9 @@ def _invoke_marlin_moe_gemm_grouped(
             num_valid_tokens,
             B.stride(0),
             B.stride(2),
-            B_scale.stride(0),
-            B_scale.stride(1),
-            B_scale.stride(2),
+            stride_se,
+            stride_sg,
+            stride_sn,
             C.stride(-2),
             C.stride(-1),
             mul_routed_weight,
@@ -3872,9 +3879,9 @@ def _invoke_marlin_moe_gemm_grouped(
         stride_bn=B.stride(2),
         stride_cm=stride_cm,
         stride_cn=stride_cn,
-        stride_bse=B_scale.stride(0),
-        stride_bsg=B_scale.stride(1),
-        stride_bsn=B_scale.stride(2),
+        stride_bse=stride_se,
+        stride_bsg=stride_sg,
+        stride_bsn=stride_sn,
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_K=(
@@ -4053,17 +4060,22 @@ def check_routed_fp8_scales(
         write_fp8_expert_scale_safety(S2, F2, expert, N2, G2, SE2, SN2, SG2, BLOCK2)
 
 
-def e8m0_byte_view(scale: torch.Tensor) -> torch.Tensor:
-    if scale.is_inference():
-        return scale.view(torch.uint8)
-    version = scale._version
-    cached = _SCALE_CACHE.get(scale)
-    if cached is not None and cached[0] == version and cached[1].is_set_to(scale):
-        return cached[1]
-    # The view shares storage for graph replay but must not keep the weak key alive.
-    raw = scale.detach().view(torch.uint8)
-    _SCALE_CACHE[scale] = (version, raw)
-    return raw
+def _scale_layout(scale: torch.Tensor, is_mxfp4: bool) -> _ScaleLayout:
+    shape, strides = scale.shape, scale.stride()
+    version = scale._version if is_mxfp4 and not scale.is_inference() else None
+    if version is not None:
+        cached = _SCALE_CACHE.get(scale)
+        # Rebinding .data can change shape or strides without bumping the version.
+        if cached is not None and cached[:3] == (version, shape, strides):
+            return cached[3]
+
+    se, sn, sg = strides
+    layout = _ScaleLayout(
+        (se, sg, sn), sum((size - 1) * stride for size, stride in zip(shape, strides))
+    )
+    if version is not None:
+        _SCALE_CACHE[scale] = (version, shape, strides, layout)
+    return layout
 
 
 def _prepare_quantized_weights(
@@ -4073,17 +4085,21 @@ def _prepare_quantized_weights(
     w2_scale,
     *,
     needs_expert_flags: bool,
+    is_mxfp4: bool,
 ):
     b1 = w1.view(torch.uint8).transpose(1, 2)
     b2 = w2.view(torch.uint8).transpose(1, 2)
-    s1 = w1_scale.transpose(1, 2)
-    s2 = w2_scale.transpose(1, 2)
+    s1 = w1_scale.view(torch.uint8) if is_mxfp4 else w1_scale
+    s2 = w2_scale.view(torch.uint8) if is_mxfp4 else w2_scale
     if needs_expert_flags:
         safe1 = torch.empty((w1.size(0),), device=w1.device, dtype=torch.int32)
         safe2 = torch.empty_like(safe1)
     else:
         safe1, safe2 = None, None
-    return _QuantizedStage(b1, s1, safe1), _QuantizedStage(b2, s2, safe2)
+    return (
+        _QuantizedStage(b1, s1, safe1, _scale_layout(w1_scale, is_mxfp4)),
+        _QuantizedStage(b2, s2, safe2, _scale_layout(w2_scale, is_mxfp4)),
+    )
 
 
 @triton.jit
@@ -4697,6 +4713,8 @@ def run_dense_wna16(
                 down,
             )
     sorted_ids, experts, padded = _align_grouped_tokens(topk_ids, 64, e)
+    if quant_type_id == QUANT_TYPE_FP4_E2M1:
+        w1_scale, w2_scale = w1_scale.view(torch.uint8), w2_scale.view(torch.uint8)
     for index, (weight, scales) in enumerate(((w1, w1_scale), (w2, w2_scale))):
         first = index == 0
         output_size, reduction = weight.shape[1:]
@@ -4901,9 +4919,6 @@ def _fused_marlin_moe_impl(
         return out
     compute_type = tl.float16 if hidden_states.dtype == torch.float16 else tl.bfloat16
     with torch.cuda.device(hidden_states.device):
-        if quant_type_id == QUANT_TYPE_FP4_E2M1:
-            w1_scale = e8m0_byte_view(w1_scale)
-            w2_scale = e8m0_byte_view(w2_scale)
         packed_fp8 = (
             quant_type_id == QUANT_TYPE_FP8_E4M3
             and hidden_states.dtype
@@ -5071,6 +5086,7 @@ def _fused_marlin_moe_impl(
             w1_scale,
             w2_scale,
             needs_expert_flags=is_joint_safety,
+            is_mxfp4=quant_type_id == QUANT_TYPE_FP4_E2M1,
         )
         split_silu = direct and (
             n >= 1024 or quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
