@@ -16,32 +16,35 @@
 
 The generic implementation composes ``fused_inv_rope_fp8_quant`` with
 ``fp8_einsum``. On Ascend both steps are unavailable: ``fp8_einsum`` rejects
-every non-NVIDIA device, BiShengHIR cannot lower a ``float8_e4m3fn`` cast (the
-FP8 byte grid has to be built with integer ops), and a per-128-block
-dequantization inside a ``tl.dot`` K loop costs several times the dot itself
-(measured 15 TOPS against 139 TOPS for the bare INT8 dot).
+every non-NVIDIA device and BiShengHIR cannot lower a ``float8_e4m3fn`` cast
+(the FP8 byte grid has to be built with integer ops).
 
-This backend therefore keeps the operator's FP8 block-wise semantics but
-transports the values as FP16:
+This backend therefore transports the values as INT8 fixed point:
 
-1. ``_inv_rope_quant_kernel`` applies the inverse RoPE and rounds every
-   128-element block onto the E4M3 grid (integer RNE on the FP32 bits), then
-   writes the dequantized FP16 value. Rows of one head are contiguous, so the
-   kernel is a streaming pass; the 128-wide block that holds the rope columns
-   is handled with a pair split/join instead of a strided gather.
-2. ``wo_a`` is a model parameter: it is decoded once into an FP16 K-major copy
-   (``[G, K, N]``, so the GEMM reads contiguous tiles) and cached per module or
-   tensor, keyed by ``data_ptr + _version``.
-3. ``_bmm_kernel`` is a plain FP16 tensor-core batched GEMM with FP32
-   accumulation; the block scales are already folded into the operands, so it
-   runs at the shape's peak instead of paying a per-block promotion.
+1. ``_inv_rope_quant_kernel`` applies the inverse RoPE, rounds every
+   128-element block onto the E4M3 grid (integer RNE on the FP32 bits, i.e. the
+   exact FP8 value the reference keeps) and renormalizes the row onto a single
+   ``row_amax / 127`` scale. Rows of one head are contiguous, so the kernel is a
+   streaming pass; the 128-wide block that holds the rope columns is quantized
+   from its even/odd halves.
+2. ``wo_a`` is a model parameter: it is decoded once into an INT8 K-major copy
+   (``[G, K, N]``, so the GEMM reads contiguous tiles) with one scale per 128
+   output columns, cached per module or tensor, keyed by ``data_ptr + _version``.
+3. ``_bmm_kernel`` runs the grouped INT8 tensor-core product as a single INT32
+   accumulator over the whole K loop and applies the rank-1
+   ``act_scale[row] * weight_scale[col block]`` factor in the epilogue. Both
+   scales are necessarily coarse: a per-128-K-block scale has to be applied
+   inside the K loop, which pushes the accumulator out of the cube every block
+   and costs ~15x on this backend (12.7 TFLOPS against 178 TFLOPS measured here,
+   234 TOPS for the bare INT8 dot).
 
 vLLM may pass a ``QuantizedActivation`` (the attention kernel already applied
-the inverse RoPE and the FP8 cast); its payload is decoded and rescaled in
-``_prequant_to_f16_kernel``, skipping the RoPE.
+the inverse RoPE and the FP8 cast); its payload is decoded and renormalized in
+``_prequant_to_int8``, skipping the RoPE.
 
-FP16 (11 mantissa bits) adds ~0.05% on top of the E4M3 grid, far below the
-grid's own ~3% quantization error.
+Renormalizing the exact FP8 values onto the row scale adds at most half an INT8
+step of the row maximum (<= 0.4% of the row peak), next to the ~3% the E4M3 grid
+already carries per element.
 """
 
 import logging
@@ -135,32 +138,80 @@ def _round_e4m3(v):
 
 
 @triton.jit
-def _quant_blocks(src, ROWS: tl.constexpr, WIDTH: tl.constexpr):
-    """Per-128 block absmax quantize a [ROWS, WIDTH] tile, FP32 out."""
-    q = tl.reshape(src, (ROWS * (WIDTH // 128), 128))
-    amax = tl.max(tl.abs(q), axis=1)
-    scale = amax * (1.0 / 448.0)
-    inv = 1.0 / tl.where(scale == 0, 1.0, scale)
-    return _round_e4m3(q * inv[:, None]) * scale[:, None]
+def _round_to_int8(v):
+    """Round a value already scaled onto the INT8 grid, half away from zero.
+
+    The cast goes straight to INT8: an INT32 intermediate doubles the live
+    bytes of the tile and overflows the 192 KB UB on this backend.
+    """
+    return tl.where(v >= 0, v + 0.5, v - 0.5).to(tl.int8)
 
 
 @triton.jit
-def _quant_store(src, out_ptr, off, valid, ROWS: tl.constexpr, WIDTH: tl.constexpr):
-    """Per-128 block absmax quantize ``src`` [ROWS, WIDTH] and store FP16.
+def _fp8_grid_to_int8(v, blk_scale, row_scale):
+    """``v`` -> the exact FP8 value, normalized by the per-row INT8 scale.
 
-    The reciprocal is taken once per row: an FP32 division per element costs
-    ~2.5x the whole pass on the Ascend vector unit.
+    ``blk_scale`` is the reference 128-element block scale ``block_amax / 448``
+    (so ``_round_e4m3(v * (1 / blk_scale))`` reproduces the FP8 value the
+    reference would keep) and ``row_scale`` is ``row_amax / 127``, the single
+    scale of the whole ``(token, group)`` row. Folding one scale per row instead
+    of one per 128-wide K block is what lets the GEMM keep the INT8 dot inside
+    the cube for the whole K loop (see ``_bmm_kernel``).
+
+    The reciprocal is taken once per row: an FP32 divide per element costs ~2.5x
+    the whole pass on the Ascend vector unit (and this backend lowers it to a
+    reciprocal multiply anyway). Either way a small share of the values sit on
+    an E4M3 midpoint and round to the neighbouring grid point, which moves a
+    single element by up to one E4M3 ulp; ``wo_b`` dilutes that to well under
+    the accuracy budget.
     """
-    cols = tl.arange(0, WIDTH)
+    inv = 1.0 / blk_scale
+    grid = _round_e4m3(v * inv[:, None]) * (blk_scale / row_scale)[:, None]
+    return _round_to_int8(tl.minimum(tl.maximum(grid, -127.0), 127.0))
+
+
+@triton.jit
+def _block_scale(amax):
+    """Reference FP8 block scale, guarded against an all-zero block."""
+    return tl.where(amax == 0, 1.0, amax * (1.0 / 448.0))
+
+
+@triton.jit
+def _block_amax(src):
+    """Per-row absmax of a [ROWS, 128] tile (one 128-wide block per row)."""
+    return tl.max(tl.abs(src), axis=1)
+
+
+@triton.jit
+def _quant_row_store(
+    src, amax, out_ptr, off, row_scale, valid, ROWS: tl.constexpr
+):
+    """Quantize one 128-wide block of a row and store it as INT8.
+
+    ``amax`` is the block absmax the caller already reduced for the row maximum:
+    a 128-wide reduce is the most expensive op of this pass on Ascend, so it is
+    taken once and reused.
+    """
+    _store_payload(
+        _fp8_grid_to_int8(src, _block_scale(amax), row_scale),
+        out_ptr,
+        off,
+        valid,
+        ROWS,
+    )
+
+
+@triton.jit
+def _store_payload(payload, out_ptr, off, valid, ROWS: tl.constexpr):
     tl.store(
-        out_ptr + off[:, None] + cols[None, :],
-        tl.reshape(_quant_blocks(src, ROWS, WIDTH), (ROWS, WIDTH)).to(tl.float16),
+        out_ptr + off[:, None] + tl.arange(0, 128)[None, :],
+        payload,
         mask=valid[:, None],
     )
 
 
 @triton.jit
-def _quant_pair_store(even, odd, out_ptr, off, valid, ROWS: tl.constexpr):
+def _quant_pair_store(even, odd, amax, out_ptr, off, row_scale, valid, ROWS: tl.constexpr):
     """Quantize a rotated rope block from its even/odd halves and store it.
 
     The 128-wide block is reduced as two [ROWS, 64] halves instead of the
@@ -169,16 +220,12 @@ def _quant_pair_store(even, odd, out_ptr, off, valid, ROWS: tl.constexpr):
     rest of the pass. Both halves share the block scale, so the result is the
     same tile.
     """
-    amax = tl.maximum(tl.max(tl.abs(even), axis=1), tl.max(tl.abs(odd), axis=1))
-    scale = amax * (1.0 / 448.0)
-    inv = 1.0 / tl.where(scale == 0, 1.0, scale)
-    dq = tl.join(
-        _round_e4m3(even * inv[:, None]) * scale[:, None],
-        _round_e4m3(odd * inv[:, None]) * scale[:, None],
-    )
+    blk_scale = _block_scale(amax)
+    ev = _fp8_grid_to_int8(even, blk_scale, row_scale)
+    od = _fp8_grid_to_int8(odd, blk_scale, row_scale)
     tl.store(
         out_ptr + off[:, None] + tl.arange(0, 128)[None, :],
-        tl.reshape(dq, (ROWS, 128)).to(tl.float16),
+        tl.reshape(tl.join(ev, od), (ROWS, 128)),
         mask=valid[:, None],
     )
 
@@ -189,6 +236,7 @@ def _inv_rope_quant_kernel(
     pos_ptr,
     tab_ptr,
     out_ptr,
+    s_ptr,
     num_tokens,
     tab_stride,
     rows_per_token: tl.constexpr,
@@ -207,6 +255,11 @@ def _inv_rope_quant_kernel(
     reads contiguous tiles; the inner 128 block that holds the rope columns is
     rotated with a pair split/join.
 
+    The row carries a single INT8 scale, so the row maximum has to be known
+    before the first block is written: the kernel loads every block of the row
+    once, keeps the tiles in registers across the two passes and quantizes from
+    those registers, so the activation is read (and the rope rotated) once.
+
     Loads are deliberately unmasked: the token index is clamped to the last
     valid row, so every load stays in bounds and only the store is predicated.
     A masked 128-wide load out of this tile shape is miscompiled by FlagTree
@@ -217,9 +270,11 @@ def _inv_rope_quant_kernel(
     group = tl.program_id(1).to(tl.int64)
     heads = tl.arange(0, heads_per_group)
     nope_cols: tl.constexpr = NOPE_DIM - (128 - ROPE_WIDTH)
+    nope_blocks: tl.constexpr = nope_cols // 128
     pairs: tl.constexpr = (128 - ROPE_WIDTH) // 2 + ROPE_WIDTH // 2
     pair_cols = tl.arange(0, pairs)
     last_cols = tl.arange(0, 128)
+    block_cols = tl.arange(0, 128)
     head_valid = heads < heads_per_group
     for j in tl.static_range(TOKENS):
         token = pid_t * TOKENS + j
@@ -229,32 +284,81 @@ def _inv_rope_quant_kernel(
         in_base = (token_ld * rows_per_token + group * heads_per_group) * HEAD_DIM
         out_base = (group * num_tokens + token) * GROUP_DIM
         row_off = heads * HEAD_DIM
-        _quant_store(
-            tl.load(
-                o_ptr
-                + in_base
-                + row_off[:, None]
-                + tl.arange(0, nope_cols)[None, :]
-            ).to(tl.float32),
-            out_ptr,
-            out_base + row_off,
-            valid,
-            heads_per_group,
-            nope_cols,
+        # --- pass 1: rotate the rope block once, then the row absmax ----------
+        # A wider int8 payload tile overflows the 192 KB UB on FlagTree 0.7.0
+        # (the cast chain needs ~144 bytes/element), so blocks stay 128 wide.
+        # The blocks are held in registers across both passes (hence the fixed
+        # unroll: the frontend has no list/tuple), so the row is read once.
+        base = o_ptr + in_base + row_off[:, None]
+        t0 = tl.load(base + block_cols[None, :]).to(tl.float32)
+        t1 = (
+            tl.load(base + 128 + block_cols[None, :]).to(tl.float32)
+            if nope_blocks > 1
+            else t0
         )
-        last = tl.load(
-            o_ptr + in_base + row_off[:, None] + nope_cols + last_cols[None, :]
-        ).to(tl.float32)
-        pair = tl.reshape(last, (heads_per_group, pairs, 2))
+        t2 = (
+            tl.load(base + 256 + block_cols[None, :]).to(tl.float32)
+            if nope_blocks > 2
+            else t0
+        )
+        t3 = (
+            tl.load(base + 384 + block_cols[None, :]).to(tl.float32)
+            if nope_blocks > 3
+            else t0
+        )
+        pair = tl.reshape(
+            tl.load(base + nope_cols + last_cols[None, :]).to(tl.float32),
+            (heads_per_group, pairs, 2),
+        )
         even, odd = tl.split(pair)
         pos = tl.load(pos_ptr + token_ld).to(tl.int64)
         cos_v = tl.load(tab_ptr + pos * tab_stride + pair_cols)
         sin_v = tl.load(tab_ptr + pairs + pos * tab_stride + pair_cols)
+        rope_even = even * cos_v[None, :] + odd * sin_v[None, :]
+        rope_odd = odd * cos_v[None, :] - even * sin_v[None, :]
+        rope_amax = tl.maximum(
+            tl.max(tl.abs(rope_even), axis=1), tl.max(tl.abs(rope_odd), axis=1)
+        )
+        a0 = _block_amax(t0)
+        a1 = _block_amax(t1) if nope_blocks > 1 else a0
+        a2 = _block_amax(t2) if nope_blocks > 2 else a0
+        a3 = _block_amax(t3) if nope_blocks > 3 else a0
+        amax = rope_amax
+        amax = tl.maximum(amax, a0)
+        if nope_blocks > 1:
+            amax = tl.maximum(amax, a1)
+        if nope_blocks > 2:
+            amax = tl.maximum(amax, a2)
+        if nope_blocks > 3:
+            amax = tl.maximum(amax, a3)
+        row_scale = tl.max(amax) * (1.0 / 127.0)
+        tl.store(s_ptr + group * num_tokens + token, row_scale, mask=in_range)
+        # --- pass 2: quantize onto the FP8 grid and the row scale --------------
+        _quant_row_store(
+            t0, a0, out_ptr, out_base + row_off, row_scale, valid, heads_per_group
+        )
+        if nope_blocks > 1:
+            _quant_row_store(
+                t1, a1, out_ptr, out_base + row_off + 128, row_scale, valid,
+                heads_per_group,
+            )
+        if nope_blocks > 2:
+            _quant_row_store(
+                t2, a2, out_ptr, out_base + row_off + 256, row_scale, valid,
+                heads_per_group,
+            )
+        if nope_blocks > 3:
+            _quant_row_store(
+                t3, a3, out_ptr, out_base + row_off + 384, row_scale, valid,
+                heads_per_group,
+            )
         _quant_pair_store(
-            even * cos_v[None, :] + odd * sin_v[None, :],
-            odd * cos_v[None, :] - even * sin_v[None, :],
+            rope_even,
+            rope_odd,
+            rope_amax,
             out_ptr,
             out_base + row_off + nope_cols,
+            row_scale,
             valid,
             heads_per_group,
         )
@@ -319,15 +423,18 @@ def _quant_activation(
     heads_per_group: int,
     nope_dim: int,
     rope_dim: int,
-) -> torch.Tensor:
-    """Return a group-major ``[groups, tokens, group_dim]`` FP16 activation."""
+):
+    """Return group-major ``[groups, tokens, group_dim]`` INT8 + row scales."""
     num_tokens, _, head_dim = o.shape
     group_dim = heads_per_group * head_dim
     out = torch.empty(
-        (n_groups, num_tokens, group_dim), dtype=torch.float16, device=o.device
+        (n_groups, num_tokens, group_dim), dtype=torch.int8, device=o.device
+    )
+    scales = torch.empty(
+        (n_groups, num_tokens), dtype=torch.float32, device=o.device
     )
     if num_tokens == 0:
-        return out
+        return out, scales
     table = _rope_table(cos_sin_cache)
     tokens = _quant_tokens(num_tokens, n_groups)
     args = (
@@ -335,6 +442,7 @@ def _quant_activation(
         positions,
         table,
         out,
+        scales,
         num_tokens,
         table.stride(0),
         n_groups * heads_per_group,
@@ -350,14 +458,14 @@ def _quant_activation(
         _inv_rope_quant_kernel,
         (triton.cdiv(num_tokens, tokens), n_groups),
         args,
-        (tuple(t.stride() for t in (o, out)), num_tokens == 1),
+        (tuple(t.stride() for t in (o, out, scales)), num_tokens == 1),
         {"num_warps": 8, "num_stages": 1},
     )
-    return out
+    return out, scales
 
 
 # ---------------------------------------------------------------------------
-# FP8 payload -> FP16 (pre-quantized activation and wo_a weights)
+# FP8 payload -> INT8 transport (pre-quantized activation and wo_a weights)
 # ---------------------------------------------------------------------------
 
 
@@ -375,156 +483,91 @@ def _e4m3_byte_to_f32(bits):
     return tl.where(exp == 0, sub, normal)
 
 
-@triton.jit
-def _prequant_to_f16_kernel(
-    x_ptr,
-    s_ptr,
-    out_ptr,
-    num_rows,
-    num_tokens,
-    num_groups: tl.constexpr,
-    blocks_per_row: tl.constexpr,
-    ROWS: tl.constexpr,
-    GRID_X: tl.constexpr,
-):
-    """``[tokens, groups, k]`` E4M3 payload -> group-major FP16 with block scales."""
-    pid = (tl.program_id(1) * GRID_X + tl.program_id(0)).to(tl.int64)
-    rows = pid * ROWS + tl.arange(0, ROWS)
-    valid = rows < num_rows
-    cols = tl.arange(0, blocks_per_row * 128)
-    x = tl.load(
-        x_ptr + rows[:, None] * (blocks_per_row * 128) + cols[None, :],
-        mask=valid[:, None],
-        other=0,
-    )
-    value = _e4m3_byte_to_f32(x)
-    scale = tl.load(
-        s_ptr + rows[:, None] * blocks_per_row + tl.arange(0, blocks_per_row)[None, :],
-        mask=valid[:, None],
-        other=0.0,
-    )
-    out = (
-        tl.reshape(value, (ROWS * blocks_per_row, 128))
-        * tl.reshape(
-            tl.broadcast_to(scale[:, :, None], (ROWS, blocks_per_row, 128)),
-            (ROWS * blocks_per_row, 128),
-        )
-    ).to(tl.float16)
-    token = rows // num_groups
-    group = rows % num_groups
-    off = (group * num_tokens + token) * (blocks_per_row * 128)
-    tl.store(
-        out_ptr + off[:, None] + cols[None, :],
-        tl.reshape(out, (ROWS, blocks_per_row * 128)),
-        mask=valid[:, None],
-    )
-
-
-def _prequant_to_f16(x: torch.Tensor, x_scale: torch.Tensor) -> torch.Tensor:
-    num_tokens, n_groups, group_dim = x.shape
-    out = torch.empty(
-        (n_groups, num_tokens, group_dim), dtype=torch.float16, device=x.device
-    )
-    rows = num_tokens * n_groups
-    if rows == 0:
-        return out
-    blocks_per_row = group_dim // _QUANT_BLOCK
-    row_tile = 1
-    while triton.cdiv(rows, row_tile) > 32768:
-        row_tile *= 2
-    grid_x = triton.cdiv(rows, row_tile)
-    _launch(
-        "prequant_f16",
-        _prequant_to_f16_kernel,
-        (grid_x,),
-        (
-            x.view(torch.uint8),
-            x_scale,
-            out,
-            rows,
-            num_tokens,
-            n_groups,
-            blocks_per_row,
-            row_tile,
-            grid_x,
-        ),
-        (tuple(t.stride() for t in (x, x_scale, out)),),
-        {"num_warps": 4, "num_stages": 1},
-    )
-    return out
-
-
-@triton.jit
-def _fp8_to_f16_kernel(src_ptr, dst_ptr, numel, BLOCK: tl.constexpr):
-    """Flat E4M3 payload -> FP16 decode (no scales)."""
-    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < numel
-    value = _e4m3_byte_to_f32(tl.load(src_ptr + offs, mask=mask, other=0))
-    tl.store(dst_ptr + offs, value.to(tl.float16), mask=mask)
-
-
-@triton.jit
-def _transpose_scale_kernel(
-    src_ptr,
-    s_ptr,
-    dst_ptr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    n_blocks: tl.constexpr,
-    k_blocks: tl.constexpr,
-    TILE: tl.constexpr,
-):
-    """``[G, N, K]`` FP16 -> ``[G, K, N]`` FP16, applying the 128x128 block scale.
-
-    Producing the K-major copy makes the GEMM read contiguous tiles; the
-    transpose happens once per weight tensor.
-    """
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    group = tl.program_id(2).to(tl.int64)
-    rn = pid_n * TILE + tl.arange(0, TILE)
-    rk = pid_k * TILE + tl.arange(0, TILE)
-    # Load already transposed ([k, n]) so no register-level ``tl.trans`` is
-    # needed: the layout conversion misbehaves under Ascend's
-    # TRITON_ALL_BLOCKS_PARALLEL kernel mode (NaN output).
-    x = tl.load(src_ptr + group * (N * K) + rn[None, :] * K + rk[:, None])
-    scale = tl.load(
-        s_ptr
-        + group * (n_blocks * k_blocks)
-        + (pid_n * TILE // 128) * k_blocks
-        + pid_k * TILE // 128
-    )
-    tl.store(
-        dst_ptr + group * (K * N) + rk[:, None] * N + rn[None, :],
-        (x * scale).to(tl.float16),
-    )
-
-
-def _quantize_weight_f16(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Decode ``wo_a`` (FP8 + 128x128 scales) into a K-major FP16 copy."""
-    n_groups, n, k = weight.shape
-    flat = torch.empty((n_groups, n, k), dtype=torch.float16, device=weight.device)
-    numel = flat.numel()
+def _decode_fp8(weight: torch.Tensor) -> torch.Tensor:
+    """Decode an E4M3 payload to FP32 values (Ascend has no FP8 cast)."""
+    values = torch.empty(weight.shape, dtype=torch.float32, device=weight.device)
+    numel = values.numel()
+    if numel == 0:
+        return values
     block = 4096
     _launch(
-        "weight_decode",
-        _fp8_to_f16_kernel,
+        "fp8_decode",
+        _fp8_to_f32_kernel,
         (triton.cdiv(numel, block),),
-        (weight.view(torch.uint8), flat, numel, block),
+        (weight.view(torch.uint8), values, numel, block),
         (numel,),
         {"num_warps": 4, "num_stages": 1},
     )
-    out = torch.empty((n_groups, k, n), dtype=torch.float16, device=weight.device)
-    tile = 64
-    _launch(
-        "weight_transpose",
-        _transpose_scale_kernel,
-        (n // tile, k // tile, n_groups),
-        (flat, scale.contiguous(), out, n, k, n // 128, k // 128, tile),
-        (weight.data_ptr(), weight._version),
-        {"num_warps": 4, "num_stages": 1},
+    return values
+
+
+def _prequant_to_int8(x: torch.Tensor, x_scale: torch.Tensor):
+    """``[tokens, groups, k]`` FP8 + block scales -> group-major INT8 + row scales.
+
+    The payload is already on the FP8 grid, so it only has to be renormalized
+    onto one INT8 scale per ``(group, token)`` row; the block scales ride into
+    the FP32 values first. This path is off the attention hot path, so the
+    tensor ops below (one extra FP32 copy of the activation) are acceptable.
+    """
+    num_tokens, n_groups, group_dim = x.shape
+    values = _decode_fp8(x)
+    if num_tokens == 0:
+        return (
+            torch.empty(
+                (n_groups, num_tokens, group_dim), dtype=torch.int8, device=x.device
+            ),
+            torch.empty((n_groups, num_tokens), dtype=torch.float32, device=x.device),
+        )
+    values = values * x_scale.repeat_interleave(_QUANT_BLOCK, dim=-1)
+    amax = values.abs().amax(dim=-1)  # [tokens, groups]
+    scale = (amax / 127.0).clamp_min(1e-30)
+    payload = (
+        torch.round(values / scale[..., None])
+        .clamp_(-127.0, 127.0)
+        .to(torch.int8)
+        .permute(1, 0, 2)
+        .contiguous()
     )
-    return out
+    return payload, scale.permute(1, 0).contiguous()
+
+
+@triton.jit
+def _fp8_to_f32_kernel(src_ptr, dst_ptr, numel, BLOCK: tl.constexpr):
+    """Flat E4M3 payload -> FP32 decode (no scales)."""
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    value = _e4m3_byte_to_f32(tl.load(src_ptr + offs, mask=mask, other=0))
+    tl.store(dst_ptr + offs, value, mask=mask)
+
+
+def _quantize_weight_int8(weight: torch.Tensor, scale: torch.Tensor):
+    """Decode ``wo_a`` (FP8 + 128x128 scales) into a K-major INT8 copy.
+
+    The 128x128 FP8 block scales are folded into the FP32 values, then the
+    whole ``n`` block is renormalized onto one INT8 scale per 128 output
+    columns. That single scale per output block (instead of one per
+    ``(n block, k block)``) is what keeps the GEMM's epilogue rank-1, so the
+    INT8 dot stays in the cube for the whole K loop.
+
+    Only the decode is a Triton kernel (Ascend cannot cast FP8 in hardware);
+    the requantization runs once per weight tensor.
+    """
+    n_groups, n, k = weight.shape
+    values = _decode_fp8(weight)
+    view = values.reshape(n_groups, n // 128, 128, k // 128, 128)
+    block_scale = scale.contiguous().reshape(n_groups, n // 128, k // 128)
+    real = view * block_scale[:, :, None, :, None]
+    amax = real.abs().amax(dim=(2, 3, 4))  # [groups, n blocks]
+    inv = 127.0 / amax.clamp_min(1e-30)
+    payload = (
+        torch.round(real * inv[:, :, None, None, None])
+        .clamp_(-127.0, 127.0)
+        .to(torch.int8)
+        .reshape(n_groups, n, k)
+        .permute(0, 2, 1)
+        .contiguous()
+    )
+    return payload, (amax / 127.0).contiguous()
 
 
 _MODULE_CACHE = weakref.WeakKeyDictionary()
@@ -545,14 +588,14 @@ def _cache_key(weight: torch.Tensor, scale: torch.Tensor):
 
 
 def _cached_weight(owner, weight: torch.Tensor, scale: torch.Tensor):
-    """Return the cached K-major FP16 ``wo_a``; weights are model parameters."""
+    """Return the cached K-major INT8 ``wo_a`` and its block scales."""
     global _TENSOR_CACHE_BYTES
     key = _cache_key(weight, scale)
     if isinstance(owner, torch.nn.Module):
         entry = _MODULE_CACHE.get(owner)
         if entry is not None and entry[0] == key:
             return entry[1]
-        quantized = _quantize_weight_f16(weight, scale)
+        quantized = _quantize_weight_int8(weight, scale)
         try:
             _MODULE_CACHE[owner] = (key, quantized)
         except TypeError:  # pragma: no cover - module without weakref support
@@ -563,18 +606,19 @@ def _cached_weight(owner, weight: torch.Tensor, scale: torch.Tensor):
     if entry is not None:
         _TENSOR_CACHE.move_to_end(key)
         return entry
-    quantized = _quantize_weight_f16(weight, scale)
-    nbytes = quantized.numel() * quantized.element_size()
+    quantized = _quantize_weight_int8(weight, scale)
+    nbytes = sum(t.numel() * t.element_size() for t in quantized)
     while _TENSOR_CACHE and _TENSOR_CACHE_BYTES + nbytes > _TENSOR_CACHE_LIMIT:
         _, evicted = _TENSOR_CACHE.popitem(last=False)
-        _TENSOR_CACHE_BYTES -= evicted.numel() * evicted.element_size()
+        _TENSOR_CACHE_BYTES -= sum(t.numel() * t.element_size() for t in evicted)
     _TENSOR_CACHE[key] = quantized
     _TENSOR_CACHE_BYTES += nbytes
     return quantized
 
 
 # ---------------------------------------------------------------------------
-# Batched FP16 GEMM with FP32 accumulation
+# Batched INT8 GEMM with one activation scale per row and one weight scale per
+# 128 output columns
 # ---------------------------------------------------------------------------
 
 
@@ -582,12 +626,16 @@ def _cached_weight(owner, weight: torch.Tensor, scale: torch.Tensor):
 def _bmm_kernel(
     A,
     W,
+    AS,
+    WS,
     O,
     M,
     SA0,
     SA1,
     SW0,
     SW1,
+    SAS0,
+    SWS0,
     SO0,
     SO1,
     N: tl.constexpr,
@@ -596,6 +644,14 @@ def _bmm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    """Grouped INT8 GEMM with a rank-1 scale applied after the K loop.
+
+    Both operands carry a single scale per row (activation) and per 128 output
+    columns (weight), so the whole K reduction stays inside the cube as one
+    INT32 accumulator; the ``act_scale * weight_scale`` factor is one FMA per
+    output element. Applying a scale per 128-wide K block instead costs ~15x on
+    this backend (the accumulator has to leave the cube every block).
+    """
     pid = tl.program_id(0)
     group = tl.program_id(1).to(tl.int64)
     cols_per_row = N // BLOCK_N
@@ -604,20 +660,24 @@ def _bmm_kernel(
     rows = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
     kk = tl.arange(0, BLOCK_K)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for kb in range(0, K // BLOCK_K):
-        k_off = kb * BLOCK_K + kk
+    row_valid = rows < M
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for k0 in range(0, K, BLOCK_K):
+        k_off = k0 + kk
         a = tl.load(
             A + group * SA0 + rows[:, None] * SA1 + k_off[None, :],
-            mask=rows[:, None] < M,
-            other=0.0,
+            mask=row_valid[:, None],
+            other=0,
         )
         w = tl.load(W + group * SW0 + k_off[:, None] * SW1 + cols[None, :])
-        acc = tl.dot(a, w, acc, out_dtype=tl.float32)
+        acc += tl.dot(a, w, out_dtype=tl.int32)
+    a_s = tl.load(AS + group * SAS0 + rows, mask=row_valid, other=0.0)
+    # One weight scale per 128 output columns; ``BLOCK_N`` may cover several.
+    w_s = tl.load(WS + group * SWS0 + cols // 128)
     tl.store(
         O + group * SO0 + rows[:, None] * SO1 + cols[None, :],
-        acc.to(tl.bfloat16),
-        mask=rows[:, None] < M,
+        (acc.to(tl.float32) * (a_s[:, None] * w_s[None, :])).to(tl.bfloat16),
+        mask=row_valid[:, None],
     )
 
 
@@ -638,26 +698,32 @@ def _multi_stage_allowed() -> bool:
 
 
 def _bmm_tile(m: int):
-    """Per-M tiles measured on Ascend910B4.
+    """Per-M tiles measured on Ascend910B4 for the rank-1 INT8 GEMM.
 
-    Decode sizes are bound by streaming ``wo_a`` (64 MB of FP16 per group
-    count), so they want a narrow M tile and a wide N tile to keep the weight
-    reads large and contiguous; from ``m == 128`` on the projection is
-    compute-bound and a 256-wide N tile with two-stage pipelining wins (223
-    TFLOPS at 8192 tokens). Pipelining is dropped when the backend's
+    Decode sizes are bound by streaming ``wo_a`` (16 MB of INT8 per 8 groups),
+    so they want a narrow M tile; from ``m == 128`` on the projection is
+    compute-bound and a 128-row / 256-column tile reaches 178 TFLOPS on the
+    bare INT8 dot. Two-stage pipelining is dropped when the backend's
     all-blocks-parallel knob is active.
     """
     stages = 2 if _multi_stage_allowed() else 1
     if m <= 32:
-        return (16, 512, 128, 8, stages)
+        return (16, 256, 256, 8, stages)
     if m <= 64:
-        return (32, 256, 128, 8, stages)
-    block_k = 256 if m >= 128 else 128
-    return (128, 256, block_k, 8, stages)
+        return (32, 256, 256, 8, stages)
+    if m <= 256:
+        return (64, 256, 256, 8, stages)
+    return (128, 256, 256, 8, stages)
 
 
-def _bmm(act: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
-    """``out[t, g, :] = act[g, t, :] @ weight[g]`` for every group."""
+def _bmm(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """``out[t, g, :] = act[g, t, :] @ weight[g]`` with rank-1 scales."""
     n_groups, m, k = act.shape
     n = weight.shape[2]
     block_m, block_n, block_k, warps, stages = _bmm_tile(m)
@@ -665,12 +731,16 @@ def _bmm(act: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
     args = (
         act,
         weight,
+        act_scale,
+        weight_scale,
         out,
         m,
         act.stride(0),
         act.stride(1),
         weight.stride(0),
         weight.stride(1),
+        act_scale.stride(0),
+        weight_scale.stride(0),
         out.stride(1),
         out.stride(0),
         n,
@@ -685,7 +755,7 @@ def _bmm(act: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
         grid,
         args,
         (
-            tuple(t.stride() for t in (act, weight, out)),
+            tuple(t.stride() for t in (act, weight, act_scale, weight_scale, out)),
             m == 1,
             m % block_m == 0,
         ),
@@ -735,7 +805,7 @@ def deep_gemm_fp8_o_proj(
     einsum_recipe: Optional[Sequence[int]] = _SUPPORTED_RECIPE,
     tma_aligned_scales: bool = False,
 ) -> torch.Tensor:
-    """DeepSeek-V4 output projection on Ascend (FP16 tensor-core transport)."""
+    """DeepSeek-V4 output projection on Ascend (INT8 tensor-core transport)."""
     logger.debug("GEMS DEEP GEMM FP8 O PROJ (ASCEND)")
 
     if tuple(einsum_recipe) != _SUPPORTED_RECIPE or tma_aligned_scales:
@@ -750,6 +820,11 @@ def deep_gemm_fp8_o_proj(
             "the Ascend implementation requires the model layout "
             f"(nope_dim % 128 == 64, rope_dim == 64), got nope_dim={nope_dim}, "
             f"rope_dim={rope_dim}"
+        )
+    if nope_dim > 4 * _QUANT_BLOCK + _ROPE_START:
+        raise NotImplementedError(
+            "the Ascend quantization kernel unrolls at most four 128-wide nope "
+            f"blocks per head, got nope_dim={nope_dim}"
         )
     assert o_lora_rank % _QUANT_BLOCK == 0, "o_lora_rank must be a multiple of 128"
 
@@ -802,9 +877,9 @@ def deep_gemm_fp8_o_proj(
             )
             return wo_b(empty)
         if prequantized:
-            act = _prequant_to_f16(act_fp8, act_scale)
+            act, act_scales = _prequant_to_int8(act_fp8, act_scale)
         else:
-            act = _quant_activation(
+            act, act_scales = _quant_activation(
                 o,
                 positions,
                 cos_sin_cache,
@@ -813,11 +888,11 @@ def deep_gemm_fp8_o_proj(
                 nope_dim,
                 rope_dim,
             )
-        weight_f16 = _cached_weight(owner, weight, weight_scale)
+        weight_i8, weight_scales = _cached_weight(owner, weight, weight_scale)
         out = torch.empty(
             (num_tokens, n_groups, o_lora_rank), dtype=torch.bfloat16, device=device
         )
-        _bmm(act, weight_f16, out)
+        _bmm(act, act_scales, weight_i8, weight_scales, out)
 
     assert callable(wo_b), "`wo_b` must be a callable linear layer"
     return wo_b(out.reshape(num_tokens, n_groups * o_lora_rank))
