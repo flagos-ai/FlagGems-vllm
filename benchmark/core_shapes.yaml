@@ -853,3 +853,10 @@ matmul_persistent:
     - [2, 32, 64, 5, 1, 2, 2, 64, 16]
     - [5, 1, 2, 2, 32, 64, 2, 64, 16]
     - [5, 1, 2, 4, 32, 64, 5, 1, 2, 4, 64, 16]
+
+minimax_qknorm_rope_cache:
+  shapes:
+    - [1, 2560]
+    - [1024, 2560]
+    - [37, 2560]
+  shape_desc: "model dimensions"
