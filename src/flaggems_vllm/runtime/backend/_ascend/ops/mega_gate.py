@@ -43,6 +43,32 @@ def _promote_activation(x, out):
 
 
 @triton.jit
+def _project_router_tile(
+    x_ptr,
+    weight_ptr,
+    rows,
+    columns,
+    tokens,
+    HIDDEN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    k = tl.arange(0, BLOCK_K)
+    acc = tl.full((BLOCK_M, BLOCK_N), 0.0, tl.float32)
+    for chunk in range(HIDDEN // BLOCK_K):
+        reduction = chunk * BLOCK_K + k
+        a = tl.load(
+            x_ptr + rows[:, None] * HIDDEN + reduction[None, :],
+            rows[:, None] < tokens,
+            other=0,
+        )
+        b = tl.load(weight_ptr + columns[None, :] * HIDDEN + reduction[:, None])
+        acc = tl.dot(a, b, acc=acc, input_precision="ieee")
+    return acc
+
+
+@triton.jit
 def _mega_gate_kernel(
     x_ptr,
     weight_ptr,
@@ -69,12 +95,15 @@ def _mega_gate_kernel(
     BLOCK_K: tl.constexpr,
     ROUTE_ROWS: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    HARDWARE_TOPK: tl.constexpr,
     USE_BOTH_SUBCORES: tl.constexpr,
 ):
     block = tl.program_id(0)
     workers = tl.num_programs(0)
     expert_tiles: tl.constexpr = EXPERTS // BLOCK_N
     row_tiles = tl.cdiv(tokens, BLOCK_M)
+    # Keeping the reduction inline preserves the compiled projection used by
+    # the short and mid-length 910B routes.
     k = tl.arange(0, BLOCK_K)
     for task in range(block, row_tiles * expert_tiles, workers):
         rows = task // expert_tiles * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -117,14 +146,116 @@ def _mega_gate_kernel(
             HAS_BIAS,
             EXPERTS,
             PAD_EXPERTS,
+            PAD_EXPERTS,
             TOPK,
             SCORING,
             GROUPS,
             TOP_GROUPS,
             ROUTE_ROWS,
             BLOCK_TOPK,
+            HARDWARE_TOPK,
             USE_BOTH_SUBCORES,
         )
+
+
+@triton.jit
+def _mega_gate_pipelined_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    input_ids_ptr,
+    table_ptr,
+    vision_bias_ptr,
+    workspace_ptr,
+    indices_ptr,
+    weights_ptr,
+    tokens,
+    scale,
+    IMAGE_LO: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    PAD_EXPERTS: tl.constexpr,
+    TOPK: tl.constexpr,
+    SCORING: tl.constexpr,
+    GROUPS: tl.constexpr,
+    TOP_GROUPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ROUTE_ROWS: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    HARDWARE_TOPK: tl.constexpr,
+    USE_BOTH_SUBCORES: tl.constexpr,
+):
+    block = tl.program_id(0)
+    workers = tl.num_programs(0)
+    row_tiles = tl.cdiv(tokens, BLOCK_M)
+    sub = tle.dsa.ascend.sub_vec_id()
+    for tile in range(block, row_tiles, workers):
+        odd = (tile // workers) % 2 != 0
+        # Each pair owns complete rows. Acknowledge slot reuse before the Cube
+        # can issue a third ready signal; the final two tiles need no ack.
+        if tile >= 2 * workers:
+            if odd:
+                tle.dsa.ascend.sync_block_wait("vector", "cube", 5)
+            else:
+                tle.dsa.ascend.sync_block_wait("vector", "cube", 4)
+        project_rows = tile * BLOCK_M + tl.arange(0, BLOCK_M)
+        for n_tile in range(EXPERTS // BLOCK_N):
+            columns = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+            acc = _project_router_tile(
+                x_ptr,
+                weight_ptr,
+                project_rows,
+                columns,
+                tokens,
+                HIDDEN,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+            )
+            tl.store(
+                workspace_ptr + project_rows[:, None] * EXPERTS + columns[None, :], acc
+            )
+        if odd:
+            tle.dsa.ascend.sync_block_set("cube", "vector", 3)
+            tle.dsa.ascend.sync_block_wait("cube", "vector", 3)
+        else:
+            tle.dsa.ascend.sync_block_set("cube", "vector", 2)
+            tle.dsa.ascend.sync_block_wait("cube", "vector", 2)
+        for stripe in range(sub, BLOCK_M // ROUTE_ROWS, 2):
+            rows = tile * BLOCK_M + stripe * ROUTE_ROWS + tl.arange(0, ROUTE_ROWS)
+            _route_rows(
+                workspace_ptr,
+                bias_ptr,
+                input_ids_ptr,
+                table_ptr,
+                vision_bias_ptr,
+                IMAGE_LO,
+                indices_ptr,
+                weights_ptr,
+                rows,
+                tokens,
+                scale,
+                HAS_BIAS,
+                EXPERTS,
+                PAD_EXPERTS,
+                EXPERTS,
+                TOPK,
+                SCORING,
+                GROUPS,
+                TOP_GROUPS,
+                ROUTE_ROWS,
+                BLOCK_TOPK,
+                HARDWARE_TOPK,
+                USE_BOTH_SUBCORES,
+            )
+        if tile + 2 * workers < row_tiles:
+            if odd:
+                tle.dsa.ascend.sync_block_set("vector", "cube", 5)
+            else:
+                tle.dsa.ascend.sync_block_set("vector", "cube", 4)
 
 
 @triton.jit
@@ -171,16 +302,18 @@ def _route_rows(
     HAS_BIAS: tl.constexpr,
     EXPERTS: tl.constexpr,
     PAD_EXPERTS: tl.constexpr,
+    LOGIT_STRIDE: tl.constexpr,
     TOPK: tl.constexpr,
     SCORING: tl.constexpr,
     GROUPS: tl.constexpr,
     TOP_GROUPS: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    HARDWARE_TOPK: tl.constexpr,
     USE_BOTH_SUBCORES: tl.constexpr,
 ):
     columns = tl.arange(0, PAD_EXPERTS)
-    logits_ptr = workspace_ptr + rows[:, None] * PAD_EXPERTS + columns[None, :]
+    logits_ptr = workspace_ptr + rows[:, None] * LOGIT_STRIDE + columns[None, :]
     if PAD_EXPERTS == EXPERTS:
         logits = tl.load(logits_ptr)
     else:
@@ -237,20 +370,40 @@ def _route_rows(
                 ranking, ROWS, EXPERTS, GROUPS, TOP_GROUPS
             )
 
-        if KEEP_SELECTED_LOGITS:
-            selected_logits = tl.full((ROWS, BLOCK_TOPK), 0.0, tl.float32)
-        for slot in tl.static_range(TOPK):
-            if KEEP_SELECTED_LOGITS:
-                value, winner = tl.max(ranking, axis=1, return_indices=True)
-                selected_logits = tl.where(
-                    slots[None, :] == slot, value[:, None], selected_logits
-                )
-            else:
-                winner = tl.argmax(ranking, axis=1, tie_break_left=True)
-            ranking = tl.where(
-                columns[None, :] == winner[:, None], -float("inf"), ranking
+        if HARDWARE_TOPK:
+            tl.static_assert(ROWS == 1)
+            # The Ascend sorter returns interleaved score / expert-ID proposals.
+            scratch = tl.zeros((4 * PAD_EXPERTS,), tl.float32)
+            proposals = tle.dsa.alloc(
+                [32], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
             )
-            indices = tl.where(slots[None, :] == slot, winner[:, None], indices)
+            packed = tle.dsa.ascend.raw(
+                "sort_1d_pack",
+                tl.reshape(ranking, (PAD_EXPERTS,)),
+                scratch,
+                True,
+                16,
+                0,
+                0,  # FlagTree SORT_IMPL_BASE
+                out=tle.dsa.to_tensor(proposals, writable=True),
+            )
+            ids = tl.gather(packed, 2 * slots + 1, axis=0).to(tl.int32, bitcast=True)
+            indices = tl.reshape(ids, (1, BLOCK_TOPK))
+        else:
+            if KEEP_SELECTED_LOGITS:
+                selected_logits = tl.full((ROWS, BLOCK_TOPK), 0.0, tl.float32)
+            for slot in tl.static_range(TOPK):
+                if KEEP_SELECTED_LOGITS:
+                    value, winner = tl.max(ranking, axis=1, return_indices=True)
+                    selected_logits = tl.where(
+                        slots[None, :] == slot, value[:, None], selected_logits
+                    )
+                else:
+                    winner = tl.argmax(ranking, axis=1, tie_break_left=True)
+                ranking = tl.where(
+                    columns[None, :] == winner[:, None], -float("inf"), ranking
+                )
+                indices = tl.where(slots[None, :] == slot, winner[:, None], indices)
 
     if table_ptr is not None:
         lookup_row = rows < tokens
@@ -263,7 +416,7 @@ def _route_rows(
         ).to(tl.int32)
         indices = tl.where(lookup_row[:, None], lookup_ids, indices)
 
-    if KEEP_SELECTED_LOGITS:
+    if KEEP_SELECTED_LOGITS and not HARDWARE_TOPK:
         weights = selected_logits
     else:
         weights = tl.gather(raw_scores, indices, axis=1)
@@ -307,7 +460,7 @@ def _validate_gate_tensors(x, weight, bias):
 
 
 def _validate_v4_inputs(x, weight, input_ids, tid2eid, bias_vl, config):
-    topk, scoring, groups, top_groups, _, image_lo, _ = config
+    topk, scoring, groups, top_groups, _, image_lo, _, _ = config
     if tid2eid is None and bias_vl is None:
         assert input_ids is None, "input_ids require hash or vision routing"
         return
@@ -488,17 +641,81 @@ def _gate_launch_args(
         max_rows = 2 if table is not None and vision_bias is not None else 4
         route_rows = min(route_rows, max_rows, max(1, 1024 // padded_experts))
         use_both_subcores = triton.cdiv(tokens, route_rows) > workers
+    local_pipeline = (
+        weight.dtype == torch.bfloat16
+        and experts >= 256
+        and expert_alignment >= 128
+        and topk <= 10
+        and tokens >= 2 * cube_cores * 64
+        and table is None
+        and vision_bias is None
+        and (
+            rank_logits
+            or (scoring == "sigmoid" and (not grouped_route or experts == 256))
+        )
+    )
+    if local_pipeline:
+        block_m = (
+            128 if tokens >= 8 * cube_cores * 64 and experts != padded_experts else 64
+        )
+        block_n = min(expert_alignment, 128)
+        block_k = min(512, hidden & -hidden)
+        route_rows = 16 if rank_logits or padded_experts <= 256 else 8
+        row_tiles = triton.cdiv(tokens, block_m)
+        workers = min(cube_cores, row_tiles)
+        use_both_subcores = True
+    # A row sort is cheap for wide expert sets while each AIV owns a
+    # small batch. The repeated reductions amortize better on longer runs.
+    sort_min = 64 if experts == 256 else 24
+    sort_max = 256 if experts == 256 else 2 * cube_cores * 32
+    hardware_topk = (
+        weight.dtype == torch.bfloat16
+        and not grouped_route
+        and not local_pipeline
+        and (rank_logits or (scoring == "sigmoid" and experts == 384))
+        and experts in (256, 384, 512)
+        and sort_min <= tokens <= sort_max
+        and table is None
+        and vision_bias is None
+        and hasattr(getattr(tle.dsa.ascend, "custom_ops", None), "sort_1d_pack")
+    )
+    if hardware_topk:
+        route_rows = 1
+        use_both_subcores = True
+    logit_stride = experts if local_pipeline else padded_experts
     compile_options = {}
     if short_projection:
         compile_options["multibuffer"] = False
     elif short_wave_preload:
         compile_options["enable_preload"] = True
+    # A 32-expert weight tile fits a long K block with one buffer for decode.
+    if (
+        tokens <= 4
+        and (
+            (
+                weight.dtype == torch.float32
+                and scoring == "sqrtsoftplus"
+                and not grouped_route
+            )
+            or (weight.dtype == torch.bfloat16 and grouped_route)
+        )
+        and table is None
+        and vision_bias is None
+        and hidden % 1024 == 0
+        and experts % 32 == 0
+    ):
+        block_n, route_rows = 32, 1
+        block_k = 512 if grouped_route and tokens == 1 else 1024
+        workers = min(cube_cores, row_tiles * (experts // block_n))
+        use_both_subcores = False
+        compile_options["multibuffer"] = False
     # Storing the projection in the requested dtype fixes its rounding point
     # before any scoring, bias, group selection or TopK.
     workspace = torch.empty(
-        (row_tiles * block_m, padded_experts), dtype=logits_dtype, device=x.device
+        (row_tiles * block_m, logit_stride), dtype=logits_dtype, device=x.device
     )
     return (
+        _mega_gate_pipelined_kernel if local_pipeline else _mega_gate_kernel,
         (workers,),
         workspace,
         dict(
@@ -515,9 +732,10 @@ def _gate_launch_args(
             BLOCK_K=block_k,
             ROUTE_ROWS=route_rows,
             BLOCK_TOPK=triton.next_power_of_2(topk),
+            HARDWARE_TOPK=hardware_topk,
             USE_BOTH_SUBCORES=use_both_subcores,
             enable_auto_bind_sub_block=False if use_both_subcores else None,
-            enable_sync_block_lock=True,
+            enable_sync_block_lock=not hardware_topk,
             disable_auto_inject_block_sync=True,
             use_bytecode=False,
             **compile_options,
@@ -527,8 +745,18 @@ def _gate_launch_args(
 
 class _PreparedMegaGate:
     def __init__(self, x, weight, bias, routing_inputs, config):
-        topk, scoring, groups, top_groups, scale, image_lo, logits_dtype = config
+        (
+            topk,
+            scoring,
+            groups,
+            top_groups,
+            scale,
+            image_lo,
+            logits_dtype,
+            output_dtypes,
+        ) = config
         tokens = x.shape[0]
+        self.output_dtypes = _resolve_output_dtypes(weight, output_dtypes)
         self.config = config
         self.x_shape = x.shape
         self.weight_shape = weight.shape
@@ -546,7 +774,7 @@ class _PreparedMegaGate:
         if x.dtype != weight.dtype:
             self.fp32_input = torch.empty_like(x, dtype=torch.float32)
             x = _promote_activation(x, self.fp32_input)
-        grid, self.workspace, options = _gate_launch_args(
+        kernel, grid, self.workspace, options = _gate_launch_args(
             x,
             weight,
             bias,
@@ -565,19 +793,18 @@ class _PreparedMegaGate:
             bias,
             *routing_inputs,
             self.workspace,
-            _index_dtype(weight),
-            torch.float32,
+            *self.output_dtypes,
             tokens,
             scale,
         )
-        compiled = _mega_gate_kernel.warmup(*warmup_args, grid=grid, **options)
+        compiled = kernel.warmup(*warmup_args, grid=grid, **options)
         if hasattr(compiled, "result"):
             compiled = compiled.result()
         assert compiled is not None and tuple(compiled.src.signature) == tuple(
-            _mega_gate_kernel.arg_names
+            kernel.arg_names
         ), "Unsupported compiled MegaGate launcher signature"
         self.launch_scalars = (tokens, scale) + tuple(
-            options[name] for name in _mega_gate_kernel.arg_names[len(warmup_args) :]
+            options[name] for name in kernel.arg_names[len(warmup_args) :]
         )
         self.launcher = compiled[grid + (1, 1)]
 
@@ -607,7 +834,7 @@ class _PreparedMegaGate:
             not aligned or tensor.data_ptr() % 16 == 0
             for aligned, tensor in zip(self.aligned_inputs, tensors)
         ), "MegaGate input alignment differs from prepare"
-        ids, weights = _gate_outputs(x, weight, config[0])
+        ids, weights = _gate_outputs(x, config[0], self.output_dtypes)
         if self.launcher is not None:
             if self.fp32_input is not None:
                 x = _promote_activation(x, self.fp32_input)
@@ -625,16 +852,25 @@ class _PreparedMegaGate:
         return ids, weights
 
 
-def _index_dtype(weight):
-    # V4 returns int32 by default. Preserve the original BF16 interface.
-    return torch.int32 if weight.dtype == torch.float32 else torch.int64
+def _resolve_output_dtypes(weight, output_dtypes):
+    if output_dtypes is None:
+        return (
+            torch.int32 if weight.dtype == torch.float32 else torch.int64
+        ), torch.float32
+    assert (
+        isinstance(output_dtypes, tuple)
+        and len(output_dtypes) == 2
+        and output_dtypes[0] in (torch.int32, torch.int64)
+        and output_dtypes[1] in (torch.float32, torch.bfloat16)
+    ), "output_dtypes must be (int32 or int64, FP32 or BF16)"
+    return output_dtypes
 
 
-def _gate_outputs(x, weight, topk):
+def _gate_outputs(x, topk, dtypes):
     shape = (x.shape[0], topk)
     return (
-        torch.empty(shape, dtype=_index_dtype(weight), device=x.device),
-        torch.empty(shape, dtype=torch.float32, device=x.device),
+        x.new_empty(shape, dtype=dtypes[0]),
+        x.new_empty(shape, dtype=dtypes[1]),
     )
 
 
@@ -653,9 +889,11 @@ def prepare_mega_gate(
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 129257,
     logits_dtype: torch.dtype = torch.float32,
+    output_dtypes: tuple[torch.dtype, torch.dtype] | None = None,
 ) -> _PreparedMegaGate:
     """Prepare one shape and routing configuration on the current NPU stream.
 
+    logits_dtype and output_dtypes are bound to the handle alongside routing.
     Input values and storage may change between calls with compatible alignment.
     Prepare a separate handle for each execution stream. Keep the handle alive
     until its captured graphs are reset, and replay them on the prepared stream
@@ -669,7 +907,16 @@ def prepare_mega_gate(
     assert (
         not torch.npu.is_current_stream_capturing()
     ), "Prepare MegaGate before capturing a graph"
-    config = (topk, scoring, groups, top_groups, scale, image_sentinel_lo, logits_dtype)
+    config = (
+        topk,
+        scoring,
+        groups,
+        top_groups,
+        scale,
+        image_sentinel_lo,
+        logits_dtype,
+        output_dtypes,
+    )
     routing_inputs = (input_ids, tid2eid, bias_vl)
     _validate_v4_inputs(x, weight, *routing_inputs, config)
     return _PreparedMegaGate(x, weight, bias, routing_inputs, config)
@@ -690,9 +937,10 @@ def mega_gate(
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 129257,
     logits_dtype: torch.dtype = torch.float32,
+    output_dtypes: tuple[torch.dtype, torch.dtype] | None = None,
     prepared: _PreparedMegaGate | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return expert IDs (int32 for V4) and FP32 routing weights.
+    """Return expert IDs and normalized routing weights.
 
     V4 projects FP32 activations (or promotes a BF16 activation) with FP32
     router weights. Pass row-aligned input_ids and a [vocab, topk] tid2eid
@@ -701,7 +949,9 @@ def mega_gate(
     Input tensors use contiguous ND storage.
 
     logits_dtype selects FP32 (default) or BF16 projection logits before
-    scoring. Routing weights are returned in FP32 for both modes.
+    scoring. output_dtypes optionally selects the (ID, weight) storage types
+    for the final stores. The default returns FP32 weights and int32 IDs
+    with FP32 projection weights, or int64 IDs with BF16 projection weights.
     Supports sqrtsoftplus, sigmoid and softmax with optional grouped selection.
     Bias changes expert selection while the weights use the unbiased scores.
     Pass a handle from prepare_mega_gate to reuse its workspace and launcher.
@@ -710,7 +960,16 @@ def mega_gate(
         prepared, _PreparedMegaGate
     ), "Invalid prepared MegaGate handle"
     _validate_routing(topk, groups, top_groups, logits_dtype)
-    config = (topk, scoring, groups, top_groups, scale, image_sentinel_lo, logits_dtype)
+    config = (
+        topk,
+        scoring,
+        groups,
+        top_groups,
+        scale,
+        image_sentinel_lo,
+        logits_dtype,
+        output_dtypes,
+    )
     routing_inputs = (input_ids, tid2eid, bias_vl)
     if prepared is not None:
         return prepared.run(x, weight, bias, routing_inputs, config)
@@ -720,11 +979,13 @@ def mega_gate(
     assert (
         not tokens or driver.active.get_current_device() == x.device.index
     ), "Run MegaGate on the input device"
-    indices, weights = _gate_outputs(x, weight, topk)
+    indices, weights = _gate_outputs(
+        x, topk, _resolve_output_dtypes(weight, output_dtypes)
+    )
     if tokens:
         if x.dtype != weight.dtype:
             x = _promote_activation(x, torch.empty_like(x, dtype=torch.float32))
-        grid, workspace, options = _gate_launch_args(
+        kernel, grid, workspace, options = _gate_launch_args(
             x,
             weight,
             bias,
@@ -735,7 +996,7 @@ def mega_gate(
             routing_inputs,
             logits_dtype,
         )
-        _mega_gate_kernel[grid](
+        kernel[grid](
             x,
             weight,
             bias,

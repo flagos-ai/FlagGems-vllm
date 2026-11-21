@@ -446,6 +446,7 @@ def test_mega_gate_empty(empty_gate_inputs):
 @pytest.mark.parametrize(
     "kwargs,message",
     [
+        ({"output_dtypes": (torch.int8, torch.float32)}, "output_dtypes"),
         ({"logits_dtype": torch.float16}, "logits_dtype"),
         ({"topk": 6.0}, "must be integers"),
         ({"topk": True}, "must be integers"),
@@ -605,3 +606,70 @@ def test_mega_gate_qwen_logits_rounding():
     assert native_ids[0, -1].item() == native_ids[1, -1].item()
     with pytest.raises(AssertionError, match="routing parameters"):
         flaggems_vllm.mega_gate(x, weight, prepared=handle, **fp32)
+
+
+@pytest.mark.parametrize("weight_out", [torch.float32, torch.bfloat16])
+def test_mega_gate_direct_outputs(weight_out):
+    from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import prepare_mega_gate
+
+    case = GateCase("qwen-35b", 5, 2048, 256, 8, "softmax")
+    args = tuple(t.npu() if t is not None else None for t in gate_inputs(case, 2026))
+    kwargs = gate_kwargs(case)
+    ids, weights = flaggems_vllm.mega_gate(*args, **kwargs)
+    kwargs["output_dtypes"] = (torch.int32, weight_out)
+    handle = prepare_mega_gate(*args, **kwargs)
+    for prepared in (None, handle):
+        output = flaggems_vllm.mega_gate(*args, **kwargs, prepared=prepared)
+        torch.testing.assert_close(output[0], ids.int(), rtol=0, atol=0)
+        torch.testing.assert_close(output[1], weights.to(weight_out), rtol=0, atol=0)
+    with pytest.raises(AssertionError, match="routing parameters"):
+        flaggems_vllm.mega_gate(*args, prepared=handle, **gate_kwargs(case))
+
+
+def test_mega_gate_long_prepared_replay():
+    from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import prepare_mega_gate
+
+    # Leave a tail tile on just one core pair and reuse the ready flags
+    # over several waves, including replay with changed inputs.
+    case = GateCase("v32", 16385, 4096, 256, 8, "sigmoid", 8, 4, 2.5)
+    kwargs = dict(**gate_kwargs(case), output_dtypes=(torch.int32, torch.float32))
+    tensors = tuple(t.npu() for t in gate_inputs(case, 2026))
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        handle = prepare_mega_gate(*tensors, **kwargs)
+    validate_graph(
+        partial(flaggems_vllm.mega_gate, prepared=handle, **kwargs),
+        case,
+        gate_inputs,
+        partial(check_gate, native=True),
+        stream=stream,
+    )
+
+
+@pytest.mark.parametrize(
+    "experts,scoring,topk",
+    [(384, "sigmoid", 8), (256, "softmax", 8), (512, "softmax", 10)],
+)
+def test_mega_gate_flat_topk_ties(experts, scoring, topk):
+    x = torch.zeros((144, 2048), device="npu", dtype=torch.bfloat16)
+    w = x.new_zeros((experts, x.shape[1]))
+    bias = (
+        x.new_zeros((experts,), dtype=torch.float32) if scoring == "sigmoid" else None
+    )
+    logits_dtype = torch.float32 if bias is not None else torch.bfloat16
+    ids, weights = flaggems_vllm.mega_gate(
+        x,
+        w,
+        bias,
+        scoring=scoring,
+        topk=topk,
+        scale=1.0,
+        logits_dtype=logits_dtype,
+        output_dtypes=(torch.int32, logits_dtype),
+    )
+    expected_ids = torch.arange(topk, dtype=torch.int32).expand(x.shape[0], -1)
+    torch.testing.assert_close(ids.cpu(), expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(
+        weights.cpu(), torch.full(weights.shape, 1 / topk, dtype=logits_dtype)
+    )

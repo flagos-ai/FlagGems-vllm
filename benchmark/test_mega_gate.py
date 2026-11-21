@@ -70,25 +70,21 @@ def test_mega_gate_latency(case, route):
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):
-        kwargs = dict(**gate_kwargs(case), **routing)
+        kwargs = dict(
+            **gate_kwargs(case),
+            **routing,
+            output_dtypes=(torch.int32, case.logits_dtype),
+        )
         handle = prepare_mega_gate(x, weight, bias, **kwargs)
         candidate = partial(
             flaggems_vllm.mega_gate, x, weight, bias, prepared=handle, **kwargs
         )
         native = partial(gate_baseline, case, x, weight, bias, **routing)
 
-        # Match the model-facing output contract; charge any conversions to MegaGate.
-        def candidate_for_model():
-            ids, weights = candidate()
-            return ids.int(), weights.to(case.logits_dtype)
-
-        measured_candidate = (
-            candidate if weight.dtype == torch.float32 else candidate_for_model
-        )
         benchmark = Benchmark("mega_gate", native)
         samples = {"native": [], "prepared": []}
         for index in range(3):
-            pairs = (("native", native), ("prepared", measured_candidate))
+            pairs = (("native", native), ("prepared", candidate))
             for name, operation in pairs if index % 2 == 0 else reversed(pairs):
                 samples[name].append(1000 * benchmark.get_latency(operation))
     native_us, prepared_us = mean(samples["native"]), mean(samples["prepared"])
