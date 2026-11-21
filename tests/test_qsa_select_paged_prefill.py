@@ -42,6 +42,8 @@ def make_inputs(
     dtype=torch.bfloat16,
     head_dim=128,
     num_heads=4,
+    physical_pages=None,
+    table_columns=None,
 ):
     """Build request-major packed queries and shuffled physical pages."""
     device = cfg.device if device is None else device
@@ -50,8 +52,10 @@ def make_inputs(
     pages_per_req = [
         (length + page_size - 1) // page_size for length in compressed_lengths
     ]
-    width = max(pages_per_req)
-    num_pages = sum(pages_per_req)
+    width = max(pages_per_req) if table_columns is None else table_columns
+    num_pages = sum(pages_per_req) if physical_pages is None else physical_pages
+    if width < max(pages_per_req) or num_pages < sum(pages_per_req):
+        raise ValueError("Cache/table capacity cannot truncate prefill inputs")
     q = torch.randn(
         (rows, num_heads, head_dim), dtype=torch.bfloat16, device=device
     ).to(dtype)
@@ -633,6 +637,21 @@ CASES = [
     ],
     pytest.param(dict(metadata_dtype=torch.int64), id="metadata-int64"),
 ]
+
+# Keep functional coverage aligned with the independent benchmark scenarios.
+PERFORMANCE_SCENARIOS = [
+    ("first_chunk", (16384,), 16384, 2712, 88),
+    ("budget_exact", (16384,), 32768, 2712, 88),
+    ("dominant_long", (16331,), 33842, 2712, 88),
+    ("tail112", (16368,), 32853, 2712, 88),
+    ("tail113", (16369,), 32851, 2712, 88),
+    ("two_balanced", (10371, 5958), 32932, 2712, 88),
+    ("two_skewed", (16330, 54), 32822, 2712, 88),
+    ("short_tail", (2316,), 33843, 2712, 88),
+    ("compact", (3200,) + (112,) * 38 + (96,) * 15, 4100, None, None),
+    ("long100k", (16384,), 118784, None, None),
+]
+
 if not cfg.QUICK_MODE:
     CASES += [
         pytest.param(
@@ -662,6 +681,26 @@ if not cfg.QUICK_MODE:
                 id=f"h{heads}-d{dim}",
             )
             for heads, dim in ((1, 1), (2, 16), (5, 40), (12, 192), (17, 33), (3, 160))
+        ],
+        *[
+            pytest.param(
+                dict(
+                    query_lengths=queries,
+                    compressed_lengths=tuple(
+                        (maximum + 3) // 4 for _ in queries
+                    ),
+                    page_size=196,
+                    visible=[
+                        (maximum - query + row + 1) // 4
+                        for query in queries
+                        for row in range(query)
+                    ],
+                    physical_pages=physical,
+                    table_columns=columns,
+                ),
+                id=f"perf-{name}",
+            )
+            for name, queries, maximum, physical, columns in PERFORMANCE_SCENARIOS
         ],
     ]
 
