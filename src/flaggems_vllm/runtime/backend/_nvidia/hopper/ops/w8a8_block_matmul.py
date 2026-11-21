@@ -25,7 +25,7 @@ import yaml
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle, pipeline_options
 
 logger = logging.getLogger(__name__)
 CACHE_USAGE_THRESHOLD = 0.8
@@ -1002,6 +1002,118 @@ def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
         tl.atomic_add(c_ptrs, acc.to(tl.float32), mask=c_mask, sem="relaxed")
 
 
+def _swap_ab_stages(K, block_k):
+    return 4 if triton.cdiv(K, block_k) >= 32 else 3
+
+
+def _pipeline_choice_configs(stages):
+    """Prefetch candidates of the swap-AB kernels on FlagTree (empty on
+    backends without its pipeline options).
+
+    For each ``num_stages`` of the fixed rule: that depth with
+    ``pipeline_hoist_copy`` on and off, plus two stages with the hoist on.
+    Issuing the next block's prefetch before the WGMMA wait costs registers.
+    On H20 the hoist gains 3-30% on most shapes, but where the lower occupancy
+    needs one more wave of CTAs it loses 5-10% (M=400-448, N=512, K=7168), and
+    on some shapes with many CTAs per SM two stages with the hoist are 3-5%
+    ahead (N=8192), so the tuning library decides per shape. The block sizes
+    stay the fixed rule's: they are passed at the launch.
+    """
+    if not pipeline_options(pipeline_hoist_copy=False):
+        return []
+    candidates = [(s, hoist) for s in stages for hoist in (True, False)]
+    candidates.append((2, True))
+    return [
+        triton.Config({"pipeline_hoist_copy": hoist}, num_warps=4, num_stages=s)
+        for s, hoist in candidates
+    ]
+
+
+def _prune_swap_ab_pipeline_choice(configs, named_args, **kwargs):
+    """Drop the candidates of the rule's other depth."""
+    stages = _swap_ab_stages(named_args["K"], kwargs["BLOCK_K"])
+    return [config for config in configs if config.num_stages in (2, stages)]
+
+
+def _pipeline_choice_tuner(kernel, stages, key, **kwargs):
+    configs = _pipeline_choice_configs(stages)
+    if not configs:
+        return None
+    # timed in a CUDA graph: the candidates differ by a few percent of a launch
+    # that takes some 20 us, less than the launch overhead of a plain loop
+    return libtuner(configs=configs, key=key, use_cuda_graph=True, **kwargs)(kernel)
+
+
+_PIPELINE_CHOICE_KEY = [
+    "M",
+    "N",
+    "K",
+    "stride_am",
+    "stride_bk",
+    "GROUP_N",
+    "GROUP_K",
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_K",
+]
+
+_swap_ab_pipeline_choice = _pipeline_choice_tuner(
+    w8a8_block_fp8_matmul_kernel_swap_ab.fn.fn,
+    (3, 4),
+    _PIPELINE_CHOICE_KEY,
+    prune_configs_by={"early_config_prune": _prune_swap_ab_pipeline_choice},
+)
+
+_swap_ab_splitk_pipeline_choice = _pipeline_choice_tuner(
+    w8a8_block_fp8_matmul_kernel_swap_ab_splitk.fn.fn,
+    (3,),
+    _PIPELINE_CHOICE_KEY + ["SPLIT_K"],
+    reset_to_zero=["C"],
+)
+
+# launch (kernel, sizes and strides, block sizes) -> the candidate chosen for it
+_pipeline_choices = {}
+
+
+def _launch_pipeline_choice(kernel, tuner, grid, *args, **meta):
+    """Launch ``kernel`` with the prefetch candidate chosen for this shape.
+
+    The first launch of a shape goes through ``tuner``, which measures the
+    candidates once and keeps the choice in the tuning cache; later launches
+    go to the kernel directly, as the fixed configuration always did. Without
+    the FlagTree options (``tuner`` is None) nothing changes.
+    """
+    if tuner is None:
+        return kernel[grid](*args, **meta)
+    key = (
+        kernel,
+        tuple(arg for arg in args if isinstance(arg, int)),
+        tuple(sorted(meta.items())),
+    )
+    choice = _pipeline_choices.get(key)
+    if choice is None:
+        # the candidates carry num_warps and num_stages
+        launch = {
+            name: value
+            for name, value in meta.items()
+            if name not in ("num_warps", "num_stages")
+        }
+        # and keep the rule's block sizes, which every later launch uses:
+        # no automatic block-size adjustment while they are measured
+        from triton import knobs
+
+        with knobs.autotuning.scope():
+            knobs.autotuning.adjust_block_size = False
+            tuner[grid](*args, **launch)
+        best = tuner.best_config
+        _pipeline_choices[key] = {
+            "num_stages": best.num_stages,
+            "pipeline_hoist_copy": best.kwargs["pipeline_hoist_copy"],
+        }
+        return None
+    return kernel[grid](*args, **{**meta, **choice})
+
+
 @libentry()
 @libtuner(
     configs=_get_short_k256_placeholder_configs(pre_hook=None),
@@ -1234,7 +1346,7 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             _SWAP_BN = 16 if M <= 16 else 32
 
             _SWAP_BK = 128
-            _SWAP_STAGES = 4 if triton.cdiv(K, _SWAP_BK) >= 32 else 3
+            _SWAP_STAGES = _swap_ab_stages(K, _SWAP_BK)
 
             SWAP_META = {
                 "BLOCK_M": _SWAP_BM,
@@ -1251,7 +1363,10 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             )
 
             with torch_device_fn.device(a.device):
-                w8a8_block_fp8_matmul_kernel_swap_ab.fn.fn[swap_grid](
+                _launch_pipeline_choice(
+                    w8a8_block_fp8_matmul_kernel_swap_ab.fn.fn,
+                    _swap_ab_pipeline_choice,
+                    swap_grid,
                     a,
                     b,
                     c,
@@ -1338,7 +1453,10 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             swap_splitk_grid = (grid_m, grid_n, split_k)
 
             with torch_device_fn.device(a.device):
-                w8a8_block_fp8_matmul_kernel_swap_ab_splitk.fn.fn[swap_splitk_grid](
+                _launch_pipeline_choice(
+                    w8a8_block_fp8_matmul_kernel_swap_ab_splitk.fn.fn,
+                    _swap_ab_splitk_pipeline_choice,
+                    swap_splitk_grid,
                     a,
                     b,
                     c,
