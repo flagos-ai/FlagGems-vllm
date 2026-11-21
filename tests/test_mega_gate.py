@@ -673,3 +673,37 @@ def test_mega_gate_flat_topk_ties(experts, scoring, topk):
     torch.testing.assert_close(
         weights.cpu(), torch.full(weights.shape, 1 / topk, dtype=logits_dtype)
     )
+
+
+@pytest.mark.parametrize(
+    "experts,tokens", [(256, 129), (256, 1028), (384, 433), (384, 1032)]
+)
+def test_mega_gate_sigmoid_group_and_expert_ties(experts, tokens):
+    x = torch.zeros((tokens, 7168), dtype=torch.bfloat16, device="npu")
+    weight = x.new_zeros((experts, x.shape[1]))
+    bias = torch.zeros(experts)
+    bias[2::32] = 0.25
+    bias[31::32] = 0.125
+    # The final group's maximum is larger, but its two largest scores
+    # have the same sum as every other group's.
+    bias[-32:] = 0
+    bias[-1] = 0.375
+    grouped = experts == 256
+    ids, weights = flaggems_vllm.mega_gate(
+        x,
+        weight,
+        bias.npu(),
+        scoring="sigmoid",
+        topk=8,
+        groups=8 if grouped else 1,
+        top_groups=4 if grouped else 1,
+        scale=1.0,
+        output_dtypes=(torch.int32, torch.float32),
+    )
+    if grouped:
+        expected = [2, 34, 66, 98, 31, 63, 95, 127]
+    else:
+        expected = [383, 2, 34, 66, 98, 130, 162, 194]
+    expected_ids = torch.tensor(expected, dtype=torch.int32).expand(tokens, -1)
+    torch.testing.assert_close(ids.cpu(), expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(weights.cpu(), torch.full((tokens, 8), 0.125))

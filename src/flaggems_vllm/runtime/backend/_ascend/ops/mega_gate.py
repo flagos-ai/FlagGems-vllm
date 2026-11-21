@@ -97,6 +97,8 @@ def _mega_gate_kernel(
     BLOCK_TOPK: tl.constexpr,
     HARDWARE_TOPK: tl.constexpr,
     USE_BOTH_SUBCORES: tl.constexpr,
+    PROJECTION_SPLITS: tl.constexpr,
+    TAIL_WINDOW: tl.constexpr,
 ):
     block = tl.program_id(0)
     workers = tl.num_programs(0)
@@ -105,20 +107,39 @@ def _mega_gate_kernel(
     # Keeping the reduction inline preserves the compiled projection used by
     # the short and mid-length 910B routes.
     k = tl.arange(0, BLOCK_K)
-    for task in range(block, row_tiles * expert_tiles, workers):
+    plane_stride = row_tiles * BLOCK_M * PAD_EXPERTS
+    for job in range(block, row_tiles * expert_tiles * PROJECTION_SPLITS, workers):
+        task = job // PROJECTION_SPLITS
+        plane = job % PROJECTION_SPLITS
         rows = task // expert_tiles * BLOCK_M + tl.arange(0, BLOCK_M)
+        if TAIL_WINDOW:
+            start = tl.minimum(task // expert_tiles * BLOCK_M, tokens - BLOCK_M)
+            load_rows = start + tl.arange(0, BLOCK_M)
         columns = task % expert_tiles * BLOCK_N + tl.arange(0, BLOCK_N)
         acc = tl.full((BLOCK_M, BLOCK_N), 0.0, tl.float32)
-        for chunk in range(HIDDEN // BLOCK_K):
-            reduction = chunk * BLOCK_K + k
-            a = tl.load(
-                x_ptr + rows[:, None] * HIDDEN + reduction[None, :],
-                rows[:, None] < tokens,
-                other=0,
-            )
+        for chunk in range(HIDDEN // (PROJECTION_SPLITS * BLOCK_K)):
+            reduction = plane * (HIDDEN // PROJECTION_SPLITS) + chunk * BLOCK_K + k
+            if TAIL_WINDOW:
+                a = tl.load(x_ptr + load_rows[:, None] * HIDDEN + reduction[None, :])
+            else:
+                a = tl.load(
+                    x_ptr + rows[:, None] * HIDDEN + reduction[None, :],
+                    rows[:, None] < tokens,
+                    other=0,
+                )
             b = tl.load(weight_ptr + columns[None, :] * HIDDEN + reduction[:, None])
             acc = tl.dot(a, b, acc=acc, input_precision="ieee")
-        tl.store(workspace_ptr + rows[:, None] * PAD_EXPERTS + columns[None, :], acc)
+        plane_ptr = workspace_ptr + plane * plane_stride
+        if TAIL_WINDOW and PROJECTION_SPLITS > 1:
+            # Keep the partial planes row-major. The prefix of the shifted
+            # tile was already computed by the preceding projection tile.
+            tl.store(
+                plane_ptr + load_rows[:, None] * PAD_EXPERTS + columns[None, :],
+                acc,
+                load_rows[:, None] >= task // expert_tiles * BLOCK_M,
+            )
+        else:
+            tl.store(plane_ptr + rows[:, None] * PAD_EXPERTS + columns[None, :], acc)
 
     # All projection tiles must be visible before a vector worker reads a row.
     tle.dsa.ascend.sync_block_all("all", 0)
@@ -155,6 +176,9 @@ def _mega_gate_kernel(
             BLOCK_TOPK,
             HARDWARE_TOPK,
             USE_BOTH_SUBCORES,
+            PROJECTION_SPLITS,
+            plane_stride,
+            TAIL_WINDOW if PROJECTION_SPLITS == 1 else 0,
         )
 
 
@@ -287,6 +311,38 @@ def _mask_unselected_groups(
 
 
 @triton.jit
+def _mask_sorted_groups(
+    ranking, EXPERTS: tl.constexpr, GROUPS: tl.constexpr, TOP_GROUPS: tl.constexpr
+):
+    # Each 32-expert group maps to one hardware sort. Only its first two
+    # scores are needed, so the interleaved index payload is unused here.
+    scores = tl.reshape(ranking, (EXPERTS,))
+    buffer = tle.dsa.alloc(
+        [2 * EXPERTS], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+    )
+    packed = tle.dsa.ascend.raw(
+        "sort32",
+        scores,
+        scores.to(tl.uint32, bitcast=True),
+        GROUPS,
+        out=tle.dsa.to_tensor(buffer, writable=True),
+    )
+    groups = tl.arange(0, GROUPS)
+    group_scores = tl.gather(packed, groups * 64, axis=0) + tl.gather(
+        packed, groups * 64 + 2, axis=0
+    )
+    ahead = (group_scores[:, None] > group_scores[None, :]) | (
+        (group_scores[:, None] == group_scores[None, :])
+        & (groups[:, None] < groups[None, :])
+    )
+    selected = tl.reshape(tl.sum(ahead.to(tl.int32), axis=0) < TOP_GROUPS, (1, GROUPS))
+    grouped = tl.reshape(ranking, (1, GROUPS, 32))
+    return tl.reshape(
+        tl.where(selected[:, :, None], grouped, -float("inf")), (1, EXPERTS)
+    )
+
+
+@triton.jit
 def _route_rows(
     workspace_ptr,
     bias_ptr,
@@ -311,14 +367,34 @@ def _route_rows(
     BLOCK_TOPK: tl.constexpr,
     HARDWARE_TOPK: tl.constexpr,
     USE_BOTH_SUBCORES: tl.constexpr,
+    PROJECTION_SPLITS: tl.constexpr = 1,
+    plane_stride=0,
+    TAIL_WINDOW: tl.constexpr = 0,
 ):
     columns = tl.arange(0, PAD_EXPERTS)
-    logits_ptr = workspace_ptr + rows[:, None] * LOGIT_STRIDE + columns[None, :]
+    logit_rows = rows
+    if TAIL_WINDOW:
+        # The last Cube tile reads a full contiguous window ending at T.
+        # Only its suffix belongs to this tile's output rows.
+        slack = tl.cdiv(tokens, TAIL_WINDOW) * TAIL_WINDOW - tokens
+        logit_rows = tl.where(
+            rows >= tokens // TAIL_WINDOW * TAIL_WINDOW,
+            tl.minimum(rows, tokens - 1) + slack,
+            rows,
+        )
+    logits_ptr = workspace_ptr + logit_rows[:, None] * LOGIT_STRIDE + columns[None, :]
     if PAD_EXPERTS == EXPERTS:
         logits = tl.load(logits_ptr)
     else:
         logits = tl.load(logits_ptr, columns[None, :] < EXPERTS, other=-float("inf"))
 
+    # Split projections store FP32 partials. Sum them before scoring or bias.
+    for plane in tl.static_range(1, PROJECTION_SPLITS):
+        ptr = logits_ptr + plane * plane_stride
+        if PAD_EXPERTS == EXPERTS:
+            logits += tl.load(ptr)
+        else:
+            logits += tl.load(ptr, columns[None, :] < EXPERTS, other=0)
     logits = logits.to(tl.float32)
     RANK_LOGITS: tl.constexpr = (
         SCORING == "softmax" and not HAS_BIAS and TOP_GROUPS == GROUPS
@@ -365,30 +441,52 @@ def _route_rows(
             )
         if PAD_EXPERTS != EXPERTS:
             ranking = tl.where(columns[None, :] < EXPERTS, ranking, -float("inf"))
-        if TOP_GROUPS < GROUPS:
+        if TOP_GROUPS < GROUPS and not HARDWARE_TOPK:
             ranking = _mask_unselected_groups(
                 ranking, ROWS, EXPERTS, GROUPS, TOP_GROUPS
             )
 
         if HARDWARE_TOPK:
-            tl.static_assert(ROWS == 1)
-            # The Ascend sorter returns interleaved score / expert-ID proposals.
+            # Each sort returns interleaved scores and expert IDs. A batched
+            # Vector tile shares the bias load and writes consecutive outputs.
             scratch = tl.zeros((4 * PAD_EXPERTS,), tl.float32)
             proposals = tle.dsa.alloc(
                 [32], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
             )
-            packed = tle.dsa.ascend.raw(
-                "sort_1d_pack",
-                tl.reshape(ranking, (PAD_EXPERTS,)),
-                scratch,
-                True,
-                16,
-                0,
-                0,  # FlagTree SORT_IMPL_BASE
-                out=tle.dsa.to_tensor(proposals, writable=True),
-            )
-            ids = tl.gather(packed, 2 * slots + 1, axis=0).to(tl.int32, bitcast=True)
-            indices = tl.reshape(ids, (1, BLOCK_TOPK))
+            for row in tl.static_range(ROWS):
+                if ROWS == 1:
+                    row_ranks = tl.reshape(ranking, (PAD_EXPERTS,))
+                else:
+                    row_ranks = tl.gather(
+                        tl.reshape(ranking, (ROWS * PAD_EXPERTS,)),
+                        row * PAD_EXPERTS + columns,
+                        axis=0,
+                    )
+                if TOP_GROUPS < GROUPS:
+                    tl.static_assert(EXPERTS == GROUPS * 32)
+                    row_ranks = tl.reshape(
+                        _mask_sorted_groups(row_ranks, EXPERTS, GROUPS, TOP_GROUPS),
+                        (EXPERTS,),
+                    )
+                packed = tle.dsa.ascend.raw(
+                    "sort_1d_pack",
+                    row_ranks,
+                    scratch,
+                    True,
+                    16,
+                    0,
+                    0,
+                    out=tle.dsa.to_tensor(proposals, writable=True),
+                )
+                ids = tl.gather(packed, 2 * slots + 1, axis=0).to(
+                    tl.int32, bitcast=True
+                )
+                if ROWS == 1:
+                    indices = tl.reshape(ids, (1, BLOCK_TOPK))
+                else:
+                    indices = tl.where(
+                        tl.arange(0, ROWS)[:, None] == row, ids[None, :], indices
+                    )
         else:
             if KEEP_SELECTED_LOGITS:
                 selected_logits = tl.full((ROWS, BLOCK_TOPK), 0.0, tl.float32)
@@ -641,12 +739,25 @@ def _gate_launch_args(
         max_rows = 2 if table is not None and vision_bias is not None else 4
         route_rows = min(route_rows, max_rows, max(1, 1024 // padded_experts))
         use_both_subcores = triton.cdiv(tokens, route_rows) > workers
+    wide_sigmoid = (
+        weight.dtype == torch.bfloat16
+        and logits_dtype == torch.float32
+        and hidden == 7168
+        and scoring == "sigmoid"
+        and has_bias
+        and topk == 8
+        and (
+            (experts == 256 and groups == 8 and top_groups == 4)
+            or (experts == 384 and groups == top_groups == 1)
+        )
+    )
+    short_pipeline = wide_sigmoid and cube_cores * 64 <= tokens < 2 * cube_cores * 64
     local_pipeline = (
         weight.dtype == torch.bfloat16
         and experts >= 256
         and expert_alignment >= 128
         and topk <= 10
-        and tokens >= 2 * cube_cores * 64
+        and (tokens >= 2 * cube_cores * 64 or short_pipeline)
         and table is None
         and vision_bias is None
         and (
@@ -661,6 +772,11 @@ def _gate_launch_args(
         block_n = min(expert_alignment, 128)
         block_k = min(512, hidden & -hidden)
         route_rows = 16 if rank_logits or padded_experts <= 256 else 8
+        if short_pipeline:
+            block_m = 48 if grouped_route and tokens % 64 else 64
+            route_rows = 8
+        if wide_sigmoid and experts == 384 and tokens < 8 * cube_cores * 64:
+            padded_experts = experts
         row_tiles = triton.cdiv(tokens, block_m)
         workers = min(cube_cores, row_tiles)
         use_both_subcores = True
@@ -668,7 +784,8 @@ def _gate_launch_args(
     # small batch. The repeated reductions amortize better on longer runs.
     sort_min = 64 if experts == 256 else 24
     sort_max = 256 if experts == 256 else 2 * cube_cores * 32
-    hardware_topk = (
+    custom_ops = getattr(tle.dsa.ascend, "custom_ops", None)
+    flat_sort = (
         weight.dtype == torch.bfloat16
         and not grouped_route
         and not local_pipeline
@@ -677,10 +794,55 @@ def _gate_launch_args(
         and sort_min <= tokens <= sort_max
         and table is None
         and vision_bias is None
-        and hasattr(getattr(tle.dsa.ascend, "custom_ops", None), "sort_1d_pack")
     )
+    group_sort = (
+        wide_sigmoid
+        and grouped_route
+        and tokens <= 320
+        and hasattr(custom_ops, "sort32")
+    )
+    hardware_topk = (flat_sort or group_sort) and hasattr(custom_ops, "sort_1d_pack")
     if hardware_topk:
-        route_rows = 1
+        route_rows, use_both_subcores = 1, True
+        if group_sort and 4 < tokens <= 256:
+            if tokens <= 16:
+                block_m = 16
+            elif tokens <= 128:
+                block_m = 32
+            else:
+                block_m = 64
+            block_n = 32 if tokens <= 64 else 64
+            block_k = 1024
+    tail_window = 0
+    if (
+        wide_sigmoid
+        and grouped_route
+        and 320 < tokens <= 512
+        and tokens % 64
+        and tokens % 16 == 0
+    ):
+        block_m, block_n, block_k = 64, 128, 512
+        route_rows, use_both_subcores = 16, True
+        tail_window = block_m
+    projection_splits = 1
+    if wide_sigmoid and not grouped_route and hardware_topk:
+        if tokens <= 32:
+            block_m, block_n, block_k = 32, 64, 1024
+        elif 128 < tokens < cube_cores * 64 and (tokens % 128 or tokens > 384):
+            # Splitting K spreads narrow expert projections over more Cubes.
+            # Window the last activation tile so both halves can use dense loads.
+            block_m = 128 if tokens % 128 else 64
+            block_n, block_k, projection_splits = 128, 512, 2
+            tail_window = block_m if tokens % block_m else 0
+    if wide_sigmoid and 512 < tokens < cube_cores * 64:
+        if grouped_route:
+            block_m, block_n, block_k = 256, 64, 256
+            hardware_topk = hasattr(custom_ops, "sort32") and hasattr(
+                custom_ops, "sort_1d_pack"
+            )
+            route_rows = 2 if hardware_topk else 16
+        elif hardware_topk:
+            route_rows = 4
         use_both_subcores = True
     logit_stride = experts if local_pipeline else padded_experts
     compile_options = {}
@@ -706,13 +868,19 @@ def _gate_launch_args(
     ):
         block_n, route_rows = 32, 1
         block_k = 512 if grouped_route and tokens == 1 else 1024
-        workers = min(cube_cores, row_tiles * (experts // block_n))
-        use_both_subcores = False
+        use_both_subcores = hardware_topk
         compile_options["multibuffer"] = False
-    # Storing the projection in the requested dtype fixes its rounding point
-    # before any scoring, bias, group selection or TopK.
+    if not local_pipeline:
+        row_tiles = triton.cdiv(tokens, block_m)
+        workers = min(cube_cores, row_tiles * (experts // block_n) * projection_splits)
+        compile_options["PROJECTION_SPLITS"] = projection_splits
+        compile_options["TAIL_WINDOW"] = tail_window
+    # BF16 logits round at this store. Split projections use FP32 planes,
+    # which the Vector pass combines before scoring.
     workspace = torch.empty(
-        (row_tiles * block_m, logit_stride), dtype=logits_dtype, device=x.device
+        (projection_splits * row_tiles * block_m, logit_stride),
+        dtype=logits_dtype,
+        device=x.device,
     )
     return (
         _mega_gate_pipelined_kernel if local_pipeline else _mega_gate_kernel,
