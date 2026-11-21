@@ -78,3 +78,34 @@ def test_silu_and_mul_with_clamp_out(shape, dtype, limit):
 
     assert ret is out
     utils.gems_assert_close(out, ref_out, dtype)
+
+
+@pytest.mark.silu_and_mul_with_clamp_out
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX tuning buckets")
+def test_strided_forward_reuses_size_bucket_with_distinct_masked_tails():
+    from flaggems_vllm.ops.silu_and_mul_with_clamp import _metax_2d_size_key
+
+    width = 1025
+    rows = (1025, 1027)
+    assert _metax_2d_size_key(31) == 31
+    assert _metax_2d_size_key(rows[0] * width) == _metax_2d_size_key(rows[1] * width)
+    for count in rows:
+        packed = torch.randn(
+            count, 2 * width, device=flaggems_vllm.device, dtype=torch.bfloat16
+        )
+        gate, up = packed.split(width, dim=-1)
+        storage = torch.full(
+            (count * width + 32,),
+            float("nan"),
+            dtype=packed.dtype,
+            device=packed.device,
+        )
+        result = storage[:-32].view(count, width)
+        flaggems_vllm.silu_and_mul_with_clamp_out(gate, up, result, 7.0)
+        expected = torch.nn.functional.silu(
+            gate.float().clamp(max=7)
+        ) * up.float().clamp(-7, 7)
+        torch.testing.assert_close(
+            result, expected.bfloat16(), atol=0.015625, rtol=0.01
+        )
+        assert storage[-32:].isnan().all()
