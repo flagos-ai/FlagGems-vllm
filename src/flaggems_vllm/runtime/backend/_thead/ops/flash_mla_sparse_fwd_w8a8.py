@@ -1,12 +1,24 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import os
+import subprocess
+import tempfile
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 from triton.language import core
+from triton.runtime.cache import get_cache_manager
+
+try:
+    import triton.experimental.tle.language as tle
+except ImportError:
+    tle = None
 
 from flaggems_vllm.runtime.backend._thead.ops.flash_attention.decode import (
     splitkv_merge_kernel,
@@ -319,6 +331,267 @@ def _fixed_decode(
             tl.store(Lse + qrow, tl.where(total > 0, tl.log(total), float("inf")))
 
 
+@lru_cache(maxsize=1)
+def _sdk_clang():
+    path = Path(os.environ.get("PPU_SDK", "/usr/local/PPU_SDK")) / "bin" / "clang++"
+    if not path.is_file():
+        return None
+    return path, subprocess.check_output([str(path), "--version"])
+
+
+@lru_cache(maxsize=4)
+def _native_library(rope, splits):
+    compiler, version = _sdk_clang()
+    source = Path(__file__).with_suffix(".cpp")
+    flags = (
+        "-target",
+        "nvptx64-nvidia-cuda",
+        "-x",
+        "c++",
+        "-std=c++17",
+        "-O3",
+        "-ffreestanding",
+        "-nostdinc",
+        "-S",
+        "-emit-llvm",
+        f"-DROPE={rope}",
+        f"-DPARTS={splits}",
+    )
+    digest = hashlib.sha256(
+        source.read_bytes() + version + str(compiler).encode() + repr(flags).encode()
+    ).hexdigest()
+    cache = get_cache_manager(digest)
+    name = "ppu_sparse_mla.ll"
+    path = cache.get_file(name)
+    if path is None:
+        with tempfile.TemporaryDirectory(prefix="ppu-sparse-mla-") as temp:
+            output = Path(temp) / name
+            subprocess.run(
+                [str(compiler), *flags, str(source), "-o", str(output)], check=True
+            )
+            path = cache.put(output.read_bytes(), name)
+    return {"sparse_mla": path}
+
+
+@core.extern
+def _native_sparse_device(*args, _semantic=None):
+    return core.extern_elementwise(
+        "",
+        "",
+        list(args),
+        {
+            (tl.uint64,) * 11
+            + (tl.uint32,)
+            + (tl.int32,) * 4
+            + (tl.float32,): ("ppu_sparse_mla", tl.uint32)
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _native_sparse_kernel(
+    Q,
+    QR,
+    KV,
+    KR,
+    QS,
+    KS,
+    Ids,
+    Out,
+    LSE,
+    Error,
+    Anchor,
+    K: tl.constexpr,
+    T: tl.constexpr,
+    R: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    # Two KV/RoPE buffers, packed probabilities, scales and warp reduction storage.
+    shared_bytes: tl.constexpr = (
+        2 * 128 * (512 + 2 * R) + 64 * 128 + 2 * 128 * 4 + 2 * 4 * 64 * 4
+    )
+    shared = tle.gpu.alloc(
+        (triton.next_power_of_2(shared_bytes // 4),),
+        tl.int32,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    ptr = (
+        tle.gpu.local_ptr(shared, (tl.full((), 0, tl.int32),))
+        .to(tl.uint64)
+        .to(tl.uint32)
+    )
+    _native_sparse_device(
+        Q.to(tl.uint64),
+        QR.to(tl.uint64),
+        KV.to(tl.uint64),
+        KR.to(tl.uint64),
+        QS.to(tl.uint64),
+        KS.to(tl.uint64),
+        Ids.to(tl.uint64),
+        Out.to(tl.uint64),
+        LSE.to(tl.uint64),
+        Error.to(tl.uint64),
+        Anchor.to(tl.uint64),
+        ptr,
+        tl.program_id(1),
+        tl.program_id(0),
+        tl.full((), K, tl.int32),
+        tl.full((), T, tl.int32),
+        tl.full((), SCALE * 1.4426950408889634, tl.float32),
+    )
+
+
+@triton.jit
+def _selected_scale_max(
+    KS, Ids, Anchor, K: tl.constexpr, T: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    n = tl.arange(0, BLOCK)
+    ids = tl.load(Ids + row * K + n, n < K, -1)
+    valid = (ids >= 0) & (ids < T)
+    ks = tl.load(KS + tl.where(valid, ids, 0), valid, 0.0)
+    tl.store(Anchor + row, tl.maximum(tl.max(ks, 0), 1.0e-30))
+
+
+@triton.jit
+def _merge_native_partitions(
+    Part, Den, PartError, Out, LSE, Error, B: tl.constexpr, S: tl.constexpr
+):
+    head, row = tl.program_id(0), tl.program_id(1)
+    splits = tl.arange(0, triton.next_power_of_2(S))
+    d = tl.arange(0, 512)
+    pos = (splits * B + row) * 64 + head
+    total = tl.sum(tl.load(Den + pos, splits < S, 0.0), 0)
+    bound = tl.sum(tl.load(PartError + pos, splits < S, 0.0), 0)
+    acc = tl.sum(
+        tl.load(
+            Part + pos[:, None].to(tl.int64) * 512 + d[None, :],
+            splits[:, None] < S,
+            0.0,
+        ),
+        0,
+    )
+    inv = 1.0 / tl.where(total > 0, total, 1.0)
+    tl.store(Out + (row * 64 + head) * 512 + d, acc * inv)
+    tl.store(LSE + row * 64 + head, tl.where(total > 0, tl.log(total), float("inf")))
+    tl.store(Error + row * 64 + head, bound * inv)
+
+
+@triton.jit
+def _repair_probability_error(
+    Q,
+    QR,
+    KV,
+    KR,
+    QS,
+    KS,
+    Ids,
+    Out,
+    LSE,
+    Error,
+    K: tl.constexpr,
+    T: tl.constexpr,
+    R: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    row = tl.program_id(1)
+    heads = tl.program_id(0) * 16 + tl.arange(0, 16)
+    bound = tl.load(Error + row * 64 + heads)
+    # NaN bounds, including inf/inf for an overflowing denominator, require rebasing.
+    if tl.sum((~(bound <= 0.0015)).to(tl.int32), 0) > 0:
+        _sparse_decode(
+            Q,
+            QR,
+            KV,
+            KR,
+            QS,
+            KS,
+            Ids,
+            None,
+            None,
+            Out,
+            LSE,
+            64,
+            1,
+            K,
+            T,
+            R,
+            SCALE,
+            False,
+            False,
+            16,
+            128,
+            REFINE=True,
+        )
+
+
+def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
+    batch = q.shape[0]
+    topk, rope, tokens = ids.shape[-1], qr.shape[-1], kv.shape[0] * 64
+    splits = 5 if batch <= 16 else 1
+    lse = torch.empty((batch, 64, 1), device=q.device, dtype=torch.float32)
+    error = torch.empty_like(lse)
+    anchor = torch.empty((batch,), device=q.device, dtype=torch.float32)
+    if splits == 1 or rope == 0:
+        _selected_scale_max[(batch,)](
+            ks, ids, anchor, topk, tokens, triton.next_power_of_2(topk), num_warps=4
+        )
+    if splits == 1:
+        partial, den, partial_error = out, lse, error
+    else:
+        partial = torch.empty(
+            (splits, batch, 64, 512), device=q.device, dtype=torch.float32
+        )
+        den = torch.empty((splits, batch, 64), device=q.device, dtype=torch.float32)
+        partial_error = torch.empty_like(den)
+    _native_sparse_kernel[(1, batch * splits)](
+        q,
+        qr,
+        kv,
+        kr,
+        qs,
+        ks,
+        ids,
+        partial,
+        den,
+        partial_error,
+        anchor,
+        topk,
+        tokens,
+        rope,
+        scale,
+        num_warps=16,
+        num_stages=1,
+        extern_libs=_native_library(rope, splits),
+    )
+    if splits > 1:
+        _merge_native_partitions[(64, batch)](
+            partial, den, partial_error, out, lse, error, batch, splits, num_warps=4
+        )
+    _repair_probability_error[(4, batch)](
+        q,
+        qr,
+        kv,
+        kr,
+        qs,
+        ks,
+        ids,
+        out,
+        lse,
+        error,
+        topk,
+        tokens,
+        rope,
+        scale,
+        num_warps=8,
+        num_stages=1,
+    )
+    return out, lse
+
+
 def flash_mla_sparse_fwd_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -409,11 +682,42 @@ def flash_mla_sparse_fwd_w8a8(
     full_heads = (
         heads == 64 and queries == 1 and attn_sink is None and topk_length is None
     )
+    if (
+        full_heads
+        and 0 < pages * 64 < 2**31
+        and q_rope.dtype == torch.bfloat16
+        and (
+            (0 < batch <= 16 and topk == 8320)
+            or (64 <= batch <= 16384 and topk in (2048, 8320))
+        )
+        and all(
+            t.data_ptr() % 16 == 0 for t in (q_nope, q_rope, k_cache_lora, k_cache_rope)
+        )
+        and all(t.data_ptr() % 4 == 0 for t in (q_scale, k_scale, indices))
+        and tle is not None
+        and torch.cuda.get_device_name(q_nope.device) == "PPU-ZW810E"
+        and _sdk_clang() is not None
+    ):
+        with torch.cuda.device(q_nope.device):
+            return _launch_native(
+                q_nope,
+                q_rope,
+                k_cache_lora,
+                k_cache_rope,
+                q_scale,
+                k_scale,
+                indices,
+                scale,
+                out,
+            )
     fixed = full_heads and rope == 0 and 512 <= topk <= 32768
     if full_heads and topk >= 512:
         bh, bn, warps = 64, 128, 16
         if batch <= 16 and topk >= 4096:
             splits = 4 if batch <= 12 else 6
+        elif rope and topk == 640 and batch <= 12:
+            # Five one-tile partitions fill the PPU for small decode batches.
+            splits = 2 if batch == 9 else 5
         elif fixed and batch <= 8:
             splits = min(triton.cdiv(topk, bn), 5)
     if splits > 1:

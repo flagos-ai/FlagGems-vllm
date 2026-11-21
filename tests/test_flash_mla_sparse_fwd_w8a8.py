@@ -419,3 +419,42 @@ def test_sparse_decode_ppu_mixed_partitions():
     )
     gems_assert_equal(out[1], torch.zeros_like(out[1]))
     gems_assert_equal(lse[1], torch.full_like(lse[1], torch.inf))
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not PPU_SPARSE_SUPPORTED, reason="Requires PPU INT8 sparse MLA")
+@pytest.mark.parametrize(
+    "batch,topk,rope", [(4, 8320, 0), (4, 8320, 64), (64, 2048, 64)]
+)
+def test_sparse_decode_ppu_replayed_scale_and_indices(batch, topk, rope):
+    from tests.test_flash_mla_sparse_fwd import FlashmlaSparseTestKit
+
+    device = flaggems_vllm.device
+    torch.manual_seed(43)
+    h, n, d = 64, 256, 512 + rope
+    query = torch.randn((batch, 1, h, d), device=device, dtype=torch.bfloat16) * 0.1
+    cache = torch.randn((n // 64, 64, d), device=device, dtype=torch.bfloat16) * 0.1
+    q, qr, qs = quantize_sparse_int8(query, power_of_two=True)
+    v, kr, ks = quantize_sparse_int8(cache, power_of_two=True)
+    ids = torch.randint(n, (batch, 1, topk), device=device, dtype=torch.int32)
+    scale = 0.5 if not rope else 1 / 24
+    args = (q, qr, v, kr, qs, ks, ids, scale)
+    flaggems_vllm.flash_mla_sparse_fwd_w8a8(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*args)
+    for update in (False, True):
+        if update:
+            # Force rebasing and change both invalid and duplicate IDs after capture.
+            ks[0, 0] = 4.0
+            ids[0, 0, :32] = 0
+            ids[0, 0, 32:64] = n
+            ids[1] = -1
+        graph.replay()
+        cpu_q = (torch.cat((q[:2, 0].float(), qr[:2, 0].float()), -1) * qs[:2, 0]).cpu()
+        cpu_k = (torch.cat((v.float(), kr.float()), -1) * ks).view(n, 1, d).cpu()
+        expected, _, logsum = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+            2, n, h, 1, d, topk, cpu_q, cpu_k, ids[:2].cpu(), scale, 512, None, None
+        )
+        gems_assert_close(out[:2, 0].cpu(), expected, out.dtype, atol=0.002)
+        gems_assert_close(lse[:2, :, 0].cpu(), logsum, torch.float32, atol=0.0002)
