@@ -29,6 +29,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import _e2m1_to_f32
 from flaggems_vllm.utils.device_info import get_device_capability
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
@@ -99,6 +100,7 @@ def _mqa_logits_kernel(
     stride_ctx_batch: tl.constexpr = 1,
     stride_ctx_next: tl.constexpr = 0,
     stride_bt_next: tl.constexpr = 0,
+    BF16_DOT: tl.constexpr = False,
 ):
     """Per-tile kernel: each program processes one BLOCK_KV tile for one row."""
     kv_block = tl.program_id(0)
@@ -194,7 +196,14 @@ def _mqa_logits_kernel(
                 dots = tl.dot(q_f16, tl.trans(kv_fp16))
             else:
                 kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
-                dots = tl.dot(q_fp8, tl.trans(kv_fp8))
+                if BF16_DOT:
+                    # Every finite E4M3FN value is exact in BF16. MetaX C550
+                    # FMA lowering rejects FP8 operands; accumulate in FP32.
+                    dots = tl.dot(
+                        q_fp8.to(tl.bfloat16), tl.trans(kv_fp8).to(tl.bfloat16)
+                    )
+                else:
+                    dots = tl.dot(q_fp8, tl.trans(kv_fp8))
 
             # Coalesced scale load: [block_size] float32
             if PAGED_KV:
@@ -609,6 +618,7 @@ def fp8_fp4_paged_mqa_logits(
             BLOCK_D=BLOCK_D,
             NUM_BLOCKS=NUM_BLOCKS,
             IS_MXFP4=is_fp4,
+            BF16_DOT=runtime.device.vendor_name == "metax",
         )
 
     return logits
