@@ -86,9 +86,7 @@ def _import_common_vendor_ops():
     except ImportError:
         return None
     try:  # the vendor kernels read device properties filled in by this helper
-        from vllm_ascend.ops.triton.triton_utils import (
-            init_device_properties_triton,
-        )
+        from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
         init_device_properties_triton()
     except Exception:  # noqa: BLE001 - optional convenience on newer builds
