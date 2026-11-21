@@ -309,6 +309,7 @@ def mha_varlan_fwd(
     num_splits=0,
 ):
     is_metax = runtime.device.vendor_name == "metax"
+    is_ascend = runtime.device.vendor_name == "ascend"
     if is_metax:
         if p_dropout != 0 or return_softmax:
             raise NotImplementedError(
@@ -322,6 +323,17 @@ def mha_varlan_fwd(
             fill_tensor,
             reshape_view_or_copy,
             view_tensor,
+        )
+    elif is_ascend:
+        if p_dropout != 0 or return_softmax:
+            raise NotImplementedError(
+                "Ascend varlen attention supports inference without dropout"
+            )
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention import (
+            launch_attention as launch_ascend_attention,
+        )
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
+            fill_tensor,
         )
     elif num_splits > 0:
         raise RuntimeError("num_splits > 0 is not implemented in GEMS.")
@@ -386,11 +398,22 @@ def mha_varlan_fwd(
     # check disable swa
     if window_size_left >= max_seqlen_k:
         window_size_left = -1
-    if window_size_right >= (max_seqlen_q if is_metax else max_seqlen_k):
-        window_size_right = -1
+    if is_ascend:
+        if window_size_right >= max_seqlen_q:
+            window_size_right = -1
+    else:
+        if window_size_right >= (max_seqlen_q if is_metax else max_seqlen_k):
+            window_size_right = -1
 
     is_local = window_size_left >= 0
     if is_metax:
+        is_local = is_local or (window_size_right >= 0 and not is_causal)
+        if is_local:
+            if window_size_left < 0:
+                window_size_left = max_seqlen_k
+            if window_size_right < 0:
+                window_size_right = max_seqlen_q
+    elif is_ascend:
         is_local = is_local or (window_size_right >= 0 and not is_causal)
         if is_local:
             if window_size_left < 0:
@@ -408,6 +431,8 @@ def mha_varlan_fwd(
         and window_size_right < 0
         and p_dropout == 0
     )
+    if is_ascend:
+        seqlenq_ngroups_swapped = False
     q_groups = num_heads // num_heads_k
     if seqlenq_ngroups_swapped:
         logger.debug("Swapping query groups and sequence dimensions")
@@ -536,6 +561,9 @@ def mha_varlan_fwd(
             if is_metax:
                 fill_tensor(out, 0.0)
                 fill_tensor(lse, float("-inf"))
+            elif is_ascend:
+                fill_tensor(out, 0.0)
+                fill_tensor(lse, float("-inf"))
             else:
                 out.zero_()
                 lse.fill_(float("-inf"))
@@ -610,6 +638,8 @@ def mha_varlan_fwd(
 
         if is_metax:
             launch_attention(params, num_splits=num_splits)
+        elif is_ascend:
+            launch_ascend_attention(params, num_splits=num_splits)
         else:
             if flaggems_vllm.vendor_name == "iluvatar":
                 params.k_ptr = k.view(k.shape[0], k.shape[1], -1)

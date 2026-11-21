@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import inspect
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import Any, List, Optional
 
 import pytest
@@ -445,6 +445,61 @@ def flash_attn_varlen_metax(*args, **kwargs):
     )
 
 
+@lru_cache(maxsize=None)
+def _ascend_fia_causal_mask(device):
+    return torch.triu(
+        torch.ones((2048, 2048), dtype=torch.int8, device=device), diagonal=1
+    )
+
+
+def flash_attn_varlen_ascend(*args, **kwargs):
+    """Adapt vLLM arguments directly to torch_npu's paged CANN FIA interface."""
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        cu_query_lens,
+        _,
+        _,
+        seqused_k,
+        _,
+        _,
+        scale,
+        causal,
+        window_size,
+        _,
+        _,
+        _,
+        _,
+        block_tables,
+        _,
+        _,
+        *_,
+    ) = args
+
+    import torch_npu
+
+    if tuple(window_size) != (-1, -1):
+        raise NotImplementedError("The FIA benchmark adapter requires full attention")
+
+    return torch_npu.npu_fused_infer_attention_score(
+        query,
+        key_cache.view(*key_cache.shape[:2], -1),
+        value_cache.view(*value_cache.shape[:2], -1),
+        atten_mask=_ascend_fia_causal_mask(query.device) if causal else None,
+        actual_seq_lengths=cu_query_lens.cpu().tolist()[1:],
+        actual_seq_lengths_kv=seqused_k.cpu().tolist(),
+        num_heads=query.shape[1],
+        num_key_value_heads=key_cache.shape[2],
+        input_layout="TND",
+        block_table=block_tables,
+        block_size=key_cache.shape[1],
+        scale=scale,
+        sparse_mode=3 if causal else 0,
+    )[0]
+
+
 @pytest.mark.skipif(
     utils.SkipVersion("vllm", "<0.9"),
     reason="vLLM version prior to 0.9 does not include the flash_attn_varlen_func API.",
@@ -464,6 +519,8 @@ def test_flash_attn_varlen_func(monkeypatch):
     elif vendor_name == "iluvatar":
         # iluvatar does not have updated vllm_flash_attn, use conversion wrapper
         flash_attn_varlen_func = flash_attn_varlen_legacy
+    elif vendor_name == "ascend":
+        flash_attn_varlen_func = flash_attn_varlen_ascend
     else:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
