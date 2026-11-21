@@ -16,6 +16,7 @@ import logging
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm import runtime
@@ -292,7 +293,7 @@ def _thead_moe_sum_general_kernel(
         + hidden_offsets * input_stride_hidden
     )
 
-    for expert_idx in range(topk):
+    for expert_idx in tle.range(topk, loop_vectorize_factor=4, loop_unroll_factor=8):
         if IDENTITY_MAP:
             input_ptrs = input_base + expert_idx * input_stride_topk
         else:
