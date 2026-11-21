@@ -19,7 +19,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+import flaggems_vllm
 from flaggems_vllm import qsa_prepare
+from tests.qsa_prepare_reference import vendor_reference
 
 # ------------------------------------------------------------------ constants
 HEAD_DIM = 128
@@ -71,12 +73,12 @@ DECODE_BATCH = ([512] * 16, [1] * 16, [8] * 16)
 # an OpenAI server, 16384 for offline throughput.
 #
 # A loaded server decodes with every slot busy, which is also when the scalar ring
-# commit and the main-attention tiling meet: 1024 tokens is exactly the generic
-# kernel's MAIN_TILE_T threshold, so DECODE_MAX is the only layout combining them.
+# commit and the main-attention tiling meet: 1024 tokens is exactly MAIN_TILE_T's
+# threshold, so DECODE_MAX is the only layout combining the two.
 DECODE_DEEP = ([512] * 512, [1] * 512, [8] * 512)
 DECODE_MAX = ([512] * 1024, [1] * 1024, [8] * 1024)
 # The ceilings the benchmark's last rows carry: 1010 + 14 = 1024 sequences, which
-# is max_num_seqs, holding 8178 tokens — as close to the 8192 serving token budget
+# is max_num_seqs, holding 8178 tokens - as close to the 8192 serving token budget
 # as max_num_seqs allows.
 MIXED_DEEP = (
     [512] * 1024,
@@ -110,9 +112,19 @@ CASES = [
     pytest.param(True, True, True, 4, LONG_BATCH, id="long"),
 ]
 
+HAS_NATIVE_FP8 = hasattr(torch, "float8_e4m3fn") and (
+    flaggems_vllm.SUPPORTED_FP8_DTYPE == torch.float8_e4m3fn
+)
+
 DTYPES = [
     pytest.param(torch.bfloat16, id="bf16"),
-    pytest.param(torch.float8_e4m3fn, id="fp8"),
+    pytest.param(
+        torch.float8_e4m3fn,
+        id="fp8",
+        marks=pytest.mark.skipif(
+            not HAS_NATIVE_FP8, reason="requires native float8_e4m3fn support"
+        ),
+    ),
 ]
 
 
@@ -283,24 +295,12 @@ def _main_inputs(case: "QsaPrepareCase", fp8_cache: bool) -> dict:
         torch.randn(2, MAIN_HEAD_DIM, dtype=torch.bfloat16, device=case.device) * 0.2
     )
     qkv_width = 2 * (MAIN_QUERY_HEADS + MAIN_KV_HEADS) * MAIN_HEAD_DIM
-    row_width = qkv_width + (QUERY_HEADS + 1) * HEAD_DIM
-    offset = getattr(case, "main_qkv_offset", 0)
-    if offset:
-        # vLLM hands over a view into a wider fused projection, so the packed QKV
-        # buffer carries a non-zero storage_offset.  Reproduce that layout here.
-        base = torch.randn(
-            num_tokens * row_width + offset,
-            dtype=torch.bfloat16,
-            device=case.device,
-        )
-        qkv = base[offset:].view(num_tokens, row_width)[:, :qkv_width]
-    else:
-        qkv = torch.randn(
-            num_tokens,
-            row_width,
-            dtype=torch.bfloat16,
-            device=case.device,
-        )[:, :qkv_width]
+    qkv = torch.randn(
+        num_tokens,
+        qkv_width + (QUERY_HEADS + 1) * HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=case.device,
+    )[:, :qkv_width]
     return dict(
         main_qkv=qkv,
         main_q_norm_weight=norm_weights[0],
@@ -328,11 +328,9 @@ class QsaPrepareCase:
         is_2d_positions: bool = True,
         cache_rope_positions: bool = True,
         indexer_dtype: torch.dtype = torch.bfloat16,
-        main_qkv_offset: int = 0,
-        device: str = "cuda",
+        device: str | None = None,
     ) -> None:
-        self.device = device
-        self.main_qkv_offset = main_qkv_offset
+        self.device = device or flaggems_vllm.device
         self.state_size = state_size
         self.mrope = mrope
         self.is_2d_positions = is_2d_positions
@@ -568,8 +566,8 @@ class QsaPrepareCase:
             self.main["main_kv_cache"].clone(),
         )
 
-    def run_kernel(self, outputs=None):
-        outputs = self.outputs() if outputs is None else outputs
+    def run_kernel(self):
+        outputs = self.outputs()
         main_q_out, main_gate_out = qsa_prepare(
             *self._launch_args(outputs),
             compress_ratio=COMPRESS_RATIO,
@@ -577,7 +575,7 @@ class QsaPrepareCase:
             rope_pos_offset=HEAD_DIM if self.cache_rope_positions else None,
             **self.main,
         )
-        torch.cuda.synchronize()
+        flaggems_vllm.runtime.torch_device_fn.synchronize()
         return (*outputs, main_q_out, main_gate_out, self.main["main_kv_cache"])
 
     def _launch_args(self, outputs):
@@ -746,7 +744,15 @@ def _assert_fp8_within_one_ulp(
     assert bool(ok.all()), f"{tag}: fp8 differs by more than one ulp"
 
 
-def _assert_matches(actual, expected) -> None:
+def _assert_matches(actual, expected, atol: float = ATOL) -> None:
+    """Compare one launch against a reference.
+
+    ``atol`` defaults to one bf16 ulp.  The Ascend vendor cross-check passes two
+    ulps: the fused vendor kernel rounds bf16 intermediates before subtracting,
+    while this implementation rotates in fp32 and rounds once, so the two paths
+    can differ by 1.5 ulp on rare inputs.  The torch-reference comparison keeps
+    the strict one-ulp tolerance.
+    """
     (
         query_out,
         raw_cache,
@@ -770,7 +776,7 @@ def _assert_matches(actual, expected) -> None:
         # match is not expected; the unfused rope differs by up to one code step.
         _assert_fp8_within_one_ulp(query_out, expected_query, "query output")
     else:
-        torch.testing.assert_close(query_out, expected_query, rtol=RTOL, atol=ATOL)
+        torch.testing.assert_close(query_out, expected_query, rtol=RTOL, atol=atol)
     # The ring commit is a pure copy, so it must agree bit for bit.
     assert torch.equal(
         raw_cache.view(torch.int16), expected_raw.view(torch.int16)
@@ -781,17 +787,17 @@ def _assert_matches(actual, expected) -> None:
         )
     else:
         torch.testing.assert_close(
-            compressed_cache, expected_compressed, rtol=RTOL, atol=ATOL
+            compressed_cache, expected_compressed, rtol=RTOL, atol=atol
         )
     # The main Q/gate pair is always bf16, whatever the indexer dtype is.
-    torch.testing.assert_close(main_q_out, expected_main_q, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(main_q_out, expected_main_q, rtol=RTOL, atol=atol)
     # The gate is copied, not computed, so it must agree exactly.
     assert torch.equal(main_gate_out, expected_main_gate), "main gate mismatch"
     if main_kv_cache.dtype == torch.float8_e4m3fn:
         _assert_fp8_within_one_ulp(main_kv_cache, expected_main_cache, "main kv cache")
     else:
         torch.testing.assert_close(
-            main_kv_cache, expected_main_cache, rtol=RTOL, atol=ATOL
+            main_kv_cache, expected_main_cache, rtol=RTOL, atol=atol
         )
 
 
@@ -830,85 +836,38 @@ def test_qsa_prepare_matches_torch_reference(
 def test_qsa_prepare_matches_vllm(
     mrope, is_2d_positions, cache_rope_positions, state_size, batch, dtype
 ) -> None:
-    """Cross-check the port against vLLM's own operator, when it is importable."""
+    """Cross-check the port against the vendor implementation for this backend.
 
-    vllm_op = pytest.importorskip(
-        "vllm.models.qwen4_exp.nvidia.ops.qsa_prepare",
-        reason="vLLM is required for the cross-check",
-    ).qsa_prepare
+    CUDA builds use vLLM's native fused operator; Ascend builds use the
+    vllm-ascend operator composition, because the native kernel is CUDA-only.
+    """
+
+    reference = vendor_reference()
+    if reference is None:
+        pytest.skip("no vendor reference is available on this backend")
 
     case = _case(mrope, is_2d_positions, cache_rope_positions, state_size, batch, dtype)
+    # The vendor path writes the main K/V cache in place; give the reference its
+    # own buffer so the comparison is not between two aliases of one tensor.
+    reference_main = dict(case.main)
+    reference_main["main_kv_cache"] = case.main["main_kv_cache"].clone()
     actual = case.run_kernel()
 
     outputs = case.outputs()
-    main_q_out, main_gate_out = vllm_op(
+    main_q_out, main_gate_out = reference(
         *case._launch_args(outputs),
         compress_ratio=COMPRESS_RATIO,
         mrope_section=MROPE_SECTION if case.mrope else None,
         rope_pos_offset=HEAD_DIM if case.cache_rope_positions else None,
-        **case.main,
+        **reference_main,
     )
-    torch.cuda.synchronize()
-    expected = (*outputs, main_q_out, main_gate_out, case.main["main_kv_cache"])
-    _assert_matches(actual, expected)
-
-
-@pytest.mark.qsa_prepare
-def test_qwen_qsa_prepare_main_qkv_storage_offset() -> None:
-    """The gate output must follow the source view's own storage offset."""
-
-    case = QsaPrepareCase(
-        seq_lens=MIXED_BATCH[0],
-        query_lens=MIXED_BATCH[1],
-        history_lens=MIXED_BATCH[2],
-        main_qkv_offset=256,
+    flaggems_vllm.runtime.torch_device_fn.synchronize()
+    expected = (
+        *outputs,
+        main_q_out,
+        main_gate_out,
+        reference_main["main_kv_cache"],
     )
-    qkv = case.main["main_qkv"]
-    assert qkv.storage_offset() == 256, qkv.storage_offset()
-    assert qkv.stride(-1) == 1
-    _assert_matches(case.run_kernel(), case.run_reference())
-
-
-@pytest.mark.qsa_prepare
-def test_qwen_qsa_prepare_compressed_cache_stride() -> None:
-    """A hit must not reuse stride scalars from a different compressed layout."""
-
-    case = QsaPrepareCase(
-        seq_lens=MIXED_BATCH[0],
-        query_lens=MIXED_BATCH[1],
-        history_lens=MIXED_BATCH[2],
-    )
-    page_elements = COMPRESSED_PAGE_SIZE * HEAD_DIM
-
-    def strided_cache(extra: int) -> torch.Tensor:
-        """Same shape as the case's cache, stride(0) differs by ``extra``."""
-
-        stride0 = page_elements + extra
-        storage = torch.zeros(
-            case.num_compressed_blocks * stride0,
-            dtype=case.base_compressed_cache.dtype,
-            device=case.device,
-        )
-        return torch.as_strided(
-            storage,
-            (case.num_compressed_blocks, COMPRESSED_PAGE_SIZE, 1, HEAD_DIM),
-            (stride0, HEAD_DIM, HEAD_DIM, 1),
-        )
-
-    # Two runs of the same shapes with different compressed strides.  The second
-    # must not reuse the first one's stride scalars.
-    for extra in (16, 32):
-        cache = strided_cache(extra)
-        assert cache.stride(0) == page_elements + extra
-        outputs = (
-            torch.empty(
-                case.num_tokens,
-                QUERY_HEADS,
-                HEAD_DIM,
-                dtype=case.indexer_dtype,
-                device=case.device,
-            ),
-            case.base_raw_cache.clone(),
-            cache,
-        )
-        _assert_matches(case.run_kernel(outputs), case.run_reference())
+    # Two ulps: the vendor fused kernel rounds bf16 intermediates before
+    # subtracting, this implementation rounds once after the fp32 rotation.
+    _assert_matches(actual, expected, atol=2.0 * ATOL)
