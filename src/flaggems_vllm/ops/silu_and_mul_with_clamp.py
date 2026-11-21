@@ -45,6 +45,14 @@ def _silu_clamp_tuning_key(value):
     return value
 
 
+def _metax_2d_size_key(n_elements):
+    # Large strided batches often differ by only a few rows. The kernel still
+    # uses the exact extent for its launch grid and tail mask.
+    if n_elements < 1 << 20:
+        return n_elements
+    return triton.next_power_of_2(n_elements)
+
+
 def _use_full_linear_kernel(n_elements):
     return n_elements >= _FULL_LINEAR_MIN_ELEMENTS and any(
         n_elements % block_size == 0 for block_size in _LINEAR_BLOCK_SIZES
@@ -204,7 +212,11 @@ def silu_and_mul_with_clamp_linear_full_kernel(
     configs=runtime.get_tuned_config("silu_and_mul_with_clamp"),
     prune_configs_by={"early_config_prune": silu_clamp_early_prune},
     key=["n_elements", "dtype", "n_cols", "X_STRIDES", "Y_STRIDES", "OUT_STRIDES"],
-    strategy=_silu_clamp_tuning_key,
+    strategy=(
+        [_metax_2d_size_key] + [_silu_clamp_tuning_key] * 5
+        if runtime.device.vendor_name == "metax"
+        else _silu_clamp_tuning_key
+    ),
     policy="default",
     warmup=25,
     rep=100,
