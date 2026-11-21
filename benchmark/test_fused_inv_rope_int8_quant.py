@@ -14,10 +14,13 @@
 
 import pytest
 import torch
+import yaml
 
 import flaggems_vllm
 
 from . import base
+from .conftest import Config
+from .consts import BenchLevel
 
 HEAD_DIM = 512
 NOPE_DIM = 448
@@ -111,11 +114,26 @@ class FusedInvRopeInt8QuantBenchmark(base.GenericBenchmark):
             (8192, 128, 8),
         ]
 
+    def set_shapes(self, shape_file_path):
+        with open(shape_file_path) as shape_file:
+            config = yaml.safe_load(shape_file) or {}
+        # Keep the shared reporting ID separate from INT8-specific shapes.
+        shape_config = config.get(
+            "fused_inv_rope_int8_quant", config.get(type(self).__name__, {})
+        )
+        self.shapes = [
+            tuple(shape) for shape in shape_config.get("shapes", self.DEFAULT_SHAPES)
+        ]
+        self.shape_desc = shape_config.get("shape_desc", self.DEFAULT_SHAPE_DESC)
+        if Config.bench_level == BenchLevel.COMPREHENSIVE and not Config.query:
+            self.shapes = list(dict.fromkeys(self.shapes + self.set_more_shapes()))
+
     def init_user_config(self):
         super().init_user_config()
         if any(len(shape) != 3 for shape in self.shapes):
             raise ValueError(
-                "fused_inv_rope_int8_quant shapes must have three dimensions"
+                f"Invalid fused_inv_rope_int8_quant shapes: {self.shapes}; "
+                "expected (num_tokens, num_heads, n_groups)"
             )
 
 
