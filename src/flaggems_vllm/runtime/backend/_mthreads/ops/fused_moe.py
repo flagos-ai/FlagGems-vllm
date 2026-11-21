@@ -3284,6 +3284,10 @@ def _dense_get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens):
     hidden_perm = torch.empty(max_tokens, H, dtype=dtype, device=device)
     gate_up = torch.empty(max_tokens, 2 * n_inter, dtype=dtype, device=device)
     act = torch.empty(max_tokens, n_inter, dtype=dtype, device=device)
+    # GEMM2 output: cached like the rest so a repeated call does not allocate
+    # and free ~268 MiB on every launch (MUSA turns that churn into an
+    # "out of bound" after roughly a hundred calls).
+    mm2 = torch.empty(max_tokens, H, dtype=dtype, device=device)
     entry = (
         meta,
         row_token,
@@ -3292,6 +3296,7 @@ def _dense_get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens):
         hidden_perm,
         gate_up,
         act,
+        mm2,
     )
     _DENSE_CACHE[key] = entry
     return entry
@@ -3320,6 +3325,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         hidden_perm,
         gate_up,
         act,
+        mm2,
     ) = _dense_get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens)
     counts = meta[:E]
     offsets = meta[E : 2 * E + 1]
@@ -3393,8 +3399,8 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         num_warps=4,
     )
     # GEMM2 must not write back into hidden_perm: that buffer is consumed by
-    # GEMM1, and reusing it here triggers an IMA on MUSA/Triton.
-    mm2 = torch.empty((max_tokens, H), dtype=dtype, device=device)
+    # GEMM1, and reusing it here triggers an IMA on MUSA/Triton. It writes to
+    # the cached mm2 buffer instead.
     if use_tle:
         _tle_gemm(act, w2, mm2, m_indices, E, total, H, n_inter, STAGES=2)
     else:
