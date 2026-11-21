@@ -47,6 +47,12 @@ def _e2m1_to_f32(nibble):
     return sign * mag
 
 
+# Pre-Hopper Triton backends (e.g. MetaX MACA) do not lower FP8 x FP8
+# tl.dot; their FMA fallback asserts on mixed element types. FP8 -> FP16
+# is exact, so keeping the IEEE fp16 MMA path is numerically equivalent
+# apart from the accumulator (still fp32).
+_FP8_DOT_NEEDS_FP16 = tl.constexpr(get_device_capability() < (9, 0))
+
 # =============================================================================
 # TLE (WGMMA) fast path — purely additive. The tuned baseline below is left
 # byte-for-byte untouched; the TLE path only fires inside its measured win band
@@ -157,7 +163,10 @@ def _fp8_fp4_mqa_logits_kernel(
         q_2d = tl.reshape(q, [BLOCK_M * HEAD_BLOCK, D])
 
         # Dot product: [BLOCK_M * HEAD_BLOCK, BLOCK_N]
-        dot = tl.dot(q_2d, tl.trans(k))
+        if _FP8_DOT_NEEDS_FP16:
+            dot = tl.dot(q_2d.to(tl.float16), tl.trans(k).to(tl.float16))
+        else:
+            dot = tl.dot(q_2d, tl.trans(k))
 
         # Fused k_scale + ReLU activation
         dot = tl.maximum(dot * k_scale[None, :], 0.0)
