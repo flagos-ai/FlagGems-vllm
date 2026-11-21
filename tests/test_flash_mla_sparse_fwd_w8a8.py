@@ -433,6 +433,7 @@ def test_sparse_decode_ppu_mixed_partitions():
         (64, 640, 0),
         (259, 640, 0),
         (16, 640, 0),
+        (9, 640, 64),
         (16, 640, 64),
     ],
 )

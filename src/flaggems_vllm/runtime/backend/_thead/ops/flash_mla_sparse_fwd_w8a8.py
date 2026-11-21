@@ -416,6 +416,7 @@ def _native_sparse_kernel(
     T: tl.constexpr,
     R: tl.constexpr,
     SCALE: tl.constexpr,
+    REPAIR: tl.constexpr = False,
 ):
     # Two KV/RoPE buffers, packed probabilities, scales and warp reduction storage.
     shared_bytes: tl.constexpr = (
@@ -455,6 +456,12 @@ def _native_sparse_kernel(
         tl.full((), T, tl.int32),
         tl.full((), SCALE * 1.4426950408889634, tl.float32),
     )
+    if REPAIR:
+        # One CTA owns the entire row, including all of its error bounds.
+        tl.debug_barrier()
+        _repair_probability_error(
+            Q, QR, KV, KR, QS, KS, Ids, Out, LSE, Error, K, T, R, SCALE, WHOLE_ROW=True
+        )
 
 
 @triton.jit
@@ -515,36 +522,22 @@ def _repair_probability_error(
     T: tl.constexpr,
     R: tl.constexpr,
     SCALE: tl.constexpr,
-    B: tl.constexpr = 1,
-    ROWS: tl.constexpr = 1,
+    WHOLE_ROW: tl.constexpr = False,
 ):
-    first = tl.program_id(1) * ROWS
-    row_ids = first + tl.arange(0, ROWS)
-    head_groups: tl.constexpr = 1 if ROWS == 1 else 4
-    first_group = tl.program_id(0) * head_groups
-    heads = first_group * 16 + tl.arange(0, head_groups * 16)
-    if ROWS == 1:
-        bound = tl.load(Error + first * 64 + heads)
-        failures = tl.sum((~(bound <= 0.0015)).to(tl.int32), 0)
-    else:
-        bound = tl.load(
-            Error + row_ids[:, None] * 64 + heads[None, :],
-            row_ids[:, None] < B,
-            0.0,
-        )
-        failures = tl.sum(tl.sum((~(bound <= 0.0015)).to(tl.int32), 1), 0)
+    row = tl.program_id(1)
+    groups: tl.constexpr = 4 if WHOLE_ROW else 1
+    start = tl.program_id(0) * groups
+    heads = start * 16 + tl.arange(0, groups * 16)
+    bound = tl.load(Error + row * 64 + heads)
     # NaNs from overflow must also take the stable path.
-    if failures > 0:
-        for i in range(ROWS * head_groups):
-            row = first + i // head_groups
-            group = first_group + i % head_groups
-            if ROWS == 1:
-                repair = True
-            else:
-                selected = tl.load(
-                    Error + row * 64 + group * 16 + tl.arange(0, 16), row < B, 0.0
-                )
+    if tl.sum((~(bound <= 0.0015)).to(tl.int32), 0) > 0:
+        for i in range(groups):
+            group = start + i
+            if WHOLE_ROW:
+                selected = tl.load(Error + row * 64 + group * 16 + tl.arange(0, 16))
                 repair = tl.sum((~(selected <= 0.0015)).to(tl.int32), 0) > 0
+            else:
+                repair = True
             if repair:
                 _sparse_decode(
                     Q,
@@ -614,6 +607,7 @@ def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
         tokens,
         rope,
         scale,
+        REPAIR=splits == 1,
         num_warps=16,
         num_stages=1,
         extern_libs=_native_library(
@@ -624,28 +618,24 @@ def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
         _merge_native_partitions[(64, batch)](
             partial, den, partial_error, out, lse, error, batch, splits, num_warps=4
         )
-    repair_rows = 8 if batch >= 256 else 1
-    repair_grid = (1 if repair_rows > 1 else 4, triton.cdiv(batch, repair_rows))
-    _repair_probability_error[repair_grid](
-        q,
-        qr,
-        kv,
-        kr,
-        qs,
-        ks,
-        ids,
-        out,
-        lse,
-        error,
-        topk,
-        tokens,
-        rope,
-        scale,
-        batch,
-        repair_rows,
-        num_warps=8,
-        num_stages=1,
-    )
+        _repair_probability_error[(4, batch)](
+            q,
+            qr,
+            kv,
+            kr,
+            qs,
+            ks,
+            ids,
+            out,
+            lse,
+            error,
+            topk,
+            tokens,
+            rope,
+            scale,
+            num_warps=8,
+            num_stages=1,
+        )
     return out, lse
 
 
@@ -745,7 +735,7 @@ def flash_mla_sparse_fwd_w8a8(
         and q_rope.dtype == torch.bfloat16
         and (
             (0 < batch <= 16 and topk == 8320)
-            or (12 <= batch <= 16 and topk == 640)
+            or (9 <= batch <= 16 and topk == 640)
             or (
                 64 <= batch <= 16384
                 and (topk in (2048, 8320) or (rope == 0 and topk == 640))
