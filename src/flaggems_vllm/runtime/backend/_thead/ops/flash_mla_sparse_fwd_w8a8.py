@@ -8,7 +8,9 @@ import triton
 import triton.language as tl
 from triton.language import core
 
-from .flash_attention.decode import splitkv_merge_kernel
+from flaggems_vllm.runtime.backend._thead.ops.flash_attention.decode import (
+    splitkv_merge_kernel,
+)
 
 
 @core.extern
