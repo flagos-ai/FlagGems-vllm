@@ -51,7 +51,9 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 __all__ = [
     "disable_symm_mem",
     "enable_symm_mem",
+    "is_paged_causal_attention_available",
     "is_paged_prefix_window_attention_available",
+    "paged_causal_attention",
     "paged_prefix_window_attention",
     "SUPPORTED_FP8_DTYPE",
     "gumbel_sample",

@@ -2001,6 +2001,18 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: paged_causal_attention
+  description: Variable-length bottom-right causal attention over read-only paged KV on MetaX.
+  for:
+  - vllm.v1.attention.ops.triton_unified_attention.unified_attention
+  labels:
+  - vLLM
+  - Attention
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: paged_prefix_window_attention
   description: Paged FP16/BF16 decode over a disjoint prefix and sliding tail using MACA KV attention and stable LSE merging.
   for:

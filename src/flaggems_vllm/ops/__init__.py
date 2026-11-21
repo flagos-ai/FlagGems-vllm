@@ -13,6 +13,10 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.paged_causal_attention import (
+    is_paged_causal_attention_available,
+    paged_causal_attention,
+)
 from flaggems_vllm.ops.paged_prefix_window_attention import (
     is_paged_prefix_window_attention_available,
     paged_prefix_window_attention,
@@ -403,6 +407,7 @@ __all__ = [
     "inplace_fused_experts",
     "instance_norm",
     "invoke_fused_moe_triton_kernel",
+    "is_paged_causal_attention_available",
     "is_paged_prefix_window_attention_available",
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
@@ -436,6 +441,7 @@ __all__ = [
     "pad_attention_heads",
     "pad_indexer_heads",
     "pad_trailing_draft_slots",
+    "paged_causal_attention",
     "paged_mqa_logits",
     "paged_prefix_window_attention",
     "parallel_nsa",
