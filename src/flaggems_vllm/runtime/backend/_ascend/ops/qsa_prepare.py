@@ -693,11 +693,26 @@ def qsa_prepare(
 ):
     """Run QSA prepare for the indexer, the raw ring and the main attention."""
 
-    fp8 = (torch.float8_e4m3fn, torch.float8_e5m2)
-    if q_out.dtype in fp8 or compressed_cache.dtype in fp8:
-        raise NotImplementedError("Ascend qsa_prepare supports bf16 indexer buffers")
-    if main_kv_cache.dtype in fp8:
-        raise NotImplementedError("Ascend qsa_prepare supports a bf16 main KV cache")
+    # Every value these kernels read or write is bf16: fp8 casting is unavailable
+    # on this software stack, and fp16/fp32 inputs would be rounded to bf16 at the
+    # store, which is a silent precision change rather than a supported mode.
+    for name, tensor in (
+        ("q", q),
+        ("k", k),
+        ("main_qkv", main_qkv),
+        ("q_out", q_out),
+        ("state_cache", state_cache),
+        ("compressed_cache", compressed_cache),
+        ("main_kv_cache", main_kv_cache),
+        ("q_norm_weight", q_norm_weight),
+        ("k_norm_weight", k_norm_weight),
+        ("main_q_norm_weight", main_q_norm_weight),
+        ("main_k_norm_weight", main_k_norm_weight),
+    ):
+        if tensor.dtype is not torch.bfloat16:
+            raise NotImplementedError(
+                f"Ascend qsa_prepare requires bf16, {name}.dtype is {tensor.dtype}"
+            )
 
     num_tokens = q.shape[0]
     num_requests = query_start_loc.numel() - 1
