@@ -36,7 +36,7 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm import qsa_prepare
-from tests.qsa_vendor_baseline import build_ascend_baseline
+from tests.qsa_prepare_reference import build_ascend_baseline
 from tests.test_qsa_prepare import (
     COMPRESS_RATIO,
     HEAD_DIM,

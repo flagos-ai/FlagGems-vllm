@@ -21,7 +21,7 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm import qsa_prepare
-from tests.qsa_vendor_baseline import vendor_reference
+from tests.qsa_prepare_reference import vendor_reference
 
 # ------------------------------------------------------------------ constants
 HEAD_DIM = 128

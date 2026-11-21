@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Vendor reference implementations for the QSA fused prepare cross-checks.
+"""Reference implementations for the QSA fused prepare cross-checks.
 
-CUDA builds of vLLM ship a fused ``qsa_prepare`` operator that tests can check
-against directly. Ascend has no single equivalent operator, so the reference
-composes the vllm-ascend operators covering the same work: the main
+On CUDA the reference is vLLM's native fused operator, resolved through the
+merged ``baseline.qsa_prepare`` module. Ascend has no single equivalent
+operator, so the reference composes the vllm-ascend operators covering the same
+work: the main
 split/norm/rope kernel, the indexer norm+RoPE (fused on newer vendor builds,
 ``triton_qsa_rmsnorm_mrope``), the group compressor and
 the row-store kernel for every cache write. Only metadata preparation and the
@@ -367,10 +368,10 @@ def vendor_reference():
     if flaggems_vllm.vendor_name == "ascend":
         io = os.environ.get("QSA_ASCEND_BASELINE_IO", "vendor").strip().lower()
         return build_ascend_baseline(io != "torch")
+    # The merged `baseline/qsa_prepare.py` already resolves the vLLM native
+    # operator; reuse it instead of duplicating the import here.
     try:
-        from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import (
-            qsa_prepare as vllm_qsa_prepare,
-        )
-    except Exception:  # noqa: BLE001 - any import failure means "not available"
+        from baseline.qsa_prepare import native as native_baseline
+    except Exception:  # noqa: BLE001 - import failure means "not available"
         return None
-    return vllm_qsa_prepare
+    return native_baseline()
