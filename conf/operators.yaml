@@ -2001,6 +2001,18 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: paged_prefix_window_attention
+  description: Paged FP16/BF16 decode over a disjoint prefix and sliding tail using MACA KV attention and stable LSE merging.
+  for:
+  - RSWAAttention
+  labels:
+  - fused
+  - vLLM
+  - vendor
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: paged_scatter_triton
   description: 'Scatters token rows into paged caches by slot index in a single kernel,
 
