@@ -340,7 +340,7 @@ def _sdk_clang():
 
 
 @lru_cache(maxsize=None)
-def _native_library(rope, splits):
+def _native_library(rope, splits, refine_last=False, short_local=False):
     compiler, version = _sdk_clang()
     source = Path(__file__).with_suffix(".cpp")
     flags = (
@@ -356,6 +356,8 @@ def _native_library(rope, splits):
         "-emit-llvm",
         f"-DROPE={rope}",
         f"-DPARTS={splits}",
+        f"-DREFINE_LAST={int(refine_last)}",
+        f"-DSHORT_LOCAL={int(short_local)}",
     )
     digest = hashlib.sha256(
         source.read_bytes() + version + str(compiler).encode() + repr(flags).encode()
@@ -410,7 +412,11 @@ def _native_sparse_kernel(
 ):
     # Two KV/RoPE buffers, packed probabilities, scales and warp reduction storage.
     shared_bytes: tl.constexpr = (
-        2 * 128 * (512 + 2 * R) + 64 * 128 + 2 * 128 * 4 + 2 * 4 * 64 * 4
+        2 * 128 * (512 + 2 * R)
+        + 64 * 128
+        + 2 * 128 * 4
+        + 2 * 4 * 64 * 4
+        + (64 * 128 if K == 640 and R == 0 else 0)
     )
     shared = tle.gpu.alloc(
         (triton.next_power_of_2(shared_bytes // 4),),
@@ -458,7 +464,7 @@ def _selected_scale_max(
         # Rare large scales and typical scales both constrain the U8 step.
         count = tl.maximum(tl.sum(valid.to(tl.int32), 0), 1)
         mean = tl.sum(ks, 0) / count
-        peak = 224.0 * tl.maximum(peak / 176.0, mean / 136.0)
+        peak = 224.0 * tl.maximum(peak / 152.0, mean / 124.0)
     tl.store(Anchor + row, peak)
 
 
@@ -538,12 +544,15 @@ def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
     batch = q.shape[0]
     topk, rope, tokens = ids.shape[-1], qr.shape[-1], kv.shape[0] * 64
     splits = 1
-    if batch <= 16:
+    if batch <= 16 and topk == 8320:
         splits = 2 if 9 <= batch <= 10 else 5
     lse = torch.empty((batch, 64, 1), device=q.device, dtype=torch.float32)
     error = torch.empty_like(lse)
-    anchor = torch.empty((batch,), device=q.device, dtype=torch.float32)
-    if splits == 1 or rope == 0:
+    short_local = batch <= 16 and topk == 640
+    local_scale = short_local or (splits > 1 and rope != 0)
+    anchor = lse
+    if not local_scale:
+        anchor = torch.empty((batch,), device=q.device, dtype=torch.float32)
         _selected_scale_max[(batch,)](
             ks, ids, anchor, topk, tokens, triton.next_power_of_2(topk), num_warps=4
         )
@@ -573,7 +582,9 @@ def _launch_native(q, qr, kv, kr, qs, ks, ids, scale, out):
         scale,
         num_warps=16,
         num_stages=1,
-        extern_libs=_native_library(rope, splits),
+        extern_libs=_native_library(
+            rope, splits, topk == 640 and rope == 0, short_local
+        ),
     )
     if splits > 1:
         _merge_native_partitions[(64, batch)](
@@ -696,6 +707,7 @@ def flash_mla_sparse_fwd_w8a8(
         and q_rope.dtype == torch.bfloat16
         and (
             (0 < batch <= 16 and topk == 8320)
+            or (13 <= batch <= 16 and topk == 640)
             or (
                 64 <= batch <= 16384
                 and (topk in (2048, 8320) or (rope == 0 and topk == 640))

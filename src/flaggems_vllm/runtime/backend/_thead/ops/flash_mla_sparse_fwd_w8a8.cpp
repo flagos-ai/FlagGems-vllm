@@ -5,8 +5,12 @@
 // asynchronous copies alternate between two KV tiles in shared memory.
 constexpr int BH = 64, BN = 128, W = 16, CUBE = 256;
 constexpr int GROUP = (ROPE || PARTS > 1) ? 32 : 16;
-constexpr bool LOCAL = PARTS > 1 && ROPE;
+constexpr bool LOCAL = SHORT_LOCAL || (PARTS > 1 && ROPE);
 constexpr float FACTOR = 224.0f;
+// Used for one 640-token selection. Even 640 * 255 * 128 * 16 fits in INT32.
+constexpr int residual_radix = 16;
+static_assert(!REFINE_LAST || (PARTS == 1 && ROPE == 0),
+              "last-tile refinement");
 using u32 = unsigned;
 using u16 = unsigned short;
 using u64 = unsigned long long;
@@ -66,10 +70,14 @@ INLINE u32 perm(u32 x, u32 y, u32 code) {
   asm("ppu.prmt.b32 %0,%1,%2,%3;" : "=r"(z) : "r"(x), "r"(y), "r"(code));
   return z;
 }
-INLINE u32 round_unsigned(float x) {
-  u32 v;
+INLINE int round_nearest(float x) {
+  int v;
   asm("ppu.cvt.rni.s32.f32 %0,%1;" : "=r"(v) : "f"(x));
   return v;
+}
+INLINE u32 pack_probabilities(const u32 (&z)[4]) {
+  u32 ab = perm(z[0], z[1], 0x5410), cd = perm(z[2], z[3], 0x5410);
+  return perm(ab, cd, 0x6420);
 }
 INLINE u16 bf(float x) {
   u32 a = __builtin_bit_cast(u32, x);
@@ -110,15 +118,21 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
   S<u32> *packed = (S<u32> *)(ropes + 2 * BN * ROPE * 2);
   S<float> *allscales = (S<float> *)(packed + BH * BN / 4);
   S<float> *sums = allscales + 2 * BN;
+  S<u32> *low_packed = (S<u32> *)(sums + 2 * WN * BH);
   float anchor;
-  // For short RoPE partitions the scale scan fits in the same CTA.
+  // Short selections and RoPE partitions scan their scales in the same CTA.
   if constexpr (LOCAL) {
-    float z = 1.e-30f;
+    float z = 1.e-30f, scale_sum = 0.f;
+    int count = 0;
     for (int i = tid; i < K; i += W * 32) {
       int idx = ids[i];
       if ((unsigned)idx < (unsigned)tokens) {
         float x = ks[idx];
         z = z > x ? z : x;
+        if constexpr (REFINE_LAST) {
+          scale_sum += x;
+          ++count;
+        }
       }
     }
     UNROLL for (int a = 1; a < 32; a *= 2) {
@@ -126,13 +140,36 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
           float, shfl(-1, __builtin_bit_cast(int, z), lane ^ a, 31));
       z = z > x ? z : x;
     }
-    if (lane == 0)
+    if constexpr (REFINE_LAST) {
+      UNROLL for (int a = 1; a < 32; a *= 2) {
+        scale_sum += __builtin_bit_cast(
+            float, shfl(-1, __builtin_bit_cast(int, scale_sum), lane ^ a, 31));
+        count += shfl(-1, count, lane ^ a, 31);
+      }
+    }
+    if (lane == 0) {
       sums[warp] = z;
+      if constexpr (REFINE_LAST) {
+        sums[W + warp] = scale_sum;
+        sums[2 * W + warp] = (float)count;
+      }
+    }
     sync();
     anchor = 1.e-30f;
+    scale_sum = 0.f;
+    float valid = 0.f;
     UNROLL for (int j = 0; j < W; ++j) {
       float x = sums[j];
       anchor = anchor > x ? anchor : x;
+      if constexpr (REFINE_LAST) {
+        scale_sum += sums[W + j];
+        valid += sums[2 * W + j];
+      }
+    }
+    if constexpr (REFINE_LAST) {
+      float typical = scale_sum / (124.f * (valid > 0 ? valid : 1.f));
+      float peak = anchor / 152.f;
+      anchor = FACTOR * (peak > typical ? peak : typical);
     }
   } else
     anchor = ((G<float> *)anchors)[row];
@@ -151,8 +188,8 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
     int off = k * 8 + quad;
     qfrag[k] = {{q[off], q[off + 4], q[off + 8 * 128], q[off + 8 * 128 + 4]}};
   }
-  // In unsplit PV a warp reuses each value fragment across several head tiles.
-  constexpr int pv_head_warps = PARTS > 1 ? WM : (ROPE ? 2 : 1);
+  // Reuse each value fragment across head tiles owned by the same warp.
+  constexpr int pv_head_warps = ROPE ? (PARTS > 1 ? WM : 2) : 1;
   constexpr int pv_feature_warps = W / pv_head_warps;
   constexpr int head_tiles = WM / pv_head_warps;
   constexpr int feature_tiles = 512 / (16 * pv_feature_warps);
@@ -243,46 +280,76 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
       }
 
       UNROLL for (int rr = 0; rr < 2; ++rr) {
-        u32 z[4];
+        u32 z[4], low[4];
         UNROLL for (int i = 0; i < 4; ++i) {
           int t = nt * 16 + quad + i * 4;
           float ksc = scales[t];
-          float p = ksc > 0 ? ex2(((float)scores[j].c[rr * 4 + i] +
-                                   rrscore.c[rr * 4 + i]) *
-                                  qs[rr] * ksc * scale)
-                            : 0.f;
+          float score = (float)scores[j].c[rr * 4 + i] + rrscore.c[rr * 4 + i];
+          float log2_weight = score * qs[rr] * ksc * scale;
+          float p = ksc > 0.f ? ex2(log2_weight) : 0.f;
           den[rr] += p;
           float norm = p * (ksc * factor);
-          z[i] = round_unsigned(norm < 255.f ? norm : 255.f);
-          err[rr] += (ksc > 0.f && !(p > 1.e-16f && p < 1.e16f))
-                         ? __builtin_inff()
-                         : __builtin_fabsf(norm - (float)z[i]);
+          z[i] = round_nearest(norm < 255.f ? norm : 255.f);
+          float delta = norm - (float)z[i];
+          if constexpr (REFINE_LAST) {
+            if (src + BN >= K) {
+              // Reuse the resident V tile for a second, signed INT8 product.
+              float extra = delta * residual_radix;
+              float clipped =
+                  extra < 127.f ? (extra > -128.f ? extra : -128.f) : 127.f;
+              int code = round_nearest(clipped);
+              low[i] = (u32)code;
+              delta -= (float)code / residual_radix;
+            }
+          }
+          float residual = __builtin_fabsf(delta);
+          bool unsafe = ksc > 0.f && !(p > 1.e-16f && p < 1.e16f);
+          err[rr] += unsafe ? __builtin_inff() : residual;
         }
-        u32 ab = perm(z[0], z[1], 0x5410), cd = perm(z[2], z[3], 0x5410);
-        u32 pl = perm(ab, cd, 0x6420);
+        u32 high_word = pack_probabilities(z);
         int peer = (lane & 16) | (quad << 2) | (lr & 3);
         int offset =
             (hm * (BN / 32) + nt / 2) * 128 + (rr * 2 + (nt & 1)) * 32 + peer;
-        packed[offset] = trans8(shfl(-1, pl, peer, 31));
+        packed[offset] = trans8(shfl(-1, high_word, peer, 31));
+        if constexpr (REFINE_LAST) {
+          if (src + BN >= K)
+            low_packed[offset] =
+                trans8(shfl(-1, pack_probabilities(low), peer, 31));
+        }
       }
     }
     sync();
-    UNROLL for (int k = 0; k < BN / 32; ++k) {
-      F ah[head_tiles];
-      UNROLL for (int m = 0; m < head_tiles; ++m)
-          UNROLL for (int i = 0; i < 4; ++i) {
-        int off = ((pv_head + m * pv_head_warps) * (BN / 32) + k) * 128 +
-                  i * 32 + lane;
-        ah[m].f[i] = packed[off];
+    const int passes = REFINE_LAST && src + BN >= K ? 2 : 1;
+    for (int pass = 0; pass < passes; ++pass) {
+      if (pass == 1) {
+        UNROLL for (int m = 0; m < head_tiles; ++m) {
+          UNROLL for (int j = 0; j < feature_tiles; ++j) {
+            UNROLL for (int e = 0; e < 8; ++e) value_acc[m][j].c[e] *=
+                residual_radix;
+          }
+        }
       }
-      UNROLL for (int j = 0; j < feature_tiles; ++j) {
-        int t = k * 32 + quad * 4 + (lr & 3);
-        int col = 16 * (pv_feature + j * pv_feature_warps) + (lane >> 4) * 4;
-        F b = {{trans8(word(sv, t, col)), trans8(word(sv, t + 16, col)),
-                trans8(word(sv, t, col + 8)),
-                trans8(word(sv, t + 16, col + 8))}};
+      UNROLL for (int k = 0; k < BN / 32; ++k) {
+        F ah[head_tiles];
         UNROLL for (int m = 0; m < head_tiles; ++m)
-            umma(value_acc[m][j], ah[m], b);
+            UNROLL for (int i = 0; i < 4; ++i) {
+          int off = ((pv_head + m * pv_head_warps) * (BN / 32) + k) * 128 +
+                    i * 32 + lane;
+          ah[m].f[i] = (pass == 0 ? packed : low_packed)[off];
+        }
+        UNROLL for (int j = 0; j < feature_tiles; ++j) {
+          int t = k * 32 + quad * 4 + (lr & 3);
+          int col = 16 * (pv_feature + j * pv_feature_warps) + (lane >> 4) * 4;
+          F b = {{trans8(word(sv, t, col)), trans8(word(sv, t + 16, col)),
+                  trans8(word(sv, t, col + 8)),
+                  trans8(word(sv, t + 16, col + 8))}};
+          UNROLL for (int m = 0; m < head_tiles; ++m) {
+            if (pass == 0)
+              umma(value_acc[m][j], ah[m], b);
+            else
+              mma(value_acc[m][j], ah[m], b);
+          }
+        }
       }
     }
   }
@@ -329,7 +396,8 @@ extern "C" u32 ppu_sparse_mla(u64 qp, u64 qrp, u64 vp, u64 krp, u64 qsp,
     UNROLL for (int j = 0; j < feature_tiles; ++j)
         UNROLL for (int a = 0; a < 4; ++a) {
       int e = r * 4 + a;
-      float out = ((float)value_acc[m][j].c[e]) * unit;
+      float out = ((float)value_acc[m][j].c[e]) *
+                  (REFINE_LAST ? unit / residual_radix : unit);
       auto dest = (u64)ix * 512 + (pv_feature + j * pv_feature_warps) * 16 +
                   quad + a * 4;
       if constexpr (PARTS == 1)
