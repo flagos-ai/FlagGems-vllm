@@ -230,7 +230,14 @@ def flash_mla_sparse_fwd_w8a8(
     )
     if batch:
         bh = 64 if heads >= 128 else min(32, max(16, triton.next_power_of_2(heads)))
-        bn = 256 if bh == 32 else 128
+        # The no-RoPE 32x256 lowering can exceed the 256 KiB shared-memory limit.
+        bn = 256 if bh == 32 and rope else 128
+        short_no_rope = (
+            bh == 32
+            and rope == 0
+            and indices.shape[-1] <= 128
+            and batch * queries >= 16
+        )
         scale = (512 + rope) ** -0.5 if softmax_scale is None else float(softmax_scale)
         with torch.cuda.device(q_nope.device):
             _sparse_decode[(triton.cdiv(heads, bh), batch * queries)](
@@ -255,7 +262,7 @@ def flash_mla_sparse_fwd_w8a8(
                 attn_sink is not None,
                 bh,
                 bn,
-                num_warps=8 if bh == 16 else 16,
+                num_warps=8 if bh == 16 or short_no_rope else 16,
                 num_stages=1,
             )
     return out, lse

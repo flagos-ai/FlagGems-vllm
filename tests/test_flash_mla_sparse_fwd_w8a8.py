@@ -337,6 +337,34 @@ def test_sparse_decode_ppu(queries, heads, topk, rope_dim, dtype):
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @pytest.mark.skipif(not PPU_SPARSE_SUPPORTED, reason="Requires PPU INT8 sparse MLA")
+@pytest.mark.parametrize("topk", [128, 640])
+def test_sparse_decode_ppu_no_rope_without_lengths(topk):
+    from tests.test_flash_mla_sparse_fwd import FlashmlaSparseTestKit
+
+    inputs, _, _ = make_sparse_decode_inputs([topk] * 4, 1, 64, topk, torch.bfloat16, 0)
+    q, _, kv, _, qs, ks, ids = inputs
+    out, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*inputs)
+    expected, _, expected_lse = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        4,
+        kv.shape[0] * 64,
+        64,
+        1,
+        512,
+        topk,
+        (q.float() * qs)[:, 0].cpu(),
+        (kv.float() * ks).view(-1, 1, 512).cpu(),
+        ids.cpu(),
+        512**-0.5,
+        512,
+        None,
+        None,
+    )
+    gems_assert_close(out[:, 0].cpu(), expected, torch.bfloat16, atol=0.002)
+    gems_assert_close(lse[:, :, 0].cpu(), expected_lse, torch.float32, atol=2e-4)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not PPU_SPARSE_SUPPORTED, reason="Requires PPU INT8 sparse MLA")
 @pytest.mark.parametrize("empty", ["indices", "pages", "batch"])
 def test_sparse_decode_ppu_empty(empty):
     inputs, _, _ = make_sparse_decode_inputs([8], 2, 16, 7, torch.bfloat16)
