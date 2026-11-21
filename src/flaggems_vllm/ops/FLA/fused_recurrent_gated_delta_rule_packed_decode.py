@@ -305,7 +305,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         V=V,
         BK=BK,
         BV=BV,
-        PRESERVE_BETA_ROUNDING=device.vendor_name == "ascend",
+        PRESERVE_BETA_ROUNDING=device.vendor_name in ("ascend", "tsingmicro"),
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         num_warps=num_warps,
