@@ -26,11 +26,6 @@ except ImportError:
     VLLM_AVAILABLE = False
     SM90_AVAILABLE = False
 
-from vllm.third_party.deep_gemm.utils.math import (
-    cast_back_from_fp4,
-    per_token_cast_to_fp4,
-)
-
 import flaggems_vllm
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
 
@@ -79,6 +74,8 @@ def quantize_to_mxfp4(x):
         packed: int8 tensor with shape [..., D//2] (two E2M1 nibbles per byte)
         scales: int32 tensor with shape [..., 1] (packed ue8m0 per-block scales)
     """
+    from vllm.third_party.deep_gemm.utils.math import per_token_cast_to_fp4
+
     orig_shape = x.shape
     D = orig_shape[-1]
     flat = x.float().reshape(-1, D)  # [flat_rows, D]
@@ -117,6 +114,8 @@ def dequantize_mxfp4(packed, scales, head_dim):
     Returns:
         x_f32: float32 [..., D]
     """
+    from vllm.third_party.deep_gemm.utils.math import cast_back_from_fp4
+
     orig_batch = packed.shape[:-1]
     D = head_dim
     n_blocks = D // MXFP4_BLOCK_SIZE
@@ -225,3 +224,30 @@ def test_fp8_fp4_mqa_logits(M, N, clean_logits, use_fp4):
     gems_assert_close(
         res_out, ref_out, res_out.dtype, equal_nan=True, atol=atol, reduce_dim=1
     )
+
+
+@pytest.mark.fp8_fp4_mqa_logits
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="requires MetaX")
+@pytest.mark.parametrize("num_queries,num_keys", [(5, 7), (65, 131)])
+def test_fp8_mqa_logits_metax(num_queries, num_keys):
+    generator = torch.Generator().manual_seed(42)
+    q = torch.randn(num_queries, 32, 128, generator=generator).to(torch.float8_e4m3fn)
+    k = torch.randn(num_keys, 128, generator=generator).to(torch.float8_e4m3fn)
+    scale = torch.linspace(0.25, 1.0, num_keys)
+    weights = torch.rand(num_queries, 32, generator=generator)
+    start = torch.ones(num_queries, dtype=torch.int32)
+    end = torch.full_like(start, num_keys - 1)
+    expected = (((q.float() @ k.float().T) * scale).relu() * weights[:, :, None]).sum(
+        dim=1
+    )
+    expected[:, 0] = expected[:, -1] = -torch.inf
+
+    actual = fp8_fp4_mqa_logits(
+        (q.to(device), None),
+        (k.to(device), scale.to(device)),
+        weights.to(device),
+        start.to(device),
+        end.to(device),
+        clean_logits=True,
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-4)
