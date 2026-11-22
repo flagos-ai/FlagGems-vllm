@@ -760,7 +760,7 @@ def _launch_pipelined(
     ):
         from functools import partial
 
-        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.submission import (
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
             submit_mixed,
         )
 

@@ -36,21 +36,19 @@ from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.direct import (
     _attention_task,
     _body_queue_partition_preflight,
     _body_queue_preflight,
-    _softmax_rows_dispatch,
-    _softmax_stack,
-    stage_q1_window,
-)
-from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.native_pipeline import (
+    _init_attention_accumulator,
+    _init_attention_state,
+    _load_attention_query,
     _native_compute_pv,
     _native_compute_qk,
     _native_update_accumulator,
     _native_update_softmax,
+    _softmax_rows_dispatch,
+    _softmax_stack,
+    stage_q1_window,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.prefill import (
     _core_finish,
-    _core_init_o,
-    _core_init_state,
-    _core_load_q,
     _core_o,
     _core_pv,
     _core_qk_only,
@@ -1517,7 +1515,7 @@ def _attention_request_coreloops(
                 klen, tl.maximum(0, tl.minimum(qlen, qt * 128 + 128) + klen - qlen)
             )
             stacks = tl.cdiv(limit, BS)
-            _core_load_q(
+            _load_attention_query(
                 Q,
                 Q_RAW,
                 query_buf,
@@ -1664,10 +1662,10 @@ def _attention_request_coreloops(
                 klen, tl.maximum(0, tl.minimum(qlen, qt * 128 + 128) + klen - qlen)
             )
             stacks = tl.cdiv(limit, BS)
-            _core_init_o(
+            _init_attention_accumulator(
                 acc_buf, ACCWORK, worker.to(tl.int64), BM, ACC_UB_ROWS, COMPACT_O
             )
-            _core_init_state(
+            _init_attention_state(
                 state_buf, row_end_buf, qt, qs, headstart, qlen, klen, group, BM
             )
             for step in range(0, stacks + 2):
@@ -2148,7 +2146,7 @@ def _attention_request_prob_stack(
                 klen, tl.maximum(0, tl.minimum(qlen, qt * 128 + 128) + klen - qlen)
             )
             stacks = tl.cdiv(limit, BS)
-            _core_load_q(
+            _load_attention_query(
                 Q,
                 Q_RAW,
                 query_buf,
@@ -2322,10 +2320,10 @@ def _attention_request_prob_stack(
                 klen, tl.maximum(0, tl.minimum(qlen, qt * 128 + 128) + klen - qlen)
             )
             stacks = tl.cdiv(limit, BS)
-            _core_init_o(
+            _init_attention_accumulator(
                 acc_buf, ACCWORK, worker.to(tl.int64), BM, ACC_UB_ROWS, COMPACT_O
             )
-            _core_init_state(
+            _init_attention_state(
                 state_buf, row_end_buf, qt, qs, headstart, qlen, klen, group, BM
             )
             for step in range(0, stacks + 2):

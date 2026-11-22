@@ -1636,7 +1636,7 @@ def flash_attn_varlen_func(
                 or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
             )
         ):
-            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.singleton import (
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
                 singleton_paged_output,
             )
 
@@ -1660,7 +1660,7 @@ def flash_attn_varlen_func(
                 or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
             )
         ):
-            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.raw_q1 import (
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
                 raw_q1_output,
             )
 
@@ -1695,7 +1695,7 @@ def flash_attn_varlen_func(
                 or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
             )
         ):
-            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.short_prefill import (
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.prefill import (
                 short_prefill_output,
             )
 
