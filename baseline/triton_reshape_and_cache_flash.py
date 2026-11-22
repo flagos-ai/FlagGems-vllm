@@ -58,6 +58,19 @@ def native():
         "v_scale",
     ):
         raise RuntimeError("native signature drift: diff before benchmarking")
+    platform = module.current_platform
+    # The audited native launch has ROCm/XPU branches and otherwise queries
+    # torch.cuda.get_device_capability, including for ordinary (non-FP8) caches.
+    if (
+        not platform.is_rocm()
+        and not platform.is_xpu()
+        and not torch.cuda.is_available()
+    ):
+        NATIVE_UNAVAILABLE_REASON = (
+            "installed native requires a CUDA-capable Torch runtime outside "
+            "its ROCm/XPU paths"
+        )
+        return None
     return op
 
 
