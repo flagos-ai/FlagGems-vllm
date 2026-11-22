@@ -1723,51 +1723,14 @@ ops:
   kind:
     - NeuralNetwork
   stages:
-  - alpha: '5.4'
-- id: mamba_mixer
-  description: Triton implementation of the Mamba mixer operator for vLLM inference.
-  for:
-  - mamba_mixer
-  labels:
-  - fused
-  - vLLM
-  kind:
-  - NeuralNetwork
-  stages:
-  - alpha: '5.4'
-- id: marlin_gemm
-  description: 'Marlin quantized GEMM supporting W4A16 chunked quantization for efficient
-    inference with quantized weights and FP16/BF16 activations.
-
-    '
-  for:
-  - marlin_gemm
-  labels:
-  - fused
-  - vLLM
-  - Quantization
-  kind:
-  - BLAS
-  stages:
-  - alpha: '5.5'
-- id: matmul_persistent
-  description: vLLM batch-invariant matmul with bounded NVIDIA small-matrix optimization.
-  for:
-    - vllm.model_executor.determinism.batch_invariant.matmul_batch_invariant
-  labels:
-    - vLLM
-    - KernelGen
-  kind:
-    - NeuralNetwork
-  stages:
-  - alpha: '5.4'
+    - alpha: '5.4'
 - id: megamhc
   description: >-
     Hygon FlagTree Triton MegaMHC forward for the DeepSeek-V4-Flash Normal BF16
     profile, combining the residual update, coefficient projection, Sinkhorn
     mixing, and RMS normalization.
   for:
-  - vllm.model_executor.kernels.mhc.mhc_fused_post_pre_tilelang
+  - vllm.model_executor.layers.mhc.MHCFusedPostPreOp
   labels:
   - fused
   - vLLM
