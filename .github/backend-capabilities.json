@@ -10,11 +10,9 @@
   },
   "backends": {
     "ascend-cann900": {
-      "auto_select": true
+      "auto_select": false
     },
-    "hygon": {
-      "auto_select": true
-    },
+    "hygon": {},
     "iluvatar": {
       "tests_allow": [
         "tests/test_mul.py"
@@ -23,9 +21,7 @@
     "metax-maca3720": {
       "auto_select": true
     },
-    "metax-maca3810": {
-      "auto_select": true
-    },
+    "metax-maca3810": {},
     "mthreads-musa520": {
       "tests_allow": [
         "tests/test_fused_inv_rope_fp8_quant.py",

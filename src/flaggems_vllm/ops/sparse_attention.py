@@ -16,6 +16,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.utils.triton_version_utils import pipeline_options
+
 
 # ---------------------------------------------------------------------------
 # Triton kernel: sparse attention with attention-sink
@@ -125,6 +128,26 @@ def sparse_attn_triton_kernel(
 # ---------------------------------------------------------------------------
 # Python wrapper
 # ---------------------------------------------------------------------------
+def _pipeline_launch_options(h_padded, num_ctas, topk, device):
+    """Pipelining of the top-k KV loop with FlagTree (measured on H20).
+
+    The loop reads the token ids, then the KV rows they select. With 16 or 32
+    heads per program and at most one CTA per SM, prefetching the KV rows two
+    stages ahead and reading the ids synchronously is fastest; a short loop
+    (top-k <= 256) or 64+ heads per program prefer 2 stages. Thresholds
+    measured on H20 (D=512, top-k 128-2048).
+    """
+    sync_index = pipeline_options(pipeline_index_prefetch=False)
+    if not sync_index:
+        return {}
+    if topk <= 256 or h_padded >= 64:
+        return {"num_stages": 2}
+    num_sms = torch_device_fn.get_device_properties(device).multi_processor_count
+    if h_padded == 32 or num_ctas <= num_sms:
+        return sync_index
+    return {}
+
+
 def sparse_attn_triton(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -139,6 +162,7 @@ def sparse_attn_triton(
     h_padded = max(16, triton.next_power_of_2(h))
 
     grid = (m, b)  # each program handles ALL h heads
+    launch_options = _pipeline_launch_options(h_padded, m * b, topk, q.device)
     sparse_attn_triton_kernel[grid](
         q,
         kv,
@@ -166,5 +190,6 @@ def sparse_attn_triton(
         D=d,
         H=h_padded,
         num_warps=8,  # 256 threads, matching tilelang
+        **launch_options,
     )
     return o

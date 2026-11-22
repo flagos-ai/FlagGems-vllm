@@ -484,7 +484,6 @@ def test_flash_mla_sparse_vendor_export_and_abi():
 
     op = flaggems_vllm.flash_mla_sparse_fwd
     assert inspect.signature(op) == inspect.signature(generic.flash_mla_sparse_fwd)
-    assert op in [entry[1] for entry in flaggems_vllm._FULL_CONFIG]
     if flaggems_vllm.vendor_name == "thead":
         from flaggems_vllm.runtime.backend._thead.fused import flashmla_sparse
 

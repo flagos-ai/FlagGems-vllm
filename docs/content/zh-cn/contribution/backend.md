@@ -35,6 +35,42 @@ backend/
 
 ## 新增后端的标准步骤
 
+### 步骤 0：添加环境搭建配置
+
+在 `src/flaggems_vllm/backends.yaml` 中新增条目，`tools/setup.sh` 会据此构建厂商环境。
+配置记录 Python 版本、厂商 torch/加速库、Triton/FlagTree、vLLM 来源、环境变量、
+厂商 env 脚本和后端专用测试依赖：
+
+```yaml
+backends:
+  myvendor-myhw:
+    vendor: myvendor
+    python: "3.12"
+    deps:
+      - torch==2.10.0+myvendor
+      - myvendor-torch==1.2.3
+    triton: triton==3.6.0+myvendor
+    flagtree: flagtree==0.7.0+myvendor
+    # 如果厂商镜像自带 vLLM，可省略；在镜像内使用 --no-venv
+    vllm:
+      - vllm-myvendor==0.24.0
+    env:
+      MYVENDOR_HOME: /opt/myvendor
+      LD_LIBRARY_PATH: $MYVENDOR_HOME/lib:$LD_LIBRARY_PATH
+    env_source:
+      - /opt/myvendor/set_env.sh
+    # 可选的后端专用测试依赖（NVIDIA 用它安装 cupy）
+    test_deps:
+      - "some-vendor-test-helper>=1.0"
+```
+
+如需通过厂商名直接选择该配置，在 `aliases:` 下添加别名。然后验证：
+
+```bash
+bash tools/setup.sh --list
+bash tools/setup.sh --dry-run myvendor
+```
+
 ### 步骤 1：创建后端目录
 
 ```bash
@@ -94,6 +130,24 @@ PYTHONPATH=src pytest -q benchmark/test_grouped_topk.py \
     --level core --iter 100 --warmup 20 \
     --record --output myvendor_results.json
 ```
+
+## CI 集成
+
+后端 CI 由数据文件驱动，不需要在 workflow 中为每个厂商单独写 job。
+不要在 `.github/workflows/unittest.yaml` 中新增 job。接入一个后端的步骤：
+
+1. 在 `src/flaggems_vllm/backends.yaml` 中添加 profile，供 `tools/setup.sh` 构建环境；
+2. 在 `.github/backends.json` 中添加条目（`backend`、`runner_label`、`label`、`gpu_check`、`enabled`），并提供健康检查脚本 `tools/gpu_check_<vendor>.sh`；
+3. 在 `.github/backend-capabilities.json` 中列出该后端已验证的测试。该文件中 `auto_select` 为 `true` 之前，只有显式的 `vendor/*` 标签会调度该后端，仅修改路径不会触发。
+
+Pull Request 如何触发后端 CI：
+
+- `unittest.yaml` 以 `preprocess` job 开始：等待 triage workflow 完成，读取 PR 标签，并选择测试（`tools/select_tests.py`）与后端（`tools/select_backends.py`、`tools/select_ci_backends.py`）；
+- 当 PR 修改了 `src/flaggems_vllm/runtime/backend/_<vendor>/`（且 `auto_select` 为 `true`），或维护者添加了对应的 `vendor/*` 标签时，该后端会运行；`ci/all-vendors` 会选中所有已启用的后端；
+- H20 任务（`python-op`）对来自本仓库的 PR 运行；fork PR 需要维护者添加 `ci/nvidia` 标签；
+- 分支保护中只需要要求 `unittest-required`。应运行的 job 被跳过，或任一 job 失败，该检查都会失败。
+
+Runner 部署与信任模型详见 `.github/MULTI_BACKEND_CI.md`。
 
 ## 编译器选择
 
