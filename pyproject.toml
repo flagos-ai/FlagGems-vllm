@@ -63,17 +63,51 @@ nvidia = [
 ascend = [
     "vllm-ascend==0.32.0rc1",
 ]
+metax = [
+    # vLLM-MetaX 0.29.0 wheel; mcoplib is pinned to the matching maca3.9.0.31 build.
+    "mcoplib @ https://repos.metax-tech.com/r/maca-pypi/packages/mcoplib/0.4.14+gf3794c4.maca3.9.0.31.torch2.10/mcoplib-0.4.14+gf3794c4.maca3.9.0.31.torch2.10-cp312-cp312-linux_x86_64.whl#sha256=2733e4d1bb338ef3f6b2e152c41ebdeddff03bd5b28ae87f58177bdcca3adc23",
+    "vllm-metax @ https://repos.metax-tech.com/r/maca-pypi/packages/vllm-metax/0.29.0+gdc48c1.d20261030.maca3.9.0.9.torch2.10.0/vllm_metax-0.29.0+gdc48c1.d20261030.maca3.9.0.9.torch2.10.0-cp312-cp312-linux_x86_64.whl#sha256=873329f1dd3d6b01e45d41f9812a576fe792644fb07d80f56817a0a23849a5b8",
+]
+
 iluvatar = [
     "vllm @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/vllm/0.24.0+flagos/vllm-0.24.0+flagos-cp312-cp312-linux_x86_64.whl#sha256=ca0450ff49eecb2c2954edd6e2350fb4a5bbe63f1512b6160aac8a798440010c",
     "ixformer @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/ixformer/0.7.0+corex.4.5.0.20260804/ixformer-0.7.0+corex.4.5.0.20260804-cp312-cp312-linux_x86_64.whl#sha256=413fe629b4ee707df83fd99a19366dd35ae757a2f495acdc2cffa7a49be7a688",
+    # Flattened the deps of vllm into the direct deps since they should be
+    # resolved from specific repos, and there are no tools to resolve them.
+    "opencv-python-headless @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/opencv-python-headless/5.0.0.93+flagos/opencv_python_headless-5.0.0.93+flagos-cp37-abi3-manylinux_2_28_x86_64.whl#sha256=33e9053e6a8d8e2fe98bc4f14ef0e5305d8dea47f328506e037051e6404a567b",
+    "compressed-tensors @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/compressed-tensors/0.17.0+flagos/compressed_tensors-0.17.0+flagos-py3-none-any.whl#sha256=42eb84cf77034f6bcb258681b93eebbb6037b6946198879f6a223dc5b2d15440",
     "numpy<2",
+]
+
+hygon = [
+    "aiter-dtk",
+    "vllm @ https://resource.flagos.net/repository/flagos-pypi-hygon/packages/vllm/0.24.0+flagos/vllm-0.24.0+flagos-cp312-cp312-linux_x86_64.whl#sha256=00662bd456160fb9d610831cd7f04012e15a1feb57c3807b746f4e2c13ffd20d",
+    # Flattened the deps of vllm into the direct deps since they should be
+    # resolved from specific repos, and there are no tools to resolve them.
+    "opencv-python-headless @ https://resource.flagos.net/repository/flagos-pypi-hygon/packages/opencv-python-headless/5.0.0.93+flagos/opencv_python_headless-5.0.0.93+flagos-cp37-abi3-manylinux_2_28_x86_64.whl#sha256=33e9053e6a8d8e2fe98bc4f14ef0e5305d8dea47f328506e037051e6404a567b",
+    "compressed-tensors @ https://resource.flagos.net/repository/flagos-pypi-hygon/packages/compressed-tensors/0.17.0+flagos/compressed_tensors-0.17.0+flagos-py3-none-any.whl#sha256=42eb84cf77034f6bcb258681b93eebbb6037b6946198879f6a223dc5b2d15440",
+]
+
+mthreads = [
+    "mate @ https://dl.mthreads.com/repo/api/pypi/pypi/mate/0.2.4/mate-0.2.4-py3-none-any.whl#sha256=3221a86f96dd73e6e0c468cccd5ea962dbeaef2c1f3a21957ba09214fd8e5cce",
+    "torchada>=0.1.76",
+    "apache-tvm-ffi==0.1.9.post3+musa.1",
+    # tvm_ffi imports ml_dtypes from its Cython init without declaring it, and
+    # ml_dtypes 0.7 is built against the NumPy 2 C-API: 0.6 is the newest build
+    # that loads on the NumPy 1.26 every MUSA image runs.
+    "ml_dtypes<0.7",
+    "vllm-musa",
 ]
 
 thead = [
     # Vendor wheel for benchmark baselines; torch is pinned to the ppu2.2 build
     # the wheel is compiled against.
     "torch @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/torch/2.13.0+v0.1.0.ppu2.2.0/torch-2.13.0+cu130ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
+    "torchaudio @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/torchaudio/2.11.0+v0.1.0.ppu2.2.0/torchaudio-2.11.0+cu130torch2.13.0ubuntu2404ce-cp312-cp312-linux_x86_64.whl",
+    "torchvision @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/torchvision/0.28.0+v0.1.0.ppu2.2.0/torchvision-0.28.0+cu130torch2.13.0ubuntu2404ce-cp312-cp312-linux_x86_64.whl",
     "vllm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm/0.31.0+v0.1.0.ppu2.2.0/vllm-0.31.0+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
+    "vllm_sail @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm_sail/0.31.0+v0.1.0.ppu2.2.0/vllm_sail-0.31.0+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
+    "deep_gemm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/deep_gemm/1.1.0+v1.0.1.ppu2.2.1/deep_gemm-1.1.0+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
     "scikit-learn>=1.5",
 ]
 
@@ -87,10 +121,24 @@ exclude-dependencies = [
     "nvidia-cuda-runtime", "nvidia-cuda-tileiras", "nvidia-cudnn-frontend",
     "nvidia-cutlass-dsl", "nvidia-cutlass-dsl-libs-base", "nvidia-cutlass-dsl-libs-cu13",
     "quack-kernels", "tilelang", "tokenspeed-mla", "tokenspeed-triton",
-    "apache-tvm-ffi",
-    # Transitive pins of the plugin wheels: letting them resolve downgrades the base image.
+    # Transitive pins of the plugin wheels: letting them resolve downgrades the
+    # base image, including the "+flagos" rebuilds only the vendor images ship.
     "transformers", "tokenizers", "starlette", "xgrammar",
+    "torch_musa", "deep_ep",
+    "flash_attn_3", "flash_mla", "deep-gemm", "sageattention",
 ]
+no-build-isolation-package = ["vllm-musa"]
+
+[tool.uv.sources]
+aiter-dtk = { path = "tools/aiter_wrapper" }
+vllm-musa = { path = "tools/vllm_musa_wrapper" }
+tilelang-musa = { index = "mthreads" }
+apache-tvm-ffi = { index = "mthreads" }
+
+[[tool.uv.index]]
+name = "mthreads"
+url = "https://dl.mthreads.com/repo/api/pypi/pypi/simple"
+explicit = true
 
 [project.urls]
 Homepage = "https://github.com/flagos-ai/FlagGems-vllm"

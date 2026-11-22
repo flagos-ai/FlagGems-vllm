@@ -29,7 +29,7 @@ try:
     )
 
     HAS_VLLM = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_VLLM = False
 
 # Operators come from the package namespace, never from their module paths: a
@@ -198,6 +198,14 @@ def _get_baseline_mhc_post_op():
     if VENDOR == "ascend":
         # npu_mhc_post(residual, h_res, h_out, h_post): mix first, (N, 4) post.
         return lambda x, r, p, m: native(r, m, x, p.squeeze(-1))
+    if VENDOR == "hygon":
+        # aiter mhc_post writes into an out tensor and returns None.
+        def _aiter_mhc_post(x, r, p, m):
+            out = torch.empty_like(r)
+            native(out, x, r, p.reshape(r.shape[0], r.shape[1]), m)
+            return out
+
+        return _aiter_mhc_post
     return native
 
 
@@ -506,7 +514,7 @@ def test_mhc_post():
 class MHCPreBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "N, hidden_size"
 
-    def __init__(self, *args, hc_mult=4, sinkhorn_repeat=10, **kwargs):
+    def __init__(self, *args, hc_mult=4, sinkhorn_repeat=20, **kwargs):
         self.hc_mult = hc_mult
         self.sinkhorn_repeat = sinkhorn_repeat
         super().__init__(*args, **kwargs)
