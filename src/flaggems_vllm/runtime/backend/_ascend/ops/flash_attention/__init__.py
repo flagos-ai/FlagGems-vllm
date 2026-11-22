@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .launcher import launch_attention
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.launcher import (
+    launch_attention,
+)
 
 # ---- __init__ ----
 

@@ -14,27 +14,38 @@
 
 from dataclasses import replace
 from math import gcd
+from threading import Lock, get_ident
 
 import torch
 import triton
+from triton.runtime import driver
 
 from flaggems_vllm.runtime import torch_device_fn
-
-from .common import prepare_contiguous_kv, prepare_packed_inputs, use_packed_k_prescale
-from .decode import (
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
+    MAX_WORKSPACE_BYTES,
+    packed_input_bytes,
+    packed_input_layout,
+    prepare_contiguous_kv,
+    prepare_packed_inputs,
+    use_packed_k_prescale,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
     ascend_attention_short_kv_staged,
     launch_decode,
     launch_decode256_staged,
     launch_decode_actual,
     launch_paged_decode,
 )
-from .direct import ascend_attention_persistent, ascend_attention_persistent_pipelined
-from .mixed import (
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.direct import (
+    ascend_attention_persistent,
+    ascend_attention_persistent_pipelined,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.mixed import (
     ascend_attention_short_kv,
     launch_grouped_tail,
     launch_split_full_body,
 )
-from .scheduling import (
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.scheduling import (
     allocate_long_request_list,
     build_mixed_decode_plan,
     build_mixed_request_lists,
@@ -43,6 +54,122 @@ from .scheduling import (
 )
 
 # ---- launcher ----
+
+
+def _partial_bytes(params, splits, rows):
+    return splits * rows * params.h * (params.d + 1) * 4 if splits > 1 else 0
+
+
+def _scratch_bytes(params, workers, rows, stack, slots=1, *, accumulator=False):
+    tile = stack * (4 + params.q_ptr.element_size()) + params.d * 4
+    return workers * rows * (slots * tile + (params.d * 4 if accumulator else 0))
+
+
+def _packed_workspace_bytes(
+    params, plan, workers, stage_workers=0, compact_native_tail=False, *, layout=None
+):
+    """Bound the allocations that can coexist with the packed inputs."""
+    packed = packed_input_bytes(
+        params, stage_workers, compact_native_tail, layout=layout
+    )
+    scratch = _scratch_bytes(params, workers, 128, plan.kv_stack, 3, accumulator=True)
+    if (
+        params.q_ptr.dtype == torch.bfloat16
+        and 512 <= params.seqlen_q <= 4608
+        and 512 <= params.seqlen_k <= 4608
+    ):
+        # Both cross-task scores and probabilities coexist with base scratch.
+        scratch += workers * 3 * 128 * 1536 * (4 + params.q_ptr.element_size())
+
+    partial = _partial_bytes(params, plan.kv_splits, params.total_q)
+    mixed = (
+        params.q_ptr.dtype == torch.bfloat16
+        and params.b > 1
+        and params.seqlen_q > 1
+        and params.b < params.total_q < params.b * params.seqlen_q
+        and params.h // params.hk in (4, 8)
+    )
+    if mixed:
+        if params.b <= 8 and params.seqlen_k >= 32768:
+            parallel_splits = min(16, workers // gcd(workers, params.h))
+            q1 = _partial_bytes(params, 4, params.b)
+            # The Q1 partials may be held across the body and tail launches.
+            if 64 < params.seqlen_q <= 256:
+                body = _partial_bytes(params, max(2, parallel_splits), params.total_q)
+                tail = min(16, workers // gcd(workers, params.hk))
+                tail_bytes = tail * params.b * params.hk * 32 * (params.d + 1) * 4
+                tail_stage = workers * 32 * params.d * params.q_ptr.element_size()
+                partial = max(partial, q1 + max(body, tail_bytes + tail_stage))
+            elif (
+                params.seqlen_q > 8192
+                and workers % params.h != 0
+                and params.total_q > params.seqlen_q + params.b - 1
+                and (
+                    params.b < 8
+                    or params.total_q <= params.seqlen_q + params.b - 1 + 127
+                )
+            ):
+                body = _partial_bytes(params, parallel_splits, params.b * 128)
+                partial = max(partial, q1 + body + params.b * 8)
+            else:
+                partial = max(partial, q1 + partial)
+        if 2304 < params.seqlen_k <= 4608 and stage_workers:
+            partial = max(partial, _partial_bytes(params, 4, params.b))
+        if (
+            stage_workers
+            and params.h // params.hk == 8
+            and params.b >= 32
+            and params.total_q <= params.seqlen_q + params.b - 1
+            and 512 <= params.seqlen_q <= 1152
+            and 1536 < params.seqlen_k <= 2304
+        ):
+            partial = max(partial, _partial_bytes(params, 4, params.total_q))
+    # Space for request lists/counters when one of the mixed paths needs them.
+    return packed + scratch + partial + (params.b * 2 + 2) * 4
+
+
+_pipeline_scratch = {}
+_pipeline_scratch_lock = Lock()
+_MAX_RETAINED_SCRATCH = 96 * 1024 * 1024
+
+
+def _pipeline_workspace(params, workers, stack, *, reuse=False):
+    device = params.q_ptr.device
+    key = None
+    if reuse and not torch.npu.is_current_stream_capturing():
+        # The two stages submit separately, so isolate concurrent callers on
+        # the same stream by thread as well as by stream.
+        key = (
+            device.index,
+            driver.active.get_current_stream(device.index),
+            get_ident(),
+            params.q_ptr.dtype,
+            workers,
+            stack,
+            params.d,
+        )
+        saved = _pipeline_scratch.get(key)
+        if saved is not None:
+            return saved
+    # Serial stages reuse private scratch. SplitKV partials live separately
+    # because a later stage may consume them.
+    workspace = (
+        torch.empty((workers, 3, 128, stack), dtype=torch.float32, device=device),
+        torch.empty((workers, 3, 128, stack), dtype=params.q_ptr.dtype, device=device),
+        torch.empty((workers, 3, 128, params.d), dtype=torch.float32, device=device),
+        torch.empty((workers, 128, params.d), dtype=torch.float32, device=device),
+    )
+    if key is not None:
+        total_bytes = sum(t.numel() * t.element_size() for t in workspace)
+        with _pipeline_scratch_lock:
+            occupied_bytes = sum(
+                t.numel() * t.element_size()
+                for buffers in _pipeline_scratch.values()
+                for t in buffers
+            )
+            if occupied_bytes + total_bytes <= _MAX_RETAINED_SCRATCH:
+                _pipeline_scratch[key] = workspace
+    return workspace
 
 
 def _launch_pipelined(
@@ -65,29 +192,25 @@ def _launch_pipelined(
     short_split_q1=False,
     merge_min_split_k=32768,
     residual_merge=None,
+    compact_native_tail=False,
+    workspace=None,
+    shared_body_scratch=False,
 ):
     q, k, v, qcap, contig_k, q_direct = packed
     pipeline_bm = 128
-    scores = torch.empty(
-        (workers, 3, pipeline_bm, plan.kv_stack),
-        dtype=torch.float32,
-        device=params.q_ptr.device,
-    )
-    probs = torch.empty(
-        (workers, 3, pipeline_bm, plan.kv_stack),
-        dtype=params.q_ptr.dtype,
-        device=params.q_ptr.device,
-    )
-    pvwork = torch.empty(
-        (workers, 3, pipeline_bm, params.d),
-        dtype=torch.float32,
-        device=params.q_ptr.device,
-    )
-    accwork = torch.empty(
-        (workers, pipeline_bm, params.d),
-        dtype=torch.float32,
-        device=params.q_ptr.device,
-    )
+    if workspace is None:
+        pvwork = torch.empty(
+            (workers, 3, pipeline_bm, params.d),
+            dtype=torch.float32,
+            device=params.q_ptr.device,
+        )
+        accwork = torch.empty(
+            (workers, pipeline_bm, params.d),
+            dtype=torch.float32,
+            device=params.q_ptr.device,
+        )
+    else:
+        scores, probs, pvwork, accwork = workspace
     partial_q = params.b if compact_q1 else params.total_q
     kernel_o, kernel_lse = params.o_ptr, params.softmax_lse_ptr
     row_stride, head_stride = params.o_row_stride, params.o_head_stride
@@ -263,17 +386,21 @@ def _launch_pipelined(
         # Avoid a separate compact-tail launch and its sparsely filled wave.
         task_options["INCLUDE_COMPACT_TAIL"] = True
     if cross_q_task and body_task_pipeline:
-        task_scores = torch.empty(
-            (workers, 3, 128, 1536), dtype=torch.float32, device=params.q_ptr.device
-        )
-        task_probs = torch.empty(
-            (workers, 3, 128, 1536),
-            dtype=params.q_ptr.dtype,
-            device=params.q_ptr.device,
-        )
-        task_options = dict(
-            BODY_TASK_PIPELINE=True, TASK_SCORES=task_scores, TASK_PROBS=task_probs
-        )
+        if shared_body_scratch:
+            assert workspace is not None and scores.shape[-1] == 1536
+            task_options = dict(BODY_TASK_PIPELINE=True, SHARED_BODY_SCRATCH=True)
+        else:
+            task_scores = torch.empty(
+                (workers, 3, 128, 1536), dtype=torch.float32, device=params.q_ptr.device
+            )
+            task_probs = torch.empty(
+                (workers, 3, 128, 1536),
+                dtype=params.q_ptr.dtype,
+                device=params.q_ptr.device,
+            )
+            task_options = dict(
+                BODY_TASK_PIPELINE=True, TASK_SCORES=task_scores, TASK_PROBS=task_probs
+            )
         if params.b >= 32 and params.seqlen_k <= 1536:
             task_options["PARTITION_SHORT_BODY"] = True
     if (
@@ -339,7 +466,9 @@ def _launch_pipelined(
         and not defer_merge
     )
     if prefill_task_queue:
-        from .prefill import ascend_attention_prefill_task_queue
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.prefill import (
+            ascend_attention_prefill_task_queue,
+        )
 
         pipeline_kernel = ascend_attention_prefill_task_queue
         if (
@@ -347,7 +476,9 @@ def _launch_pipelined(
             and params.total_q == params.seqlen_q == params.seqlen_k
             and 1024 < params.total_q <= 1152
         ):
-            from .prefill import ascend_attention_prefill_clipped
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.prefill import (
+                ascend_attention_prefill_clipped,
+            )
 
             pipeline_kernel = ascend_attention_prefill_clipped
         if (
@@ -356,7 +487,9 @@ def _launch_pipelined(
             and params.total_q == params.seqlen_q == params.seqlen_k
             and 1024 < params.total_q <= 1152
         ):
-            from .prefill import ascend_attention_prefill_balanced
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.prefill import (
+                ascend_attention_prefill_balanced,
+            )
 
             pipeline_kernel = ascend_attention_prefill_balanced
         task_scores = torch.empty(
@@ -368,6 +501,21 @@ def _launch_pipelined(
             device=params.q_ptr.device,
         )
         task_options = dict(TASK_SCORES=task_scores, TASK_PROBS=task_probs)
+        # The short prefill kernels choose between the task queue and the
+        # regular pipeline before touching scratch. The larger task buffers
+        # cover both layouts, so the inactive layout needs no allocation.
+        scores, probs = task_scores, task_probs
+    elif workspace is None:
+        scores = torch.empty(
+            (workers, 3, pipeline_bm, plan.kv_stack),
+            dtype=torch.float32,
+            device=params.q_ptr.device,
+        )
+        probs = torch.empty(
+            (workers, 3, pipeline_bm, plan.kv_stack),
+            dtype=params.q_ptr.dtype,
+            device=params.q_ptr.device,
+        )
     long_prefill_stream = (
         params.q_ptr.dtype == torch.bfloat16
         and params.is_cu_seqlens_q
@@ -389,7 +537,9 @@ def _launch_pipelined(
         and not defer_merge
     )
     if long_prefill_stream or prefill_4k_stream:
-        from .prefill import launch_long_prefill
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.prefill import (
+            launch_long_prefill,
+        )
 
         launch_long_prefill(
             params,
@@ -409,6 +559,8 @@ def _launch_pipelined(
         pipeline_kernel = ascend_attention_short_kv_staged
         stage_options["NATIVE_SPLIT_Q1"] = True
         stage_options["MIN_SPLIT_K"] = 2048 if short_split_q1 else 32768
+        if compact_native_tail:
+            stage_options["COMPACT_NATIVE_TAIL"] = True
     if stage_q1:
         if use_packed_k_prescale(params):
             stage_options["QUERY_SCALE"] = params.scale_softmax
@@ -448,7 +600,9 @@ def _launch_pipelined(
         and not defer_merge
         and merge_q1 is None
     ):
-        from .decode import ascend_attention_q1_coreloops_staged
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
+            ascend_attention_q1_coreloops_staged,
+        )
 
         pipeline_kernel = ascend_attention_q1_coreloops_staged
     # Let native sparse-4K Q1 Cube/Vector loops advance independently.
@@ -463,7 +617,9 @@ def _launch_pipelined(
         and compact_q1
         and merge_q1 is None
     ):
-        from .decode import ascend_attention_q1_native_coreloops_staged
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
+            ascend_attention_q1_native_coreloops_staged,
+        )
 
         pipeline_kernel = ascend_attention_q1_native_coreloops_staged
     residual_wave = (
@@ -496,7 +652,9 @@ def _launch_pipelined(
     if merge_q1 is not None:
         merge_o, merge_lse, merge_ids, merge_count, merge_splits_count = merge_q1
         if merge_min_split_k != 32768:
-            assert pipeline_kernel is ascend_attention_persistent_pipelined
+            assert pipeline_kernel is ascend_attention_persistent_pipelined or (
+                compact_long_tail and pipeline_kernel is ascend_attention_short_kv
+            )
             task_options["MERGE_MIN_SPLIT_K"] = merge_min_split_k
     if (
         cross_q_task
@@ -515,15 +673,24 @@ def _launch_pipelined(
         and 2304 < params.seqlen_q <= 4608
         and 2304 < params.seqlen_k <= 4608
     ):
-        from .mixed import ascend_attention_mixed_coreloops
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.mixed import (
+            ascend_attention_mixed_coreloops,
+        )
 
         pipeline_kernel = ascend_attention_mixed_coreloops
         if params.h // params.hk == 8:
-            from .mixed import ascend_attention_mixed_prob_stack
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.mixed import (
+                ascend_attention_mixed_prob_stack,
+            )
 
             pipeline_kernel = ascend_attention_mixed_prob_stack
+            # Use the smaller FP32 Softmax reduction scratch for paged GQA8 Mixed.
+            if cross_4k and not prefill_4k_stream and params.block_size == 32:
+                task_options["enable_ubuf_saving"] = True
     if long_mixed_stream:
-        from .mixed import ascend_attention_mixed_coreloops
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.mixed import (
+            ascend_attention_mixed_coreloops,
+        )
 
         pipeline_kernel = ascend_attention_mixed_coreloops
         if (
@@ -537,7 +704,10 @@ def _launch_pipelined(
             and workers % params.h != 0
             and params.total_q > params.seqlen_q + params.b - 1
         ):
-            from .mixed import ascend_attention_long_short_main, launch_long_short_split
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.mixed import (
+                ascend_attention_long_short_main,
+                launch_long_short_split,
+            )
 
             launch_long_short_split(
                 params,
@@ -562,7 +732,47 @@ def _launch_pipelined(
             WAVE_IDS=wave_ids,
             WAVE_COUNT=wave_count,
         )
-    pipeline_kernel[(workers,)](
+    dispatch = pipeline_kernel[(workers,)]
+    if (
+        params.q_ptr.dtype == torch.bfloat16
+        and 1 < params.b < params.total_q < params.b * params.seqlen_q
+        and (
+            512 <= params.seqlen_k <= 2304
+            or (
+                2304 < params.seqlen_k <= 4608
+                and params.h == 4
+                and params.hk == 1
+                and params.b >= 32
+                and params.total_q <= params.seqlen_q + params.b - 1
+                and params.total_q <= 128 * params.b
+                and 512 <= params.seqlen_q <= 1152
+                and params.is_causal
+                and params.is_paged
+                and params.d == 256
+            )
+        )
+        and pipeline_kernel.__name__
+        in {
+            "ascend_attention_persistent_pipelined",
+            "ascend_attention_short_kv",
+            "ascend_attention_q1_coreloops_staged",
+        }
+    ):
+        from functools import partial
+
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.submission import (
+            submit_mixed,
+        )
+
+        dispatch = partial(
+            submit_mixed,
+            pipeline_kernel,
+            (workers,),
+            params.q_ptr.device.index,
+            params.h <= 8,
+            params.h == 4 and params.hk == 1,
+        )
+    dispatch(
         q,
         params.q_ptr,
         k,
@@ -792,6 +1002,26 @@ def launch_attention(params, *, num_splits=0):
         if params.d in (128, 192):
             _launch_dimension_direct(params, plan)
             return
+        workers = torch.npu.get_device_limit(params.q_ptr.device.index)["cube_core_num"]
+        if (
+            params.b == 1
+            and params.h in (4, 8, 16)
+            and 2304 < params.total_q == params.seqlen_q == params.seqlen_k <= 4608
+            and params.is_cu_seqlens_q
+            and params.is_paged
+            and params.is_causal
+            and params.d == 256
+            and params.h // params.hk in (4, 8)
+            and params.q_ptr.dtype == torch.bfloat16
+            and params.scale_softmax == 0.0625
+        ):
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.prefill import (
+                try_launch_cached_prefill,
+            )
+
+            if try_launch_cached_prefill(params, workers):
+                return
+        raw_paged_only = False
         # Keep dynamic actual lengths on device, including graph replay.
         if (
             params.q_ptr.dtype == torch.bfloat16
@@ -813,13 +1043,24 @@ def launch_attention(params, *, num_splits=0):
             * 2
             <= (1 << 30)
         ):
-            from .decode import launch_decode_split_staged
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
+                decode_split_stage_layout,
+                launch_decode_split_staged,
+            )
 
-            workers = torch.npu.get_device_limit(params.q_ptr.device.index)[
-                "cube_core_num"
-            ]
-            launch_decode_split_staged(params, plan, workers)
-            return
+            stage_workers, capacity = decode_split_stage_layout(params, plan, workers)
+            stage_bytes = (
+                stage_workers * 256 * (128 + 2 * capacity) * params.q_ptr.element_size()
+            )
+            workspace = (
+                stage_bytes
+                + _scratch_bytes(params, stage_workers, 128, 512, 3, accumulator=True)
+                + _partial_bytes(params, plan.kv_splits, params.total_q)
+            )
+            if workspace <= MAX_WORKSPACE_BYTES:
+                launch_decode_split_staged(params, plan, workers)
+                return
+            raw_paged_only = True
         if (
             params.q_ptr.dtype == torch.bfloat16
             and params.is_cu_seqlens_q
@@ -846,20 +1087,21 @@ def launch_attention(params, *, num_splits=0):
             and params.seqlen_k > 256
             and num_splits == 0
         ):
-            fused_ids, fused_count = None, None
-            if params.seqlen_k >= 32768:
-                fused_ids, fused_count = allocate_long_request_list(params)
-            workers = torch.npu.get_device_limit(params.q_ptr.device.index)[
-                "cube_core_num"
-            ]
-            packed = prepare_packed_inputs(
-                params, workers, fused_ids, fused_count, fuse_short_decode=True
+            raw_paged_only |= (
+                _packed_workspace_bytes(params, plan, workers) > MAX_WORKSPACE_BYTES
             )
-            if packed is not None:
-                _launch_pipelined(
-                    params, plan, workers, packed, 32, fused_ids, fused_count
+            if not raw_paged_only:
+                fused_ids, fused_count = None, None
+                if params.seqlen_k >= 32768:
+                    fused_ids, fused_count = allocate_long_request_list(params)
+                packed = prepare_packed_inputs(
+                    params, workers, fused_ids, fused_count, fuse_short_decode=True
                 )
-                return
+                if packed is not None:
+                    _launch_pipelined(
+                        params, plan, workers, packed, 32, fused_ids, fused_count
+                    )
+                    return
         if (
             params.q_ptr.dtype == torch.bfloat16
             and params.is_cu_seqlens_q
@@ -916,7 +1158,9 @@ def launch_attention(params, *, num_splits=0):
             if params.seqlen_k >= 32768:
                 request_ids, request_count = allocate_long_request_list(params)
             if qdirect_cube:
-                from .decode import launch_qdirect_decode
+                from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
+                    launch_qdirect_decode,
+                )
 
                 launch_qdirect_decode(params, request_ids, request_count)
             else:
@@ -924,7 +1168,6 @@ def launch_attention(params, *, num_splits=0):
             if params.seqlen_k <= 32:
                 return
             skip_short_kv = 32
-        workers = torch.npu.get_device_limit(params.q_ptr.device.index)["cube_core_num"]
         local_q1 = (
             params.q_ptr.dtype == torch.bfloat16
             and params.is_cu_seqlens_q
@@ -983,34 +1226,16 @@ def launch_attention(params, *, num_splits=0):
             <= (1 << 30)
         )
         if local_q1:
+            layout = packed_input_layout(params, workers)
+            raw_paged_only |= (
+                _packed_workspace_bytes(params, plan, workers, workers, layout=layout)
+                > MAX_WORKSPACE_BYTES
+            )
+        if local_q1 and not raw_paged_only:
+            # The packing kernel can classify this whole batch in parallel
+            # with its copy tiles. Only aligned direct-Q layouts allow fused Q.
             fuse_classification = (
-                (
-                    (
-                        params.h // params.hk == 4
-                        and params.b >= 32
-                        and params.seqlen_q + params.b - 1
-                        < params.total_q
-                        <= 128 * params.b
-                        and 512 <= params.seqlen_q <= 1152
-                        and 512 <= params.seqlen_k <= 1536
-                        and use_packed_k_prescale(params)
-                    )
-                    or (
-                        params.h // params.hk == 8
-                        and params.b >= 32
-                        and params.b < params.total_q <= 128 * params.b
-                        and 512 <= params.seqlen_q <= 1152
-                        and 1536 < params.seqlen_k <= 2304
-                    )
-                    or (
-                        params.h // params.hk == 4
-                        and params.b >= 32
-                        and params.b < params.total_q <= params.seqlen_q + params.b - 1
-                        and 512 <= params.seqlen_q <= 1152
-                        and 2304 < params.seqlen_k <= 4608
-                    )
-                )
-                and params.q_ptr.stride(-1) == 1
+                params.q_ptr.stride(-1) == 1
                 and params.q_row_stride >= 256
                 and params.q_head_stride >= 256
                 and params.q_row_stride % 16 == 0
@@ -1026,11 +1251,12 @@ def launch_attention(params, *, num_splits=0):
                 other_ids,
                 counts[1:],
                 stage_workers=workers,
+                layout=layout,
+                q_direct=fuse_classification,
                 fused_mixed_lists=(
                     (decode_ids, other_ids, counts) if fuse_classification else None
                 ),
             )
-            assert packed is not None
             # Split the raw-paged Q1 stream; keep the body on its original D1 path.
             dense_native_q1_4k = (
                 params.h // params.hk == 4
@@ -1047,6 +1273,26 @@ def launch_attention(params, *, num_splits=0):
             )
             split_q1_4k = split_q1_4k or dense_native_q1_4k
             q1_plan = replace(plan, kv_splits=4) if split_q1_4k else plan
+            # Both serial Mixed stages can use the body queue's wide scratch.
+            shared_body_scratch = (
+                params.h == 4
+                and params.hk == 1
+                and 512 <= params.seqlen_q <= 1152
+                and params.total_q * params.h >= 8192
+                and params.seqlen_k <= 1536
+            )
+            workspace = _pipeline_workspace(
+                params,
+                workers,
+                1536 if shared_body_scratch else plan.kv_stack,
+                reuse=(
+                    params.q_ptr.dtype == torch.bfloat16
+                    and params.h == 4
+                    and params.hk == 1
+                    and params.b >= 32
+                    and params.seqlen_k <= 2048
+                ),
+            )
             q1_partials = _launch_pipelined(
                 params,
                 q1_plan,
@@ -1059,7 +1305,8 @@ def launch_attention(params, *, num_splits=0):
                 stage_q1=True,
                 native_split_q1=split_q1_4k,
                 short_split_q1=split_q1_4k,
-                defer_merge=split_q1_4k and not dense_native_q1_4k,
+                defer_merge=split_q1_4k,
+                workspace=workspace,
             )
             _launch_pipelined(
                 params,
@@ -1075,6 +1322,8 @@ def launch_attention(params, *, num_splits=0):
                 ),
                 merge_min_split_k=2048 if split_q1_4k else 32768,
                 residual_merge=None if split_q1_4k else q1_partials,
+                workspace=workspace,
+                shared_body_scratch=shared_body_scratch,
                 body_task_pipeline=(
                     (params.h // params.hk == 8 and params.seqlen_k <= 2304)
                     or (params.h // params.hk == 4 and params.seqlen_k <= 1536)
@@ -1092,6 +1341,9 @@ def launch_attention(params, *, num_splits=0):
                     request_count=counts[1:],
                     task_m=16,
                     compact_long_tail=True,
+                    merge_q1=q1_partials if dense_native_q1_4k else None,
+                    merge_min_split_k=2048,
+                    workspace=workspace,
                 )
             return
         native_split_q1 = (
@@ -1112,11 +1364,22 @@ def launch_attention(params, *, num_splits=0):
             <= (1 << 30)
         )
         if native_split_q1:
+            raw_paged_only |= (
+                _packed_workspace_bytes(
+                    params, plan, workers, workers, compact_native_tail=True
+                )
+                > MAX_WORKSPACE_BYTES
+            )
+        if native_split_q1 and not raw_paged_only:
             decode_ids, other_ids, counts = build_mixed_request_lists(params)
             packed = prepare_packed_inputs(
-                params, workers, other_ids, counts[1:], stage_workers=workers
+                params,
+                workers,
+                other_ids,
+                counts[1:],
+                stage_workers=workers,
+                compact_native_tail=True,
             )
-            assert packed is not None
             # TOTAL_Q > B guarantees at least one non-Q1 request. Bound
             # Q1 work by (B - 1) * HK and avoid a partly occupied second wave.
             q1_splits = workers // ((params.b - 1) * params.hk)
@@ -1133,6 +1396,7 @@ def launch_attention(params, *, num_splits=0):
                 defer_merge=True,
                 stage_q1=True,
                 native_split_q1=True,
+                compact_native_tail=True,
             )
             _launch_pipelined(
                 params,
@@ -1156,6 +1420,7 @@ def launch_attention(params, *, num_splits=0):
             and params.d == 256
             and params.block_size in (16, 32)
             and params.h // params.hk in (4, 8)
+            and params.b <= 8  # build_mixed_decode_plan must select SplitKV.
             and (
                 (
                     1 < params.b <= 8
@@ -1184,26 +1449,57 @@ def launch_attention(params, *, num_splits=0):
             and params.b * params.hk * triton.cdiv(params.seqlen_k, 512) * 512 * 256 * 4
             <= (1 << 30)
         )
-        if native_long_body_q1:
+        if not raw_paged_only and params.is_cu_seqlens_q and params.seqlen_k:
+            raw_paged_only = (
+                _packed_workspace_bytes(
+                    params,
+                    plan,
+                    workers,
+                    workers if native_long_body_q1 else 0,
+                    compact_native_tail=native_long_body_q1,
+                )
+                > MAX_WORKSPACE_BYTES
+            )
+        mixed_decode = (
+            params.q_ptr.dtype == torch.bfloat16
+            and params.is_cu_seqlens_q
+            and params.is_paged
+            and params.b > 1
+            and params.seqlen_q > 1
+            and params.b < params.total_q < params.b * params.seqlen_q
+            and params.h // params.hk in (4, 8)
+            and plan.kv_splits == 1
+        )
+        fused_lists = None
+        if raw_paged_only:
+            packed = None
+        elif native_long_body_q1:
             decode_ids, other_ids, counts = build_mixed_request_lists(params)
             packed = prepare_packed_inputs(
-                params, workers, other_ids, counts[1:], stage_workers=workers
+                params,
+                workers,
+                other_ids,
+                counts[1:],
+                stage_workers=workers,
+                compact_native_tail=True,
+            )
+        elif mixed_decode and params.is_causal and params.seqlen_k <= 4608:
+            # Preserve the full pack; only move the independent classifier into
+            # the first pack program, with no producer/consumer dependency.
+            fused_lists = build_mixed_request_lists(params, defer=True)
+            packed = prepare_packed_inputs(
+                params,
+                workers,
+                fused_mixed_lists=fused_lists,
+                pack_mixed_body_only=False,
             )
         else:
             packed = prepare_packed_inputs(params, workers, request_ids, request_count)
         if packed is not None:
-            mixed_decode = (
-                params.q_ptr.dtype == torch.bfloat16
-                and params.is_cu_seqlens_q
-                and params.is_paged
-                and params.b > 1
-                and params.seqlen_q > 1
-                and params.b < params.total_q < params.b * params.seqlen_q
-                and params.h // params.hk in (4, 8)
-                and plan.kv_splits == 1
-            )
             if mixed_decode:
-                if not native_long_body_q1:
+                if fused_lists is not None:
+                    decode_ids, other_ids, counts = fused_lists
+                elif not native_long_body_q1:
                     decode_ids, other_ids, counts = build_mixed_request_lists(params)
                 decode_plan = build_mixed_decode_plan(params, plan, num_splits, workers)
                 # A padded M128 tail creates a second worker wave for H>workers/2.
@@ -1254,6 +1550,7 @@ def launch_attention(params, *, num_splits=0):
                     defer_merge=decode_plan.kv_splits > 1,
                     stage_q1=native_long_body_q1,
                     native_split_q1=native_long_body_q1,
+                    compact_native_tail=native_long_body_q1,
                 )
                 split_full_body = (
                     num_splits == 0
@@ -1349,6 +1646,14 @@ def launch_attention(params, *, num_splits=0):
             )
             return
 
+        scratch = _scratch_bytes(params, workers, plan.block_m, plan.kv_stack)
+        partial = _partial_bytes(params, plan.kv_splits, params.total_q)
+        request_bytes = (params.b + 1) * 4 if request_ids is not None else 0
+        if scratch + partial + request_bytes > MAX_WORKSPACE_BYTES:
+            # Direct reads the original pages and does not need Split-KV partials.
+            plan = replace(plan, kv_splits=1)
+            raw_paged_only = True
+            partial = 0
         scores = torch.empty(
             (workers, plan.block_m, plan.kv_stack),
             dtype=torch.float32,
@@ -1374,7 +1679,13 @@ def launch_attention(params, *, num_splits=0):
                 device=params.q_ptr.device,
             )
             row_stride, head_stride = params.h * params.d, params.d
-        k, v, contiguous_k = prepare_contiguous_kv(params, workers)
+        k, v, contiguous_k = params.k_ptr, params.v_ptr, 0
+        if not raw_paged_only:
+            k, v, contiguous_k = prepare_contiguous_kv(
+                params,
+                workers,
+                budget=MAX_WORKSPACE_BYTES - scratch - partial - request_bytes,
+            )
         ascend_attention_persistent[(workers,)](
             params.q_ptr,
             k,

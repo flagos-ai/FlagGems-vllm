@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from threading import Lock
+
+import torch
 import triton
 import triton.experimental.tle as tle
 import triton.language as tl
@@ -21,8 +24,14 @@ from triton.experimental.tle.language.dsa.ascend import (
     sync_block_set,
     sync_block_wait,
 )
+from triton.runtime import driver
 
-from .direct import (
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
+    _packed_q_base,
+    pack_kv_prescaled,
+    packed_input_layout,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.direct import (
     _attention_request_stream,
     _softmax_rows_dispatch,
     _softmax_stack,
@@ -31,6 +40,10 @@ from .direct import (
     _whole_task_qk,
     _whole_task_softmax,
     ascend_attention_persistent_pipelined,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.submission import (
+    _raw_stream_nowait,
+    bind_runner,
 )
 
 # ---- decoupled_prefill ----
@@ -95,7 +108,8 @@ def _core_load_q(
     Q_RAW,
     query_buf,
     batch,
-    qbase,
+    qstart,
+    H: tl.constexpr,
     qlen,
     task,
     qt,
@@ -113,7 +127,10 @@ def _core_load_q(
         if direct:
             raw_head = kh * group + headstart
             raw_base = (
-                Q_RAW + qbase + qt.to(tl.int64) * 128 * QR + raw_head.to(tl.int64) * QH
+                Q_RAW
+                + qstart.to(tl.int64) * QR
+                + qt.to(tl.int64) * 128 * QR
+                + raw_head.to(tl.int64) * QH
             )
             query_ptr = tl.make_block_ptr(
                 raw_base, (128, 256), (QR, 1), (0, 0), (128, 256), (1, 0)
@@ -121,7 +138,7 @@ def _core_load_q(
             tle.dsa.copy(query_ptr, query_buf, [128, 256])
         else:
             query_ptr = tl.make_block_ptr(
-                Q + (batch.to(tl.int64) * QCAP + task) * 128 * 256,
+                Q + (_packed_q_base(batch, qstart, QCAP, H) + task) * 128 * 256,
                 (BM, 256),
                 (256, 1),
                 (0, 0),
@@ -131,7 +148,7 @@ def _core_load_q(
             tle.dsa.copy(query_ptr, query_buf, [BM, 256])
     else:
         query_ptr = tl.make_block_ptr(
-            Q + (batch.to(tl.int64) * QCAP + task) * 128 * 256,
+            Q + (_packed_q_base(batch, qstart, QCAP, H) + task) * 128 * 256,
             (BM, 256),
             (256, 1),
             (0, 0),
@@ -171,6 +188,10 @@ def _core_qk_only(
     BS: tl.constexpr,
     SCALE: tl.constexpr,
     SINGLE_HEAD_INDEX: tl.constexpr,
+    K_FIRST: tl.constexpr = False,
+    V0_BASE=None,
+    V0_BUF=None,
+    MOVE_V0=False,
 ):
     q1 = tle.dsa.to_tensor(query_buf, writable=False)
     pair_end = (stack + 127) // 256 * 256
@@ -184,6 +205,12 @@ def _core_qk_only(
         )
         tle.dsa.copy(kptr_0, key_buf_0, [128, 256])
         tle.dsa.copy(kptr_1, key_buf_1, [128, 256])
+        if K_FIRST:
+            if MOVE_V0 & (ck == 0):
+                vptr = tl.make_block_ptr(
+                    V0_BASE, (256, 256), (256, 1), (0, 0), (256, 256), (1, 0)
+                )
+                tle.dsa.copy(vptr, V0_BUF, [256, 256])
         key_0 = tle.dsa.to_tensor(key_buf_0, writable=False)
         key_1 = tle.dsa.to_tensor(key_buf_1, writable=False)
         qk_0 = tl.dot(q1, tl.trans(key_0))
@@ -624,7 +651,8 @@ def ascend_attention_prefill_coreloops(
                 Q_RAW,
                 query_buf,
                 batch,
-                qstart.to(tl.int64) * QR,
+                qstart,
+                H,
                 qlen,
                 task,
                 qt,
@@ -1129,7 +1157,8 @@ def ascend_attention_prefill_vfirst(
                     Q_RAW,
                     query_buf,
                     batch,
-                    qstart.to(tl.int64) * QR,
+                    qstart,
+                    H,
                     qlen,
                     task,
                     qt,
@@ -1548,7 +1577,8 @@ def ascend_attention_prefill_bounded_release(
                     Q_RAW,
                     query_buf,
                     batch,
-                    qstart.to(tl.int64) * QR,
+                    qstart,
+                    H,
                     qlen,
                     task,
                     qt,
@@ -1847,6 +1877,7 @@ def _pv_whole_probability(
     BS: tl.constexpr,
     ACC_UB_ROWS: tl.constexpr,
     COMPACT_O: tl.constexpr = False,
+    EARLY_SECOND_V: tl.constexpr = False,
 ):
     if stack > BN:
         full_prob_buf = tle.dsa.alloc(
@@ -1857,21 +1888,34 @@ def _pv_whole_probability(
         sync_block_wait("vector", "cube", 3 + prevslot, PIPE.PIPE_MTE3, PIPE.PIPE_S)
         pptr = tl.make_block_ptr(prob, (BM, BS), (BS, 1), (0, 0), (BM, BS), (1, 0))
         tle.dsa.copy(pptr, full_prob_buf, [BM, BS])
+        if EARLY_SECOND_V:
+            v_next = tle.dsa.alloc([BN, 256], V.dtype.element_ty, tle.dsa.ascend.L1)
+            vptr = tl.make_block_ptr(
+                V + ((batch.to(tl.int64) * HK + kh) * CONTIG_K + begin + BN) * 256,
+                (BN, 256),
+                (256, 1),
+                (0, 0),
+                (BN, 256),
+                (1, 0),
+            )
+            tle.dsa.copy(vptr, v_next, [BN, 256])
         all_weights = tle.dsa.to_tensor(full_prob_buf, writable=False)
         weights0 = tle.dsa.extract_slice(all_weights, [0, 0], [BM, BN], [1, 1])
         value0 = tle.dsa.to_tensor(value_buf, writable=False)
         c2 = tl.dot(weights0, value0, tl.zeros((BM, 256), tl.float32))
-        vptr = tl.make_block_ptr(
-            V + ((batch.to(tl.int64) * HK + kh) * CONTIG_K + begin + BN) * 256,
-            (BN, 256),
-            (256, 1),
-            (0, 0),
-            (BN, 256),
-            (1, 0),
-        )
-        tle.dsa.copy(vptr, value_buf, [BN, 256])
+        if not EARLY_SECOND_V:
+            vptr = tl.make_block_ptr(
+                V + ((batch.to(tl.int64) * HK + kh) * CONTIG_K + begin + BN) * 256,
+                (BN, 256),
+                (256, 1),
+                (0, 0),
+                (BN, 256),
+                (1, 0),
+            )
+            tle.dsa.copy(vptr, value_buf, [BN, 256])
+            v_next = value_buf
         weights1 = tle.dsa.extract_slice(all_weights, [0, BN], [BM, BN], [1, 1])
-        value1 = tle.dsa.to_tensor(value_buf, writable=False)
+        value1 = tle.dsa.to_tensor(v_next, writable=False)
         c2 = tl.dot(weights1, value1, c2)
         tl.store(
             pvwork + tl.arange(0, BM)[:, None] * 256 + tl.arange(0, 256)[None, :], c2
@@ -1932,6 +1976,7 @@ def ascend_attention_prefill_prob_stack(
     CONTIG_K: tl.constexpr,
     QCAP: tl.constexpr,
     Q_DIRECT: tl.constexpr,
+    EARLY_SECOND_V: tl.constexpr = False,
 ):
     BM: tl.constexpr = 128
     BN: tl.constexpr = 256
@@ -1939,8 +1984,12 @@ def ascend_attention_prefill_prob_stack(
     group: tl.constexpr = H // HK
     BALANCED_TASKS: tl.constexpr = TOTAL_Q >= 4096 and TOTAL_Q <= 4352
     query_buf = tle.dsa.alloc([BM, 256], Q.dtype.element_ty, tle.dsa.ascend.L1)
-    key_buf_0 = tle.dsa.alloc([128, 256], K.dtype.element_ty, tle.dsa.ascend.L1)
-    key_buf_1 = tle.dsa.alloc([128, 256], K.dtype.element_ty, tle.dsa.ascend.L1)
+    if EARLY_SECOND_V:
+        key_buf_0 = None
+        key_buf_1 = None
+    else:
+        key_buf_0 = tle.dsa.alloc([128, 256], K.dtype.element_ty, tle.dsa.ascend.L1)
+        key_buf_1 = tle.dsa.alloc([128, 256], K.dtype.element_ty, tle.dsa.ascend.L1)
     value_buf = tle.dsa.alloc([BN, 256], V.dtype.element_ty, tle.dsa.ascend.L1)
     prob_buf = tle.dsa.alloc([BM, BN], PROBS.dtype.element_ty, tle.dsa.ascend.L1)
     state_buf = tle.dsa.alloc([5, BM // 2], tl.float32, tle.dsa.ascend.UB)
@@ -1977,7 +2026,8 @@ def ascend_attention_prefill_prob_stack(
                     Q_RAW,
                     query_buf,
                     batch,
-                    qstart.to(tl.int64) * QR,
+                    qstart,
+                    H,
                     qlen,
                     task,
                     qt,
@@ -2013,13 +2063,23 @@ def ascend_attention_prefill_prob_stack(
                         stack = tl.minimum(BS, limit - begin)
                         scratch = SCORES + (worker.to(tl.int64) * 3 + slot) * 128 * BS
                         prob = PROBS + (worker.to(tl.int64) * 3 + slot) * 128 * BS
+                        # K staging can reuse the L1 space of the second V tile.
+                        if EARLY_SECOND_V:
+                            qk_key_0 = tle.dsa.alloc(
+                                [128, 256], K.dtype.element_ty, tle.dsa.ascend.L1
+                            )
+                            qk_key_1 = tle.dsa.alloc(
+                                [128, 256], K.dtype.element_ty, tle.dsa.ascend.L1
+                            )
+                        else:
+                            qk_key_0, qk_key_1 = key_buf_0, key_buf_1
                         _core_qk_only(
                             K,
                             scratch,
                             prob,
                             query_buf,
-                            key_buf_0,
-                            key_buf_1,
+                            qk_key_0,
+                            qk_key_1,
                             state_buf,
                             row_end_buf,
                             batch,
@@ -2078,6 +2138,7 @@ def ascend_attention_prefill_prob_stack(
                             BS,
                             64,
                             True,
+                            EARLY_SECOND_V,
                         )
                 generation += stacks
         for drain in range(tl.minimum(generation, 3)):
@@ -2326,6 +2387,301 @@ def ascend_attention_long_prefill(
 # ---- long_prefill ----
 
 
+_prefill_launchers = {}
+_fused_4k_launchers = {}
+_fused_4k_workspaces = {}
+_fused_4k_workspace_lock = Lock()
+_MAX_FUSED_4K_WORKSPACE_BYTES = 64 << 20
+
+
+def _allocate_4k_workspace(q, q_shape, kv_shape, workers, reuse):
+    device = q.device
+    key = None
+    if reuse and not torch.npu.is_current_stream_capturing():
+        # This route consumes all seven buffers in a single launch. Reuse on
+        # the same stream is ordered; a captured graph owns distinct buffers.
+        current_stream = _raw_stream_nowait or driver.active.get_current_stream
+        key = (device.index, current_stream(device.index))
+        layout = (q_shape, kv_shape, workers, q.dtype)
+        cached = _fused_4k_workspaces.get(key)
+        if cached is not None and cached[0] == layout:
+            return cached[2]
+
+    qp = torch.empty(q_shape, dtype=q.dtype, device=device)
+    kp = torch.empty(kv_shape, dtype=q.dtype, device=device)
+    vp = torch.empty_like(kp)
+    scores = torch.empty((workers, 3, 128, 512), dtype=torch.float32, device=device)
+    probs = torch.empty_like(scores, dtype=q.dtype)
+    pvwork = torch.empty((workers, 3, 128, 256), dtype=torch.float32, device=device)
+    accwork = torch.empty((workers, 128, 256), dtype=torch.float32, device=device)
+    workspace = qp, kp, vp, scores, probs, pvwork, accwork
+    if key is not None:
+        size = sum(x.numel() * x.element_size() for x in workspace)
+        with _fused_4k_workspace_lock:
+            retained = sum(
+                value[1]
+                for cached_key, value in _fused_4k_workspaces.items()
+                if cached_key != key
+            )
+            if retained + size <= _MAX_FUSED_4K_WORKSPACE_BYTES:
+                _fused_4k_workspaces[key] = (layout, size, workspace)
+    return workspace
+
+
+@triton.jit
+def _prefill_4k_fused(
+    Q,
+    QQ,
+    K,
+    V,
+    KP,
+    VP,
+    O,
+    LSE,
+    CUQ,
+    USED,
+    TABLE,
+    SCORES,
+    PROBS,
+    PVWORK,
+    ACCWORK,
+    H: tl.constexpr,
+    HK: tl.constexpr,
+    TOTAL_Q: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    PAGE: tl.constexpr,
+    QCAP: tl.constexpr,
+    GROUP_PAGES: tl.constexpr,
+):
+    with tle.scope(core_mode="vector"):
+        lane = tl.program_id(0) * 2 + sub_vec_id()
+        lanes = tl.num_programs(0) * 2
+        length = tl.load(USED)
+        qstart = tl.load(CUQ)
+        qlen = tl.load(CUQ + 1) - qstart
+        tiled_rows: tl.constexpr = PAGE * GROUP_PAGES
+        tiles = tl.cdiv(length, 512) * (512 // tiled_rows)
+        d = tl.arange(0, 256)
+        for tile in range(lane, tiles * HK, lanes):
+            kh = tile % HK
+            logical = (tile // HK) * tiled_rows + tl.arange(0, tiled_rows)
+            valid = logical < length
+            physical = tl.load(TABLE + logical // PAGE, valid, 0).to(tl.int64)
+            raw = ((physical * PAGE + logical % PAGE) * HK + kh) * 256
+            key = tl.load(K + raw[:, None] + d[None, :], valid[:, None], 0)
+            value = tl.load(V + raw[:, None] + d[None, :], valid[:, None], 0)
+            offset = (kh * CAPACITY + logical[:, None]) * 256 + d[None, :]
+            tl.store(KP + offset, key.to(tl.float32) * 0.0625)
+            tl.store(VP + offset, value)
+        tail = qlen % 128
+        if tail:
+            for part in range(lane, H * 4, lanes):
+                head = part // 4
+                row = tl.arange(0, 32) + (part % 4) * 32
+                batch_row = qlen // 128 * 128 + row
+                q_value = tl.load(
+                    Q + ((qstart + batch_row[:, None]) * H + head) * 256 + d[None, :],
+                    row[:, None] < tail,
+                    0,
+                )
+                dest = _packed_q_base(tl.full((), 0, tl.int32), qstart, QCAP, H)
+                dest += (qlen // 128) * H + head
+                tl.store(QQ + (dest * 128 + row[:, None]) * 256 + d[None, :], q_value)
+    tle.dsa.ascend.sync_block_all("all", 15)
+    ascend_attention_prefill_prob_stack(
+        QQ,
+        Q,
+        KP,
+        VP,
+        O,
+        LSE,
+        CUQ,
+        USED,
+        SCORES,
+        PROBS,
+        PVWORK,
+        ACCWORK,
+        H,
+        HK,
+        TOTAL_Q,
+        1.0,
+        H * 256,
+        256,
+        H * 256,
+        256,
+        CAPACITY,
+        QCAP,
+        True,
+    )
+
+
+def try_launch_cached_prefill(params, workers):
+    """Submit the existing 4K BF16 pack and compute kernels on the current stream."""
+    q, k, v, o = params.q_ptr, params.k_ptr, params.v_ptr, params.o_ptr
+    cu, used, table = (
+        params.cu_seqlens_q_ptr,
+        params.seqused_k_ptr,
+        params.page_table_ptr,
+    )
+    lse = params.softmax_lse_ptr
+    if any(
+        x.dtype != torch.bfloat16 or not x.is_contiguous() or x.data_ptr() % 32
+        for x in (q, k, v, o)
+    ) or any(x.dtype != torch.int32 or x.data_ptr() % 32 for x in (cu, used, table)):
+        return False
+    if lse is not None and (lse.dtype != torch.float32 or lse.data_ptr() % 32):
+        return False
+    q_shape, kv_shape, _, qcap, capacity = packed_input_layout(params)
+    page, h, hk = params.block_size, params.h, params.hk
+    n_pages = 4 if h == 4 and hk == 1 else 1
+    wave = workers * 2 if n_pages == 4 else workers * 8 // hk
+    programs = min(capacity // (n_pages * page), wave)
+    if programs * hk < 4 * h:
+        return False
+    device = q.device
+    layout = (
+        *k.stride()[:3],
+        *v.stride()[:3],
+        params.page_table_batch_stride,
+        capacity,
+        page,
+        hk,
+        programs,
+    )
+    grid = (programs, 1, hk)
+    compute_grid = (workers, 1, 1)
+    compute_layout = (
+        h,
+        hk,
+        params.total_q,
+        1.0,
+        params.q_row_stride,
+        params.q_head_stride,
+        params.o_row_stride,
+        params.o_head_stride,
+        capacity,
+        qcap,
+        True,
+    )
+    key = (device.index, grid, compute_grid, layout, compute_layout, lse is None)
+    fused = h == 4 and hk == 1 and cu.is_contiguous() and workers <= 32
+    qp, kp, vp, scores, probs, pvwork, accwork = _allocate_4k_workspace(
+        q, q_shape, kv_shape, workers, reuse=fused
+    )
+    if fused:
+        args = (
+            q,
+            qp,
+            k,
+            v,
+            kp,
+            vp,
+            o,
+            lse,
+            cu,
+            used,
+            table,
+            scores,
+            probs,
+            pvwork,
+            accwork,
+            h,
+            hk,
+            params.total_q,
+            capacity,
+            page,
+            qcap,
+            2,
+        )
+        runner = _fused_4k_launchers.get(key)
+        if runner is not None:
+            runner(args)
+        else:
+            compiled = _prefill_4k_fused[compute_grid](
+                *args,
+                disable_auto_inject_block_sync=True,
+                enable_fp_fusion=False,
+                multibuffer=False,
+                enable_reduce_sum_strength=True,
+            )
+            if len(_fused_4k_launchers) < 64 and hasattr(compiled, "__getitem__"):
+                _fused_4k_launchers[key] = bind_runner(
+                    compiled, compute_grid, device.index
+                )
+        return True
+    pack_args = (
+        k,
+        v,
+        table,
+        used,
+        kp,
+        vp,
+        *layout,
+        None,
+        None,
+        False,
+        True,
+        q,
+        cu,
+        qp,
+        h,
+        qcap,
+        params.q_row_stride,
+        params.q_head_stride,
+        False,
+        True,
+        None,
+        None,
+        None,
+        0,
+        n_pages,
+    )
+    early_second_v = page == 32 and h // hk == 8 and 4096 <= params.total_q <= 4352
+    compute_args = (
+        qp,
+        q,
+        kp,
+        vp,
+        o,
+        lse,
+        cu,
+        used,
+        scores,
+        probs,
+        pvwork,
+        accwork,
+        *compute_layout,
+        early_second_v,
+    )
+    runners = _prefill_launchers.get(key)
+    if runners is not None:
+        pack, compute = runners
+        pack(pack_args)
+        compute(compute_args)
+    else:
+        pack_options = {"multibuffer": False} if n_pages > 1 else {}
+        pack = pack_kv_prescaled[grid](*pack_args, **pack_options)
+        stack_options = {"enable_ubuf_saving": True} if early_second_v else {}
+        compute = ascend_attention_prefill_prob_stack[compute_grid](
+            *compute_args,
+            disable_auto_inject_block_sync=True,
+            enable_fp_fusion=False,
+            multibuffer=False,
+            enable_reduce_sum_strength=True,
+            **stack_options,
+        )
+        if (
+            len(_prefill_launchers) < 64
+            and hasattr(pack, "__getitem__")
+            and hasattr(compute, "__getitem__")
+        ):
+            _prefill_launchers[key] = (
+                bind_runner(pack, grid, device.index),
+                bind_runner(compute, compute_grid, device.index),
+            )
+    return True
+
+
 def launch_long_prefill(
     params, workers, packed, scores, probs, pvwork, accwork, scale=None
 ):
@@ -2535,6 +2891,7 @@ def _attention_prefill_clipped_queue(
                     c_current_qstart,
                     c_current_qlen,
                     c_limit,
+                    H,
                     HK,
                     QR,
                     QH,
@@ -3217,6 +3574,7 @@ def _attention_prefill_balanced_queue(
                 current_qstart,
                 current_qlen,
                 limit,
+                H,
                 HK,
                 QR,
                 QH,
@@ -3638,6 +3996,7 @@ def _attention_prefill_corequeue(
                     c_current_qstart,
                     c_current_qlen,
                     c_limit,
+                    H,
                     HK,
                     QR,
                     QH,
@@ -4261,6 +4620,7 @@ def _attention_prefill_task_queue(
                 current_qstart,
                 current_qlen,
                 limit,
+                H,
                 HK,
                 QR,
                 QH,

@@ -20,9 +20,11 @@ import triton.language as tl
 from triton.experimental.tle.language.dsa import insert_slice
 
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.scheduling import (
+    _classify_long_requests,
+    classify_mixed_requests,
+)
 from flaggems_vllm.utils import libentry
-
-from .scheduling import _classify_long_requests, classify_mixed_requests
 
 # ---- common ----
 
@@ -231,6 +233,20 @@ def reshape_view_or_copy(source, shape):
     return _contiguous_copy(source).as_strided(shape, _contiguous_strides(shape))
 
 
+@triton.jit
+def _packed_q_base(batch, qstart, QCAP: tl.constexpr, H: tl.constexpr):
+    # Negative QCAP denotes a compact allocation. Adjacent request bases
+    # differ by at least ceil(qlen / 128) * H, including unaligned CUQ.
+    if QCAP < 0:
+        return (qstart.to(tl.int64) // 128 + batch) * H
+    return batch.to(tl.int64) * QCAP
+
+
+@triton.jit
+def _packed_q_stage_base(B: tl.constexpr, QCAP: tl.constexpr):
+    return -QCAP if QCAP < 0 else B * QCAP
+
+
 # ---- scaled_k_pack ----
 
 
@@ -327,6 +343,7 @@ def pack_kv_prescaled(
     QR: tl.constexpr = 0,
     QH: tl.constexpr = 0,
     FUSE_MIXED_LISTS: tl.constexpr = False,
+    MIXED_BODY_ONLY: tl.constexpr = True,
     DECODE_IDS=None,
     OTHER_IDS=None,
     COUNTS=None,
@@ -338,12 +355,12 @@ def pack_kv_prescaled(
             classify_mixed_requests(
                 CUQ, DECODE_IDS, OTHER_IDS, COUNTS, B, triton.next_power_of_2(B)
             )
-    count = B if FUSE_MIXED_LISTS else tl.num_programs(1)
+    count = B if FUSE_MIXED_LISTS and MIXED_BODY_ONLY else tl.num_programs(1)
     if REQUEST_LIST:
         count = tl.load(REQUEST_COUNT)
     first = tl.program_id(1)
     stride = tl.num_programs(1)
-    if FUSE_MIXED_LISTS:
+    if FUSE_MIXED_LISTS and MIXED_BODY_ONLY:
         first = tl.where(first == 0, B, first - 1)
         stride -= 1
     for request in range(first, count, stride):
@@ -351,7 +368,7 @@ def pack_kv_prescaled(
         if REQUEST_LIST:
             batch = tl.load(REQUEST_IDS + request)
         keep_request = True
-        if FUSE_MIXED_LISTS:
+        if FUSE_MIXED_LISTS and MIXED_BODY_ONLY:
             keep_request = tl.load(CUQ + batch + 1) - tl.load(CUQ + batch) > 1
         if keep_request:
             if PACK_Q:
@@ -409,7 +426,8 @@ def pack_kv_prescaled(
                         tl.store(
                             QP
                             + (
-                                (batch.to(tl.int64) * MAX_TASKS + q_task) * 128
+                                (_packed_q_base(batch, q_start, MAX_TASKS, H) + q_task)
+                                * 128
                                 + q_rows[:, None]
                             )
                             * 256
@@ -618,6 +636,7 @@ def pack_query(
     QH: tl.constexpr,
     PROGRAMS: tl.constexpr,
     Q_DIRECT: tl.constexpr = False,
+    QCAP: tl.constexpr = 0,
     REQUEST_IDS=None,
     REQUEST_COUNT=None,
     REQUEST_LIST: tl.constexpr = False,
@@ -680,7 +699,14 @@ def pack_query(
                             0,
                         )
                     dst = (
-                        (batch.to(tl.int64) * MAX_TASKS + tile) * 128 + rr[:, None]
+                        (
+                            _packed_q_base(
+                                batch, qstart, QCAP if QCAP != 0 else MAX_TASKS, H
+                            )
+                            + tile
+                        )
+                        * 128
+                        + rr[:, None]
                     ) * 256 + dims[None, :]
                     tl.store(QP + dst, q)
 
@@ -719,6 +745,7 @@ def pack_kv(
     QR: tl.constexpr = 0,
     QH: tl.constexpr = 0,
     FUSE_MIXED_LISTS: tl.constexpr = False,
+    MIXED_BODY_ONLY: tl.constexpr = True,
     DECODE_IDS=None,
     OTHER_IDS=None,
     COUNTS=None,
@@ -729,12 +756,12 @@ def pack_kv(
             classify_mixed_requests(
                 CUQ, DECODE_IDS, OTHER_IDS, COUNTS, B, triton.next_power_of_2(B)
             )
-    count = B if FUSE_MIXED_LISTS else tl.num_programs(1)
+    count = B if FUSE_MIXED_LISTS and MIXED_BODY_ONLY else tl.num_programs(1)
     if REQUEST_LIST:
         count = tl.load(REQUEST_COUNT)
     first = tl.program_id(1)
     stride = tl.num_programs(1)
-    if FUSE_MIXED_LISTS:
+    if FUSE_MIXED_LISTS and MIXED_BODY_ONLY:
         first = tl.where(first == 0, B, first - 1)
         stride -= 1
     for request in range(first, count, stride):
@@ -742,7 +769,7 @@ def pack_kv(
         if REQUEST_LIST:
             batch = tl.load(REQUEST_IDS + request)
         keep_request = True
-        if FUSE_MIXED_LISTS:
+        if FUSE_MIXED_LISTS and MIXED_BODY_ONLY:
             keep_request = tl.load(CUQ + batch + 1) - tl.load(CUQ + batch) > 1
         if keep_request:
             if PACK_Q:
@@ -800,7 +827,8 @@ def pack_kv(
                         tl.store(
                             QP
                             + (
-                                (batch.to(tl.int64) * MAX_TASKS + q_task) * 128
+                                (_packed_q_base(batch, q_start, MAX_TASKS, H) + q_task)
+                                * 128
                                 + q_rows[:, None]
                             )
                             * 256
@@ -980,6 +1008,38 @@ def ascend_flash_attention_decode_pack(
 # ---- repack ----
 
 
+MAX_WORKSPACE_BYTES = 1 << 30
+
+
+def packed_input_layout(params, stage_workers=0, compact_native_tail=False):
+    capacity = triton.cdiv(params.seqlen_k, 512) * 512
+    tasks = triton.cdiv(params.seqlen_q, 128) * params.h
+    rectangular_tiles = params.b * tasks
+    compact_tiles = (params.total_q // 128 + params.b) * params.h
+    q_tiles = min(rectangular_tiles, compact_tiles)
+    qcap = -q_tiles if q_tiles < rectangular_tiles else tasks
+    q_shape = (q_tiles + stage_workers, 128, 256)
+    if compact_native_tail:
+        # Native Q1 reads full pages directly; only its final page pair is staged.
+        rows = params.b * params.hk * capacity + stage_workers * 2 * params.block_size
+        kv_shape = (rows, 256)
+    else:
+        kv_shape = (params.b * params.hk + stage_workers, capacity, 256)
+    return q_shape, kv_shape, tasks, qcap, capacity
+
+
+def packed_input_bytes(
+    params, stage_workers=0, compact_native_tail=False, *, layout=None
+):
+    if layout is None:
+        layout = packed_input_layout(params, stage_workers, compact_native_tail)
+    q_shape, kv_shape, _, _, _ = layout
+    return (
+        math.prod(q_shape) * params.q_ptr.element_size()
+        + math.prod(kv_shape) * params.k_ptr.element_size() * 2
+    )
+
+
 def prepare_packed_inputs(
     params,
     workers,
@@ -989,45 +1049,33 @@ def prepare_packed_inputs(
     fuse_short_decode=False,
     stage_workers=0,
     fused_mixed_lists=None,
+    pack_mixed_body_only=True,
+    compact_native_tail=False,
+    layout=None,
+    q_direct=None,
 ):
     """Pack Q/K/V once so the pipelined kernel can use affine L1 loads."""
-    capacity = triton.cdiv(params.seqlen_k, 512) * 512
-    tasks = triton.cdiv(params.seqlen_q, 128) * params.h
-    elements = params.b * params.hk * capacity * params.d
-    bytes_needed = elements * params.k_ptr.element_size() * 2
+    if layout is None:
+        layout = packed_input_layout(params, stage_workers, compact_native_tail)
+    q_shape, kv_shape, tasks, qcap, capacity = layout
     if (
         not params.is_cu_seqlens_q
         or not params.is_paged
         or not capacity
-        or bytes_needed > (1 << 30)
+        or packed_input_bytes(params, layout=layout) > MAX_WORKSPACE_BYTES
     ):
         return None
-    q_direct = (
-        params.q_ptr.stride(-1) == 1
-        and params.q_row_stride >= 256
-        and params.q_head_stride >= 256
-        and params.q_row_stride % 16 == 0
-        and params.q_head_stride % 16 == 0
-        and params.q_ptr.data_ptr() % 32 == 0
-    )
-    qp = torch.empty(
-        (
-            (params.b * tasks + stage_workers, 128, 256)
-            if stage_workers
-            else (params.b, tasks, 128, 256)
-        ),
-        dtype=params.q_ptr.dtype,
-        device=params.q_ptr.device,
-    )
-    kp = torch.empty(
-        (
-            (params.b * params.hk + stage_workers, capacity, 256)
-            if stage_workers
-            else (params.b, params.hk, capacity, 256)
-        ),
-        dtype=params.k_ptr.dtype,
-        device=params.k_ptr.device,
-    )
+    if q_direct is None:
+        q_direct = (
+            params.q_ptr.stride(-1) == 1
+            and params.q_row_stride >= 256
+            and params.q_head_stride >= 256
+            and params.q_row_stride % 16 == 0
+            and params.q_head_stride % 16 == 0
+            and params.q_ptr.data_ptr() % 32 == 0
+        )
+    qp = torch.empty(q_shape, dtype=params.q_ptr.dtype, device=params.q_ptr.device)
+    kp = torch.empty(kv_shape, dtype=params.k_ptr.dtype, device=params.k_ptr.device)
     vp = torch.empty_like(kp)
     if fuse_short_decode:
         programs = min(
@@ -1068,7 +1116,7 @@ def prepare_packed_inputs(
             REQUEST_LIST=request_ids is not None,
             enable_fp_fusion=False,
         )
-        return qp, kp, vp, tasks, capacity, q_direct
+        return qp, kp, vp, qcap, capacity, q_direct
     # A bounded wave visits only actual tiles/pages, irrespective of capacity.
     query_programs = min(tasks, max(1, workers * 8 // (params.b * 4)))
     kv_programs = min(
@@ -1096,7 +1144,20 @@ def prepare_packed_inputs(
         and params.h // params.hk in (4, 8)
         and q_direct
     )
-    fuse_query = fuse_prefill_q or fuse_mixed_q
+    fuse_long_q = (
+        params.q_ptr.dtype == torch.bfloat16
+        and params.is_causal
+        and q_direct
+        and 1 < params.b <= 8
+        and params.b < params.total_q <= params.seqlen_q + params.b - 1
+        and 64 < params.seqlen_q <= 144
+        and 32768 <= params.seqlen_k <= 32768 + 512
+        and compact_native_tail
+        and stage_workers > 0
+        and request_ids is not None
+        and fused_mixed_lists is None
+    )
+    fuse_query = fuse_prefill_q or fuse_mixed_q or fuse_long_q
     if fuse_mixed_q:
         kv_programs = max(kv_programs, 4)
     if not fuse_query:
@@ -1111,12 +1172,11 @@ def prepare_packed_inputs(
             params.q_head_stride,
             query_programs,
             Q_DIRECT=q_direct,
+            QCAP=qcap,
             REQUEST_IDS=request_ids,
             REQUEST_COUNT=request_count,
             REQUEST_LIST=request_ids is not None,
         )
-    from .common import pack_kv_prescaled, use_packed_k_prescale
-
     pack_kernel = pack_kv_prescaled if use_packed_k_prescale(params) else pack_kv
     multipage_prefill_pack = (
         pack_kernel is pack_kv_prescaled
@@ -1135,15 +1195,37 @@ def prepare_packed_inputs(
 
     fused_list_options = {}
     if fused_mixed_lists is not None:
-        assert fuse_query and request_ids is not None
+        if pack_mixed_body_only:
+            assert fuse_query and request_ids is not None
+        else:
+            assert request_ids is None
         fused_list_options = dict(
             FUSE_MIXED_LISTS=True,
+            MIXED_BODY_ONLY=pack_mixed_body_only,
             DECODE_IDS=fused_mixed_lists[0],
             OTHER_IDS=fused_mixed_lists[1],
             COUNTS=fused_mixed_lists[2],
             B=params.b,
         )
-    pack_kernel[(kv_programs, batches + (fused_mixed_lists is not None), params.hk)](
+    extra_batch = int(fused_mixed_lists is not None and pack_mixed_body_only)
+    pack_grid = (kv_programs, batches + extra_batch, params.hk)
+    dispatch = pack_kernel[pack_grid]
+    if fuse_mixed_q:
+        from functools import partial
+
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.submission import (
+            submit_mixed,
+        )
+
+        dispatch = partial(
+            submit_mixed,
+            pack_kernel,
+            pack_grid,
+            params.q_ptr.device.index,
+            params.h <= 8,
+            params.h == 4 and params.hk == 1,
+        )
+    dispatch(
         params.k_ptr,
         params.v_ptr,
         params.page_table_ptr,
@@ -1162,14 +1244,14 @@ def prepare_packed_inputs(
         REQUEST_COUNT=request_count,
         REQUEST_LIST=request_ids is not None and fused_mixed_lists is None,
         **fused_list_options,
+        CUQ=params.cu_seqlens_q_ptr if fuse_query or fused_mixed_lists else None,
         **(
             dict(
                 PACK_Q=True,
                 Q=params.q_ptr,
-                CUQ=params.cu_seqlens_q_ptr,
                 QP=qp,
                 H=params.h,
-                MAX_TASKS=tasks,
+                MAX_TASKS=qcap,
                 QR=params.q_row_stride,
                 QH=params.q_head_stride,
             )
@@ -1177,13 +1259,13 @@ def prepare_packed_inputs(
             else {}
         ),
     )
-    return qp, kp, vp, tasks, capacity, q_direct
+    return qp, kp, vp, qcap, capacity, q_direct
 
 
 # ---- repack ----
 
 
-def prepare_contiguous_kv(params, workers):
+def prepare_contiguous_kv(params, workers, budget=MAX_WORKSPACE_BYTES):
     length = triton.cdiv(params.seqlen_k, params.block_size) * params.block_size
     elements = params.b * params.hk * length * params.d
     if (
@@ -1191,7 +1273,8 @@ def prepare_contiguous_kv(params, workers):
         or params.seqlen_q < 128
         or params.total_q < 1024
         or not length
-        or elements * params.k_ptr.element_size() * 2 > (1 << 30)
+        or elements * (params.k_ptr.element_size() + params.v_ptr.element_size())
+        > budget
     ):
         return params.k_ptr, params.v_ptr, 0
     shape = (params.b, params.hk, length, params.d)

@@ -23,8 +23,15 @@ from triton.experimental.tle.language.dsa.ascend import (
     sync_block_wait,
 )
 
-from .common import load_kv_tile
-from .scheduling import _merge_request, effective_kv_splits, merge_request_list
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
+    _packed_q_base,
+    load_kv_tile,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.scheduling import (
+    _merge_request,
+    effective_kv_splits,
+    merge_request_list,
+)
 
 # ---- body_task_queue ----
 
@@ -46,6 +53,7 @@ def _whole_task_qk(
     qstart,
     qlen,
     limit,
+    H: tl.constexpr,
     HK: tl.constexpr,
     QR: tl.constexpr,
     QH: tl.constexpr,
@@ -64,7 +72,7 @@ def _whole_task_qk(
             tle.dsa.copy(qp, query_buf, [128, 256])
         else:
             qp = tl.make_block_ptr(
-                Q + (batch.to(tl.int64) * QCAP + task) * 128 * 256,
+                Q + (_packed_q_base(batch, qstart, QCAP, H) + task) * 128 * 256,
                 (128, 256),
                 (256, 1),
                 (0, 0),
@@ -669,6 +677,7 @@ def _attention_body_task_queue(
                 current_qstart,
                 current_qlen,
                 limit,
+                H,
                 HK,
                 QR,
                 QH,
@@ -1513,6 +1522,7 @@ def _attention_task(
     Q1_STREAM: tl.constexpr = False,
     RAW_K=None,
     RAW_V=None,
+    PACKED_Q_START=None,
 ):
     VM: tl.constexpr = 8 if BM == 16 else 16
     SOFTMAX_VM_256: tl.constexpr = 32 if BM == 128 else VM
@@ -1529,6 +1539,8 @@ def _attention_task(
         qstart = batch * SEQLEN_Q
         qbase = batch.to(tl.int64) * QB
         obase = batch.to(tl.int64) * OB
+    # SplitKV can remap output rows to a partial buffer; Q packing keeps CUQ.
+    packed_qstart = qstart if PACKED_Q_START is None else PACKED_Q_START
     output_qstart = qstart
     if COMPACT_Q1:
         output_qstart = batch
@@ -1634,7 +1646,12 @@ def _attention_task(
                 tle.dsa.copy(query_ptr, query_buf, [128, 256])
             else:
                 query_ptr = tl.make_block_ptr(
-                    Q + ((batch.to(tl.int64) * QCAP + outer) * 128 + sub * BM) * 256,
+                    Q
+                    + (
+                        (_packed_q_base(batch, packed_qstart, QCAP, H) + outer) * 128
+                        + sub * BM
+                    )
+                    * 256,
                     (BM, 256),
                     (256, 1),
                     (0, 0),
@@ -1644,7 +1661,12 @@ def _attention_task(
                 tle.dsa.copy(query_ptr, query_buf, [BM, 256])
         else:
             query_ptr = tl.make_block_ptr(
-                Q + ((batch.to(tl.int64) * QCAP + outer) * 128 + sub * BM) * 256,
+                Q
+                + (
+                    (_packed_q_base(batch, packed_qstart, QCAP, H) + outer) * 128
+                    + sub * BM
+                )
+                * 256,
                 (BM, 256),
                 (256, 1),
                 (0, 0),
@@ -2151,7 +2173,8 @@ def _stream_load_q(
     Q_RAW,
     query_buf,
     batch,
-    qbase,
+    qstart,
+    H: tl.constexpr,
     qlen,
     task,
     qt,
@@ -2171,7 +2194,7 @@ def _stream_load_q(
                 raw_head = kh * group + headstart
                 raw_base = (
                     Q_RAW
-                    + qbase
+                    + qstart.to(tl.int64) * QR
                     + qt.to(tl.int64) * 128 * QR
                     + raw_head.to(tl.int64) * QH
                 )
@@ -2181,7 +2204,7 @@ def _stream_load_q(
                 tle.dsa.copy(query_ptr, query_buf, [128, 256])
             else:
                 query_ptr = tl.make_block_ptr(
-                    Q + ((batch.to(tl.int64) * QCAP + task) * 128) * 256,
+                    Q + ((_packed_q_base(batch, qstart, QCAP, H) + task) * 128) * 256,
                     (BM, 256),
                     (256, 1),
                     (0, 0),
@@ -2191,7 +2214,7 @@ def _stream_load_q(
                 tle.dsa.copy(query_ptr, query_buf, [BM, 256])
         else:
             query_ptr = tl.make_block_ptr(
-                Q + ((batch.to(tl.int64) * QCAP + task) * 128) * 256,
+                Q + ((_packed_q_base(batch, qstart, QCAP, H) + task) * 128) * 256,
                 (BM, 256),
                 (256, 1),
                 (0, 0),
@@ -2669,7 +2692,6 @@ def _attention_stream_task(
     headtile = task % H
     kh = headtile // group
     headstart = headtile % group
-    qbase = qstart.to(tl.int64) * QR
     obase = qstart.to(tl.int64) * OR
     limit = tl.minimum(
         klen, tl.maximum(0, tl.minimum(qlen, qt * 128 + 128) + klen - qlen)
@@ -2697,7 +2719,8 @@ def _attention_stream_task(
             Q_RAW,
             query_buf,
             batch,
-            qbase,
+            qstart,
+            H,
             qlen,
             task,
             qt,
@@ -2780,7 +2803,8 @@ def _attention_stream_task(
                 Q_RAW,
                 query_buf,
                 batch,
-                qbase,
+                qstart,
+                H,
                 qlen,
                 next_task,
                 next_qt,
@@ -3060,6 +3084,7 @@ def ascend_attention_persistent_pipelined(
     PARTITION_SHORT_BODY: tl.constexpr = False,
     TASK_SCORES=None,
     TASK_PROBS=None,
+    SHARED_BODY_SCRATCH: tl.constexpr = False,
     RESIDUAL_MERGE: tl.constexpr = False,
     WAVE_PARTIAL=None,
     WAVE_LSE=None,
@@ -3136,6 +3161,14 @@ def ascend_attention_persistent_pipelined(
     queue_total = 0
     queue_has_short = False
     if BODY_TASK_PIPELINE:
+        if SHARED_BODY_SCRATCH:
+            tl.static_assert(BM == 128 and TASK_M == 0 and BS <= 1536)
+            # The queue owns the three wide slots until its final drain.
+            task_scores = SCORES
+            task_probs = PROBS
+        else:
+            task_scores = TASK_SCORES
+            task_probs = TASK_PROBS
         if PARTITION_SHORT_BODY:
             queue_supported, queue_total, queue_has_short = (
                 _body_queue_partition_preflight(
@@ -3172,8 +3205,8 @@ def ascend_attention_persistent_pipelined(
                 CUQ,
                 USED,
                 REQUEST_IDS,
-                TASK_SCORES,
-                TASK_PROBS,
+                task_scores,
+                task_probs,
                 PVWORK,
                 ACCWORK,
                 queue_total,
@@ -3236,6 +3269,13 @@ def ascend_attention_persistent_pipelined(
                     use_stream = (head_rows == 1) & (qlen > 64) & (klen <= 73728)
                 if use_stream:
                     if CROSS_Q_TASK or LONG_MIXED_STREAM:
+                        if SHARED_BODY_SCRATCH:
+                            # Move the original three-slot stride into the worker's wide slab.
+                            offset = worker.to(tl.int64) * (3 * 1536 - 3 * BS) * 128
+                            fallback_scores = SCORES + offset
+                            fallback_probs = PROBS + offset
+                        else:
+                            fallback_scores, fallback_probs = SCORES, PROBS
                         _attention_request_stream(
                             Q,
                             Q_RAW,
@@ -3244,8 +3284,8 @@ def ascend_attention_persistent_pipelined(
                             O,
                             LSE,
                             CUQ,
-                            SCORES,
-                            PROBS,
+                            fallback_scores,
+                            fallback_probs,
                             PVWORK,
                             ACCWORK,
                             batch,
@@ -3275,6 +3315,13 @@ def ascend_attention_persistent_pipelined(
                         )
                 else:
                     for task in range(first, ntiles, workers):
+                        if SHARED_BODY_SCRATCH:
+                            # The non-stream fallback uses one slot per worker.
+                            offset = worker.to(tl.int64) * (3 * 1536 - BS) * 128
+                            fallback_scores = SCORES + offset
+                            fallback_probs = PROBS + offset
+                        else:
+                            fallback_scores, fallback_probs = SCORES, PROBS
                         _attention_task(
                             Q,
                             Q_RAW,
@@ -3285,8 +3332,8 @@ def ascend_attention_persistent_pipelined(
                             CUQ,
                             USED,
                             TABLE,
-                            SCORES,
-                            PROBS,
+                            fallback_scores,
+                            fallback_probs,
                             PVWORK,
                             ACCWORK,
                             batch,

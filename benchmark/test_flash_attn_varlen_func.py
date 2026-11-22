@@ -18,10 +18,12 @@ from typing import Any, List, Optional
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
 
-from . import base, utils
+from . import base, consts, utils
+from .conftest import Config
 
 vendor_name = flaggems_vllm.vendor_name
 IS_HOPPER = (
@@ -73,6 +75,26 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
     """
     benchmark for flash_attn_varlen_func
     """
+
+    def get_latency(self, op, *args, **kwargs):
+        if vendor_name == "ascend":
+            if op is flash_attn_varlen_ascend:
+                # FIA takes host lengths. Prepare them once per case before timing;
+                # FlagGems still gets the original device tensors.
+                fia_args = list(args)
+                fia_args[4] = fia_args[4].cpu().tolist()[1:]
+                fia_args[7] = fia_args[7].cpu().tolist()
+                args = tuple(fia_args)
+            if Config.mode == consts.BenchMode.KERNEL:
+                # Time one whole call between device events, including any packing
+                # and merge kernels. Host metadata preparation is outside the events.
+                return triton.testing.do_bench(
+                    lambda: op(*args, **kwargs),
+                    warmup=Config.warm_up,
+                    rep=Config.repetition,
+                    return_mode="median",
+                )
+        return super().get_latency(op, *args, **kwargs)
 
     def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
         # Collected from Qwen3.6-35B-A3B: six TP1 cases followed by six TP4 cases.
@@ -245,7 +267,8 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
                 dtype=dtype,
                 device=device,
             )
-            out = torch.empty_like(query)
+            # FIA allocates its output, so let both Ascend paths allocate it.
+            out = None if vendor_name == "ascend" else torch.empty_like(query)
             key_cache = torch.randn(
                 num_blocks,
                 block_size,
@@ -453,16 +476,16 @@ def _ascend_fia_causal_mask(device):
 
 
 def flash_attn_varlen_ascend(*args, **kwargs):
-    """Adapt vLLM arguments directly to torch_npu's paged CANN FIA interface."""
+    """Call paged CANN FIA with sequence lengths prepared on the host."""
     (
         query,
         key_cache,
         value_cache,
         _,
-        cu_query_lens,
+        actual_seq_lengths,
         _,
         _,
-        seqused_k,
+        actual_seq_lengths_kv,
         _,
         _,
         scale,
@@ -488,8 +511,8 @@ def flash_attn_varlen_ascend(*args, **kwargs):
         key_cache.view(*key_cache.shape[:2], -1),
         value_cache.view(*value_cache.shape[:2], -1),
         atten_mask=_ascend_fia_causal_mask(query.device) if causal else None,
-        actual_seq_lengths=cu_query_lens.cpu().tolist()[1:],
-        actual_seq_lengths_kv=seqused_k.cpu().tolist(),
+        actual_seq_lengths=actual_seq_lengths,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
         num_heads=query.shape[1],
         num_key_value_heads=key_cache.shape[2],
         input_layout="TND",

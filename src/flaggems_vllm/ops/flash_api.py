@@ -316,8 +316,11 @@ def mha_varlan_fwd(
     assert cu_seqlens_q.dtype == torch.int32
     assert cu_seqlens_q.is_contiguous()
 
-    assert cu_seqlens_k.dtype == torch.int32
-    assert cu_seqlens_k.is_contiguous()
+    if not is_ascend or cu_seqlens_k is not None:
+        assert cu_seqlens_k.dtype == torch.int32
+        assert cu_seqlens_k.is_contiguous()
+    else:
+        assert seqused_k is not None
 
     is_paged = page_table is not None
     if not is_paged:
@@ -340,7 +343,8 @@ def mha_varlan_fwd(
 
     assert k.size() == v.size()
     assert cu_seqlens_q.size() == (batch_size + 1,)
-    assert cu_seqlens_k.size() == (batch_size + 1,)
+    if cu_seqlens_k is not None:
+        assert cu_seqlens_k.size() == (batch_size + 1,)
 
     # Check output shape
     if out is not None:
@@ -505,7 +509,11 @@ def mha_varlan_fwd(
             )
         else:
             is_dropout = False
-            philox_args = torch.empty((2,), dtype=torch.int64, device=q_device)
+            philox_args = (
+                None
+                if is_ascend
+                else torch.empty((2,), dtype=torch.int64, device=q_device)
+            )
 
         p_dropout = 1 - p_dropout
         p_dropout_in_uint8_t = math.floor(p_dropout * 255.0)
@@ -518,7 +526,7 @@ def mha_varlan_fwd(
                 device=q_device,
             )
         else:
-            p = torch.empty((), device=q_device)
+            p = None if is_ascend else torch.empty((), device=q_device)
 
         if zero_tensors:
             if is_metax:
@@ -684,7 +692,9 @@ def mha_varlan_fwd(
                     out = out.reshape(batch_size, num_heads_k * max_seqlen_q, head_size)
                 lse = lse.reshape(num_heads_k, batch_size, max_seqlen_q)
                 lse = lse.reshape(num_heads_k * max_seqlen_q, batch_size)
-        unused = torch.empty((), dtype=torch.int64, device=q_device)
+        unused = (
+            None if is_ascend else torch.empty((), dtype=torch.int64, device=q_device)
+        )
     return out, q, k, v, lse, philox_args, unused, p
 
 

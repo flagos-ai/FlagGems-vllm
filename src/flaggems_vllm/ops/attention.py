@@ -1575,48 +1575,136 @@ def flash_attn_varlen_func(
                 "Ascend varlen attention does not return attention probabilities"
             )
         if (
-            any(
-                x is not None
-                for x in (
-                    q_v,
-                    scheduler_metadata,
-                    q_descale,
-                    k_descale,
-                    v_descale,
-                    s_aux,
-                    cp_tot_seqused_k,
-                )
-            )
+            q_v is not None
+            or scheduler_metadata is not None
+            or q_descale is not None
+            or k_descale is not None
+            or v_descale is not None
+            or s_aux is not None
+            or cp_tot_seqused_k is not None
             or cp_world_size != 1
             or cp_rank != 0
         ):
             raise NotImplementedError(
                 "Ascend varlen attention does not support FA3 or context-parallel extensions"
             )
-        if isinstance(num_splits, bool) or not isinstance(num_splits, int):
+        if type(num_splits) is not int and (
+            isinstance(num_splits, bool) or not isinstance(num_splits, int)
+        ):
             raise TypeError(
                 f"num_splits must be an integer in [0, 1], got {num_splits!r}"
             )
         if not 0 <= num_splits <= 1:
             raise ValueError(f"num_splits must be in [0, 1], got {num_splits}")
-        if not isinstance(max_seqlen_q, Integral) or not isinstance(
-            max_seqlen_k, Integral
-        ):
-            raise TypeError("max_seqlen_q and max_seqlen_k must be host integers")
-        max_seqlen_q, max_seqlen_k = int(max_seqlen_q), int(max_seqlen_k)
+        if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
+            if not isinstance(max_seqlen_q, Integral) or not isinstance(
+                max_seqlen_k, Integral
+            ):
+                raise TypeError("max_seqlen_q and max_seqlen_k must be host integers")
+            max_seqlen_q, max_seqlen_k = int(max_seqlen_q), int(max_seqlen_k)
         if max_seqlen_q < 0 or max_seqlen_k < 0:
             raise ValueError("maximum sequence lengths must be nonnegative")
-        assert q.device == k.device == v.device
-        assert cu_seqlens_q.device == q.device
+        device = q.device
+        assert device == k.device == v.device
+        assert cu_seqlens_q.device == device
         if cu_seqlens_k is not None:
-            assert cu_seqlens_k.device == q.device
+            assert cu_seqlens_k.device == device
         if seqused_k is not None:
-            assert seqused_k.device == q.device and seqused_k.dtype == torch.int32
+            assert seqused_k.device == device and seqused_k.dtype == torch.int32
         if block_table is not None:
-            assert block_table.device == q.device and block_table.dtype == torch.int32
+            assert block_table.device == device and block_table.dtype == torch.int32
             assert block_table.stride(-1) == 1
         if out is not None:
-            assert out.device == q.device
+            assert out.device == device
+        elif (
+            not return_softmax_lse
+            and max_seqlen_q == max_seqlen_k == 1
+            and block_table is not None
+            and seqused_k is not None
+            and cu_seqlens_k is None
+            and alibi_slopes is None
+            and softcap <= 0
+            and (
+                window_size is None
+                or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
+            )
+        ):
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.singleton import (
+                singleton_paged_output,
+            )
+
+            singleton_out = singleton_paged_output(
+                q, k, v, cu_seqlens_q, seqused_k, block_table, device
+            )
+            if singleton_out is not None:
+                return singleton_out
+        elif (
+            not return_softmax_lse
+            and num_splits == 0
+            and max_seqlen_q == 1
+            and max_seqlen_k >= 32768
+            and block_table is not None
+            and seqused_k is not None
+            and cu_seqlens_k is None
+            and alibi_slopes is None
+            and softcap <= 0
+            and (
+                window_size is None
+                or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
+            )
+        ):
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.raw_q1 import (
+                raw_q1_output,
+            )
+
+            q1_out = raw_q1_output(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_k,
+                softmax_scale,
+                device,
+            )
+            if q1_out is not None:
+                return q1_out
+        elif (
+            not return_softmax_lse
+            and max_seqlen_q <= max_seqlen_k <= 1152
+            and max_seqlen_q >= 512
+            and causal
+            and cu_seqlens_q.shape == (2,)
+            and cu_seqlens_q.dtype == torch.int32
+            and cu_seqlens_q.is_contiguous()
+            and block_table is not None
+            and seqused_k is not None
+            and cu_seqlens_k is None
+            and alibi_slopes is None
+            and softcap <= 0
+            and (
+                window_size is None
+                or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
+            )
+        ):
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.short_prefill import (
+                short_prefill_output,
+            )
+
+            prefill_out = short_prefill_output(
+                q,
+                k,
+                v,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                device,
+            )
+            if prefill_out is not None:
+                return prefill_out
     else:
         if fa_version != 2:
             raise RuntimeError("Only FA2 is implemented.")
@@ -1691,7 +1779,9 @@ def flash_attn_varlen_func(
             q, k, v = [ensure_last_dim_contiguous(x) for x in (q, k, v)]
         else:
             q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-        dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
+        if cu_seqlens_k is None and not is_ascend:
+            # The common CUDA API expects a tensor even when using seqused_k.
+            cu_seqlens_k = torch.empty_like(cu_seqlens_q)
         max_seqlen_q = (
             max_seqlen_q.item() if hasattr(max_seqlen_q, "item") else max_seqlen_q
         )
@@ -1704,9 +1794,7 @@ def flash_attn_varlen_func(
             v,
             out,
             cu_seqlens_q,
-            # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp
-            # still wants it so we pass all zeros
-            dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
+            cu_seqlens_k,
             seqused_k,
             None,
             block_table,
