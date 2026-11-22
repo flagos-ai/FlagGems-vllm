@@ -768,7 +768,7 @@ def _gate_launch_args(
     split_flat = (
         wide_sigmoid
         and not grouped_route
-        and (64 < tokens <= 128 or 512 < tokens < 2 * cube_cores * 64)
+        and (64 < tokens <= 128 or 256 < tokens < 2 * cube_cores * 64)
         and hasattr(custom_ops, "sort_1d_pack")
     )
     split_sigmoid = split_group or split_flat
@@ -801,6 +801,13 @@ def _gate_launch_args(
     )
     fp32_score = fp32_router and table is None and vision_bias is None
     fp32_pipeline = fp32_router and tokens >= cube_cores * 64
+    sorted_pipeline = (
+        local_pipeline
+        and wide_sigmoid
+        and tokens <= 4 * 64 * cube_cores
+        and hasattr(custom_ops, "sort_1d_pack")
+        and (not grouped_route or hasattr(custom_ops, "sort32"))
+    )
     if fp32_pipeline:
         # Each Cube owns a full expert row. Its Vector subcores rank rows
         # while the Cube projects the next tile.
@@ -817,7 +824,10 @@ def _gate_launch_args(
         block_n = min(expert_alignment, 128)
         block_k = min(512, hidden & -hidden)
         route_rows = 16 if rank_logits or padded_experts <= 256 else 8
-        if short_pipeline:
+        if sorted_pipeline:
+            # Amortize projection loads across 96 rows and sort two rows per AIV.
+            block_m, route_rows = 96, 2
+        elif short_pipeline:
             block_m = 48 if grouped_route and tokens % 64 else 64
             route_rows = 8
         if wide_sigmoid and experts == 384 and tokens < 8 * cube_cores * 64:
@@ -847,8 +857,10 @@ def _gate_launch_args(
         and tokens <= 320
         and hasattr(custom_ops, "sort32")
     )
-    hardware_topk = (flat_sort or group_sort) and hasattr(custom_ops, "sort_1d_pack")
-    if hardware_topk:
+    hardware_topk = (flat_sort or group_sort or sorted_pipeline) and hasattr(
+        custom_ops, "sort_1d_pack"
+    )
+    if hardware_topk and not sorted_pipeline:
         route_rows, use_both_subcores = 1, True
         if group_sort and 4 < tokens <= 16:
             block_m, block_n, block_k = 16, 32, 1024
@@ -868,12 +880,9 @@ def _gate_launch_args(
     if wide_sigmoid and not grouped_route and hardware_topk:
         if tokens <= 32:
             block_m, block_n, block_k = 32, 64, 1024
-        elif 128 < tokens < cube_cores * 64 and (tokens % 128 or tokens > 384):
-            # Splitting K spreads narrow expert projections over more Cubes.
-            # Window the last activation tile so both halves can use dense loads.
-            block_m = 128 if tokens % 128 else 64
-            block_n, block_k, projection_splits = 128, 512, 2
-            tail_window = block_m if tokens % block_m else 0
+        elif 128 < tokens < 256:
+            block_m, block_n, block_k, projection_splits = 128, 128, 512, 2
+            tail_window = block_m
     if wide_sigmoid and not split_group and 512 < tokens < cube_cores * 64:
         if grouped_route:
             block_m, block_n, block_k = 256, 64, 256
@@ -884,7 +893,6 @@ def _gate_launch_args(
         elif hardware_topk:
             route_rows = 4
         use_both_subcores = True
-    logit_stride = experts if local_pipeline else padded_experts
     compile_options = {}
     if short_projection:
         compile_options["multibuffer"] = False
@@ -924,8 +932,22 @@ def _gate_launch_args(
             block_m, block_n = (32, 64) if tokens <= 64 else (64, 128)
             block_k = 256
             projection_splits = 2 if split_sigmoid or tokens <= 256 else 1
-            if (split_group and tokens > 256) or (split_flat and tokens > 512):
+            if split_group and tokens > 512:
                 block_m, block_n, block_k = 128, 128, 512
+            elif split_sigmoid and tokens > 128:
+                # Spread rows across Cube waves after splitting experts and K.
+                # Round each row tile up to a hardware multiple of 16.
+                if grouped_route and tokens <= 256:
+                    projection_splits = 4
+                else:
+                    block_k = 512
+                rows_per_wave = max(
+                    1, cube_cores // ((experts // block_n) * projection_splits)
+                )
+                waves = triton.cdiv(tokens, 128 * rows_per_wave)
+                block_m = 16 * triton.cdiv(tokens, 16 * rows_per_wave * waves)
+                if split_flat:
+                    padded_experts = experts
             tail_window = block_m if tokens >= block_m and tokens % block_m else 0
     qwen_router = (
         rank_logits
@@ -959,6 +981,7 @@ def _gate_launch_args(
         compile_options["TAIL_WINDOW"] = tail_window
     # BF16 logits round at this store. Split projections use FP32 planes,
     # which the Vector pass combines before scoring.
+    logit_stride = experts if local_pipeline else padded_experts
     workspace = torch.empty(
         (projection_splits * row_tiles * block_m, logit_stride),
         dtype=torch.float32 if projection_splits > 1 else logits_dtype,
