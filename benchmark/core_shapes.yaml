@@ -110,6 +110,32 @@ concat_mla_q:
     - [8192, 64, 512, 64]
   shape_desc: "tokens, heads, nope_width, rope_width"
 
+mega_mhc:
+  # Frequent V4 Flash trace buckets plus split-K, tile transitions, tails and long prefill.
+  shape_desc: "profile, tokens, hidden, shifted"
+  quick_tokens: [1, 16, 24, 128, 2048]
+  shapes:
+    - [v4-flash-normal, 1, 4096, false]
+    - [v4-flash-normal, 2, 4096, false]
+    - [v4-flash-normal, 4, 4096, false]
+    - [v4-flash-normal, 16, 4096, false]
+    - [v4-flash-normal, 24, 4096, false]
+    - [v4-flash-normal, 64, 4096, false]
+    - [v4-flash-normal, 88, 4096, false]
+    - [v4-flash-normal, 128, 4096, false]
+    - [v4-flash-normal, 160, 4096, false]
+    - [v4-flash-normal, 192, 4096, false]
+    - [v4-flash-normal, 240, 4096, false]
+    - [v4-flash-normal, 384, 4096, false]
+    - [v4-flash-normal, 496, 4096, false]
+    - [v4-flash-normal, 512, 4096, false]
+    - [v4-flash-normal, 2048, 4096, false]
+    - [v4-flash-normal, 3805, 4096, false]
+    - [v4-flash-normal, 16384, 4096, false]
+    - [v4-pro-normal, 1, 7168, false]
+    - [v41-flash-shifted, 1, 5120, true]
+    - [v41-flash-shifted, 16, 5120, true]
+
 megapreattention:
   shape_desc: "global tokens, TP, hidden, Q heads, KV heads, head_dim, rotary_dim"
   shapes:
