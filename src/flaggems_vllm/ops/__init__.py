@@ -21,6 +21,7 @@ from flaggems_vllm.ops.logit_bias import apply_logit_bias
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
 from flaggems_vllm.ops.matmul_persistent import matmul_persistent
 from flaggems_vllm.ops.top_k_top_p import top_k_top_p
+from flaggems_vllm.ops.topk_sample_from_logits import topk_sample_from_logits
 from flaggems_vllm.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.bad_words import apply_bad_words
@@ -487,6 +488,7 @@ __all__ = [
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
     "top_k_top_p",
+    "topk_sample_from_logits",
     "topk_sigmoid",
     "topk_softmax",
     "topk_softplus_sqrt",

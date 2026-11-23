@@ -53,5 +53,6 @@ __all__ = [
     "enable_symm_mem",
     "SUPPORTED_FP8_DTYPE",
     "gumbel_sample",
+    "topk_sample_from_logits",
     "use_symm_mem",
 ]

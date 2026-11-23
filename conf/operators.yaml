@@ -2447,6 +2447,18 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: topk_sample_from_logits
+  description: Fuses per-row Top-K filtering, FP32 softmax and sampling from
+    caller-supplied exponential noise on MUSA.
+  for:
+  - vllm.v1.sample.ops.topk_topp_sampler.TopKTopPSampler.forward_native
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: topk_sigmoid
   description: Selects MoE experts using sigmoid scores and optional correction bias.
     Returns uncorrected weights with optional normalization and scaling and marks
