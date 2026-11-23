@@ -1625,23 +1625,6 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
-- id: kda_state_scatter
-  description: 'Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
-
-    chunk operator back into the paged [H, V, K] cache layout with the
-
-    transpose and dtype cast folded into a single kernel.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
 - id: kpool_state_compress
   description: 'Fused fast path for the GLM5 Next A3 indexer pre-compress sequence:
 
@@ -2219,6 +2202,22 @@ ops:
     than 0.30.0, the upstream has implemented its own Triton kernel.
   for:
     - torch chain (arange/masked_fill -> where/zeros_like/sum -> index_copy_)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
+- id: scatter_kda_state
+  description: |
+    Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
+    chunk operator back into the paged [H, V, K] cache layout with the
+    transpose and dtype cast folded into a single kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream use the native op npu_scatter_nd_update_.
+  for:
+    - torch chain (transpose -> contiguous -> cast -> index_put)
   labels:
     - fused
     - FLA
