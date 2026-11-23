@@ -284,9 +284,7 @@ def _inv_rope_quant_int8_kernel(
     mask2d = rows_valid[:, None]
     row_off = rows[:, None] * o_stride_token
     chunk_cols = tl.arange(0, QUANT_GROUP_SIZE)
-    out_row = (
-        out_ptr + g * out_stride_group + rows[:, None] * out_stride_token
-    )
+    out_row = out_ptr + g * out_stride_group + rows[:, None] * out_stride_token
     scale_base = scale_ptr + g * scale_stride_group + rows * scale_stride_token
 
     # Token-level inputs are shared by every head this program handles; keeping
@@ -361,9 +359,7 @@ def _inv_rope_quant_int8_kernel(
 
         q_lo = _round_to_e4m3_grid(lo * rscale_last[:, None]) * (int8_max / fp8_max)
         q_lo = tl.where(q_lo >= 0, q_lo + 0.5, q_lo - 0.5).to(tl.int32).to(tl.int8)
-        q_hi = _round_to_e4m3_grid(hi_rot * rscale_last[:, None]) * (
-            int8_max / fp8_max
-        )
+        q_hi = _round_to_e4m3_grid(hi_rot * rscale_last[:, None]) * (int8_max / fp8_max)
         q_hi = tl.where(q_hi >= 0, q_hi + 0.5, q_hi - 0.5).to(tl.int32).to(tl.int8)
         tl.store(out_base + last_base + lo_cols[None, :], q_lo, mask=mask2d)
         tl.store(
@@ -778,9 +774,7 @@ def _quantize_weight_int8(
     weight = weight.contiguous()
     out = torch.empty(weight.shape, dtype=torch.int8, device=weight.device)
     _fp8_payload_to_int8(weight, out)
-    out_scale = torch.empty(
-        scale.shape, dtype=torch.float32, device=scale.device
-    )
+    out_scale = torch.empty(scale.shape, dtype=torch.float32, device=scale.device)
     _fp8_scale_to_int8(scale.contiguous(), out_scale)
     return out, out_scale
 
@@ -1079,9 +1073,7 @@ def deep_gemm_fp8_o_proj(
         # order. The strided store used to cost 24% with the 256-row tile, but
         # with 128x128 it matches the dense tile (1.049 vs 1.047 ms at 4096
         # tokens) and saves the 0.11 ms group->token reorder pass.
-        out = _scratch(
-            (num_tokens, n_groups, o_lora_rank), torch.bfloat16, device
-        )
+        out = _scratch((num_tokens, n_groups, o_lora_rank), torch.bfloat16, device)
         z = out.permute(1, 0, 2)
         try:
             _lean_bmm(act_i8, weight_i8, act_scale_i8, weight_scale_i8, z)

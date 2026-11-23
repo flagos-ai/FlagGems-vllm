@@ -99,9 +99,7 @@ pytestmark = [
 
 # The INT8 transport adds at most half an INT8 step on top of the FP8 grid
 # (~1.2% peak-relative measured); Hopper stays on exact FP8.
-COMPOSED_ATOL = (
-    0.02 if (is_int8_transport_vendor() or is_ascend_vendor()) else 0.01
-)
+COMPOSED_ATOL = 0.02 if (is_int8_transport_vendor() or is_ascend_vendor()) else 0.01
 
 
 class _QuantizedActivation:

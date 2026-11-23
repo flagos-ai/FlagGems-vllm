@@ -194,9 +194,7 @@ def _block_amax(src):
 
 
 @triton.jit
-def _quant_row_store(
-    src, amax, out_ptr, off, row_scale, valid, ROWS: tl.constexpr
-):
+def _quant_row_store(src, amax, out_ptr, off, row_scale, valid, ROWS: tl.constexpr):
     """Quantize one 128-wide block of a row and store it as INT8.
 
     ``amax`` is the block absmax the caller already reduced for the row maximum:
@@ -222,7 +220,9 @@ def _store_payload(payload, out_ptr, off, valid, ROWS: tl.constexpr):
 
 
 @triton.jit
-def _quant_pair_store(even, odd, amax, out_ptr, off, row_scale, valid, ROWS: tl.constexpr):
+def _quant_pair_store(
+    even, odd, amax, out_ptr, off, row_scale, valid, ROWS: tl.constexpr
+):
     """Quantize a rotated rope block from its even/odd halves and store it.
 
     The 128-wide block is reduced as two [ROWS, 64] halves instead of the
@@ -350,17 +350,32 @@ def _inv_rope_quant_kernel(
         )
         if nope_blocks > 1:
             _quant_row_store(
-                t1, a1, out_ptr, out_base + row_off + 128, row_scale, valid,
+                t1,
+                a1,
+                out_ptr,
+                out_base + row_off + 128,
+                row_scale,
+                valid,
                 heads_per_group,
             )
         if nope_blocks > 2:
             _quant_row_store(
-                t2, a2, out_ptr, out_base + row_off + 256, row_scale, valid,
+                t2,
+                a2,
+                out_ptr,
+                out_base + row_off + 256,
+                row_scale,
+                valid,
                 heads_per_group,
             )
         if nope_blocks > 3:
             _quant_row_store(
-                t3, a3, out_ptr, out_base + row_off + 384, row_scale, valid,
+                t3,
+                a3,
+                out_ptr,
+                out_base + row_off + 384,
+                row_scale,
+                valid,
                 heads_per_group,
             )
         _quant_pair_store(
@@ -442,9 +457,7 @@ def _quant_activation(
     out = torch.empty(
         (n_groups, num_tokens, group_dim), dtype=torch.int8, device=o.device
     )
-    scales = torch.empty(
-        (n_groups, num_tokens), dtype=torch.float32, device=o.device
-    )
+    scales = torch.empty((n_groups, num_tokens), dtype=torch.float32, device=o.device)
     if num_tokens == 0:
         return out, scales
     table = _rope_table(cos_sin_cache)
@@ -534,7 +547,7 @@ def _prequant_to_int8(x: torch.Tensor, x_scale: torch.Tensor):
     amax = values.abs().amax(dim=-1)  # [tokens, groups]
     scale = (amax / 127.0).clamp_min(1e-30)
     payload = (
-        torch.round(values / scale[..., None])
+        torch.round(values / scale[..., None])  # allow-torch-compute
         .clamp_(-127.0, 127.0)
         .to(torch.int8)
         .permute(1, 0, 2)
@@ -572,7 +585,7 @@ def _quantize_weight_int8(weight: torch.Tensor, scale: torch.Tensor):
     amax = real.abs().amax(dim=(2, 3, 4))  # [groups, n blocks]
     inv = 127.0 / amax.clamp_min(1e-30)
     payload = (
-        torch.round(real * inv[:, :, None, None, None])
+        torch.round(real * inv[:, :, None, None, None])  # allow-torch-compute
         .clamp_(-127.0, 127.0)
         .to(torch.int8)
         .reshape(n_groups, n, k)

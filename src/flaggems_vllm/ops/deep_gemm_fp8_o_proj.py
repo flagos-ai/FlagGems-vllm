@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import logging
-from typing import Callable, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Tuple, Union
 
 import torch
 
 from flaggems_vllm.ops.fp8_einsum import fp8_einsum
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 
 logger = logging.getLogger(__name__)
 

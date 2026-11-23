@@ -37,7 +37,7 @@ stays opt-in.
 """
 
 import os
-from typing import Callable, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 import torch
 import triton
@@ -60,6 +60,9 @@ from flaggems_vllm.runtime.backend._nvidia.hopper.ops import (
 from flaggems_vllm.runtime.backend._nvidia.hopper.ops.w8a8_block_fp8_bmm import (
     w8a8_block_fp8_bmm as _block_fp8_bmm,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 
 # Decode regime covered by the fused kernel, and the fixed tiles it uses.
 # T=32 is excluded: a 32-row tile measured 4x slower than T<=16 on H100.

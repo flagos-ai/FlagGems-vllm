@@ -97,9 +97,7 @@ vllm_deep_gemm_fp8_o_proj = None
 HAS_VLLM = False
 if HOPPER_AVAILABLE:
     try:
-        from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
-            compute_fp8_einsum_recipe,
-        )
+        from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
         from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
             deep_gemm_fp8_o_proj as vllm_deep_gemm_fp8_o_proj,
         )

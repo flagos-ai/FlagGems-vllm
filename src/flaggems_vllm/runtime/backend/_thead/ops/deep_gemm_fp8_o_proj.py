@@ -730,9 +730,7 @@ def _decode_splitk_bmm(act, weight, act_scale, weight_scale, out) -> None:
     batch, m, k = act.shape
     n = weight.shape[1]
     split = _DECODE_SPLIT
-    partial = torch.empty(
-        (split, m, batch, n), dtype=torch.float32, device=act.device
-    )
+    partial = torch.empty((split, m, batch, n), dtype=torch.float32, device=act.device)
     grid = (batch * (n // _DECODE_SPLIT_BN) * split,)
     _decode_splitk_kernel[grid](
         act,
