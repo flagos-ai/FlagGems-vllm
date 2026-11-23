@@ -36,8 +36,15 @@ REQUIRES = (
     "torchada>=0.1.76",
 )
 CHECKOUT = pathlib.Path("~/.cache/flaggems/src/vllm-musa").expanduser()
-# vllm-musa imports these while it generates its metadata.
-BUILD_PREREQS = {"torchada": "torchada>=0.1.76"}
+# vllm-musa imports these while it generates its metadata. ``tvm_ffi`` is the
+# Moore Threads build of apache-tvm-ffi, published only on the vendor index, so
+# the index is passed to that single install instead of being declared globally
+# where it would capture the package for every other vendor.
+VENDOR_INDEX = "https://dl.mthreads.com/repo/api/pypi/pypi/simple"
+BUILD_PREREQS = {
+    "torchada": ("torchada>=0.1.76", None),
+    "tvm_ffi": ("apache-tvm-ffi==0.1.9.post3+musa.1", VENDOR_INDEX),
+}
 
 
 def _log(message: str) -> None:
@@ -182,11 +189,14 @@ def _cxx_toolchain_env(env: dict) -> None:
 
 def _ensure_build_prereqs() -> None:
     """Install what the vendored build imports; probe without importing it."""
-    for module, package in BUILD_PREREQS.items():
+    for module, (requirement, index) in BUILD_PREREQS.items():
         if importlib.util.find_spec(module) is not None:
             continue
-        _log(f"installing {package}")
-        _run([sys.executable, "-m", "pip", "install", "--quiet", package])
+        command = [sys.executable, "-m", "pip", "install", "--quiet"]
+        if index is not None:
+            command += ["--index-url", index]
+        _log(f"installing {requirement}")
+        _run([*command, requirement])
 
 
 def _vendor_wheel() -> pathlib.Path:
