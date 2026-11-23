@@ -505,7 +505,7 @@ cooperative_topk_ascend_finish_sorted:
 gumbel_sample:
   # Offline no-cache/no-bias FP32 tile; other paths retain the shared 1024 tile.
   - META:
-      BLOCK_SIZE: 4096
+      BLOCK_SIZE: 2048
     num_warps: 4
     num_stages: 1
 
