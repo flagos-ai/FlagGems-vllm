@@ -19,6 +19,7 @@ import os
 import struct
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +37,42 @@ MAX_SPARSE_SPLITS = 24
 LARGE_BATCH_ROWS = 256
 MAX_SPARSE_ROWS = 16384
 LENGTH_BLOCK = 256
+COMPACT_BLOCK = 1024
+MAX_WORKSPACE_BYTES = 8 * 1024**3
+
+
+@dataclass(frozen=True)
+class SparseMLATensors:
+    query_nope: torch.Tensor
+    query_rope: torch.Tensor
+    kv_nope: torch.Tensor
+    kv_rope: torch.Tensor
+    query_scale: torch.Tensor
+    kv_scale: torch.Tensor
+    page_table: torch.Tensor
+    lengths: torch.Tensor
+
+    def as_kernel_args(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.query_nope,
+            self.query_rope,
+            self.kv_nope,
+            self.kv_rope,
+            self.query_scale,
+            self.kv_scale,
+            self.page_table,
+            self.lengths,
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def is_metax_c550(device_index: int) -> bool:
+    return "C550" in torch.cuda.get_device_name(device_index)
+
+
+def device_index_of(tensor: torch.Tensor) -> int:
+    index = tensor.device.index
+    return torch.cuda.current_device() if index is None else index
 
 
 @libentry()
@@ -51,12 +88,14 @@ def merge_int8_partials(
     SPLITS: tl.constexpr,
     NORMALIZED: tl.constexpr = False,
 ):
-    batch, head = tl.program_id(0), tl.program_id(1)
+    batch = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
     splits = tl.arange(0, triton.next_power_of_2(SPLITS))
+    splits_i64 = splits.to(tl.int64)
     dims = tl.arange(0, 512)
     merged_heads = H * SQ
     maxima = tl.load(
-        Stats + (splits * 2 * B + batch) * merged_heads + head,
+        Stats + (splits_i64 * 2 * B + batch) * merged_heads + head,
         splits < SPLITS,
         -float("inf"),
     )
@@ -64,12 +103,14 @@ def merge_int8_partials(
     safe_maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
     weights = tl.exp2(maxima - safe_maximum)
     sums = tl.load(
-        Stats + ((splits * 2 + 1) * B + batch) * merged_heads + head, splits < SPLITS, 0
+        Stats + ((splits_i64 * 2 + 1) * B + batch) * merged_heads + head,
+        splits < SPLITS,
+        0,
     )
     denominator = tl.sum(sums * weights, 0)
     values = tl.load(
         Partial
-        + ((splits[:, None] * B + batch) * merged_heads + head) * 512
+        + ((splits_i64[:, None] * B + batch) * merged_heads + head) * 512
         + dims[None, :],
         splits[:, None] < SPLITS,
         0,
@@ -95,16 +136,18 @@ class FlashMLAInt8PreparedHandle:
 
     def __init__(
         self,
-        tensors: tuple[torch.Tensor, ...],
+        tensors: SparseMLATensors,
         splits: int,
         scale: float,
         *,
         uses_raw_indices: bool = False,
         fp32_output: bool = False,
+        allocate_split_workspace: bool = True,
     ):
         self.tensors = tensors
         self.uses_raw_indices = uses_raw_indices
-        query, rope, _, _, _, _, _, _ = tensors
+        query = tensors.query_nope
+        rope = tensors.query_rope
         self.batch, self.queries, self.heads, _ = query.shape
         self.head_tile = 16
         self.splits = splits
@@ -129,21 +172,25 @@ class FlashMLAInt8PreparedHandle:
             dtype=torch.float32,
             device=query.device,
         )
-        workspace_splits = splits if splits > 1 else 0
-        self.partial = torch.empty(
-            (workspace_splits, self.batch, self.queries * self.heads, 512),
-            dtype=torch.float32,
-            device=query.device,
-        )
-        self.stats = torch.empty(
-            (workspace_splits, 2, self.batch, self.queries * self.heads),
-            dtype=torch.float32,
-            device=query.device,
-        )
+        if allocate_split_workspace:
+            workspace_splits = splits if splits > 1 else 0
+            self.partial = torch.empty(
+                (workspace_splits, self.batch, self.queries * self.heads, 512),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            self.stats = torch.empty(
+                (workspace_splits, 2, self.batch, self.queries * self.heads),
+                dtype=torch.float32,
+                device=query.device,
+            )
+        else:
+            self.partial = None
+            self.stats = None
 
-    def _prepare_batch_order(self):
+    def prepare_batch_order(self):
         if self.batch_order is not None:
-            lengths = self.tensors[7]
+            lengths = self.tensors.lengths
             self.batch_order_kernel[(1,)](
                 lengths,
                 self.batch_order,
@@ -157,32 +204,17 @@ class FlashMLAInt8PreparedHandle:
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.batch == 0 or self.heads == 0:
             return self.output, self.lse
-        query, rope, kv, kv_rope, qs, ks, table, lengths = self.tensors
-        # The single-split kernel only needs the grid's batch coordinate.
-        batch_stride = self.batch if self.splits > 1 else 1
+        query = self.tensors.query_nope
+        rope = self.tensors.query_rope
         with torch_device_fn.device(query.device):
-            self._prepare_batch_order()
+            self.prepare_batch_order()
             self.kernel[self.grid](
-                *self.tensors,
+                *self.tensors.as_kernel_args(),
                 self.partial,
                 self.stats,
                 self.output,
                 self.lse,
-                query.stride(),
-                rope.stride(),
-                kv.stride(),
-                kv_rope.stride(),
-                qs.stride(),
-                ks.stride(),
-                table.stride(0),
-                lengths.stride(0),
-                batch_stride,
-                self.heads,
                 self.splits,
-                self.scale,
-                self.queries,
-                False,
-                BH=self.head_tile,
                 num_warps=self.num_warps,
                 num_stages=2,
                 scenario="mla",
@@ -328,7 +360,11 @@ def sort_batches_by_length(
 
 
 @functools.lru_cache(maxsize=1)
-def _compiler():
+def compiler_info():
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "warm up flash_mla_sparse_fwd_w8a8 before CUDA graph capture"
+        )
     path = Path(os.environ.get("MACA_PATH", "/opt/maca")) / "mxgpu_llvm/bin/mxcc"
     return path.resolve(), subprocess.check_output(
         [str(path), "--version"], stderr=subprocess.STDOUT
@@ -336,9 +372,9 @@ def _compiler():
 
 
 @functools.lru_cache(maxsize=128)
-def _library(stage, tile, spec):
-    """Build one CTA-wide device function before CUDA Graph capture."""
-    compiler, version = _compiler()
+def compile_stage_bitcode(stage, tile, spec):
+    """Build one CTA-wide device function; cached results are safe during graph capture."""
+    compiler, version = compiler_info()
     source = Path(__file__).with_suffix(".cu")
     flags = [
         "-x",
@@ -364,6 +400,10 @@ def _library(stage, tile, spec):
     cached = cache.get_file(filename)
     if cached is not None:
         return cached
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "warm up flash_mla_sparse_fwd_w8a8 before CUDA graph capture"
+        )
     # A unique temporary directory also permits concurrent handle preparation.
     with tempfile.TemporaryDirectory(prefix="flaggems-mla-int8-") as temporary:
         output = Path(temporary) / filename
@@ -373,30 +413,29 @@ def _library(stage, tile, spec):
         return cache.put(output.read_bytes(), filename)
 
 
-def _scale_spec(handle):
+def build_scale_spec(handle):
     value = struct.unpack("f", struct.pack("f", handle.scale * 1.4426950408889634))[0]
     index_spec = ()
     if handle.uses_raw_indices:
         index_spec += (
             ("SPARSE_RAW", 1),
-            ("CACHE_TOKENS", handle.tensors[2].shape[0] * 64),
+            ("CACHE_TOKENS", handle.tensors.kv_nope.shape[0] * 64),
         )
     return index_spec + (
-        ("NO_ROPE", int(handle.tensors[1].shape[-1] == 0)),
+        ("NO_ROPE", int(handle.tensors.query_rope.shape[-1] == 0)),
         ("HQ", handle.heads),
         ("SQ", handle.queries),
-        ("CAP", handle.tensors[6].shape[1] * 64),
-        ("CAUSAL", 0),
-        ("BF16", int(handle.tensors[1].dtype == torch.bfloat16)),
+        ("CAP", handle.tensors.page_table.shape[1] * 64),
+        ("BF16", int(handle.tensors.query_rope.dtype == torch.bfloat16)),
         ("SCALE", value.hex() + "f"),
     )
 
 
-SMALL_SIGNATURE = (tl.int64,) * 16 + (tl.int32,) * 6 + (tl.float32,) + (tl.int32,) * 3
+SMALL_SIGNATURE = (tl.int64,) * 14 + (tl.int32,) * 3
 
 
 @extern
-def _small_device(*args, _semantic=None):
+def small_device_extern(*args, _semantic=None):
     return tl.core.extern_elementwise(
         "",
         "",
@@ -421,26 +460,12 @@ def small_native(
     Stats,
     Output,
     LSE,
-    Q_STRIDES: tl.constexpr,
-    QR_STRIDES: tl.constexpr,
-    KV_STRIDES: tl.constexpr,
-    KR_STRIDES: tl.constexpr,
-    QS_STRIDES: tl.constexpr,
-    KS_STRIDES: tl.constexpr,
-    TABLE_STRIDE: tl.constexpr,
-    LENGTH_STRIDE: tl.constexpr,
-    B: tl.constexpr,
-    H: tl.constexpr,
     SPLITS: tl.constexpr,
-    SCALE: tl.constexpr,
-    SQ: tl.constexpr,
-    CAUSAL: tl.constexpr,
-    BH: tl.constexpr,
     BatchOrder=None,
     SelectedScales=None,
     REVERSE_SPLITS: tl.constexpr = False,
 ):
-    _small_device(
+    small_device_extern(
         tl.cast(Q, tl.int64),
         tl.cast(QR, tl.int64),
         tl.cast(KV, tl.int64),
@@ -453,8 +478,6 @@ def small_native(
         tl.cast(Stats, tl.int64),
         tl.cast(Output, tl.int64),
         tl.cast(LSE, tl.int64),
-        tl.cast(TABLE_STRIDE, tl.int64),
-        tl.cast(LENGTH_STRIDE, tl.int64),
         (
             tl.full((), 0, tl.int64)
             if BatchOrder is None
@@ -465,24 +488,17 @@ def small_native(
             if SelectedScales is None
             else tl.cast(SelectedScales, tl.int64)
         ),
-        tl.cast(B, tl.int32),
-        tl.cast(H, tl.int32),
-        tl.cast(SQ, tl.int32),
-        tl.cast(SPLITS, tl.int32),
-        tl.cast(CAUSAL, tl.int32),
-        tl.cast(QR.dtype.element_ty == tl.bfloat16, tl.int32),
-        tl.cast(SCALE * 1.4426950408889634, tl.float32),
         tl.program_id(0),
         tl.program_id(1),
         SPLITS - 1 - tl.program_id(2) if REVERSE_SPLITS else tl.program_id(2),
     )
 
 
-SCORES_SIGNATURE = (tl.int64,) * 14 + (tl.int32,) * 6 + (tl.float32,) + (tl.int32,) * 3
+SCORES_SIGNATURE = (tl.int64,) * 12 + (tl.int32,) * 3
 
 
 @extern
-def _scores_device(*args, _semantic=None):
+def scores_device_extern(*args, _semantic=None):
     return tl.core.extern_elementwise(
         "",
         "",
@@ -506,26 +522,9 @@ def scores_native(
     Quantized,
     PageStats,
     SplitStats,
-    Q_STRIDES: tl.constexpr,
-    QR_STRIDES: tl.constexpr,
-    KV_STRIDES: tl.constexpr,
-    KR_STRIDES: tl.constexpr,
-    QS_STRIDES: tl.constexpr,
-    KS_STRIDES: tl.constexpr,
-    TS: tl.constexpr,
-    LS: tl.constexpr,
-    H: tl.constexpr,
-    SQ: tl.constexpr,
-    CAP: tl.constexpr,
-    SCALE: tl.constexpr,
-    CAUSAL: tl.constexpr,
-    BH: tl.constexpr = 64,
-    SPLITS: tl.constexpr = 4,
     BatchOrder=None,
-    COL_STATS: tl.constexpr = True,
-    NATIVE_SYNC: tl.constexpr = True,
 ):
-    _scores_device(
+    scores_device_extern(
         tl.cast(Q, tl.int64),
         tl.cast(QR, tl.int64),
         tl.cast(KV, tl.int64),
@@ -542,26 +541,17 @@ def scores_native(
             if BatchOrder is None
             else tl.cast(BatchOrder, tl.int64)
         ),
-        tl.cast(TS, tl.int64),
-        tl.cast(LS, tl.int64),
-        tl.cast(H, tl.int32),
-        tl.cast(SQ, tl.int32),
-        tl.cast(CAP, tl.int32),
-        tl.cast(SPLITS, tl.int32),
-        tl.cast(CAUSAL, tl.int32),
-        tl.cast(QR.dtype.element_ty == tl.bfloat16, tl.int32),
-        tl.cast(SCALE * 1.4426950408889634, tl.float32),
         tl.program_id(0),
         tl.program_id(1),
         tl.program_id(2),
     )
 
 
-VALUES_SIGNATURE = (tl.int64,) * 14 + (tl.int32,) * 11
+VALUES_SIGNATURE = (tl.int64,) * 10 + (tl.int32,) * 3
 
 
 @extern
-def _values_device(*args, _semantic=None):
+def values_device_extern(*args, _semantic=None):
     return tl.core.extern_elementwise(
         "",
         "",
@@ -584,19 +574,8 @@ def values_native_fragments(
     Output,
     Partial,
     SplitFlag,
-    KV_STRIDES: tl.constexpr,
-    TS: tl.constexpr,
-    LS: tl.constexpr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    SQ: tl.constexpr,
-    CAP: tl.constexpr,
-    SPLITS: tl.constexpr = 1,
-    ADAPTIVE: tl.constexpr = False,
-    SORT_BATCHES: tl.constexpr = False,
-    UNIFORM_SPLITS: tl.constexpr = 1,
 ):
-    _values_device(
+    values_device_extern(
         tl.cast(KV, tl.int64),
         tl.cast(Table, tl.int64),
         tl.cast(Lengths, tl.int64),
@@ -607,18 +586,6 @@ def values_native_fragments(
         tl.cast(Output, tl.int64),
         tl.cast(Partial, tl.int64),
         tl.cast(SplitFlag, tl.int64),
-        tl.cast(KV_STRIDES[0], tl.int64),
-        tl.cast(KV_STRIDES[1], tl.int64),
-        tl.cast(TS, tl.int64),
-        tl.cast(LS, tl.int64),
-        tl.cast(B, tl.int32),
-        tl.cast(H * SQ, tl.int32),
-        tl.cast(CAP, tl.int32),
-        tl.cast(SPLITS, tl.int32),
-        tl.cast(ADAPTIVE, tl.int32),
-        tl.cast(SORT_BATCHES, tl.int32),
-        tl.cast(UNIFORM_SPLITS, tl.int32),
-        tl.cast(Output.dtype.element_ty == tl.bfloat16, tl.int32),
         tl.program_id(0),
         tl.program_id(1),
         tl.program_id(2),
@@ -626,13 +593,13 @@ def values_native_fragments(
 
 
 @functools.lru_cache(maxsize=1)
-def _bsm_offset_kernel():
+def bsm_offset_kernel():
     """Use BSM immediates for this specialization only on the validated toolchain."""
     from triton.backends.metax.compiler import get_lld_version
     from triton.compiler import CompiledKernel, compile
     from triton.runtime.jit import JITFunction
 
-    compiler, version = _compiler()
+    compiler, version = compiler_info()
     if b"(d9102a1572)" not in version or get_lld_version() != 19:
         return small_native
 
@@ -670,6 +637,10 @@ def _bsm_offset_kernel():
         cache = get_cache_manager(key)
         path = cache.get_file(binary)
         if path is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "warm up flash_mla_sparse_fwd_w8a8 before CUDA graph capture"
+                )
             llvm_flags = [flag for item in flags for flag in ("-mllvm", item)]
             with tempfile.TemporaryDirectory(prefix="flaggems-mla-bsm-") as work:
                 llir = Path(work) / "kernel.ll"
@@ -707,31 +678,33 @@ class SmallKernel:
     def __init__(self, heads, handle):
         # Batch size only strides the split workspace when a merge is needed.
         batch_stride = handle.batch if handle.splits > 1 else 1
-        spec = _scale_spec(handle) + (("B", batch_stride), ("SPLITS", handle.splits))
+        spec = build_scale_spec(handle) + (
+            ("B", batch_stride),
+            ("SPLITS", handle.splits),
+        )
         if "SelectedScales" in handle.kernel_arguments:
             spec += (("SCALE_TABLE", 1),)
         if handle.output.dtype == torch.float32:
             spec += (("FP32_OUTPUT", 1),)
-        pages = handle.tensors[6].shape[1]
+        pages = handle.tensors.page_table.shape[1]
         # With one remainder page, only the last partition is longer.
         self.reverse_splits = (
             handle.uses_raw_indices
-            and handle.tensors[1].shape[-1] == 0
+            and handle.tensors.query_rope.shape[-1] == 0
             and handle.batch <= 32
             and pages <= 16
             and 1 < handle.splits <= 6
             and pages % handle.splits == 1
         )
         self.fn = (
-            _bsm_offset_kernel()
+            bsm_offset_kernel()
             if heads == 32
             and handle.uses_raw_indices
             and (
-                handle.tensors[1].shape[-1] == 0
+                handle.tensors.query_rope.shape[-1] == 0
                 or "SelectedScales" in handle.kernel_arguments
             )
-            and torch.cuda.get_device_properties(handle.tensors[0].device).name
-            == "MetaX C550"
+            and is_metax_c550(device_index_of(handle.tensors.query_nope))
             else small_native
         )
         if (
@@ -742,7 +715,7 @@ class SmallKernel:
             and 4096 <= pages * 64 <= 16384
         ):
             spec += (("PAGE_UNROLL", 3),)
-        self.bitcode = _library("small", heads, spec)
+        self.bitcode = compile_stage_bitcode("small", heads, spec)
 
     def __getitem__(self, grid):
         def launch(*args, **kwargs):
@@ -759,8 +732,8 @@ class SmallKernel:
 
 class ScoresKernel:
     def __init__(self, handle):
-        spec = _scale_spec(handle) + (("SPLITS", handle.score_splits),)
-        self.bitcode = _library("scores", 64, spec)
+        spec = build_scale_spec(handle) + (("SPLITS", handle.score_splits),)
+        self.bitcode = compile_stage_bitcode("scores", 64, spec)
 
     def __getitem__(self, grid):
         def launch(*args, **kwargs):
@@ -793,9 +766,9 @@ class ValuesKernel:
         if handle.uses_raw_indices:
             spec += (
                 ("SPARSE_RAW", 1),
-                ("CACHE_TOKENS", handle.tensors[2].shape[0] * 64),
+                ("CACHE_TOKENS", handle.tensors.kv_nope.shape[0] * 64),
             )
-        self.bitcode = _library("values", dims, spec)
+        self.bitcode = compile_stage_bitcode("values", dims, spec)
 
     def __getitem__(self, grid):
         def launch(*args, **kwargs):
@@ -813,15 +786,23 @@ class ValuesKernel:
 
 
 class NativeSmallHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors, scale, *, uses_raw_indices=False, fp32_output=False):
-        capacity = tensors[6].shape[1] * 64
+    def __init__(
+        self,
+        tensors: SparseMLATensors,
+        scale: float,
+        *,
+        uses_raw_indices: bool = False,
+        fp32_output: bool = False,
+    ):
+        capacity = tensors.page_table.shape[1] * 64
         splits = min(
             (
                 4
-                if tensors[0].shape[1] * tensors[0].shape[2] == 32 and capacity <= 8192
+                if tensors.query_nope.shape[1] * tensors.query_nope.shape[2] == 32
+                and capacity <= 8192
                 else 8
             ),
-            triton.next_power_of_2(tensors[6].shape[1]),
+            triton.next_power_of_2(tensors.page_table.shape[1]),
         )
         super().__init__(
             tensors,
@@ -834,7 +815,7 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
         self.normalized_partials = True
         if self.head_tile == 32 and 1 < self.batch <= 256:
             self.batch_order = torch.empty(
-                (self.batch,), dtype=torch.int32, device=tensors[0].device
+                (self.batch,), dtype=torch.int32, device=tensors.query_nope.device
             )
             self.batch_order_kernel = sort_batches_by_length
         self.kernel_arguments = {"BatchOrder": self.batch_order}
@@ -843,18 +824,26 @@ class NativeSmallHandle(FlashMLAInt8PreparedHandle):
 
 
 class NativeCachedHandle(FlashMLAInt8PreparedHandle):
-    def __init__(self, tensors, scale, *, uses_raw_indices=False, fp32_output=False):
+    def __init__(
+        self,
+        tensors: SparseMLATensors,
+        scale: float,
+        *,
+        uses_raw_indices: bool = False,
+        fp32_output: bool = False,
+    ):
         super().__init__(
             tensors,
             1,
             scale,
             uses_raw_indices=uses_raw_indices,
             fp32_output=fp32_output,
+            allocate_split_workspace=False,
         )
         merged = self.queries * self.heads
         rows = self.batch * merged
-        device = tensors[0].device
-        self.capacity = tensors[6].shape[1] * 64
+        device = tensors.query_nope.device
+        self.capacity = tensors.page_table.shape[1] * 64
         self.head_tile = 64
         self.adaptive = merged <= 64
         self.sort_batches = self.batch <= 256
@@ -909,33 +898,16 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
         self.value_kernel = ValuesKernel(256 if merged <= 64 else 512, self)
 
     def __call__(self):
-        q, qr, kv, kr, qs, ks, table, lengths = self.tensors
+        tensors = self.tensors
         merged = self.queries * self.heads
         rows = self.batch * merged
-        with torch_device_fn.device(q.device):
-            self._prepare_batch_order()
+        with torch_device_fn.device(tensors.query_nope.device):
+            self.prepare_batch_order()
             self.score_kernel[(self.score_splits, triton.cdiv(merged, 64), self.batch)](
-                *self.tensors,
+                *tensors.as_kernel_args(),
                 self.scores,
                 self.cache_metadata,
                 self.stats,
-                q.stride(),
-                qr.stride(),
-                kv.stride(),
-                kr.stride(),
-                qs.stride(),
-                ks.stride(),
-                table.stride(0),
-                lengths.stride(0),
-                self.heads,
-                self.queries,
-                self.capacity,
-                self.scale,
-                False,
-                BH=64,
-                SPLITS=self.score_splits,
-                COL_STATS=True,
-                NATIVE_SYNC=True,
                 BatchOrder=self.batch_order,
             )
             merge_int8_probabilities[(triton.cdiv(rows, 32),)](
@@ -943,9 +915,9 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 self.probability_metadata,
                 self.probability_scale,
                 self.lse,
-                lengths,
+                tensors.lengths,
                 self.split_flag,
-                lengths.stride(0),
+                tensors.lengths.stride(0),
                 self.batch,
                 triton.next_power_of_2(self.batch),
                 self.heads,
@@ -960,9 +932,9 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
             self.value_kernel[
                 (2, triton.cdiv(merged, 64), self.batch * self.value_splits)
             ](
-                kv,
-                table,
-                lengths,
+                tensors.kv_nope,
+                tensors.page_table,
+                tensors.lengths,
                 self.scores,
                 self.cache_metadata,
                 self.probability_metadata,
@@ -970,17 +942,6 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
                 self.output,
                 self.partial,
                 self.split_flag,
-                kv.stride(),
-                table.stride(0),
-                lengths.stride(0),
-                self.batch,
-                self.heads,
-                self.queries,
-                self.capacity,
-                SPLITS=self.value_splits,
-                ADAPTIVE=self.adaptive,
-                UNIFORM_SPLITS=self.uniform_value_splits,
-                SORT_BATCHES=self.sort_batches,
             )
             if self.adaptive:
                 merge_int8_values[(self.batch, triton.cdiv(merged, 4))](
@@ -999,7 +960,7 @@ class NativeCachedHandle(FlashMLAInt8PreparedHandle):
         return self.output, self.lse
 
 
-def _c550_small_route(rows, heads, capacity, rope, raw_indices):
+def c550_small_route(rows, heads, capacity, rope, raw_indices):
     if not raw_indices or heads != 64 or rope.shape[-1] != 0:
         return None
     if rows == 16 and 512 <= capacity <= 1024:
@@ -1008,11 +969,7 @@ def _c550_small_route(rows, heads, capacity, rope, raw_indices):
         route = "even_splits"
     else:
         return None
-    return (
-        route
-        if torch.cuda.get_device_properties(rope.device).name == "MetaX C550"
-        else None
-    )
+    return route if is_metax_c550(device_index_of(rope)) else None
 
 
 @libentry()
@@ -1034,7 +991,7 @@ def gather_sparse_scales(
     TOKENS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     ids = tl.load(Indices + offsets, offsets < ELEMENTS, -1)
     valid = (ids >= 0) & (ids < TOKENS) & (offsets < ELEMENTS)
     weights = tl.load(Scales + ids, valid, -1.0)
@@ -1054,16 +1011,25 @@ def compact_sparse_indices(
     HAS_LENGTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, BLOCK)
     length = tl.minimum(tl.maximum(tl.load(Lengths + row), 0), K) if HAS_LENGTH else K
-    selected = tl.load(Indices + row * K + offsets, offsets < K, -1)
-    valid = (offsets < length) & (selected >= 0) & (selected < TOKENS)
-    ranks = tl.cumsum(valid.to(tl.int32)) - 1
-    count = tl.sum(valid.to(tl.int32), 0)
-    tl.store(Table + row * CAP + offsets, 0, (offsets >= count) & (offsets < CAP))
-    tl.store(Table + row * CAP + ranks, selected, valid)
-    tl.store(Counts + row, count)
+    running_count = tl.zeros((), dtype=tl.int32)
+    for tile_start in range(0, CAP, BLOCK):
+        positions = tile_start + offsets
+        selected = tl.load(Indices + row * K + positions, positions < K, -1)
+        valid = (positions < length) & (selected >= 0) & (selected < TOKENS)
+        ranks = running_count + tl.cumsum(valid.to(tl.int32)) - 1
+        tl.store(Table + row * CAP + ranks, selected, valid)
+        running_count += tl.sum(valid.to(tl.int32), 0)
+    for tile_start in range(0, CAP, BLOCK):
+        positions = tile_start + offsets
+        tl.store(
+            Table + row * CAP + positions,
+            0,
+            (positions >= running_count) & (positions < CAP),
+        )
+    tl.store(Counts + row, running_count)
 
 
 @libentry()
@@ -1074,12 +1040,13 @@ def sparse_output_epilogue(
     Sink,
     Output,
     H: tl.constexpr,
-    SQ: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
-    row, head = tl.program_id(0), tl.program_id(1)
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
     dims = tl.arange(0, 512)
-    values = tl.load(Source + (row * H + head) * 512 + dims)
+    base = (row * H + head) * 512 + dims
+    values = tl.load(Source + base)
     if HAS_SINK:
         lse = tl.load(LSE + row * H + head)
         sink = tl.load(Sink + head)
@@ -1088,7 +1055,7 @@ def sparse_output_epilogue(
         ratio = tl.exp(-tl.abs(delta))
         weight = tl.where(delta > 0, ratio, 1.0) / (1.0 + ratio)
         values *= tl.where(lse == float("inf"), 0.0, weight)
-    tl.store(Output + (row * H + head) * 512 + dims, values)
+    tl.store(Output + base, values)
 
 
 class SparseMLAInt8PreparedHandle:
@@ -1129,15 +1096,15 @@ class SparseMLAInt8PreparedHandle:
         self.native = None
         self.selected_scales = None
         if rows > 0 and self.heads > 0:
-            native_tensors = (
-                q.view(rows, 1, self.heads, 512),
-                qr.view(rows, 1, self.heads, qr.shape[-1]),
-                kv,
-                kr,
-                qs.view(rows, 1, self.heads, 1),
-                ks,
-                self.table,
-                self.counts,
+            native_tensors = SparseMLATensors(
+                query_nope=q.view(rows, 1, self.heads, 512),
+                query_rope=qr.view(rows, 1, self.heads, qr.shape[-1]),
+                kv_nope=kv,
+                kv_rope=kr,
+                query_scale=qs.view(rows, 1, self.heads, 1),
+                kv_scale=ks,
+                page_table=self.table,
+                lengths=self.counts,
             )
             if self.heads <= 32:
                 self.native = NativeSmallHandle(
@@ -1147,7 +1114,7 @@ class SparseMLAInt8PreparedHandle:
                     fp32_output=sink is not None,
                 )
             elif rows <= 32 or single_split:
-                route = _c550_small_route(
+                route = c550_small_route(
                     rows, self.heads, self.capacity, qr, self.uses_raw_indices
                 )
                 prefetch_scales = route == "prefetch_scales"
@@ -1268,6 +1235,9 @@ class SparseMLAInt8PreparedHandle:
             return self.output, self.lse
         with torch_device_fn.device(self.indices.device):
             if not self.uses_raw_indices:
+                compact_block = min(
+                    COMPACT_BLOCK, triton.next_power_of_2(self.capacity)
+                )
                 compact_sparse_indices[(self.batch * self.queries,)](
                     self.indices,
                     self.lengths,
@@ -1277,7 +1247,7 @@ class SparseMLAInt8PreparedHandle:
                     self.capacity,
                     self.tokens,
                     self.lengths is not None,
-                    triton.next_power_of_2(self.capacity),
+                    compact_block,
                     num_warps=4,
                 )
             if self.selected_scales is not None:
@@ -1286,7 +1256,7 @@ class SparseMLAInt8PreparedHandle:
                 block = 128 if self.batch * self.queries <= 32 else 512
                 gather_sparse_scales[(triton.cdiv(count, block),)](
                     self.indices,
-                    self.native.tensors[5],
+                    self.native.tensors.kv_scale,
                     self.selected_scales,
                     count,
                     self.tokens,
@@ -1301,14 +1271,13 @@ class SparseMLAInt8PreparedHandle:
                     self.sink,
                     self.output,
                     self.heads,
-                    self.queries,
                     self.sink is not None,
                     num_warps=4,
                 )
         return self.output, self.lse
 
 
-def _prepare_flash_mla_sparse_fwd_w8a8(
+def prepare_flash_mla_sparse_fwd_w8a8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,
@@ -1412,37 +1381,65 @@ def _prepare_flash_mla_sparse_fwd_w8a8(
     )
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("softmax_scale must be finite and positive")
-    if "C550" not in torch.cuda.get_device_name(q_nope.device):
+    if not is_metax_c550(device_index_of(q_nope)):
         raise NotImplementedError("native sparse INT8 MLA requires MetaX C550")
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "prepare sparse MLA before graph capture, then call the handle"
-        )
     rows = batch * queries
     capacity = max(64, triton.cdiv(indices.shape[-1], 64) * 64)
-    cached_workspace = rows * (capacity * (3 * heads + 4) + heads * 8192)
-    cached_fits = (
-        rows < MAX_SPARSE_ROWS
-        and rows * capacity * max(heads, 1) < 2**30
-        and cached_workspace <= 8 * 1024**3
-    )
-    # Fusing QK and PV reuses the gathered K tile and avoids cached-score traffic.
-    aligned_rope = (
-        heads == 64
-        and q_rope.shape[-1] == 64
-        and indices.shape[-1] == 2048
+    uses_raw_indices = (
+        indices.shape[-1] > 0
+        and indices.shape[-1] % 64 == 0
         and topk_length is None
+        and k_nope.shape[0] > 0
     )
-    single_split = (rows > 32 and aligned_rope) or (
-        rows > LARGE_BATCH_ROWS
-        and heads >= 64
-        and (q_rope.shape[-1] == 0 or not cached_fits)
+    output_bytes = (
+        (6 if out is None else 4)
+        if attn_sink is not None
+        else (2 if out is None else 0)
     )
-    if single_split:
-        output_bytes = 6 if attn_sink is not None else 2
-        fits = rows * (capacity * 4 + heads * (512 * output_bytes + 4)) <= 8 * 1024**3
+    base_workspace = rows * (
+        4 + (0 if uses_raw_indices else capacity * 4) + heads * (512 * output_bytes + 4)
+    )
+    if heads <= 32:
+        small_splits = min(
+            4 if heads == 32 and capacity <= 8192 else 8,
+            triton.next_power_of_2(capacity // 64),
+        )
+        split_workspace = (
+            (small_splits if small_splits > 1 else 0) * rows * heads * (512 * 4 + 2 * 4)
+        )
+        single_split = False
+        fits = base_workspace + split_workspace <= MAX_WORKSPACE_BYTES
     else:
-        fits = cached_fits
+        cached_workspace = rows * (capacity * (3 * heads + 4) + heads * 8192)
+        cached_fits = (
+            rows < MAX_SPARSE_ROWS
+            and rows * capacity * max(heads, 1) < 2**30
+            and cached_workspace <= MAX_WORKSPACE_BYTES
+        )
+        # Fusing QK and PV reuses the gathered K tile and avoids cached-score traffic.
+        aligned_rope = (
+            heads == 64
+            and q_rope.shape[-1] == 64
+            and indices.shape[-1] == 2048
+            and topk_length is None
+        )
+        single_split = (rows > 32 and aligned_rope) or (
+            rows > LARGE_BATCH_ROWS
+            and heads >= 64
+            and (q_rope.shape[-1] == 0 or not cached_fits)
+        )
+        if single_split:
+            scale_table_bytes = rows * capacity * 4 if uses_raw_indices else 0
+            fits = base_workspace + scale_table_bytes <= MAX_WORKSPACE_BYTES
+        elif rows <= 32:
+            small_batch_workspace = (
+                base_workspace
+                + MAX_SPARSE_SPLITS * rows * heads * (512 * 4 + 2 * 4)
+                + rows * capacity * 4
+            )
+            fits = small_batch_workspace <= MAX_WORKSPACE_BYTES
+        else:
+            fits = cached_fits
     if rows > MAX_SPARSE_ROWS or k_nope.shape[0] * 64 >= 2**31 or not fits:
         raise NotImplementedError(
             "native sparse workspace exceeds its indexing or 8 GiB budget"
@@ -1466,7 +1463,7 @@ def flash_mla_sparse_fwd_w8a8(
     topk_length: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA on MetaX C550 with signed INT8 NoPE and FP16/BF16 RoPE."""
-    _, output = _prepare_flash_mla_sparse_fwd_w8a8(
+    _, output = prepare_flash_mla_sparse_fwd_w8a8(
         q_nope,
         q_rope,
         k_cache_lora,

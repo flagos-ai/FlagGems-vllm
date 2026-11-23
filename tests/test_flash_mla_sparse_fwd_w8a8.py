@@ -18,6 +18,7 @@ import math
 import os
 import random
 import sys
+from contextlib import contextmanager
 from functools import lru_cache, partial
 from pathlib import Path
 from types import ModuleType
@@ -30,25 +31,36 @@ from tests.test_flash_mla_with_kvcache_w8a8 import SUPPORTED as HAS_FP8_MLA
 from tests.test_flash_mla_with_kvcache_w8a8 import quantize_dense_fp8
 
 from .accuracy_utils import gems_assert_close, gems_assert_equal, to_cpu, to_reference
+from .conftest import QUICK_MODE
 
 HAS_INT8_MLA = (
     flaggems_vllm.vendor_name == "metax"
     and "flash_mla_sparse_fwd_w8a8"
     in dict(flaggems_vllm.runtime.backend.get_customized_ops())
     and torch.cuda.is_available()
-    and "C550" in torch.cuda.get_device_name()
+    and "C550" in torch.cuda.get_device_name(torch.cuda.current_device())
 )
 requires_int8_mla = pytest.mark.skipif(
     not HAS_INT8_MLA, reason="INT8 MLA requires MetaX C550"
 )
 
 
+@contextmanager
+def disable_tf32():
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
 def prepare_sparse_int8(*args, **kwargs):
     from flaggems_vllm.runtime.backend._metax.ops.flash_mla_sparse_fwd_w8a8 import (
-        _prepare_flash_mla_sparse_fwd_w8a8,
+        prepare_flash_mla_sparse_fwd_w8a8,
     )
 
-    return _prepare_flash_mla_sparse_fwd_w8a8(*args, **kwargs)
+    return prepare_flash_mla_sparse_fwd_w8a8(*args, **kwargs)
 
 
 @lru_cache(maxsize=1)
@@ -136,8 +148,6 @@ def make_sparse_inputs(shape, dtype=torch.bfloat16, *, sm_scale=0.5):
         mask = torch.randn((h_q,), dtype=torch.float32, device=device)
         attn_sink[mask < -0.5] = -torch.inf
         attn_sink[mask > 0.5] = torch.inf
-    else:
-        pass
     topk_length = (
         torch.randint(
             0, max(topk + 1, 64), (s_q,), dtype=torch.int32, device=device
@@ -227,17 +237,17 @@ def test_flash_mla_sparse_flashmla(shape):
 
 
 def check_sparse_int8(packed, *outputs):
-    torch.backends.cuda.matmul.allow_tf32 = False
     q, qr, kv, kr, qs, ks, indices, scale, sink, lengths = packed
     rows = torch.linspace(
         0, q.shape[0] - 1, min(16, q.shape[0]), device=q.device
     ).long()
-    expected = reference(
-        (q[rows], qr[rows], kv, kr, qs[rows], ks, indices[rows]),
-        attn_sink=sink,
-        topk_length=None if lengths is None else lengths[rows],
-        softmax_scale=scale,
-    )
+    with disable_tf32():
+        expected = reference(
+            (q[rows], qr[rows], kv, kr, qs[rows], ks, indices[rows]),
+            attn_sink=sink,
+            topk_length=None if lengths is None else lengths[rows],
+            softmax_scale=scale,
+        )
     for out, lse in outputs:
         assert_accuracy((out[rows], lse[rows]), expected)
 
@@ -339,42 +349,50 @@ def test_sink_before_fp16_store(batch, topk):
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @requires_int8_mla
 @pytest.mark.parametrize("rope_dim", [0, 64])
-@pytest.mark.parametrize("queries", [1, 2])
-@pytest.mark.parametrize("heads", [16, 32, 64, 128])
+@pytest.mark.parametrize("queries", [1] if QUICK_MODE else [1, 2])
+@pytest.mark.parametrize("heads", [32, 64] if QUICK_MODE else [16, 32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_sparse_decode(queries, heads, dtype, rope_dim):
-    torch.backends.cuda.matmul.allow_tf32 = False
-    inputs = make_int8_inputs(4, queries, heads, 129, dtype=dtype, rope_dim=rope_dim)
-    inputs[4].mul_(1.3)
-    inputs[4][2].mul_(256)
-    inputs[5].mul_(0.7)
-    indices = inputs[-1]
-    indices[0].fill_(-1)
-    indices[1, :, ::3] = inputs[2].shape[0] * 64
-    indices[2, :, 1] = indices[2, :, 0]
-    lengths = torch.full((4, queries), 97, dtype=torch.int32, device=inputs[0].device)
-    lengths[-1] = 0
-    sink = torch.randn(heads, dtype=torch.float32, device=inputs[0].device)
-    sink[0], sink[1] = float("inf"), -float("inf")
-    out = torch.empty((4, queries, heads, 512), dtype=dtype, device=inputs[0].device)
-    _, actual = prepare_sparse_int8(
-        *inputs,
-        topk_length=lengths,
-        attn_sink=sink,
-        out=out,
-        softmax_scale=0.125,
-    )
-    assert actual[0] is out
-    assert_accuracy(
-        actual,
-        reference(inputs, topk_length=lengths, attn_sink=sink, softmax_scale=0.125),
-    )
+    with disable_tf32():
+        inputs = make_int8_inputs(
+            4, queries, heads, 129, dtype=dtype, rope_dim=rope_dim
+        )
+        inputs[4].mul_(1.3)
+        inputs[4][2].mul_(256)
+        inputs[5].mul_(0.7)
+        indices = inputs[-1]
+        indices[0].fill_(-1)
+        indices[1, :, ::3] = inputs[2].shape[0] * 64
+        indices[2, :, 1] = indices[2, :, 0]
+        lengths = torch.full(
+            (4, queries), 97, dtype=torch.int32, device=inputs[0].device
+        )
+        lengths[-1] = 0
+        sink = torch.randn(heads, dtype=torch.float32, device=inputs[0].device)
+        sink[0], sink[1] = float("inf"), -float("inf")
+        out = torch.empty(
+            (4, queries, heads, 512), dtype=dtype, device=inputs[0].device
+        )
+        _, actual = prepare_sparse_int8(
+            *inputs,
+            topk_length=lengths,
+            attn_sink=sink,
+            out=out,
+            softmax_scale=0.125,
+        )
+        assert actual[0] is out
+        assert_accuracy(
+            actual,
+            reference(inputs, topk_length=lengths, attn_sink=sink, softmax_scale=0.125),
+        )
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @requires_int8_mla
 @pytest.mark.parametrize("rope_dim", [0, 64])
-@pytest.mark.parametrize("topk", [0, 1, 64, 65, 512, 2048, 8320])
+@pytest.mark.parametrize(
+    "topk", [0, 65, 2048] if QUICK_MODE else [0, 1, 64, 65, 512, 2048, 8320]
+)
 def test_sparse_decode_lengths(topk, rope_dim):
     inputs = make_int8_inputs(2, 1, 64, topk, rope_dim=rope_dim)
     if topk > 0:
@@ -517,3 +535,44 @@ def test_sparse_value_split_merge(topk, variable_lengths):
         lengths[0], lengths[1] = 1023, 0
     packed = (*inputs, 0.5, None, lengths)
     check_sparse_int8(packed, flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed))
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@requires_int8_mla
+def test_sparse_public_api_cuda_graph():
+    inputs = make_int8_inputs(64, 1, 64, 2048, pages=64, rope_dim=64)
+    # Warm up compilation caches before graph capture.
+    flaggems_vllm.flash_mla_sparse_fwd_w8a8(*inputs, softmax_scale=576**-0.5)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = flaggems_vllm.flash_mla_sparse_fwd_w8a8(
+            *inputs, softmax_scale=576**-0.5
+        )
+    inputs[-1][0].fill_(-1)
+    inputs[-1][1, :, :8] = inputs[-1][1, :, 0:1]
+    inputs[5].mul_(1.25)
+    graph.replay()
+    torch.cuda.synchronize()
+    packed = (*inputs, 576**-0.5, None, None)
+    check_sparse_int8(packed, captured)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@requires_int8_mla
+def test_sparse_compact_large_topk():
+    # Exercises multi-tile compaction when topk exceeds COMPACT_BLOCK (1024).
+    inputs = make_int8_inputs(4, 1, 64, 2049, pages=48, rope_dim=64)
+    indices = inputs[-1]
+    indices[0].fill_(-1)
+    indices[1, :, ::5] = inputs[2].shape[0] * 64
+    indices[2, :, 1024] = indices[2, :, 0]
+    lengths = torch.tensor(
+        [2049, 1500, 1025, 0], dtype=torch.int32, device=indices.device
+    )
+    actual = flaggems_vllm.flash_mla_sparse_fwd_w8a8(
+        *inputs, softmax_scale=576**-0.5, topk_length=lengths
+    )
+    assert_accuracy(
+        actual, reference(inputs, softmax_scale=576**-0.5, topk_length=lengths)
+    )

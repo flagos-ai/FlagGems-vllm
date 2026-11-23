@@ -48,10 +48,6 @@ __device__ __forceinline__ float4_ rope_mma(uint2_ a, uint2_ b, float4_ c,
   return __builtin_mxc_mma_16x16x16f16(a, b, c);
 }
 // Sparse tables contain compact physical token IDs rather than page IDs.
-__device__ __forceinline__ long long cache_page(long long table, int batch,
-                                                long long stride, int page) {
-  return page;
-}
 __device__ __forceinline__ long long cache_token(long long table, int batch,
                                                  long long page, int token) {
   const int index = input<int>(table)[(long long)batch * FMLA_CAP + page * 64 + token];
@@ -123,11 +119,10 @@ __device__ __forceinline__ int roff(int token, int dim) {
 template <bool DirectExp>
 __device__ __forceinline__ bool
 compute_sparse_tile(long long qp, long long qrp, long long kp, long long krp,
-               long long qsp, long long ksp, long long tp, long long lp,
-               long long pp, long long sp, long long op, long long lsep,
-               long long ts, long long ls, long long orderp, long long selectedp, int batches,
-               int hq, int sq, int splits, int causal, int bf16,
-               float scale_log2, int head_tile, int batch, int split, unsigned char (*planes)[8192]) {
+                    long long qsp, long long ksp, long long tp, long long lp,
+                    long long pp, long long sp, long long op, long long lsep,
+                    long long orderp, long long selectedp, int head_tile,
+                    int batch, int split, unsigned char (*planes)[8192]) {
   qp = uniform(qp);
   qrp = uniform(qrp);
   kp = uniform(kp);
@@ -140,27 +135,16 @@ compute_sparse_tile(long long qp, long long qrp, long long kp, long long krp,
   sp = uniform(sp);
   op = uniform(op);
   lsep = uniform(lsep);
-  ts = uniform(ts);
-  ls = uniform(ls);
   orderp = uniform(orderp);
-  batches = uniform(batches);
-  hq = uniform(hq);
-  sq = uniform(sq);
-  splits = uniform(splits);
-  causal = uniform(causal);
-  bf16 = uniform(bf16);
   head_tile = uniform(head_tile);
   batch = uniform(batch);
   split = uniform(split);
-  batches = FMLA_B;
-  hq = FMLA_HQ;
-  sq = FMLA_SQ;
-  splits = FMLA_SPLITS;
-  causal = FMLA_CAUSAL;
-  bf16 = FMLA_BF16;
-  ts = FMLA_CAP / 64;
-  ls = 1;
-  scale_log2 = FMLA_SCALE;
+  constexpr int batches = FMLA_B;
+  constexpr int hq = FMLA_HQ;
+  constexpr int sq = FMLA_SQ;
+  constexpr int splits = FMLA_SPLITS;
+  constexpr int bf16 = FMLA_BF16;
+  constexpr float scale_log2 = FMLA_SCALE;
   if (orderp)
     batch = uniform(input<int>(orderp)[batch]);
   const int t = (threadIdx.x & 255), lane = t & 63, wave = t >> 6,
@@ -176,10 +160,10 @@ compute_sparse_tile(long long qp, long long qrp, long long kp, long long krp,
   // The aligned raw path has no per-query length, so all capacity slots are visited.
   const int length = fixed_h16 || (!FMLA_NO_ROPE && FMLA_EARLY_SCALE)
                          ? FMLA_CAP
-                         : uniform(input<int>(lp)[batch * ls]);
+                         : uniform(input<int>(lp)[batch]);
   const int pages = (length + 63) / 64, begin = pages * split / splits,
             end = pages * (split + 1) / splits;
-  const int bound = causal ? max(length - sq + head / hq + 1, 0) : length;
+  const int bound = length;
   const long long qrow = (long long)batch * allheads + head;
   const float qs = input<float>(qsp)[qrow];
 #if HEADS == 32
@@ -317,7 +301,7 @@ compute_sparse_tile(long long qp, long long qrp, long long kp, long long krp,
   // Keep the lower register-pressure chain for long TopK.
   constexpr bool independent_mma = (prefetch_k || fixed_h16) && FMLA_CAP <= 1024;
   constexpr bool pair_stats = prefetch_k && FMLA_SPLITS == 1;
-  constexpr bool stats_outside_probability = pair_stats && true;
+  constexpr bool stats_outside_probability = pair_stats;
   // Resolve the same two physical tokens once for all four channel planes.
   auto token_offsets = [&](long long page, long long (&offsets)[2]) {
     const int token = t >> 3;
@@ -325,7 +309,7 @@ compute_sparse_tile(long long qp, long long qrp, long long kp, long long krp,
     offsets[1] = cache_token(tp, batch, page, token + 32) * 512;
   };
   if (prefetch_k && begin < end) {
-    const long long first = cache_page(tp, batch, ts, begin);
+    const long long first = begin;
     long long first_offsets[2];
     token_offsets(first, first_offsets);
 #pragma unroll
@@ -344,7 +328,7 @@ compute_sparse_tile(long long qp, long long qrp, long long kp, long long krp,
     const float4_ scale0 = *(const float4_ *)scale_base;
     const float4_ scale1 = *(const float4_ *)(scale_base + 4);
 #endif
-    const long long page = cache_page(tp, batch, ts, page_index);
+    const long long page = page_index;
 #if FMLA_PEEL_LAST_PAGE
     constexpr bool early_next = decltype(next)::value;
     const long long next_page = early_next ? page_index + 1 : 0;
@@ -640,7 +624,7 @@ compute_sparse_tile(long long qp, long long qrp, long long kp, long long krp,
     const bool has_next = prefetch_k && page_index + 1 < end;
 #endif
 #if !FMLA_PEEL_LAST_PAGE
-    const long long next_page = has_next ? cache_page(tp, batch, ts, page_index + 1) : 0;
+    const long long next_page = has_next ? page_index + 1 : 0;
     long long next_offsets[2];
     if (has_next)
       token_offsets(next_page, next_offsets);
@@ -831,22 +815,19 @@ extern "C" __device__ __attribute__((used, always_inline)) float
 mla_int8_small(long long qp, long long qrp, long long kp, long long krp,
                long long qsp, long long ksp, long long tp, long long lp,
                long long pp, long long sp, long long op, long long lsep,
-               long long ts, long long ls, long long orderp, long long selectedp, int batches,
-               int hq, int sq, int splits, int causal, int bf16,
-               float scale_log2, int head_tile, int batch, int split) {
+               long long orderp, long long selectedp, int head_tile, int batch,
+               int split) {
   __shared__ unsigned char planes[HEADS == 32 ? 4 : 2][8192];
 #if defined(FMLA_SCALE_TABLE) && HEADS == 32 && FMLA_CAP <= 16384 && \
     (FMLA_SPLITS == 1 || FMLA_CAP >= 4096)
   if (compute_sparse_tile<true>(
-          qp, qrp, kp, krp, qsp, ksp, tp, lp, pp, sp, op, lsep, ts, ls,
-          orderp, selectedp, batches, hq, sq, splits, causal, bf16, scale_log2,
-          head_tile, batch, split, planes))
+          qp, qrp, kp, krp, qsp, ksp, tp, lp, pp, sp, op, lsep, orderp,
+          selectedp, head_tile, batch, split, planes))
     return 0.f;
 #endif
   compute_sparse_tile<false>(
-      qp, qrp, kp, krp, qsp, ksp, tp, lp, pp, sp, op, lsep, ts, ls, orderp,
-      selectedp, batches, hq, sq, splits, causal, bf16, scale_log2, head_tile,
-      batch, split, planes);
+      qp, qrp, kp, krp, qsp, ksp, tp, lp, pp, sp, op, lsep, orderp, selectedp,
+      head_tile, batch, split, planes);
   return 0.f;
 }
 
@@ -872,9 +853,7 @@ extern "C" __device__ __attribute__((used, always_inline)) float
 mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
                 long long qsp, long long ksp, long long tp, long long lp,
                 long long probability_ptr, long long page_stats_ptr,
-                long long split_stats_ptr, long long orderp, long long ts,
-                long long ls, int hq, int sq, int capacity, int splits,
-                int causal, int bf16, float scale_log2, int split,
+                long long split_stats_ptr, long long orderp, int split,
                 int head_tile, int batch) {
   qp = uniform(qp);
   qrp = uniform(qrp);
@@ -888,35 +867,24 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
   page_stats_ptr = uniform(page_stats_ptr);
   split_stats_ptr = uniform(split_stats_ptr);
   orderp = uniform(orderp);
-  ts = uniform(ts);
-  ls = uniform(ls);
-  hq = uniform(hq);
-  sq = uniform(sq);
-  capacity = uniform(capacity);
-  splits = uniform(splits);
-  causal = uniform(causal);
-  bf16 = uniform(bf16);
   split = uniform(split);
   head_tile = uniform(head_tile);
   batch = uniform(batch);
-  hq = FMLA_HQ;
-  sq = FMLA_SQ;
-  capacity = FMLA_CAP;
-  splits = FMLA_SPLITS;
-  causal = FMLA_CAUSAL;
-  bf16 = FMLA_BF16;
-  ts = FMLA_CAP / 64;
-  ls = 1;
-  scale_log2 = FMLA_SCALE;
+  constexpr int hq = FMLA_HQ;
+  constexpr int sq = FMLA_SQ;
+  constexpr int capacity = FMLA_CAP;
+  constexpr int splits = FMLA_SPLITS;
+  constexpr int bf16 = FMLA_BF16;
+  constexpr float scale_log2 = FMLA_SCALE;
   if (orderp)
     batch = uniform(input<int>(orderp)[batch]);
   const int t = (threadIdx.x & 255), lane = t & 63, wave = t >> 6,
             row = lane & 15, group = lane >> 4;
   const int head = head_tile * 64 + wave * 16 + row, heads = hq * sq;
-  const int length = uniform(input<int>(lp)[batch * ls]),
+  const int length = uniform(input<int>(lp)[batch]),
             pages = (length + 63) / 64;
   const int begin = pages * split / splits, end = pages * (split + 1) / splits;
-  const int bound = causal ? max(length - sq + head / hq + 1, 0) : length;
+  const int bound = length;
   const long long qrow = (long long)batch * heads + head;
   const float qs = input<float>(qsp)[qrow];
   // A lane owns one complete 16-token quantization group.
@@ -940,7 +908,7 @@ mla_int8_scores(long long qp, long long qrp, long long kp, long long krp,
   __shared__ unsigned short rope[4096];
   float maximum = -INFINITY, denominator = 0.f, pscale = 0.f;
   for (int page_index = begin; page_index < end; ++page_index) {
-    const long long page = cache_page(tp, batch, ts, page_index);
+    const long long page = page_index;
     int4_ content[4];
 #pragma unroll
     for (int n = 0; n < 4; ++n)
@@ -1103,11 +1071,8 @@ extern "C" __device__ __attribute__((used, always_inline)) float
 mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
             long long scores_ptr, long long cache_metadata_ptr,
             long long metadata_ptr, long long scale_ptr, long long output_ptr,
-            long long partial_ptr, long long flag_ptr, long long kv_page_stride,
-            long long kv_token_stride, long long table_stride,
-            long long length_stride, int batches, int heads, int capacity,
-            int splits, int adaptive, int sort_batches, int uniform_splits,
-            int output_bf16, int value_tile, int head_tile, int job) {
+            long long partial_ptr, long long flag_ptr, int value_tile,
+            int head_tile, int job) {
   kv_ptr = uniform(kv_ptr);
   table_ptr = uniform(table_ptr);
   lengths_ptr = uniform(lengths_ptr);
@@ -1118,33 +1083,18 @@ mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
   output_ptr = uniform(output_ptr);
   partial_ptr = uniform(partial_ptr);
   flag_ptr = uniform(flag_ptr);
-  kv_page_stride = uniform(kv_page_stride);
-  kv_token_stride = uniform(kv_token_stride);
-  table_stride = uniform(table_stride);
-  length_stride = uniform(length_stride);
-  batches = uniform(batches);
-  heads = uniform(heads);
-  capacity = uniform(capacity);
-  splits = uniform(splits);
-  adaptive = uniform(adaptive);
-  sort_batches = uniform(sort_batches);
-  uniform_splits = uniform(uniform_splits);
-  output_bf16 = uniform(output_bf16);
   value_tile = uniform(value_tile);
   head_tile = uniform(head_tile);
   job = uniform(job);
-  batches = FMLA_B;
-  heads = FMLA_HEADS;
-  capacity = FMLA_CAP;
-  splits = FMLA_SPLITS;
-  adaptive = FMLA_ADAPTIVE;
-  sort_batches = FMLA_SORT;
-  uniform_splits = FMLA_UNIFORM;
-  output_bf16 = FMLA_BF16;
-  kv_page_stride = 32768;
-  kv_token_stride = 512;
-  table_stride = FMLA_CAP / 64;
-  length_stride = 1;
+  constexpr int batches = FMLA_B;
+  constexpr int heads = FMLA_HEADS;
+  constexpr int capacity = FMLA_CAP;
+  constexpr int splits = FMLA_SPLITS;
+  constexpr int adaptive = FMLA_ADAPTIVE;
+  constexpr int sort_batches = FMLA_SORT;
+  constexpr int uniform_splits = FMLA_UNIFORM;
+  constexpr int output_bf16 = FMLA_BF16;
+  constexpr long long kv_token_stride = 512;
   int batch = adaptive ? job % batches : job;
   const int split = adaptive ? job / batches : 0;
   const auto flags = input<int>(flag_ptr);
@@ -1154,7 +1104,7 @@ mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
     return 0.f;
   if (sort_batches)
     batch = uniform(flags[1 + batch]);
-  const int length = uniform(input<int>(lengths_ptr)[batch * length_stride]);
+  const int length = uniform(input<int>(lengths_ptr)[batch]);
   const int pages = (length + 63) / 64, begin = pages * split / split_count,
             end = pages * (split + 1) / split_count;
   const int t = threadIdx.x & (THREADS - 1), lane = t & 63, warp = t >> 6,
@@ -1233,8 +1183,7 @@ mla_int8_pv(long long kv_ptr, long long table_ptr, long long lengths_ptr,
     }
   };
   auto issue_values = [&](int page_index) {
-    const long long page =
-        cache_page(table_ptr, batch, table_stride, page_index);
+    const long long page = page_index;
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
       const int i = t + c * THREADS, token = i / (VDIM / 16),

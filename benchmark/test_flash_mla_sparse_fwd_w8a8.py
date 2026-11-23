@@ -120,8 +120,16 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             output, _, lse = native()
             expected = output[:, None], lse[:, :, None]
         check_sparse_int8(packed, actual, expected)
-        # The paged reference may rewrite invalid indices in place.
-        indices.copy_(packed[6])
+        mutated = not torch.equal(indices, packed[6])
+        if mutated:
+            # The paged reference may rewrite invalid indices in place.
+            indices.copy_(packed[6])
+
+            def native_with_reset():
+                indices.copy_(packed[6])
+                return native()
+
+            return native_with_reset, handle
         return native, handle
 
     def unpack_to_args_kwargs(self, input_tuple):
