@@ -16,22 +16,22 @@ from typing import Tuple
 
 import torch
 import triton
-import triton.experimental.tle as tle
 import triton.language as tl
+
+try:
+    import triton.experimental.tle as tle
+
+    _HAS_TLE = True
+except ImportError:
+    tle = None
+    _HAS_TLE = False
 
 from flaggems_vllm.runtime import torch_device_fn
 
-# Best measured combination on Ascend910B4 (do_bench_npu device time, all 7
-# benchmark shapes >= 1.15x vs torch_npu.npu_rms_norm x2):
-# - narrow rows (whole-tile single pass fits UB), tokens <= 1024: ONE launch
-#   with q/kv on the task axis (uni_launch); single cast per element, weights
-#   DMA'd into UB once per program.
-# - otherwise: sep_launch per tensor, each routed by its own width --
-#   narrow -> whole-tile single pass (sp); wide -> GM-streaming two-pass
-#   (sep_2p_wub, pass 2 re-reads L2-resident rows; multibuffered TILE_N loop).
-#   Mirrors CANN's own per-tensor template selection (MERGE_N / SPLIT_D).
-# Tile sizes come from measured sweeps instead of runtime autotune
-# (one config per shape key -> one compile per shape).
+# Routing: tokens <= 1024 narrow -> one task-axis launch (uni); otherwise q
+# and kv launch separately, each narrow (whole-tile single pass) or wide
+# (two-pass TILE_N loop). tle.dsa weight-UB kernels when TLE is available,
+# plain-Triton fallbacks otherwise.
 _SP_TILE_BUDGET_BYTES = 128 * 1024
 _SP_TASK_MAX_TOKENS = 1024
 
@@ -53,12 +53,10 @@ def _core_num() -> int:
 
 
 def _sp_feasible(n_pad2: int, esz: int) -> bool:
-    # can one [TILE_M, n_pad2] whole tile live in the per-core UB budget?
     return n_pad2 * (4 + esz) <= _SP_TILE_BUDGET_BYTES
 
 
 def _sp_budget_tile(n_pad2: int, esz: int) -> int:
-    # TILE_M from the UB budget alone (caller guarantees _sp_feasible)
     row = n_pad2 * (4 + esz)
     tile = 1
     while tile * 2 * row <= _SP_TILE_BUDGET_BYTES:
@@ -67,8 +65,6 @@ def _sp_budget_tile(n_pad2: int, esz: int) -> int:
 
 
 def _sep_sp_wub_tile_m(num_tokens: int, n_pad2: int, esz: int) -> int:
-    # TILE_M for the sep sp route: UB budget, capped so the grid still
-    # floods the vector cores
     flood = triton.next_power_of_2(max(1, triton.cdiv(num_tokens, _core_num())))
     return max(
         1,
@@ -87,8 +83,7 @@ def _uni_feasible(q_pad2: int, kv_pad2: int, q_esz: int, kv_esz: int) -> bool:
 def _uni_sp_wub_tile_m(
     num_tokens: int, q_pad2: int, kv_pad2: int, q_esz: int, kv_esz: int
 ) -> int:
-    # TILE_M for the uni launch: min of both tensors' budgets, capped only
-    # by the token count (no flood cap -- measured better for the combined kernel)
+    # no flood cap: measured better for the combined kernel
     return max(
         1,
         min(
@@ -100,9 +95,7 @@ def _uni_sp_wub_tile_m(
 
 
 def _sep_2p_tiles(num_tokens: int) -> Tuple[int, int]:
-    # largest TILE_M whose grid still fills ~3/4 of the vector cores;
-    # largest TILE_N whose per-element staging (f32 cast 4B + y f32 4B +
-    # y bf16 2B) stays within ~160KB
+    # staging: f32 cast 4B + y f32 4B + y bf16 2B per element, <= ~160KB
     min_programs = max(8, _core_num() * 3 // 4)
     tile_m = 1
     while tile_m < 16 and triton.cdiv(num_tokens, tile_m * 2) >= min_programs:
@@ -255,6 +248,107 @@ def _rmsnorm_sep_sp_wub_kernel(
 
 
 @triton.jit(do_not_specialize=["eps"])
+def _rmsnorm_uni_sp_kernel(
+    q_ptr,
+    q_out_ptr,
+    q_weight_ptr,
+    q_in_stride,
+    q_out_stride,
+    kv_ptr,
+    kv_out_ptr,
+    kv_weight_ptr,
+    kv_in_stride,
+    kv_out_stride,
+    eps,
+    num_tokens,
+    Q_SIZE: tl.constexpr,
+    KV_SIZE: tl.constexpr,
+    Q_PAD2: tl.constexpr,
+    KV_PAD2: tl.constexpr,
+    TILE_M: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    task = tl.program_id(1)
+
+    offs_m = pid * TILE_M + tl.arange(0, TILE_M)
+    token_mask = offs_m < num_tokens
+
+    if task == 0:
+        q_cols = tl.arange(0, Q_PAD2)
+        q_mask = token_mask[:, None] & (q_cols < Q_SIZE)[None, :]
+        q_w = tl.load(q_weight_ptr + q_cols, mask=q_cols < Q_SIZE, other=0.0).to(
+            tl.float32
+        )
+        q_x = tl.load(
+            q_ptr + offs_m[:, None] * q_in_stride + q_cols[None, :],
+            mask=q_mask,
+            other=0.0,
+        ).to(tl.float32)
+        q_ssq = tl.sum(q_x * q_x, axis=1)
+        q_rrms = tl.rsqrt(q_ssq / Q_SIZE + eps)
+        q_y = q_x * q_rrms[:, None] * q_w[None, :]
+        tl.store(
+            q_out_ptr + offs_m[:, None] * q_out_stride + q_cols[None, :],
+            q_y.to(q_out_ptr.dtype.element_ty),
+            mask=q_mask,
+        )
+    else:
+        kv_cols = tl.arange(0, KV_PAD2)
+        kv_mask = token_mask[:, None] & (kv_cols < KV_SIZE)[None, :]
+        kv_w = tl.load(kv_weight_ptr + kv_cols, mask=kv_cols < KV_SIZE, other=0.0).to(
+            tl.float32
+        )
+        kv_x = tl.load(
+            kv_ptr + offs_m[:, None] * kv_in_stride + kv_cols[None, :],
+            mask=kv_mask,
+            other=0.0,
+        ).to(tl.float32)
+        kv_ssq = tl.sum(kv_x * kv_x, axis=1)
+        kv_rrms = tl.rsqrt(kv_ssq / KV_SIZE + eps)
+        kv_y = kv_x * kv_rrms[:, None] * kv_w[None, :]
+        tl.store(
+            kv_out_ptr + offs_m[:, None] * kv_out_stride + kv_cols[None, :],
+            kv_y.to(kv_out_ptr.dtype.element_ty),
+            mask=kv_mask,
+        )
+
+
+@triton.jit(do_not_specialize=["eps"])
+def _rmsnorm_sep_sp_kernel(
+    x_ptr,
+    out_ptr,
+    w_ptr,
+    x_in_stride,
+    out_stride,
+    eps,
+    num_tokens,
+    N_SIZE: tl.constexpr,
+    N_PAD2: tl.constexpr,
+    TILE_M: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    offs_m = pid * TILE_M + tl.arange(0, TILE_M)
+    token_mask = offs_m < num_tokens
+
+    cols = tl.arange(0, N_PAD2)
+    mask = token_mask[:, None] & (cols < N_SIZE)[None, :]
+    w = tl.load(w_ptr + cols, mask=cols < N_SIZE, other=0.0).to(tl.float32)
+    x = tl.load(
+        x_ptr + offs_m[:, None] * x_in_stride + cols[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    ssq = tl.sum(x * x, axis=1)
+    rrms = tl.rsqrt(ssq / N_SIZE + eps)
+    y = x * rrms[:, None] * w[None, :]
+    tl.store(
+        out_ptr + offs_m[:, None] * out_stride + cols[None, :],
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+@triton.jit(do_not_specialize=["eps"])
 def _rmsnorm_sep_2p_kernel(
     x_ptr,
     out_ptr,
@@ -312,8 +406,9 @@ def _uni_launch(qr, kv, q_weight, kv_weight, eps, q_out, kv_out):
     )
     num_tile_m = triton.cdiv(num_tokens, tile_m)
     grid = (num_tile_m, 2)
+    kernel = _rmsnorm_uni_sp_wub_kernel if _HAS_TLE else _rmsnorm_uni_sp_kernel
     with torch_device_fn.device(qr.device):
-        _rmsnorm_uni_sp_wub_kernel[grid](
+        kernel[grid](
             qr,
             q_out,
             q_weight,
@@ -337,7 +432,6 @@ def _uni_launch(qr, kv, q_weight, kv_weight, eps, q_out, kv_out):
 
 
 def _sep_launch(qr, kv, q_weight, kv_weight, eps, q_out, kv_out):
-    # one sep entry: q and kv each get their own launch, routed by width
     for x, w, out in ((qr, q_weight, q_out), (kv, kv_weight, kv_out)):
         num_tokens = x.shape[0]
         n_pad2 = triton.next_power_of_2(x.shape[1])
@@ -348,7 +442,10 @@ def _sep_launch(qr, kv, q_weight, kv_weight, eps, q_out, kv_out):
                 tile_m = _sep_sp_wub_tile_m(num_tokens, n_pad2, x.element_size())
                 num_tile_m = triton.cdiv(num_tokens, tile_m)
                 grid = (num_tile_m,)
-                _rmsnorm_sep_sp_wub_kernel[grid](
+                kernel = (
+                    _rmsnorm_sep_sp_wub_kernel if _HAS_TLE else _rmsnorm_sep_sp_kernel
+                )
+                kernel[grid](
                     x,
                     out,
                     w,
