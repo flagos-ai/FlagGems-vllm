@@ -39,17 +39,15 @@ VENDOR = flaggems_vllm.vendor_name
 # Only the NVIDIA build ships an upstream qwen4_exp implementation today.
 VLLM_NATIVE_VENDORS = {"nvidia"}
 
-if VENDOR in VLLM_NATIVE_VENDORS:
-    from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import (
-        qsa_prepare as _vllm_native_qsa_prepare,
-    )
-
 
 def _get_baseline_op():
     """Return the vendor-native implementation, or None when there is none."""
 
     if VENDOR in VLLM_NATIVE_VENDORS:
-        return _vllm_native_qsa_prepare
+        module = base.import_vllm_benchmark_baseline(
+            "vllm.models.qwen4_exp.nvidia.ops.qsa_prepare"
+        )
+        return module.qsa_prepare
     return None
 
 

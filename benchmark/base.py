@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import importlib
 import math
 import os
 import time
@@ -54,6 +55,18 @@ else:
         torch_backend_device.matmul.allow_tf32 = False
     except Exception:
         pass
+
+
+def import_vllm_benchmark_baseline(module_name):
+    """Skip a benchmark when its vLLM baseline module is unavailable."""
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name and (
+            exc.name == module_name or module_name.startswith(f"{exc.name}.")
+        ):
+            pytest.skip(f"installed vLLM does not provide {module_name}")
+        raise
 
 
 def get_iter_count(fn):
