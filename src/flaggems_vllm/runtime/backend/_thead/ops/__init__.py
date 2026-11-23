@@ -22,6 +22,9 @@ from flaggems_vllm.runtime.backend._thead.ops.deep_gemm_fp8_o_proj import (
 from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache import (
+    flash_mla_with_kvcache,
+)
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -61,6 +64,7 @@ __all__ = [
     "chunk_gated_delta_rule_w8a16_int8",
     "cooperative_topk",
     "deep_gemm_fp8_o_proj",
+    "flash_mla_with_kvcache",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
