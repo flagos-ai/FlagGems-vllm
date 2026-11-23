@@ -207,6 +207,35 @@ def thead_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
         )
 
 
+def _build_metax_layer(num_experts, hidden_size, intermediate_size, topk, dtype):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    if not _CACHE["workspace_ready"]:
+        init_workspace_manager(torch.device("cuda"))
+        _CACHE["workspace_ready"] = True
+    ctx = VllmConfig()
+    previous = torch.get_default_device()
+    torch.set_default_device("cuda")
+    try:
+        with set_current_vllm_config(ctx):
+            runner = FusedMoEFactory(
+                num_experts,
+                topk,
+                hidden_size,
+                intermediate_size,
+                params_dtype=dtype,
+                quant_config=None,
+                tp_size=1,
+                dp_size=1,
+                pcp_size=1,
+            )
+    finally:
+        torch.set_default_device(previous)
+    _CACHE.update(layer=runner, experts=runner.routed_experts, ctx=ctx)
+
+
 def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
     """Run vLLM-MetaX's production unquantized MoE method."""
     assert (
@@ -216,24 +245,13 @@ def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
         topk_ids.dtype == torch.int32
     ), "MetaX mctlass baseline expects int32 topk_ids"
     import vllm_metax
+    import vllm_metax.patch.enhancement.utils  # noqa: F401
     from vllm.config import set_current_vllm_config
     from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory  # noqa: F401
 
-    # The flagos MetaX image does not ship the mctlass extension.  Without
-    # it the vendor TritonExperts path asserts in its BF16 block-size
-    # override, so keep the available MetaX Triton path selected.
-    try:
-        import mctlassEx  # noqa: F401
-    except Exception:
-        import vllm_metax.envs as _mx_envs
-
-        _mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE = False
-        _mx_envs.MACA_VLLM_ENABLE_MCTLASS_PYTHON_API = False
-
-    # The plugin's OOT method is registered by this entry point; importing
-    # vllm_metax alone leaves FusedMoE on the upstream Triton fallback.
     if not _CACHE.get("metax_registered"):
-        vllm_metax.register_customized()
+        vllm_metax._out_of_tree()
         _CACHE["metax_registered"] = True
 
     # Keep subsequent FlagGems allocations on the same device; _build_layer
@@ -257,7 +275,7 @@ def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
     if struct_key != _CACHE.get("metax_struct"):
         _CACHE["layer"] = None
         torch.cuda.empty_cache()
-        _build_layer(
+        _build_metax_layer(
             num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
         )
         _CACHE["metax_struct"] = struct_key
@@ -270,8 +288,7 @@ def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
             experts.w13_weight.data = w1
             experts.w2_weight.data = w2
             experts.quant_method.process_weights_after_loading(experts)
-            if hasattr(experts, "ensure_moe_quant_config_init"):
-                experts.ensure_moe_quant_config_init()
+            experts._ensure_moe_quant_config_init()
         _CACHE["metax_weight_key"] = weight_key
 
     ctx = _CACHE["ctx"]
