@@ -28,10 +28,17 @@ def fused_topk_sample_kernel(
     kth = tl.full((), -float("inf"), tl.float32)
     if k < VOCAB:
         SMALL_K: tl.constexpr = min(BLOCK, 32)
+        MEDIUM_K: tl.constexpr = min(BLOCK, 64)
         if k <= SMALL_K:
             small_ranked = tl.topk(logits, SMALL_K)
             ranks = tl.arange(0, SMALL_K)
             kth = tl.max(tl.where(ranks == k - 1, small_ranked, -float("inf")), 0)
+        elif k <= MEDIUM_K:
+            medium_ranked = tl.topk(logits, MEDIUM_K)
+            medium_ranks = tl.arange(0, MEDIUM_K)
+            kth = tl.max(
+                tl.where(medium_ranks == k - 1, medium_ranked, -float("inf")), 0
+            )
         else:
             ranked = tl.sort(logits, descending=True)
             kth = tl.max(tl.where(index == k - 1, ranked, -float("inf")), 0)

@@ -27,7 +27,7 @@ def test_topk_sample_from_logits(batch, vocab, k_dtype):
     rng = torch.Generator(device="musa").manual_seed(19)
     logits = torch.randn((batch, vocab), device="musa", generator=rng)
     noise = torch.empty_like(logits).exponential_(generator=rng)
-    cases = [1, min(25, vocab), min(32, vocab), min(33, vocab), vocab]
+    cases = [min(value, vocab) for value in (1, 25, 32, 33, 64, 65, vocab)]
     k = torch.tensor(
         [cases[row % len(cases)] for row in range(batch)], dtype=k_dtype, device="musa"
     )
