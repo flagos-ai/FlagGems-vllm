@@ -5,6 +5,17 @@ import torch
 import triton
 import triton.language as tl
 
+_MUSA_LAUNCH_OPTIONS = {"num_warps": 8}
+try:
+    from triton.backends.mthreads.compiler import MUSAOptions
+
+    if "enable_llc_opt" in MUSAOptions.__dataclass_fields__:
+        # MUSA's burst combine can fail to compile this kernel's FP32 selects.
+        # Override it at launch when another operator enables it process-wide.
+        _MUSA_LAUNCH_OPTIONS["enable_llc_opt"] = False
+except (ImportError, AttributeError):
+    pass
+
 
 @triton.jit
 def fused_topk_sample_kernel(
@@ -81,6 +92,6 @@ def topk_sample_from_logits(
                 output,
                 vocab,
                 triton.next_power_of_2(vocab),
-                num_warps=8,
+                **_MUSA_LAUNCH_OPTIONS,
             )
     return output

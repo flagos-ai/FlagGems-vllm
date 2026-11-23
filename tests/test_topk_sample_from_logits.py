@@ -1,6 +1,8 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import pytest
 import torch
 
@@ -60,7 +62,8 @@ def test_empty_batch_and_bad_dtype():
 
 
 @pytest.mark.topk_sample_from_logits
-def test_musa_graph_replay():
+def test_musa_graph_replay(monkeypatch):
+    monkeypatch.setenv("TRITON_MUSA_ENABLE_LLC_OPT", "1")
     op = flaggems_vllm.topk_sample_from_logits
     logits = torch.randn((16, 6761), device="musa")
     k = torch.full((16,), 25, dtype=torch.int32, device="musa")
@@ -76,3 +79,4 @@ def test_musa_graph_replay():
     logits.normal_()
     graph.replay()
     torch.testing.assert_close(actual, reference(logits, k, noise), rtol=0, atol=0)
+    assert os.environ["TRITON_MUSA_ENABLE_LLC_OPT"] == "1"
