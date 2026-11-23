@@ -34,6 +34,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import cooperati
 from flaggems_vllm.runtime.backend._ascend.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.deep_gemm_fp8_o_proj import (
+    deep_gemm_fp8_o_proj,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
@@ -84,9 +87,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_con
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.kda_state_scatter import (
-    scatter_kda_state,
-)
 from flaggems_vllm.runtime.backend._ascend.ops.kpool_state_compress import (
     glm5_next_kpool_state_compress_and_write_cache_triton as kpool_state_compress,
 )
@@ -113,6 +113,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.scatter_conv_state import (
     scatter_conv_state,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.scatter_kda_state import (
+    scatter_kda_state,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
@@ -153,6 +156,7 @@ __all__ = [
     "compute_slot_mappings",
     "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
+    "deep_gemm_fp8_o_proj",
     "dequantize_and_gather_k_cache",
     "fused_add_rms_norm",
     "fused_experts_impl",
