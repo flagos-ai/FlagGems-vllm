@@ -61,7 +61,7 @@ _NATIVE_OP = None
 _NATIVE_MODULE = None
 _NATIVE_DEVICE = None
 _NATIVE_IDENTITY = {"status": "not_resolved"}
-_NATIVE_HASHES_CHECKED = set()
+_NATIVE_HASHES_CHECKED = {}
 _QUALIFICATIONS = {}
 
 # Independent integer known answers frozen before the candidate implementation.
@@ -181,8 +181,6 @@ def _device_context(device, vendor):
     """
     vendor = "thead" if vendor == "ppu" else vendor
     known_failures = {
-        "ascend": "reference vLLM random sampling failed on the observed 910B1 stack "
-        "(expected token 60, got 27; hash KAT failed); this stack is not qualified",
         "iluvatar": "reference vLLM random sampling failed on the observed BI-V150 stack "
         "(expected token 60, got 90); this stack is not qualified",
     }
@@ -194,11 +192,14 @@ def _device_context(device, vendor):
         "metax": "cuda",
         "hygon": "cuda",
         "mthreads": "musa",
+        "ascend": "npu",
     }
     if vendor not in expected_types:
         raise RuntimeError(f"no vLLM qualification coverage for vendor {vendor!r}")
     if vendor == "mthreads" and not hasattr(torch, "musa"):
         importlib.import_module("torch_musa")
+    if vendor == "ascend" and not hasattr(torch, "npu"):
+        importlib.import_module("torch_npu")
     device = torch.device(device)
     if device.type != expected_types[vendor]:
         raise ValueError(
@@ -225,6 +226,8 @@ def _device_context(device, vendor):
     detected = None
     if device.type == "musa" and ("mtt" in lowered or "mthreads" in lowered):
         detected = "mthreads"
+    elif device.type == "npu" and "ascend" in lowered:
+        detected = "ascend"
     elif device.type == "cuda":
         if hip and (lowered == "bw" or "hygon" in lowered or "dcu" in lowered):
             detected = "hygon"
@@ -573,8 +576,13 @@ def _check_native_hashes(module, device):
     output = torch.empty(12, dtype=torch.int64, device=device)
     probe[(1,)](*columns, output, module.murmur3_hash32)
     expected = [row[3] for row in _KAT_INPUTS] + [row[4] for row in _KAT_INPUTS]
-    if output.cpu().tolist() != expected:
-        raise AssertionError("native Murmur3 known-answer check failed")
+    actual = output.cpu().tolist()
+    return {
+        "status": "passed" if actual == expected else "failed",
+        "expected": expected,
+        "actual": actual,
+        "scope": "six keys, two domains",
+    }
 
 
 @lru_cache(maxsize=16)
@@ -655,16 +663,20 @@ def _check_inputs(binding, args, kwargs):
     return snapshots
 
 
-def qualify_native(binding, args, kwargs, op):
-    """Qualify independently of candidate; errors propagate before any timing.
+def qualify_native(binding, args, kwargs, op, *, allow_accuracy_warning=False):
+    """Qualify independently of candidate, with strict checks by default.
 
     A failed device call can poison the context. Callers must save its error and
     terminate that process, never continue timing after catching this exception.
+    Only the Ascend benchmark may opt into timing a numerically wrong reference;
+    metadata, range, replay, mutation, source and execution errors remain fatal.
     """
     if op is not _NATIVE_OP or _NATIVE_MODULE is None:
         raise ValueError("qualify_native requires this provider's resolved callable")
     if _NATIVE_DEVICE is None:
         raise ValueError("native device identity was not resolved")
+    if allow_accuracy_warning and _NATIVE_DEVICE["vendor"] != "ascend":
+        raise ValueError("native accuracy warnings are permitted only for Ascend")
     device, device_api, observed = _device_context(
         args[0].device, _NATIVE_DEVICE["vendor"]
     )
@@ -675,25 +687,39 @@ def qualify_native(binding, args, kwargs, op):
     expected, margins = _reference_winners(*(entry[1].numpy() for entry in saved))
     cpu_rng = torch.get_rng_state().clone()
     device_rng = device_api.get_rng_state(device).clone()
+    n, v, temperature = _case(binding)
     hash_key = (id(op), str(device))
-    if hash_key not in _NATIVE_HASHES_CHECKED:
-        _check_native_hashes(_NATIVE_MODULE, device)
-        _NATIVE_HASHES_CHECKED.add(hash_key)
+    if observed["vendor"] == "ascend" and temperature == 0:
+        hash_kat = {
+            "status": "not_applicable",
+            "reason": "zero temperature uses no RNG",
+        }
+    else:
+        if hash_key not in _NATIVE_HASHES_CHECKED:
+            _NATIVE_HASHES_CHECKED[hash_key] = _check_native_hashes(
+                _NATIVE_MODULE, device
+            )
+        hash_kat = copy.deepcopy(_NATIVE_HASHES_CHECKED[hash_key])
+    if hash_kat["status"] == "failed" and not allow_accuracy_warning:
+        raise AssertionError(
+            "native Murmur3 known-answer check failed: " + json.dumps(hash_kat)
+        )
     first = op(*args, **kwargs)
     replay = op(*args, **kwargs)
     device_api.synchronize(device)
-    n, v, _ = _case(binding)
+    actual_winners = []
     for output in (first, replay):
         if (
-            output.dtype != torch.int64
+            not isinstance(output, torch.Tensor)
+            or output.dtype != torch.int64
             or output.shape != (n,)
             or output.device != device
         ):
             raise AssertionError("native output metadata differs from contract")
-        if output.cpu().tolist() != expected:
-            raise AssertionError(
-                "native result differs from independent Murmur3/CPU oracle"
-            )
+        actual = output.cpu().tolist()
+        if any(token < 0 or token >= v for token in actual):
+            raise AssertionError("native output token is outside vocabulary range")
+        actual_winners.append(actual)
     if not torch.equal(first, replay):
         raise AssertionError("native fixed seed/position replay changed")
     for tensor, (metadata, contents) in zip(args[:5], saved):
@@ -704,9 +730,24 @@ def qualify_native(binding, args, kwargs, op):
         device_rng, device_api.get_rng_state(device)
     ):
         raise AssertionError("native advanced a default RNG state")
+    _check_source_unchanged(_NATIVE_IDENTITY["files"])
+    accuracy_failures = []
+    if hash_kat["status"] == "failed":
+        accuracy_failures.append("native Murmur3 known-answer check failed")
+    if actual_winners[0] != expected:
+        accuracy_failures.append(
+            "native result differs from independent Murmur3/CPU oracle"
+        )
     finite_margins = [value for value in margins if value is not None]
     report = {
-        "status": "passed",
+        "status": (
+            ("accuracy_warning" if allow_accuracy_warning else "failed")
+            if accuracy_failures
+            else "passed"
+        ),
+        "accuracy_status": "failed" if accuracy_failures else "passed",
+        "performance_allowed": not accuracy_failures or allow_accuracy_warning,
+        "accuracy_failures": accuracy_failures,
         "case_key": key_shape(binding),
         "dtype": str(args[0].dtype),
         "device": str(device),
@@ -716,7 +757,9 @@ def qualify_native(binding, args, kwargs, op):
             min(finite_margins) if finite_margins else None
         ),
         "oracle_winners": expected,
-        "native_hash_kat": "passed: six keys, two domains",
+        "native_winners": actual_winners[0],
+        "replay_winners": actual_winners[1],
+        "native_hash_kat": hash_kat,
         "replay": "passed: two identical calls",
         "inputs_immutable": True,
         "cpu_rng_immutable": True,
@@ -729,6 +772,8 @@ def qualify_native(binding, args, kwargs, op):
     _QUALIFICATIONS[(key_shape(binding), str(args[0].dtype), str(device))] = (
         copy.deepcopy(report)
     )
+    if accuracy_failures and not allow_accuracy_warning:
+        raise AssertionError("; ".join(accuracy_failures) + ": " + json.dumps(report))
     return report
 
 

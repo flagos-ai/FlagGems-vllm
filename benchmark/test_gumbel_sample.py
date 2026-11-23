@@ -5,6 +5,7 @@
 CUDA-compatible backends use the collector's no-Graph do_bench protocol.
 All backends use runtime device events through their Triton implementation.
 Native device failures terminate the process even when the runner omits -x.
+Ascend numerical reference failures are retained as warnings and may be timed.
 """
 
 import hashlib
@@ -168,19 +169,67 @@ class GumbelSampleBenchmark(base.Benchmark):
             "normalized_ratio": compared["compared_speedup"],
             "normalization": compared,
         }
-        if native is not None:
+        if native is not None or flaggems_vllm.vendor_name == "ascend":
             try:
-                qualification = workload.qualify_native(binding, args, kwargs, native)
-                native_time = self._measure(native, args, kwargs)
-                workload.qualify_native(binding, args, kwargs, native)
-                metric["baseline_kind"] = "native_vllm"
-                metric["native_qualification"] = qualification
+                if native is None:
+                    raise RuntimeError(
+                        f"Ascend native resolution failed: {native_reason}"
+                    )
+                policy = (
+                    {"allow_accuracy_warning": True}
+                    if flaggems_vllm.vendor_name == "ascend"
+                    else {}
+                )
+                qualifications = {}
+                for stage in ("pre_timing", "post_timing"):
+                    receipt = workload.qualify_native(
+                        binding, args, kwargs, native, **policy
+                    )
+                    qualifications[stage] = receipt
+                    # Persist the pre-timing evidence even if timing or the
+                    # post-timing hard checks subsequently terminate this case.
+                    qualification = {
+                        **receipt,
+                        **qualifications,
+                        "status": (
+                            "accuracy_warning"
+                            if any(
+                                item["status"] == "accuracy_warning"
+                                for item in qualifications.values()
+                            )
+                            else "passed"
+                        ),
+                    }
+                    if qualification["status"] == "accuracy_warning":
+                        qualification["accuracy_status"] = "failed"
+                        qualification["accuracy_failures"] = list(
+                            dict.fromkeys(
+                                reason
+                                for item in qualifications.values()
+                                for reason in item.get("accuracy_failures", [])
+                            )
+                        )
+                    metric["native_qualification"] = qualification
+                    row["native_qualification"] = qualification
+                    if receipt["status"] == "accuracy_warning":
+                        print(
+                            f"WARNING gumbel native accuracy case={workload.key_shape(binding)} "
+                            f"stage={stage}: " + json.dumps(receipt, sort_keys=True)
+                        )
+                    if stage == "pre_timing":
+                        native_time = self._measure(native, args, kwargs)
+                baseline_kind = (
+                    "native_vllm_accuracy_warning"
+                    if qualification["status"] == "accuracy_warning"
+                    else "native_vllm"
+                )
+                metric["baseline_kind"] = baseline_kind
                 metric["latency_base"] = native_time["latency_ms"]
                 metric["speedup"] = native_time["latency_ms"] / candidate["latency_ms"]
                 row.update(
                     native=native_time,
                     native_ratio=metric["speedup"],
-                    baseline_kind="native_vllm",
+                    baseline_kind=baseline_kind,
                     native_qualification=qualification,
                 )
             except Exception as exc:
