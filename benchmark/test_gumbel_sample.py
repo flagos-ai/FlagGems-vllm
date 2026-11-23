@@ -9,6 +9,7 @@ Native device failures terminate the process even when the runner omits -x.
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 
@@ -87,6 +88,8 @@ class GumbelSampleBenchmark(base.Benchmark):
 
     def _measure(self, op, args, kwargs):
         latency_ms = self.get_latency(op, *args, **kwargs)
+        if not math.isfinite(latency_ms) or latency_ms <= 0:
+            raise ValueError(f"invalid gumbel latency: {latency_ms!r}")
         return {
             "median_us": latency_ms * 1000,
             "latency_ms": latency_ms,
@@ -127,19 +130,11 @@ class GumbelSampleBenchmark(base.Benchmark):
             base_data_source=source,
             timing_protocol=candidate["timing_protocol"],
         )
-        native_reason = None
-        native = None
-        identity = {"status": "unavailable"}
-        if flaggems_vllm.vendor_name == "nvidia":
-            native = self.torch_op = workload.native()
-            identity = workload.native_identity()
-            native_reason = workload.NATIVE_UNAVAILABLE_REASON
-        else:
-            native_reason = (
-                "pinned provider device qualification covers NVIDIA only; "
-                "no qualified on-device native for this backend"
-            )
-            identity["reason"] = native_reason
+        native = self.torch_op = workload.native(
+            device=args[0].device, vendor=flaggems_vllm.vendor_name
+        )
+        identity = workload.native_identity()
+        native_reason = workload.NATIVE_UNAVAILABLE_REASON
         metric = {
             "shape_detail": workload.key_shape(binding),
             "latency": candidate["latency_ms"],
@@ -148,6 +143,8 @@ class GumbelSampleBenchmark(base.Benchmark):
             "timing_protocol": candidate["timing_protocol"],
             "workload_config": cfg,
             "native_identity": identity,
+            "baseline_kind": "unavailable",
+            "native_baseline_skip_reason": native_reason,
             **compared,
         }
         row = {
@@ -166,6 +163,7 @@ class GumbelSampleBenchmark(base.Benchmark):
             "candidate": candidate,
             "native_identity": identity,
             "baseline_kind": "unavailable",
+            "native_baseline_skip_reason": native_reason,
             "native_ratio": None,
             "normalized_ratio": compared["compared_speedup"],
             "normalization": compared,
@@ -175,6 +173,7 @@ class GumbelSampleBenchmark(base.Benchmark):
                 qualification = workload.qualify_native(binding, args, kwargs, native)
                 native_time = self._measure(native, args, kwargs)
                 workload.qualify_native(binding, args, kwargs, native)
+                metric["baseline_kind"] = "native_vllm"
                 metric["native_qualification"] = qualification
                 metric["latency_base"] = native_time["latency_ms"]
                 metric["speedup"] = native_time["latency_ms"] / candidate["latency_ms"]
@@ -187,6 +186,8 @@ class GumbelSampleBenchmark(base.Benchmark):
             except Exception as exc:
                 native_reason = f"native qualification/execution failed: {type(exc).__name__}: {exc}"
                 metric["error_msg"] = native_reason
+                metric["native_baseline_skip_reason"] = native_reason
+                row["native_baseline_skip_reason"] = native_reason
                 row["native_error"] = native_reason
                 _record(row, metric, native_reason)
                 # Central runners do not all pass -x. A failed native call may

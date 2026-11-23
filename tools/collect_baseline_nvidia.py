@@ -582,6 +582,10 @@ def _collect_one_op_ops(
     except (
         Exception
     ) as e:  # noqa: BLE001 - any failure means this host cannot collect it
+        if callable(getattr(op_module, "qualification", None)):
+            # A provider's device qualification failure can poison the context.
+            # Preserve its error and terminate this worker before more timing.
+            raise
         print(
             f"\nskipping {op_name}: pre-check failed, cannot collect on this host"
             f" ({type(e).__name__}: {str(e)[:120]})"
@@ -618,6 +622,11 @@ def _collect_one_op_ops(
             latency_ms = _measure_latency(
                 op_module, op, args, kwargs, raw_samples=samples
             )
+            post_measure_hook = getattr(op_module, "qualify_native", None)
+            if callable(post_measure_hook):
+                # Validate the state/output after timing, outside the interval.
+                # A failure terminates this worker before publishing the row.
+                post_measure_hook(binding, args, kwargs, op)
             # The NCU subprocess allocates its own inputs; free ours first so a
             # large-E MoE does not OOM from holding two copies at once.
             del args, kwargs
@@ -637,6 +646,16 @@ def _collect_one_op_ops(
             )
             if samples:
                 per_dtype[dtype_str]["samples_ms"] = samples
+            # Optional provider receipts bind this measurement to the actual
+            # source and per-case checks; providers without hooks are unchanged.
+            identity_hook = getattr(op_module, "native_identity", None)
+            if callable(identity_hook):
+                per_dtype[dtype_str]["native_identity"] = identity_hook()
+            qualification_hook = getattr(op_module, "qualification", None)
+            if callable(qualification_hook):
+                per_dtype[dtype_str]["native_qualification"] = qualification_hook(
+                    binding, dtype
+                )
 
             bn = ncu["bottle_neck_unit"]
             suffix = f"  bottleneck={bn} ({ncu['U_bottle_neck']:.1f}%)" if bn else ""

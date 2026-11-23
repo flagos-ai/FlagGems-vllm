@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Pinned vLLM native provider for the 16 immutable FP32 performance cases.
+"""Compatible vLLM native provider for the 16 immutable FP32 performance cases.
 
-The collector calls native() before build_inputs(); only that order, on real
-NVIDIA CUDA, enables automatic qualification before collection/profiling.
+The NVIDIA collector calls native() before build_inputs(); that default remains
+compatible. Other supported devices pass their actual device and expected vendor.
 Candidate benchmarks pass qualify=False and explicitly qualify any native.
 Set GUMBEL_NATIVE_SOURCE_ROOT to a task-private vLLM source tree containing the
-three exact files in NATIVE_SOURCE to avoid changing an installed vLLM package.
-The returned callable is the unmodified pinned vLLM function, not a wrapper.
+three source files named in NATIVE_SOURCE to avoid changing an installed vLLM package.
+The returned callable is the unmodified selected vLLM function, not a wrapper.
 """
 
 import ast
@@ -59,6 +59,7 @@ SHAPES = (
 SEED = 0x123456789ABCDEF
 _NATIVE_OP = None
 _NATIVE_MODULE = None
+_NATIVE_DEVICE = None
 _NATIVE_IDENTITY = {"status": "not_resolved"}
 _NATIVE_HASHES_CHECKED = set()
 _QUALIFICATIONS = {}
@@ -106,7 +107,7 @@ def config(binding, dtype):
         return {"shape": shape, "dtype": str(dt), "stride": stride, "values": values}
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_key": key_shape(binding),
         "inputs": {
             "logits": tensor(
@@ -131,7 +132,8 @@ def config(binding, dtype):
         "outputs": {"shape": [n], "dtype": "torch.int64", "stride": [1]},
         "mutation": [],
         "rng": "Murmur3 fixed explicit seed/pos; identical stream replay; no generator advance",
-        "native_source": copy.deepcopy(NATIVE_SOURCE),
+        "semantic_reference": copy.deepcopy(NATIVE_SOURCE),
+        "runtime_source_policy": "compatible-vllm-murmur3",
         "qualification_protocol": "independent-murmur-kat-cpu-winner-replay-input-and-rng-immutable-v1",
         "timing_protocol": TIMING_PROTOCOL,
         "timing": {
@@ -166,37 +168,183 @@ def build_inputs(binding, dtype, device, *, qualify=True):
         True,
         False,
     )
-    if qualify and _NATIVE_OP is not None and _is_nvidia(device):
+    if qualify and _NATIVE_OP is not None:
         qualify_native(binding, args, {}, _NATIVE_OP)
     return args, {}
 
 
-def _is_nvidia(device):
+def _device_context(device, vendor):
+    """Verify the requested vendor against the actual runtime and device name.
+
+    This permits qualification attempts on previously exercised device families;
+    it is not a claim that another SKU/compiler passed the per-case checks.
+    """
+    vendor = "thead" if vendor == "ppu" else vendor
+    known_failures = {
+        "ascend": "reference vLLM random sampling failed on the observed 910B1 stack "
+        "(expected token 60, got 27; hash KAT failed); this stack is not qualified",
+        "iluvatar": "reference vLLM random sampling failed on the observed BI-V150 stack "
+        "(expected token 60, got 90); this stack is not qualified",
+    }
+    if vendor in known_failures:
+        raise RuntimeError(known_failures[vendor])
+    expected_types = {
+        "nvidia": "cuda",
+        "thead": "cuda",
+        "metax": "cuda",
+        "hygon": "cuda",
+        "mthreads": "musa",
+    }
+    if vendor not in expected_types:
+        raise RuntimeError(f"no vLLM qualification coverage for vendor {vendor!r}")
+    if vendor == "mthreads" and not hasattr(torch, "musa"):
+        importlib.import_module("torch_musa")
     device = torch.device(device)
-    if device.type != "cuda" or not getattr(torch.version, "cuda", None):
-        return False
-    if getattr(torch.version, "hip", None) or not torch.cuda.is_available():
-        return False
-    # CUDA-compatible vendor runtimes must not silently collect as NVIDIA.
-    name = torch.cuda.get_device_name(device).lower()
-    return "nvidia" in name or "tesla" in name or "geforce" in name or "quadro" in name
+    if device.type != expected_types[vendor]:
+        raise ValueError(
+            f"vendor {vendor} requires {expected_types[vendor]}, got {device}"
+        )
+    api = getattr(torch, device.type, None)
+    for method in (
+        "is_available",
+        "current_device",
+        "get_device_name",
+        "get_rng_state",
+        "synchronize",
+    ):
+        if not callable(getattr(api, method, None)):
+            raise RuntimeError(f"torch.{device.type}.{method} is unavailable")
+    if not api.is_available():
+        raise RuntimeError(f"torch.{device.type} is unavailable")
+    if device.index is None:
+        device = torch.device(device.type, api.current_device())
+    name = api.get_device_name(device)
+    lowered = name.lower()
+    hip = bool(getattr(torch.version, "hip", None))
+    cuda = bool(getattr(torch.version, "cuda", None))
+    detected = None
+    if device.type == "musa" and ("mtt" in lowered or "mthreads" in lowered):
+        detected = "mthreads"
+    elif device.type == "cuda":
+        if hip and (lowered == "bw" or "hygon" in lowered or "dcu" in lowered):
+            detected = "hygon"
+        elif not hip:
+            if "ppu" in lowered:
+                detected = "thead"
+            elif "metax" in lowered:
+                detected = "metax"
+            elif cuda and any(
+                tag in lowered for tag in ("nvidia", "tesla", "geforce", "quadro")
+            ):
+                detected = "nvidia"
+    if detected != vendor:
+        raise ValueError(
+            f"requested vendor {vendor!r} differs from observed device: "
+            f"{device}, name={name!r}, CUDA={cuda}, HIP={hip}"
+        )
+    return (
+        device,
+        api,
+        {
+            "vendor": detected,
+            "device": str(device),
+            "device_name": name,
+            "device_api": f"torch.{device.type}",
+            "torch_cuda_version": getattr(torch.version, "cuda", None),
+            "torch_hip_version": getattr(torch.version, "hip", None),
+        },
+    )
 
 
 def _sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _verified_source(root):
+def _source_files(root):
+    """Record actual source bytes; reference hashes are not a version allowlist."""
     files = {}
-    for relative, expected in NATIVE_SOURCE["files"].items():
+    for relative in NATIVE_SOURCE["files"]:
         path = (root / relative).resolve()
-        actual = _sha(path)
-        if actual != expected:
-            raise ValueError(
-                f"native dependency differs from pin: {relative}: {actual}"
-            )
-        files[relative] = {"path": str(path), "sha256": actual}
+        files[relative] = {"path": str(path), "sha256": _sha(path)}
     return files
+
+
+def _source_digest(files):
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+
+def _check_source_unchanged(files):
+    for relative, entry in files.items():
+        if _sha(entry["path"]) != entry["sha256"]:
+            raise ValueError(f"native source changed after loading: {relative}")
+
+
+def _check_interface(module, files):
+    for entry in files.values():
+        tree = ast.parse(Path(entry["path"]).read_bytes(), filename=entry["path"])
+        for node in ast.walk(tree):
+            names = (
+                [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""] if isinstance(node, ast.ImportFrom) else []
+            )
+            if any(
+                name.split(".")[0] in ("flaggems_vllm", "flag_gems") for name in names
+            ):
+                raise ValueError(
+                    "native source must not import the candidate implementation"
+                )
+    function = module.gumbel_sample
+    if (
+        function.__globals__ is not vars(module)
+        or function.__name__ != "gumbel_sample"
+        or function.__module__.startswith(("flaggems_vllm", "flag_gems"))
+    ):
+        raise ValueError("native callable was replaced or wrapped")
+    signature = inspect.signature(function)
+    parameters = tuple(signature.parameters)
+    expected = (
+        "logits",
+        "expanded_idx_mapping",
+        "temperature",
+        "seed",
+        "pos",
+        "apply_temperature",
+        "is_drafting",
+    )
+    if parameters[:7] != expected:
+        raise ValueError(f"incompatible gumbel_sample input signature: {signature}")
+    signature.bind(None, None, None, None, None, True, False)
+    for name, default in (
+        ("use_fp64", False),
+        ("logits_cache", None),
+        ("logits_cache_col", None),
+        ("logits_cache_source", None),
+        ("logits_cache_row_mapping", None),
+        ("bias", None),
+    ):
+        if (
+            name in signature.parameters
+            and signature.parameters[name].default is not default
+        ):
+            raise ValueError(f"incompatible gumbel_sample default: {name}")
+    gumbel_path = files["vllm/v1/worker/gpu/sample/gumbel.py"]["path"]
+    draft_path = files["vllm/v1/worker/gpu/spec_decode/draft_logits.py"]["path"]
+    for name, expected_path in (
+        ("gumbel_sample", gumbel_path),
+        ("murmur3_hash32", gumbel_path),
+        ("draft_logits_row", draft_path),
+    ):
+        helper = getattr(module, name, None)
+        helper = getattr(helper, "fn", helper)
+        if not callable(helper):
+            raise ValueError(f"native source lacks compatible {name} helper")
+        path = inspect.getsourcefile(helper)
+        if not path or str(Path(path).resolve()) != expected_path:
+            raise ValueError(
+                f"native {name} was redirected outside its vLLM source file"
+            )
+    return str(signature)
 
 
 def _private_module(name, path):
@@ -207,11 +355,11 @@ def _private_module(name, path):
     return module
 
 
-def _load_pinned_source(root, files):
-    """Execute exact source with explicit imports, without importing vLLM."""
+def _load_source(root, files):
+    """Execute original source with explicit imports, without importing vLLM."""
     triton = importlib.import_module("triton")
     tl = importlib.import_module("triton.language")
-    prefix = "_flaggems_native_gumbel_" + SOURCE_SHA256[:16]
+    prefix = "_flaggems_native_gumbel_" + _source_digest(files)[:16]
     draft_path = root / "vllm/v1/worker/gpu/spec_decode/draft_logits.py"
     tree = ast.parse(draft_path.read_bytes(), filename=str(draft_path))
     node = next(
@@ -221,14 +369,13 @@ def _load_pinned_source(root, files):
     )
     helper = _private_module(prefix + "_draft", draft_path)
     helper.__dict__.update(triton=triton, tl=tl)
-    # The helper's original AST and original filename preserve source identity.
-    exec(
-        compile(ast.Module(body=[node], type_ignores=[]), str(draft_path), "exec"),
-        helper.__dict__,
-    )
     aliases = types.SimpleNamespace(triton=triton, tl=tl)
 
     def native_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.split(".")[0] in ("flaggems_vllm", "flag_gems"):
+            raise ImportError(
+                "native source must not import the candidate implementation"
+            )
         if name == "vllm.triton_utils" and set(fromlist) == {"triton", "tl"}:
             return aliases
         if name == "vllm.v1.worker.gpu.spec_decode.draft_logits" and tuple(
@@ -239,72 +386,68 @@ def _load_pinned_source(root, files):
             raise ImportError(f"unfrozen native dependency: {name}")
         return builtins.__import__(name, globals, locals, fromlist, level)
 
+    guarded_builtins = {**vars(builtins), "__import__": native_import}
+    helper.__dict__["__builtins__"] = guarded_builtins
+    # The helper's original AST and original filename preserve source identity.
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), str(draft_path), "exec"),
+        helper.__dict__,
+    )
     path = root / "vllm/v1/worker/gpu/sample/gumbel.py"
     module = _private_module(prefix, path)
-    module.__dict__["__builtins__"] = {**vars(builtins), "__import__": native_import}
+    module.__dict__["__builtins__"] = guarded_builtins
     exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     return module, {
-        "kind": "pinned_vllm_source_tree",
-        "dependency_loading": "exact gumbel source; exact draft_logits_row AST; direct triton/tl aliases",
+        "kind": "vllm_source_tree",
+        "dependency_loading": "original gumbel source; original draft_logits_row AST; direct triton/tl aliases",
         "files": files,
     }
 
 
-def native():
+def native(device="cuda", vendor="nvidia"):
     """Resolve source identity only; device qualification is a separate gate."""
-    global _NATIVE_OP, _NATIVE_MODULE, _NATIVE_IDENTITY, NATIVE_UNAVAILABLE_REASON
+    global _NATIVE_OP, _NATIVE_MODULE, _NATIVE_DEVICE, _NATIVE_IDENTITY, NATIVE_UNAVAILABLE_REASON
     _NATIVE_OP = None
     _NATIVE_MODULE = None
+    _NATIVE_DEVICE = None
     _QUALIFICATIONS.clear()
     _NATIVE_HASHES_CHECKED.clear()
+    identity = {}
+    observed = None
     disabled = os.environ.get("GUMBEL_BENCH_DISABLE_NATIVE")
     try:
         if disabled:
             raise RuntimeError(f"disabled with evidence: {disabled}")
-        if not _is_nvidia("cuda"):
-            raise RuntimeError(
-                "this native provider requires a real NVIDIA CUDA device"
-            )
+        device, _, observed = _device_context(device, vendor)
         source_root = os.environ.get("GUMBEL_NATIVE_SOURCE_ROOT")
         if source_root:
             root = Path(source_root).resolve()
-            module, identity = _load_pinned_source(root, _verified_source(root))
+            files = _source_files(root)
+            identity = {"kind": "vllm_source_tree", "files": files}
+            module, identity = _load_source(root, files)
         else:
             module = importlib.import_module("vllm.v1.worker.gpu.sample.gumbel")
-            path = Path(inspect.getsourcefile(module.gumbel_sample)).resolve()
-            root = path.parents[5]
-            files = _verified_source(root)
-            if path != Path(files["vllm/v1/worker/gpu/sample/gumbel.py"]["path"]):
-                raise ValueError("native callable was redirected outside pinned vLLM")
-            helper = getattr(module.draft_logits_row, "fn", module.draft_logits_row)
-            helper_path = inspect.getsourcefile(helper)
-            if (
-                not helper_path
-                or _sha(helper_path)
-                != NATIVE_SOURCE["files"][
-                    "vllm/v1/worker/gpu/spec_decode/draft_logits.py"
-                ]
-            ):
-                raise ValueError("native draft helper was redirected outside pin")
-            identity = {"kind": "installed_pinned_vllm", "files": files}
+            root = Path(module.__file__).resolve().parents[5]
+            files = _source_files(root)
+            identity = {"kind": "installed_vllm", "files": files}
         if module.triton is not importlib.import_module(
             "triton"
         ) or module.tl is not importlib.import_module("triton.language"):
             raise ValueError("native triton/tl aliases are not the recorded runtime")
+        signature = _check_interface(module, files)
+        _check_source_unchanged(files)
         function = module.gumbel_sample
-        if (
-            function.__globals__ is not vars(module)
-            or function.__name__ != "gumbel_sample"
-        ):
-            raise ValueError("native callable was replaced or wrapped")
-        if _sha(inspect.getsourcefile(function)) != SOURCE_SHA256:
-            raise ValueError("native callable differs from frozen source")
         _NATIVE_MODULE, _NATIVE_OP = module, function
+        _NATIVE_DEVICE = observed
         NATIVE_UNAVAILABLE_REASON = None
         _NATIVE_IDENTITY = {
             **identity,
+            "device_identity": observed,
             "status": "resolved_unqualified",
-            "source": copy.deepcopy(NATIVE_SOURCE),
+            "semantic_reference": copy.deepcopy(NATIVE_SOURCE),
+            "source_policy": "compatible-vllm-murmur3",
+            "source_digest": _source_digest(files),
+            "signature": signature,
             "torch_version": torch.__version__,
             "triton_version": module.triton.__version__,
             "triton_file": module.triton.__file__,
@@ -314,11 +457,15 @@ def native():
     except Exception as exc:
         _NATIVE_OP = None
         _NATIVE_MODULE = None
+        _NATIVE_DEVICE = None
         NATIVE_UNAVAILABLE_REASON = f"{type(exc).__name__}: {exc}"
         _NATIVE_IDENTITY = {
+            **identity,
+            "device_identity": observed,
             "status": "unavailable",
             "reason": NATIVE_UNAVAILABLE_REASON,
-            "source": copy.deepcopy(NATIVE_SOURCE),
+            "semantic_reference": copy.deepcopy(NATIVE_SOURCE),
+            "source_policy": "compatible-vllm-murmur3",
         }
         return None
 
@@ -516,20 +663,25 @@ def qualify_native(binding, args, kwargs, op):
     """
     if op is not _NATIVE_OP or _NATIVE_MODULE is None:
         raise ValueError("qualify_native requires this provider's resolved callable")
-    if not _is_nvidia(args[0].device):
-        raise ValueError("this native provider is qualified only on NVIDIA CUDA")
+    if _NATIVE_DEVICE is None:
+        raise ValueError("native device identity was not resolved")
+    device, device_api, observed = _device_context(
+        args[0].device, _NATIVE_DEVICE["vendor"]
+    )
+    if observed != _NATIVE_DEVICE:
+        raise ValueError("qualification device differs from the resolved native device")
+    _check_source_unchanged(_NATIVE_IDENTITY["files"])
     saved = _check_inputs(binding, args, kwargs)
     expected, margins = _reference_winners(*(entry[1].numpy() for entry in saved))
-    device = args[0].device
     cpu_rng = torch.get_rng_state().clone()
-    device_rng = torch.cuda.get_rng_state(device).clone()
+    device_rng = device_api.get_rng_state(device).clone()
     hash_key = (id(op), str(device))
     if hash_key not in _NATIVE_HASHES_CHECKED:
         _check_native_hashes(_NATIVE_MODULE, device)
         _NATIVE_HASHES_CHECKED.add(hash_key)
     first = op(*args, **kwargs)
     replay = op(*args, **kwargs)
-    torch.cuda.synchronize(device)
+    device_api.synchronize(device)
     n, v, _ = _case(binding)
     for output in (first, replay):
         if (
@@ -549,7 +701,7 @@ def qualify_native(binding, args, kwargs, op):
         if current != metadata or not torch.equal(current_contents, contents):
             raise AssertionError("native mutated a read-only input")
     if not torch.equal(cpu_rng, torch.get_rng_state()) or not torch.equal(
-        device_rng, torch.cuda.get_rng_state(device)
+        device_rng, device_api.get_rng_state(device)
     ):
         raise AssertionError("native advanced a default RNG state")
     finite_margins = [value for value in margins if value is not None]
@@ -558,6 +710,7 @@ def qualify_native(binding, args, kwargs, op):
         "case_key": key_shape(binding),
         "dtype": str(args[0].dtype),
         "device": str(device),
+        "device_identity": observed,
         "oracle": "independent NumPy integer Murmur3 and FP64 log1p, FP32 score",
         "minimum_sampling_winner_margin": (
             min(finite_margins) if finite_margins else None
@@ -573,10 +726,17 @@ def qualify_native(binding, args, kwargs, op):
         ).hexdigest(),
         "native_identity": native_identity(),
     }
-    _QUALIFICATIONS[(key_shape(binding), str(args[0].dtype))] = copy.deepcopy(report)
+    _QUALIFICATIONS[(key_shape(binding), str(args[0].dtype), str(device))] = (
+        copy.deepcopy(report)
+    )
     return report
 
 
 def qualification(binding, dtype):
-    """Return the latest actual qualification receipt for a collector sidecar."""
-    return copy.deepcopy(_QUALIFICATIONS.get((key_shape(binding), str(dtype))))
+    """Return the resolved device's qualification receipt for a collector sidecar."""
+    if _NATIVE_DEVICE is None:
+        return None
+    _check_source_unchanged(_NATIVE_IDENTITY["files"])
+    return copy.deepcopy(
+        _QUALIFICATIONS.get((key_shape(binding), str(dtype), _NATIVE_DEVICE["device"]))
+    )
