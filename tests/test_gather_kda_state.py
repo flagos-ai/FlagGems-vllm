@@ -66,10 +66,10 @@ def _ref_gather(cache, state_indices, has_initial_state):
     )
 
 
-@pytest.mark.kda_state_gather
+@pytest.mark.gather_kda_state
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
-def test_kda_state_gather_accuracy(case, dtype):
+def test_gather_kda_state_accuracy(case, dtype):
     S, N, H, V, K = case
     torch.manual_seed(0)
     cache = torch.randn(S, H, V, K, dtype=torch.float32, device="npu").to(dtype)
