@@ -305,6 +305,7 @@ def _cooperative_topk_impl(
     small_max_rows=64,
     wide_kernel=None,
     wide_max_width=2147483647,
+    try_specialized=None,
 ):
     """Implementation shared by the generic and vendor-specialized entrypoints.
 
@@ -313,7 +314,8 @@ def _cooperative_topk_impl(
     always use the small kernel. Validation, workspace rules, and the wide-row
     radix protocol are shared across backends. ``wide_kernel`` can replace the
     wide-row launcher up to ``wide_max_width`` after the same validation and
-    device-context setup.
+    device-context setup. An optional ``try_specialized`` launcher returns true
+    when it handles a validated call and false to use the existing Triton paths.
 
     ``logits`` is FP32 [rows, width] with contiguous columns; ``lengths``
     is contiguous INT32 with one entry per row (rank 1 or 2). Callers must
@@ -390,6 +392,10 @@ def _cooperative_topk_impl(
         return
 
     with runtime.torch_device_fn.device(logits.device):
+        if try_specialized is not None and try_specialized(
+            logits, lengths, output, workspace, k
+        ):
+            return
         # Keep the default tile bound at 8192; vendor limits can extend the
         # single-CTA path for batches where it beats the partitioned launches.
         if width <= 8192 or (width <= small_max_width and rows <= small_max_rows):

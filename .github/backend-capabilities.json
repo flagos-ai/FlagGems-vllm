@@ -21,7 +21,15 @@
     "metax-maca3720": {
       "auto_select": true
     },
-    "metax-maca3810": {},
+    "metax-maca3810": {
+      "tests_allow": [
+        "tests/test_cooperative_topk.py"
+      ],
+      "benchmarks_enabled": true,
+      "benchmarks_allow": [
+        "benchmark/test_cooperative_topk.py"
+      ]
+    },
     "mthreads-musa520": {
       "tests_allow": [
         "tests/test_fused_inv_rope_fp8_quant.py",
