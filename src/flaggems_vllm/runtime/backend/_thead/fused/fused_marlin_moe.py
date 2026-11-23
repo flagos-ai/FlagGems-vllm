@@ -1240,7 +1240,6 @@ def check_routed_fp8_scales(
 
 _PPU_DIRECT_ROUTE_LIMIT = 32
 MAX_COMPACT_SCALE_ELEMENTS = 16 * 1024
-_PPU_WIDE_SHARED_BYTES = 64 << 10
 _PPU_DENSE_MAX_DECODE_BYTES = 1 << 30
 
 
@@ -1329,206 +1328,52 @@ class MoEShape(NamedTuple):
     top_k: int
 
 
-def validate_w8(
-    shape: MoEShape,
-    activation_dtype: torch.dtype,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    group_size: int,
-    quant_type_id: int,
-) -> None:
-    _, k, n, e, _ = shape
-    if w1.shape != (e, 2 * n, k) or w2.shape != (e, k, n):
-        raise ValueError("8-bit weight shapes do not match activations")
-    allowed_group_sizes = (
-        (-1, 32, 64, 128) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (128,)
-    )
-    if group_size not in allowed_group_sizes:
-        raise NotImplementedError(
-            f"quant_type_id={quant_type_id} does not support group_size="
-            f"{group_size}"
-        )
-    if group_size != -1 and (k % group_size or n % group_size):
-        raise ValueError("Input dimensions must be divisible by group_size")
-    g1 = 1 if group_size == -1 else k // group_size
-    g2 = 1 if group_size == -1 else n // group_size
-    if w1_scale.shape != (e, 2 * n, g1) or w2_scale.shape != (e, k, g2):
-        raise ValueError("8-bit scale shapes must match the selected group size")
-    if quant_type_id == QUANT_TYPE_FP8_E4M3:
-        fp8_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
-        if w1.dtype not in (torch.uint8, fp8_dtype) or w2.dtype not in (
-            torch.uint8,
-            fp8_dtype,
-        ):
-            raise NotImplementedError("Expected output-major E4M3FN weights")
-        if w1_scale.dtype not in (torch.float16, torch.bfloat16, torch.float32) or (
-            w2_scale.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-        ):
-            raise NotImplementedError("FP8 scales must be FP16, BF16 or FP32")
-    elif w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
-        raise NotImplementedError("INT8 weights must use output-major uint8")
-    elif w1_scale.dtype != activation_dtype or w2_scale.dtype != activation_dtype:
-        raise NotImplementedError("INT8 scales must match activation dtype")
-
-
-def validate_w4(
-    shape: MoEShape,
-    activation_dtype: torch.dtype,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    group_size: int,
-    quant_type_id: int,
-) -> None:
-    _, k, n, e, _ = shape
-    if w1.shape != (e, 2 * n, k // 2) or w2.shape != (e, k, n // 2):
-        raise ValueError("4-bit weight shapes do not match activations")
-    if w1.dtype != torch.uint8 or w2.dtype != torch.uint8:
-        raise NotImplementedError("Expected output-major packed uint8 weights")
-    expected_group_size = 128 if quant_type_id == QUANT_TYPE_UINT4B8 else 32
-    if group_size != expected_group_size:
-        raise NotImplementedError(
-            f"quant_type_id={quant_type_id} requires group_size="
-            f"{expected_group_size}"
-        )
-    if k % 128 or n % 128:
-        raise ValueError(
-            "4-bit hidden_size and intermediate_size must be multiples of 128"
-        )
-    if w1_scale.shape != (e, 2 * n, k // group_size) or w2_scale.shape != (
-        e,
-        k,
-        n // group_size,
-    ):
-        raise ValueError("4-bit scale shapes do not match the selected group size")
-    if quant_type_id == QUANT_TYPE_UINT4B8:
-        if w1_scale.dtype != activation_dtype or w2_scale.dtype != activation_dtype:
-            raise NotImplementedError("INT4 scales must match activation dtype")
-    else:
-        e8m0_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
-        if w1_scale.dtype not in (torch.uint8, e8m0_dtype) or w2_scale.dtype not in (
-            torch.uint8,
-            e8m0_dtype,
-        ):
-            raise NotImplementedError("MXFP4 scales must use E8M0 bytes")
-
-
-def validate_output(
-    hidden_states: torch.Tensor,
-    output: Optional[torch.Tensor],
-    inplace: bool,
-    live_inputs: Tuple[torch.Tensor, ...],
-) -> None:
-    if inplace and output is not None:
-        raise ValueError("Cannot pass both inplace=True and output")
-    if output is not None:
-        if (
-            output.shape != hidden_states.shape
-            or output.dtype != hidden_states.dtype
-            or output.device != hidden_states.device
-        ):
-            raise ValueError("Output shape/dtype/device must match hidden_states")
-        if not output.is_contiguous() or output.requires_grad:
-            raise ValueError("Output must be contiguous and inference-only")
-    # Weights, scales and routing remain live during GEMM2.
-    target = hidden_states if inplace else output
-    if target is not None and target.numel():
-        for tensor in live_inputs:
-            if (
-                tensor.numel()
-                and target.untyped_storage().data_ptr()
-                == tensor.untyped_storage().data_ptr()
-            ):
-                raise ValueError("Output must not alias weights, scales or routing")
-
-
 def validate_inputs(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     output: Optional[torch.Tensor],
     inplace: bool,
     group_size: int,
     quant_type_id: int,
 ) -> MoEShape:
-    if any(tensor.layout != torch.strided for tensor in (w1, w2, w1_scale, w2_scale)):
-        raise NotImplementedError(
-            "PPU Marlin weights and scales require strided tensors"
-        )
-    if hidden_states.ndim != 2 or w1.ndim != 3 or w2.ndim != 3 or topk_ids.ndim != 2:
-        raise ValueError("Expected activations/routing rank 2 and weights rank 3")
-    if not w1.is_contiguous() or not w2.is_contiguous():
-        raise NotImplementedError(
-            "PPU Marlin requires contiguous output-major weights with unit K stride"
-        )
+    if inplace and output is not None:
+        raise ValueError("Cannot pass both inplace=True and output")
+    if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+        raise NotImplementedError("PPU fused Marlin MoE requires FP16 or BF16")
     m, k = hidden_states.shape
     e, n2, _ = w1.shape
     n = n2 // 2
-    if e <= 0 or n2 % 2 or min(k, n) <= 0 or k % 32 or n % 32:
-        raise ValueError(
-            "Positive K/N multiples of 32 and paired gate/up weights required"
+    if quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3):
+        allowed_group_sizes = (
+            (-1, 32, 64, 128) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (128,)
         )
-    if (
-        topk_weights.shape != topk_ids.shape
-        or topk_ids.shape[0] != m
-        or not 1 <= topk_ids.shape[1] <= e
+        if group_size not in allowed_group_sizes:
+            raise NotImplementedError(
+                f"quant_type_id={quant_type_id} does not support group_size={group_size}"
+            )
+        if (
+            k % 32
+            or n % 32
+            or (group_size != -1 and (k % group_size or n % group_size))
+        ):
+            raise ValueError("Input dimensions must be divisible by group_size")
+    else:
+        expected_group_size = 128 if quant_type_id == QUANT_TYPE_UINT4B8 else 32
+        if group_size != expected_group_size:
+            raise NotImplementedError(
+                f"quant_type_id={quant_type_id} requires group_size="
+                f"{expected_group_size}"
+            )
+        if k % 128 or n % 128:
+            raise ValueError(
+                "4-bit hidden_size and intermediate_size must be multiples of 128"
+            )
+    if output is not None and (
+        output.shape != hidden_states.shape or output.dtype != hidden_states.dtype
     ):
-        raise ValueError("Routing must have shape [M, topk], 1 <= topk <= E")
-    shape = MoEShape(m, k, n, e, topk_ids.shape[1])
-    validate_format = (
-        validate_w8
-        if quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
-        else validate_w4
-    )
-    validate_format(
-        shape,
-        hidden_states.dtype,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        group_size,
-        quant_type_id,
-    )
-    if any(
-        scale.size(-1) > 1 and scale.stride(-1) != 1 for scale in (w1_scale, w2_scale)
-    ):
-        raise NotImplementedError(
-            "PPU Marlin scales require unit stride along the group dimension"
-        )
-    if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-        raise NotImplementedError("PPU fused Marlin MoE requires FP16 or BF16")
-    if topk_ids.dtype not in (torch.int32, torch.int64) or topk_weights.dtype not in (
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-    ):
-        raise NotImplementedError("Unsupported routing dtype")
-    tensors = (hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids)
-    if hidden_states.device.type != "cuda" or any(
-        tensor.device != hidden_states.device for tensor in tensors
-    ):
-        raise ValueError("All tensors must reside on the same PPU device")
-    if any(tensor.requires_grad for tensor in tensors):
-        raise NotImplementedError("PPU fused Marlin MoE is inference-only")
-    if any(
-        not tensor.is_contiguous() for tensor in (hidden_states, topk_weights, topk_ids)
-    ):
-        raise NotImplementedError("Activations and routing must be contiguous")
-    validate_output(
-        hidden_states,
-        output,
-        inplace,
-        (w1, w2, w1_scale, w2_scale, topk_weights, topk_ids),
-    )
-    return shape
+        raise ValueError("Output shape/dtype must match hidden_states")
+    return MoEShape(m, k, n, e, topk_ids.shape[1])
 
 
 def scale_layout(scale: torch.Tensor, is_mxfp4: bool) -> ScaleLayout:
@@ -1684,7 +1529,6 @@ def direct_schedule(
     small_fp8_gate = wide_fp8_gate_shape and tokens in (1, 2, 4)
     decode_fp8_gate = (
         wide_fp8_gate_shape
-        and raw_w8
         and 4 < tokens <= 32
         and 32 <= routes <= 192
         # Denser routes reuse expert weights in the grouped projection.
@@ -1713,10 +1557,6 @@ def select_sparse_plan(call: MarlinCall, workspace_limit: int) -> SparsePlan:
         and call.hidden_states.dtype == torch.bfloat16
         and 1024 <= tokens < _PPU_DENSE_MIN_TOKENS
         and 32 * experts < routes <= 64 * experts
-        and torch.cuda.get_device_properties(
-            call.hidden_states.device
-        ).shared_memory_per_block_optin
-        >= _PPU_WIDE_SHARED_BYTES
     )
     raw_w8, raw_w4 = raw_tile_modes(call, use_wide_tile)
     direct, is_tiny_int8_matvec, small_fp8_gate, decode_fp8_gate = direct_schedule(
@@ -2475,9 +2315,6 @@ def run_dense_wna16(
         and down_tile <= k // 2
         and k % down_tile == 0
         and down_tile % 256 == 0
-        and hidden_states.is_contiguous()
-        and topk_ids.is_contiguous()
-        and topk_weights.is_contiguous()
     ):
         workspace = (
             2 * decode_elements
@@ -2518,10 +2355,6 @@ def run_dense_wna16(
             "bf16",
             gemm_stage="gemm1" if first else "gemm2",
         )
-        if config["BLOCK_SIZE_M"] != DENSE_BLOCK_ROWS:
-            raise NotImplementedError(
-                "Dense Marlin workspace requires 64-row expert blocks"
-            )
         if first:
             sorted_ids, experts, padded = align_grouped_tokens(
                 topk_ids, config["BLOCK_SIZE_M"], e
@@ -2601,13 +2434,6 @@ def run_dense_batches(
     )
     if batch_tokens < 1:
         raise NotImplementedError("PPU dense MoE workspace exceeds its budget")
-    if batch_tokens < call.shape.tokens and call.out is not call.hidden_states:
-        # A chunk can overwrite activations needed by a later chunk.
-        byte_offset = abs(call.out.data_ptr() - call.hidden_states.data_ptr())
-        if 0 < byte_offset < call.hidden_states.nbytes:
-            raise ValueError(
-                "output must not partially overlap hidden_states in chunked dense MoE"
-            )
     for start in range(0, call.shape.tokens, batch_tokens):
         end = min(start + batch_tokens, call.shape.tokens)
         run_dense_wna16(
@@ -5053,9 +4879,6 @@ def invoke_marlin_moe_gemm_direct(
     pipeline_stages: Optional[int] = None,
     use_wide_gate: bool = False,
 ) -> None:
-    if tle_async is None:
-        raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
-
     B, B_scale = stage.weight, stage.scale
     stride_se, stride_sg, stride_sn = stage.layout.strides
     reduction_size = activations.size(1)
@@ -5115,7 +4938,6 @@ def invoke_marlin_moe_gemm_direct(
 
     target = output_tile
     if split_k > 1:
-        assert use_matvec and not fuse_silu
         target = torch.empty(
             (split_k, routes, num_columns),
             device=output_tile.device,
@@ -5184,9 +5006,6 @@ def invoke_marlin_moe_gemm_reduce_direct(
     compute_type: tl.dtype,
     quant_type_id: int,
 ) -> None:
-    if tle_async is None:
-        raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
-
     B, B_scale = stage.weight, stage.scale
     stride_se, stride_sg, stride_sn = stage.layout.strides
     reduction_size = activations.size(1)
@@ -5251,8 +5070,6 @@ def stage_grouped_activations(
         and activations.dtype == torch.bfloat16
         and activations.size(1) >= 1024
         and activations.size(1) % (32 if permute_k32 else 16) == 0
-        and activations.stride(1) == 1
-        and activations.stride(0) % 2 == 0
         and activations.data_ptr() % 4 == 0
     ):
         k_pairs = activations.size(1) // 2
@@ -5458,18 +5275,19 @@ def launch_raw_projection(
             num_warps=8,
             num_stages=1,
         )
-        return
-    assert block_m == 8
-    marlin_moe_gemm_grouped_narrow_kernel[(triton.cdiv(em, 8) * triton.cdiv(n, 128),)](
-        *tile_args,
-        stage.scale_safe,
-        quant_type_id == QUANT_TYPE_FP8_E4M3,
-        USE32=use32,
-        PREFETCH_BEFORE_SCALE=prefetch_before_scale,
-        SCALE_PAIR=scale_pair,
-        num_warps=8,
-        num_stages=1,
-    )
+    else:
+        marlin_moe_gemm_grouped_narrow_kernel[
+            (triton.cdiv(em, 8) * triton.cdiv(n, 128),)
+        ](
+            *tile_args,
+            stage.scale_safe,
+            quant_type_id == QUANT_TYPE_FP8_E4M3,
+            USE32=use32,
+            PREFETCH_BEFORE_SCALE=prefetch_before_scale,
+            SCALE_PAIR=scale_pair,
+            num_warps=8,
+            num_stages=1,
+        )
 
 
 def invoke_marlin_moe_gemm_grouped(
@@ -5492,8 +5310,6 @@ def invoke_marlin_moe_gemm_grouped(
     raw_w4: bool = False,
     packed_width: bool = False,
 ) -> None:
-    if tle_async is None:
-        raise RuntimeError("PPU fused Marlin MoE requires Triton TLE")
     B, B_scale = stage.weight, stage.scale
     stride_se, stride_sg, stride_sn = stage.layout.strides
     em = sorted_token_ids.size(0)
@@ -5719,7 +5535,6 @@ def run_direct(
     tiny_fp8_down = (
         plan.small_fp8_gate
         and call.shape.tokens == 2
-        and call.w2.is_contiguous()
         and call.w2_scale.is_contiguous()
         and call.w2.numel() < (1 << 31)
     )
@@ -5995,10 +5810,6 @@ def run_marlin_moe(
     shape = validate_inputs(
         hidden_states,
         w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        topk_weights,
         topk_ids,
         output,
         inplace,
@@ -6076,10 +5887,13 @@ def fused_marlin_moe(
         quant_type_id = QUANT_TYPE_FP8_E4M3
     if quant_type_id not in _PPU_QUANT_TYPES:
         return generic_fused_marlin_moe(**locals())
-    activation_str = getattr(
-        activation, "value", getattr(activation, "name", activation)
-    )
-    if activation_str is not None and str(activation_str).lower() != "silu":
+    if isinstance(activation, Enum):
+        if (
+            activation.name.lower() != "silu"
+            and str(activation.value).lower() != "silu"
+        ):
+            raise NotImplementedError("PPU fused Marlin MoE supports only SiLU")
+    elif activation is not None and str(activation).lower() != "silu":
         raise NotImplementedError("PPU fused Marlin MoE supports only SiLU")
     if any(
         value is not None for value in (g_idx1, g_idx2, sort_indices1, sort_indices2)
@@ -6109,7 +5923,7 @@ def fused_marlin_moe(
             "Unsupported PPU fused Marlin MoE option "
             "(bias/map/scaling/workspace/activation)"
         )
-    if w1.ndim != 3 or global_num_experts not in (-1, w1.shape[0]):
+    if global_num_experts not in (-1, w1.shape[0]):
         raise NotImplementedError("PPU fused Marlin MoE requires local weights")
     return run_marlin_moe(
         hidden_states,
