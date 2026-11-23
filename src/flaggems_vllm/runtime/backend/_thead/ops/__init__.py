@@ -19,6 +19,9 @@ from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import cooperativ
 from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._thead.ops.fused_indexer_weight_scale import (
+    fused_indexer_weight_scale,
+)
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -55,6 +58,7 @@ __all__ = [
     "chunk_gated_delta_rule_w8a16_int8",
     "cooperative_topk",
     "fused_experts_impl",
+    "fused_indexer_weight_scale",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
