@@ -204,16 +204,22 @@ def test_mhc_post_hc2_delegates():
 @requires_ascend
 @pytest.mark.parametrize(
     "variant",
-    ["pipeline", "rows", "concat_reduce"],
-    ids=["pipeline", "rows", "concat_reduce"],
+    ["persistent", "pipeline", "rows", "concat_reduce"],
+    ids=["persistent", "pipeline", "rows", "concat_reduce"],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_mhc_post_ascend_variants(dtype, variant):
-    """All three TLE kernels must agree with the AscendC reference."""
+    """Every TLE kernel must agree with the AscendC reference.
+
+    ``persistent`` is the default fast path (grid-stride over the vector cores,
+    row-wise math, unpadded ``BLOCK_D``); the other three are the older
+    per-token kernels, kept reachable through ``use_persistent=False``.
+    """
     kwargs = {
-        "pipeline": {},
-        "rows": {"use_pipeline": False},
-        "concat_reduce": {"use_concat_reduce": True},
+        "persistent": {},
+        "pipeline": {"use_persistent": False},
+        "rows": {"use_persistent": False, "use_pipeline": False},
+        "concat_reduce": {"use_persistent": False, "use_concat_reduce": True},
     }[variant]
     data = _make_ascend_data(8, 1024, dtype=dtype)
     out = _ascend_entry()(*data, **kwargs)
