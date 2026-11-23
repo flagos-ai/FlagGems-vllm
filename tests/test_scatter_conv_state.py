@@ -78,10 +78,10 @@ def _ref_scatter(conv_state, staged, flat):
     conv_state.index_copy_(0, safe, restore)
 
 
-@pytest.mark.kda_conv_scatter
+@pytest.mark.scatter_conv_state
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
-def test_conv_scatter_accuracy(case, dtype):
+def test_scatter_conv_state_accuracy(case, dtype):
     conv_state, idx = _make_inputs(case, seed=1, dtype=dtype)
     staged = torch.randn_like(conv_state[: idx.numel()]).to(dtype)
 
