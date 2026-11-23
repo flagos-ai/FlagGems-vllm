@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from functools import partial
-from importlib import import_module
 
 import pytest
 import torch
@@ -44,13 +43,12 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             [torch.bfloat16],
         )
         if SPARSE_INT8_OP is not None:
-            implementation = import_module(SPARSE_INT8_OP.__module__)
-            self.prepare_int8 = implementation.prepare_flash_mla_sparse_fwd_w8a8_int8
+            self.is_int8 = True
             # The native comparison includes BF16 input rounding.
             self.assert_output = partial(assert_sparse_int8_close, lse_atol=2e-3)
             self.set_gems(SPARSE_INT8_OP)
         else:
-            self.prepare_int8 = None
+            self.is_int8 = False
             self.assert_output = assert_sparse_fixture_close
             self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
 
@@ -62,21 +60,21 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
                     "optionally followed by sink,topk_length,seed"
                 )
             inputs = make_sparse_inputs(shape, dtype=dtype)
-            int8 = self.prepare_int8 is not None
-            packed = quantize_sparse_fixture(*inputs, int8=int8)
-            if int8:
+            packed = quantize_sparse_fixture(*inputs, int8=self.is_int8)
+            if self.is_int8:
                 q, kv, indices, *options = dequantize_sparse_int8_fixture(
                     packed, inputs[1].shape[0], dtype
                 )
-                # Keep reference indices separate from the prepared INT8 input.
+                # Validate on a separate clone because native flash_mla_sparse_fwd
+                # can sort indices in-place on Hygon.
+                validation_inputs = (q, kv, indices.clone(), *options)
                 inputs = (q, kv, indices.clone(), *options)
-                run = self.prepare_int8(*packed)
             else:
-                run = partial(self.gems_op, *packed)
-            reference, _, reference_lse = self.torch_op(*inputs)
-            output, lse = run()
+                validation_inputs = inputs
+            reference, _, reference_lse = self.torch_op(*validation_inputs)
+            output, lse = self.gems_op(*packed)
             self.assert_output(output[:, 0], lse[:, :, 0], reference, reference_lse)
-            yield inputs, run, shape
+            yield inputs, packed, shape
 
     def unpack_to_args_kwargs(self, input_tuple):
         return [input_tuple], {}
@@ -85,10 +83,9 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
         return input_tuple[2]
 
     def get_latency(self, op, *args, **kwargs):
-        original, run, _ = args[0]
-        if op is self.gems_op:
-            return super().get_latency(run)
-        return super().get_latency(op, *original)
+        original, packed, _ = args[0]
+        selected = packed if op is self.gems_op else original
+        return super().get_latency(op, *selected)
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8

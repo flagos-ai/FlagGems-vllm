@@ -2,14 +2,30 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-from functools import partial
+from functools import lru_cache, partial
 from typing import Callable, Optional
 
 import torch
 import triton
 import triton.language as tl
 
-_V32_ORDER_MIN_TOKENS = 65536
+V32_ORDER_MIN_TOKENS = 65536
+V32_ROW_CHUNK = 512
+CTAS_PER_CU_TARGET = 4
+INT64_KV_TOKEN_THRESHOLD = tl.constexpr(4194304)
+LOG2_E = tl.constexpr(1.4426950408889634)
+LN_2 = tl.constexpr(0.6931471805599453)
+SCALE_FLOOR = tl.constexpr(1.0e-30)
+UNSIGNED_P14_ROUND_BIAS = tl.constexpr(65536.0)
+UNSIGNED_P14_ROUND_BITS = tl.constexpr(0x47800000)
+SIGNED_P14_ROUND_BIAS = tl.constexpr(12582912.0)
+SIGNED_P14_ROUND_BITS = tl.constexpr(0x4B400000)
+
+
+@lru_cache(maxsize=8)
+def get_target_cta_count(device_index: int) -> int:
+    props = torch.cuda.get_device_properties(device_index)
+    return props.multi_processor_count * CTAS_PER_CU_TARGET
 
 
 @triton.jit
@@ -77,16 +93,17 @@ def sparse_int8_attention(
         split = 0
     else:
         value_offset = 0
+    row_i64 = row.to(tl.int64)
     heads = head_tile * BH + tl.arange(0, BH)
     lanes = tl.arange(0, BN)
     dims = tl.arange(0, BK)
     vd = value_offset + tl.arange(0, 128)
-    query_row = row * H + heads
-    query_scale = tl.load(QScale + query_row) * (Scale * 1.4426950408889634)
+    query_row = row_i64 * H + heads
+    query_scale = tl.load(QScale + query_row) * (Scale * LOG2_E)
     if Rope:
         rd = tl.arange(0, 64)
         qr = tl.load(QRope + query_row[:, None] * 64 + rd[None, :])
-    length = tl.minimum(tl.maximum(tl.load(Length + row), 0), K) if HasLength else K
+    length = tl.minimum(tl.maximum(tl.load(Length + row_i64), 0), K) if HasLength else K
     maximum = tl.full((BH,), -float("inf"), tl.float32)
     denominator = tl.full((BH,), 0.0, tl.float32)
     # Bound the live QK register tile and reload V in channel panels.
@@ -107,10 +124,10 @@ def sparse_int8_attention(
     end = tl.minimum(begin + SplitTiles * BN, length)
     for start in range(begin, end, BN):
         offsets = start + lanes
-        token = tl.load(Indices + row * K + offsets, offsets < length, -1)
+        token = tl.load(Indices + row_i64 * K + offsets, offsets < length, -1)
         valid = (token >= 0) & (token < Tokens)
         token = tl.where(valid, token, 0)
-        if Tokens <= 4194304:
+        if Tokens <= INT64_KV_TOKEN_THRESHOLD:
             kv_base = KV + token[:, None] * 512
         else:
             kv_base = KV + token[:, None].to(tl.int64) * 512
@@ -158,13 +175,15 @@ def sparse_int8_attention(
             probability = tl.exp2(score - safe_maximum[None, :])
             weight = probability * ks[:, None]
         denominator = denominator * correction + tl.sum(probability, TokenAxis)
-        weight_scale = tl.maximum(tl.max(weight, TokenAxis) * (1.0 / 127), 1.0e-30)
+        weight_scale = tl.maximum(tl.max(weight, TokenAxis) * (1.0 / 127), SCALE_FLOOR)
         if HeadMajor:
             scaled = weight * (1.0 / weight_scale[:, None])
         else:
             scaled = weight * (1.0 / weight_scale[None, :])
         # The FP32 ULP at 65536 is 1/128: split the rounded fixed point into signed bytes.
-        quant = (scaled + 65536.0).to(tl.int32, bitcast=True) - 0x47800000
+        quant = (scaled + UNSIGNED_P14_ROUND_BIAS).to(
+            tl.int32, bitcast=True
+        ) - UNSIGNED_P14_ROUND_BITS
         high_raw = (quant + 64) >> 7
         high = high_raw.to(tl.int8)
         low = (quant - (high_raw << 7)).to(tl.int8)
@@ -200,7 +219,7 @@ def sparse_int8_attention(
             )
         maximum = next_maximum
 
-    maximum *= 0.6931471805599453
+    maximum *= LN_2
     if Splits == 1:
         logsum = tl.where(denominator > 0, maximum + tl.log(denominator), float("inf"))
         inv = 1.0 / tl.where(denominator > 0, denominator, 1.0)
@@ -219,9 +238,9 @@ def sparse_int8_attention(
             tl.store(ptr + 256, acc2 * inv)
             tl.store(ptr + 384, acc3 * inv)
         if value_offset == 0:
-            tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, logsum)
+            tl.store(LSE + (row_i64 // SQ * H + heads) * SQ + row_i64 % SQ, logsum)
     else:
-        partial_row = (row * Splits + split) * H + heads
+        partial_row = (row_i64 * Splits + split) * H + heads
         if HeadMajor:
             ptr = Partial + partial_row[:, None] * 512 + vd[None, :]
         else:
@@ -249,9 +268,10 @@ def merge_sparse_int8_attention(
     BV: tl.constexpr,
 ):
     row, head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    row_i64 = row.to(tl.int64)
     splits = tl.arange(0, SplitBlock)
     channels = tile * BV + tl.arange(0, BV)
-    partial_row = (row * Splits + splits) * H + head
+    partial_row = (row_i64 * Splits + splits) * H + head
     maxima = tl.load(Stats + partial_row * 2, splits < Splits, -float("inf"))
     sums = tl.load(Stats + partial_row * 2 + 1, splits < Splits, 0.0)
     maximum = tl.max(maxima, 0)
@@ -269,13 +289,13 @@ def merge_sparse_int8_attention(
         0.0,
     )
     output = tl.sum(partial * weights[:, None], 0) * inv
-    tl.store(Output + (row * H + head) * 512 + channels, output)
+    tl.store(Output + (row_i64 * H + head) * 512 + channels, output)
     if tile == 0:
-        tl.store(LSE + (row // SQ * H + head) * SQ + row % SQ, logsum)
+        tl.store(LSE + (row_i64 // SQ * H + head) * SQ + row_i64 % SQ, logsum)
 
 
 @triton.jit
-def _v32_order_qk_tiles(
+def v32_order_qk_tiles(
     Indices,
     Order,
     Rows: tl.constexpr,
@@ -290,7 +310,7 @@ def _v32_order_qk_tiles(
     row_start = block * Chunk
     count = tl.minimum(Chunk, Rows - row_start) * Tiles
     valid = tasks < count
-    offset = (row_start * Tiles + tasks) * 128
+    offset = (row_start.to(tl.int64) * Tiles + tasks) * 128
     first = tl.load(Indices + offset, valid, -1)
     middle = tl.load(Indices + offset + 64, valid, -1)
     pair_valid = (first >= 0) & (first < Tokens) & (middle >= 0) & (middle < Tokens)
@@ -308,7 +328,7 @@ def _v32_order_qk_tiles(
 
 
 @triton.jit
-def _v32_prefill_weights(
+def v32_prefill_weights(
     Q,
     QRope,
     KV,
@@ -337,17 +357,18 @@ def _v32_prefill_weights(
         task = tl.load(Order + tl.program_id(0))
         tile, head_tile, local_row = task % (K // 128), 0, task // (K // 128)
     row = RowOffset + local_row
+    row_i64 = row.to(tl.int64)
     heads = head_tile * 64 + tl.arange(0, 64)
     offsets = tile * 128 + tl.arange(0, 128)
-    length = tl.minimum(K, tl.load(Length + row)) if HasLength else K
-    token = tl.load(Indices + row * K + offsets, offsets < length, -1)
+    length = tl.minimum(tl.maximum(tl.load(Length + row_i64), 0), K) if HasLength else K
+    token = tl.load(Indices + row_i64 * K + offsets, offsets < length, -1)
     valid = (token >= 0) & (token < Tokens)
     token = tl.where(valid, token, 0)
-    query_row = row * H + heads
+    query_row = row_i64 * H + heads
     channels = tl.arange(0, 128)
     query_base = Q + query_row[:, None] * 512 + channels[None, :]
     key_base = KV + token[None, :].to(tl.int64) * 512 + channels[:, None]
-    qs = tl.load(QScale + query_row) * (Scale * 1.4426950408889634)
+    qs = tl.load(QScale + query_row) * (Scale * LOG2_E)
     ks = tl.load(KScale + token, valid, 0.0)
     content = tl.full((64, 128), 0, tl.int32)
     for panel in range(4):
@@ -373,12 +394,15 @@ def _v32_prefill_weights(
     probability = tl.exp2(score - safe_maximum[:, None])
     weight = probability * ks[None, :]
     # Represent each weight in units of 1/128 of the signed INT8 range.
-    quantum = tl.maximum(tl.max(tl.abs(weight), 1) * (1.0 / (127 * 128)), 1.0e-30)
+    quantum = tl.maximum(tl.max(tl.abs(weight), 1) * (1.0 / (127 * 128)), SCALE_FLOOR)
     scaled = weight * (1.0 / quantum[:, None])
     if H > 64 or Tokens <= 16384:
-        # The signed P14 range fits in the FP32 unit-ULP bin around this bias.
-        quant = (scaled + 12582912.0).to(tl.int32, bitcast=True) - 0x4B400000
+        # Use FP32 bias bitcast rounding to reduce VALU instructions on compute-bound regimes.
+        quant = (scaled + SIGNED_P14_ROUND_BIAS).to(
+            tl.int32, bitcast=True
+        ) - SIGNED_P14_ROUND_BITS
     else:
+        # On large-cache H64 kernels, arithmetic rounding avoids extra bitcast register pressure.
         quant = (scaled + tl.where(scaled >= 0.0, 0.5, -0.5)).to(tl.int32)
     high = (quant + 64) >> 7
     low = quant - (high << 7)
@@ -392,7 +416,7 @@ def _v32_prefill_weights(
 
 
 @triton.jit
-def _v32_normalize_tile_stats(
+def v32_normalize_tile_stats(
     TileStats,
     Sink,
     LSE,
@@ -403,7 +427,7 @@ def _v32_normalize_tile_stats(
     HasSink: tl.constexpr,
 ):
     head_tile, local_row = tl.program_id(0), tl.program_id(1)
-    row = RowOffset + local_row
+    row_i64 = (RowOffset + local_row).to(tl.int64)
     heads = head_tile * 32 + tl.arange(0, 32)
     tiles = tl.arange(0, K // 128)
     stats_offsets = (local_row * (K // 128) + tiles[:, None]) * 3 * H + heads[None, :]
@@ -416,7 +440,7 @@ def _v32_normalize_tile_stats(
     denominator = tl.sum(tile_masses * retain, 0)
     lse = tl.where(
         denominator > 0.0,
-        maximum * 0.6931471805599453 + tl.log(denominator),
+        maximum * LN_2 + tl.log(denominator),
         float("inf"),
     )
     inverse = 1.0 / tl.where(denominator > 0.0, denominator, 1.0)
@@ -425,11 +449,11 @@ def _v32_normalize_tile_stats(
         inverse *= tl.where(denominator > 0.0, 1.0 / (1.0 + tl.exp(sink - lse)), 0.0)
     # Reuse the quantum slots for factors shared by all value blocks.
     tl.store(TileStats + stats_offsets + 2 * H, quantum * retain * inverse[None, :])
-    tl.store(LSE + (row // SQ * H + heads) * SQ + row % SQ, lse)
+    tl.store(LSE + (row_i64 // SQ * H + heads) * SQ + row_i64 % SQ, lse)
 
 
 @triton.jit
-def _v32_prefill_values(
+def v32_prefill_values(
     KV,
     Indices,
     Length,
@@ -448,15 +472,15 @@ def _v32_prefill_values(
         tl.program_id(1),
         tl.program_id(2),
     )
-    row = RowOffset + local_row
+    row_i64 = (RowOffset + local_row).to(tl.int64)
     heads = head_tile * 64 + tl.arange(0, 64)
     channels = value_tile * BV + tl.arange(0, BV)
     lanes = tl.arange(0, 128)
-    length = tl.minimum(K, tl.load(Length + row)) if HasLength else K
+    length = tl.minimum(tl.maximum(tl.load(Length + row_i64), 0), K) if HasLength else K
     output = tl.full((64, BV), 0.0, tl.float32)
     for tile in tl.range(0, K // 128, loop_unroll_factor=1):
         offsets = tile * 128 + lanes
-        token = tl.load(Indices + row * K + offsets, offsets < length, -1)
+        token = tl.load(Indices + row_i64 * K + offsets, offsets < length, -1)
         valid = (token >= 0) & (token < Tokens)
         token = tl.where(valid, token, 0).to(tl.int64)
         values = tl.load(
@@ -473,10 +497,13 @@ def _v32_prefill_values(
         stats = (local_row * (K // 128) + tile) * 3 * H + heads
         scale = tl.load(TileStats + stats + 2 * H)
         output += numerator.to(tl.float32) * scale[:, None]
-    tl.store(Output + (row * H + heads[:, None]) * 512 + channels[None, :], output)
+    tl.store(
+        Output + (row_i64 * H + heads[:, None]) * 512 + channels[None, :],
+        output,
+    )
 
 
-def _prepare_v32_prefill(
+def prepare_v32_prefill(
     q_nope,
     q_rope,
     k_cache_lora,
@@ -498,14 +525,14 @@ def _prepare_v32_prefill(
     bv = 256 if tokens > 16384 else 128
     pv_warps = 8 if bv == 256 else 4
     # Process row chunks so the P14 workspace does not grow with the batch.
-    chunk = min(rows, 512)
+    chunk = min(rows, V32_ROW_CHUNK)
     tiles = topk // 128
     weights = torch.empty((chunk, heads, topk), device=q_nope.device, dtype=torch.int16)
     stats = torch.empty(
         (chunk, tiles, 3, heads), device=q_nope.device, dtype=torch.float32
     )
     order = None
-    if heads == 64 and tokens >= _V32_ORDER_MIN_TOKENS:
+    if heads == 64 and tokens >= V32_ORDER_MIN_TOKENS:
         chunks = triton.cdiv(rows, chunk)
         order_block = triton.next_power_of_2(chunk * tiles)
         # Reserve bits for the task ID and leave the largest key for padding.
@@ -516,7 +543,7 @@ def _prepare_v32_prefill(
 
     def run():
         if order is not None:
-            _v32_order_qk_tiles[(chunks,)](
+            v32_order_qk_tiles[(chunks,)](
                 indices,
                 order,
                 rows,
@@ -534,7 +561,7 @@ def _prepare_v32_prefill(
                 if order is not None
                 else (tiles, heads // 64, count)
             )
-            _v32_prefill_weights[qk_grid](
+            v32_prefill_weights[qk_grid](
                 q_nope,
                 q_rope,
                 k_cache_lora,
@@ -556,7 +583,7 @@ def _prepare_v32_prefill(
                 num_stages=1,
                 kpack=2,
             )
-            _v32_normalize_tile_stats[(heads // 32, count)](
+            v32_normalize_tile_stats[(heads // 32, count)](
                 stats,
                 attn_sink,
                 lse,
@@ -567,7 +594,7 @@ def _prepare_v32_prefill(
                 attn_sink is not None,
                 num_warps=4,
             )
-            _v32_prefill_values[(512 // bv, heads // 64, count)](
+            v32_prefill_values[(512 // bv, heads // 64, count)](
                 k_cache_lora,
                 indices,
                 topk_length,
@@ -588,7 +615,7 @@ def _prepare_v32_prefill(
     return run
 
 
-def prepare_flash_mla_sparse_fwd_w8a8_int8(
+def validate_sparse_int8_inputs(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_cache_lora: torch.Tensor,
@@ -596,10 +623,10 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     indices: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    attn_sink: Optional[torch.Tensor] = None,
-    topk_length: Optional[torch.Tensor] = None,
-) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
+    softmax_scale: Optional[float],
+    attn_sink: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor],
+) -> tuple[int, int, int, int, int, int, float]:
     if q_nope.ndim != 4 or k_cache_lora.ndim != 3 or indices.ndim != 3:
         raise ValueError("Expected rank-four Q, rank-three KV and rank-three indices")
     batch, sq, heads, content_dim = q_nope.shape
@@ -655,22 +682,52 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
             tensor.device != device or not tensor.is_contiguous()
         ):
             raise ValueError("All inputs must be contiguous and on the same device")
+    if isinstance(softmax_scale, bool):
+        raise TypeError("softmax_scale must be a positive finite float or None")
     scale = (512 + rope) ** -0.5 if softmax_scale is None else float(softmax_scale)
-    if not math.isfinite(scale):
-        raise ValueError("softmax_scale must be finite")
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("softmax_scale must be positive and finite")
+    return batch, sq, heads, pages, topk, rope, scale
 
+
+def prepare_flash_mla_sparse_fwd_w8a8_int8(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_cache_lora: torch.Tensor,
+    k_cache_rope: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    indices: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
+    batch, sq, heads, pages, topk, rope, scale = validate_sparse_int8_inputs(
+        q_nope,
+        q_rope,
+        k_cache_lora,
+        k_cache_rope,
+        q_scale,
+        k_scale,
+        indices,
+        softmax_scale,
+        attn_sink,
+        topk_length,
+    )
+    rows = batch * sq
+    device = q_nope.device
     output = torch.empty_like(q_nope, dtype=q_rope.dtype)
     lse = torch.empty((batch, heads, sq), dtype=torch.float32, device=device)
     if rows == 0:
         return lambda: (output, lse)
     # With a large H64 cache, ordering the parallel QK tiles by KV location
     # also pays off for shorter batches.
-    h64_min_rows = 64 if pages * 64 >= _V32_ORDER_MIN_TOKENS else 4096
+    h64_min_rows = 64 if pages * 64 >= V32_ORDER_MIN_TOKENS else 4096
     use_staged_v32 = (heads == 128 and rows >= 32) or (
         heads == 64 and rows >= h64_min_rows
     )
     if rope == 64 and topk == 2048 and use_staged_v32:
-        return _prepare_v32_prefill(
+        return prepare_v32_prefill(
             q_nope,
             q_rope,
             k_cache_lora,
@@ -706,8 +763,8 @@ def prepare_flash_mla_sparse_fwd_w8a8_int8(
     else:
         bn, bk, warps = 64, 256 if head_major else 128, 4
     tiles = triton.cdiv(topk, bn)
-    # Target four CTAs per CU on the 80-CU HCU BW.
-    occupancy = triton.cdiv(320, rows * (heads // bh))
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    occupancy = triton.cdiv(get_target_cta_count(device_index), rows * (heads // bh))
     num_splits = min(32, triton.next_power_of_2(occupancy))
     if small_decode and topk <= 1024:
         # Keep at least two KV tiles in most splits to amortize scratch and merge.
