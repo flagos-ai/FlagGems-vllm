@@ -35,6 +35,10 @@ else:
 
 THREADS_PER_BLOCK = 1024
 RADIX = 256
+# Candidate capacity for the inline coarse+refine wide path. Must keep the
+# per-group workspace (histogram + state + 2*CAP uint32) within the caller
+# budget even at num_groups == num_rows (<= 32): 32*(3072+32+2*2048*4) < 1 MiB.
+RADIX_CAPACITY = 2048
 MEDIUN_HIST_BYTES = 2 * (RADIX + 128) * 4  # 3072
 MEDIUM_SCALARS_BYTES = 5 * 4  # 20
 MEDIUM_HEADER_SIZE = (MEDIUN_HIST_BYTES + MEDIUM_SCALARS_BYTES + 127) & (~127)  # 3200
@@ -123,6 +127,297 @@ def _barrier_with_atomic_add(
             sem="acquire",
             scope="gpu",
         )
+
+
+# Inline coarse+refine wide path: linear 256-bin coarse histogram (order
+# preserving over [-4, 4], NaN -> top) prunes the row to a single threshold
+# bucket, whose candidates are compacted into the caller workspace and then
+# refined by a single-CTA 4-round radix on their exact 32-bit keys. If the
+# threshold bucket overflows RADIX_CAPACITY it returns overflow=True and the
+# caller falls back to the classic 4-round global radix.
+@triton.jit
+def _radix_topk_coarse(
+    row_input,
+    row_output,
+    seq_len,
+    my_chunk_start,
+    CHUNK_SIZE: tl.constexpr,
+    local_histogram_ptr,
+    suffix_sum_ptr,
+    shared_scalars_ptr,
+    shared_ordered_ptr,
+    g_histogram_ptr,
+    g_state_ptr,
+    g_cand_keys_ptr,
+    g_cand_idx_ptr,
+    cta_in_group,
+    ctas_per_group,
+    barrier_phase,
+    iter_idx,
+    TOPK: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    RADIX: tl.constexpr = 256
+    CAP: tl.constexpr = 2048
+
+    my_chunk_end = my_chunk_start + CHUNK_SIZE
+    my_chunk_end = min(my_chunk_end, seq_len)
+    actual_chunk_size = my_chunk_end - my_chunk_start if my_chunk_start < seq_len else 0
+    lane = tl.arange(0, BLOCK_SIZE)
+    zeros = tl.zeros([BLOCK_SIZE], dtype=tl.uint32)
+    zeros_2d = tl.zeros([BLOCK_SIZE, VEC_SIZE], dtype=tl.uint32)
+    vec = tl.arange(0, VEC_SIZE)
+
+    # The coarse histogram and compaction read logits directly from global
+    # memory (no shared round-trip); only the overflow fallback loads the chunk.
+    n_vec_full = actual_chunk_size // (BLOCK_SIZE * VEC_SIZE)
+    rem_tiles = (actual_chunk_size - n_vec_full * BLOCK_SIZE * VEC_SIZE) // BLOCK_SIZE
+    rem_elems = actual_chunk_size % BLOCK_SIZE
+
+    tl.store(shared_scalars_ptr + zeros, 0, mask=lane == 0)  # prefix (unused here)
+    tl.store(shared_scalars_ptr + 1 + zeros, TOPK, mask=lane == 0)  # remaining_k
+    tl.debug_barrier()
+
+    _barrier_with_atomic_add(
+        g_state_ptr + 2, zeros, lane, (barrier_phase + 1) * ctas_per_group
+    )
+    barrier_phase += 1
+
+    if cta_in_group == 0:
+        tl.store(g_histogram_ptr + lane, 0, mask=lane < RADIX)
+        tl.store(g_histogram_ptr + RADIX + lane, 0, mask=lane < RADIX)
+        tl.store(g_histogram_ptr + 2 * RADIX + lane, 0, mask=lane < RADIX)
+        tl.store(g_state_ptr + 3 + zeros, 0, mask=lane == 0)  # output counter
+        tl.store(g_state_ptr + 4 + zeros, 0, mask=lane == 0)  # candidate counter
+
+    # Coarse histogram: linear 256-bin key over [-4, 4], NaN -> 255.
+    tl.store(local_histogram_ptr + lane, 0, mask=lane < RADIX)
+    tl.debug_barrier()
+    for t in tl.range(0, n_vec_full):
+        base = t * BLOCK_SIZE * VEC_SIZE + lane * VEC_SIZE
+        offs = base[:, None] + vec[None, :]
+        x = tl.load(row_input + my_chunk_start + offs)
+        scaled = tl.minimum(tl.maximum(x, -4.0), 4.0) * 32.0
+        digit = tl.minimum(scaled.to(tl.int32) + 128, 255)
+        bits = x.to(tl.uint32, bitcast=True)
+        bucket = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 255, digit)
+        tl.atomic_add(
+            local_histogram_ptr + bucket.reshape(BLOCK_SIZE * VEC_SIZE),
+            1,
+            sem="relaxed",
+            scope="cta",
+        )
+    for t in tl.range(0, rem_tiles):
+        offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
+        x = tl.load(row_input + my_chunk_start + offs)
+        scaled = tl.minimum(tl.maximum(x, -4.0), 4.0) * 32.0
+        digit = tl.minimum(scaled.to(tl.int32) + 128, 255)
+        bits = x.to(tl.uint32, bitcast=True)
+        bucket = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 255, digit)
+        tl.atomic_add(local_histogram_ptr + bucket, 1, sem="relaxed", scope="cta")
+    if rem_elems > 0:
+        offs = (n_vec_full * VEC_SIZE + rem_tiles) * BLOCK_SIZE + lane
+        in_range = lane < rem_elems
+        x = tl.load(
+            row_input + my_chunk_start + offs, mask=in_range, other=float("-inf")
+        )
+        scaled = tl.minimum(tl.maximum(x, -4.0), 4.0) * 32.0
+        digit = tl.minimum(scaled.to(tl.int32) + 128, 255)
+        bits = x.to(tl.uint32, bitcast=True)
+        bucket = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 255, digit)
+        tl.atomic_add(
+            local_histogram_ptr + bucket, 1, mask=in_range, sem="relaxed", scope="cta"
+        )
+    tl.debug_barrier()
+    counts = tl.load(local_histogram_ptr + lane, mask=lane < RADIX)
+    tl.atomic_add(
+        g_histogram_ptr + lane,
+        counts,
+        mask=(counts > 0) & (lane < RADIX),
+        sem="relaxed",
+        scope="gpu",
+    )
+    _barrier_with_atomic_add(
+        g_state_ptr + 2, zeros, lane, (barrier_phase + 1) * ctas_per_group
+    )
+    barrier_phase += 1
+
+    # Suffix scan + threshold.
+    g_counts = tl.load(g_histogram_ptr + lane, mask=lane < RADIX, other=0)
+    tl.store(suffix_sum_ptr + lane, g_counts, mask=lane < RADIX)
+    tl.debug_barrier()
+    for t in tl.static_range(0, 8):
+        val = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX)
+        other_offs = lane + (1 << t)
+        tmp = tl.load(suffix_sum_ptr + other_offs, mask=other_offs < RADIX, other=0)
+        val += tmp
+        tl.debug_barrier()
+        tl.store(suffix_sum_ptr + lane, val, mask=lane < RADIX)
+        tl.debug_barrier()
+
+    remaining_k = tl.load(shared_scalars_ptr + 1)
+    count_ge = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX, other=0)
+    count_gt = tl.load(suffix_sum_ptr + lane + 1, mask=(lane + 1) < RADIX, other=0)
+    threshold_mask = (count_ge >= remaining_k) & (count_gt < remaining_k) & (lane < RADIX)
+    tl.store(shared_scalars_ptr + 2 + zeros, lane, mask=threshold_mask)
+    tl.store(shared_scalars_ptr + 3 + zeros, remaining_k - count_gt, mask=threshold_mask)
+    tl.store(
+        shared_scalars_ptr + 4 + zeros, count_ge - count_gt, mask=threshold_mask
+    )  # num_equal
+    tl.debug_barrier()
+    threshold_bin = tl.load(shared_scalars_ptr + 2)
+    next_remaining_k = tl.load(shared_scalars_ptr + 3)
+    tl.store(shared_scalars_ptr + 1 + zeros, next_remaining_k, mask=lane == 0)
+    num_equal = tl.load(shared_scalars_ptr + 4).to(tl.int32)
+    tl.debug_barrier()
+
+    if num_equal > CAP:
+        return barrier_phase, True
+
+    # Compact: emit above-threshold indices to output, buffer equal-threshold
+    # (key, index) pairs into the workspace candidate arrays.
+    for t in tl.range(0, n_vec_full):
+        base = t * BLOCK_SIZE * VEC_SIZE + lane * VEC_SIZE
+        offs = base[:, None] + vec[None, :]
+        x = tl.load(row_input + my_chunk_start + offs)
+        scaled = tl.minimum(tl.maximum(x, -4.0), 4.0) * 32.0
+        digit = tl.minimum(scaled.to(tl.int32) + 128, 255)
+        bits = x.to(tl.uint32, bitcast=True)
+        bucket = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 255, digit)
+        above = (bucket > threshold_bin).reshape(BLOCK_SIZE, VEC_SIZE)
+        equal = (bucket == threshold_bin).reshape(BLOCK_SIZE, VEC_SIZE)
+        out_pos = tl.atomic_add(
+            g_state_ptr + 3 + zeros_2d, 1, mask=above, sem="relaxed", scope="gpu"
+        )
+        tl.store(row_output + out_pos, my_chunk_start + offs, mask=above)
+        cand_pos = tl.atomic_add(
+            g_state_ptr + 4 + zeros_2d, 1, mask=equal, sem="relaxed", scope="gpu"
+        )
+        in_cap = equal & (cand_pos < CAP)
+        tl.store(
+            g_cand_keys_ptr + cand_pos,
+            _convert_to_uint32_v2(x).reshape(BLOCK_SIZE, VEC_SIZE),
+            mask=in_cap,
+        )
+        tl.store(
+            g_cand_idx_ptr + cand_pos, (my_chunk_start + offs).to(tl.int32), mask=in_cap
+        )
+    for t in tl.range(0, rem_tiles):
+        offs = (n_vec_full * VEC_SIZE + t) * BLOCK_SIZE + lane
+        x = tl.load(row_input + my_chunk_start + offs)
+        scaled = tl.minimum(tl.maximum(x, -4.0), 4.0) * 32.0
+        digit = tl.minimum(scaled.to(tl.int32) + 128, 255)
+        bits = x.to(tl.uint32, bitcast=True)
+        bucket = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 255, digit)
+        above = bucket > threshold_bin
+        equal = bucket == threshold_bin
+        out_pos = tl.atomic_add(
+            g_state_ptr + 3 + zeros, 1, mask=above, sem="relaxed", scope="gpu"
+        )
+        tl.store(row_output + out_pos, my_chunk_start + offs, mask=above)
+        cand_pos = tl.atomic_add(
+            g_state_ptr + 4 + zeros, 1, mask=equal, sem="relaxed", scope="gpu"
+        )
+        in_cap = equal & (cand_pos < CAP)
+        tl.store(g_cand_keys_ptr + cand_pos, _convert_to_uint32_v2(x), mask=in_cap)
+        tl.store(
+            g_cand_idx_ptr + cand_pos, (my_chunk_start + offs).to(tl.int32), mask=in_cap
+        )
+    if rem_elems > 0:
+        offs = (n_vec_full * VEC_SIZE + rem_tiles) * BLOCK_SIZE + lane
+        in_range = lane < rem_elems
+        x = tl.load(
+            row_input + my_chunk_start + offs, mask=in_range, other=float("-inf")
+        )
+        scaled = tl.minimum(tl.maximum(x, -4.0), 4.0) * 32.0
+        digit = tl.minimum(scaled.to(tl.int32) + 128, 255)
+        bits = x.to(tl.uint32, bitcast=True)
+        bucket = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 255, digit)
+        above = in_range & (bucket > threshold_bin)
+        equal = in_range & (bucket == threshold_bin)
+        out_pos = tl.atomic_add(
+            g_state_ptr + 3 + zeros, 1, mask=above, sem="relaxed", scope="gpu"
+        )
+        tl.store(row_output + out_pos, my_chunk_start + offs, mask=above)
+        cand_pos = tl.atomic_add(
+            g_state_ptr + 4 + zeros, 1, mask=equal, sem="relaxed", scope="gpu"
+        )
+        in_cap = equal & (cand_pos < CAP)
+        tl.store(g_cand_keys_ptr + cand_pos, _convert_to_uint32_v2(x), mask=in_cap)
+        tl.store(
+            g_cand_idx_ptr + cand_pos, (my_chunk_start + offs).to(tl.int32), mask=in_cap
+        )
+    _barrier_with_atomic_add(
+        g_state_ptr + 2, zeros, lane, (barrier_phase + 1) * ctas_per_group
+    )
+    barrier_phase += 1
+
+    # Refine: single CTA does a 4-round radix over the compacted candidate keys.
+    if cta_in_group == 0:
+        prefix = tl.full((), 0, tl.uint32)
+        remaining = tl.load(shared_scalars_ptr + 1)
+        for round_idx in tl.static_range(0, 4):
+            shift_bits = 24 - round_idx * 8
+            tl.store(local_histogram_ptr + lane, 0, mask=lane < RADIX)
+            tl.debug_barrier()
+            for t in tl.range(0, tl.cdiv(num_equal, BLOCK_SIZE)):
+                cand_offs = t * BLOCK_SIZE + lane
+                valid = cand_offs < num_equal
+                key = tl.load(g_cand_keys_ptr + cand_offs, mask=valid, other=0)
+                mask = 0 if round_idx == 0 else ((~0) << (32 - round_idx * 8))
+                match = valid & ((key & mask) == prefix)
+                bucket = (key >> shift_bits) & 0xFF
+                tl.atomic_add(
+                    local_histogram_ptr + bucket,
+                    1,
+                    mask=match,
+                    sem="relaxed",
+                    scope="cta",
+                )
+            tl.debug_barrier()
+            counts = tl.load(local_histogram_ptr + lane, mask=lane < RADIX)
+            tl.store(suffix_sum_ptr + lane, counts, mask=lane < RADIX)
+            tl.debug_barrier()
+            for t in tl.static_range(0, 8):
+                val = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX)
+                other_offs = lane + (1 << t)
+                tmp = tl.load(suffix_sum_ptr + other_offs, mask=other_offs < RADIX, other=0)
+                val += tmp
+                tl.debug_barrier()
+                tl.store(suffix_sum_ptr + lane, val, mask=lane < RADIX)
+                tl.debug_barrier()
+            count_ge = tl.load(suffix_sum_ptr + lane, mask=lane < RADIX, other=0)
+            count_gt = tl.load(suffix_sum_ptr + lane + 1, mask=(lane + 1) < RADIX, other=0)
+            thr = (count_ge >= remaining) & (count_gt < remaining) & (lane < RADIX)
+            tl.store(shared_scalars_ptr + 2 + zeros, lane, mask=thr)
+            tl.store(shared_scalars_ptr + 3 + zeros, remaining - count_gt, mask=thr)
+            tl.debug_barrier()
+            threshold_bin = tl.load(shared_scalars_ptr + 2)
+            prefix = prefix | (threshold_bin << shift_bits)
+            remaining = tl.load(shared_scalars_ptr + 3)
+            tl.store(shared_scalars_ptr + zeros, prefix, mask=lane == 0)
+            tl.store(shared_scalars_ptr + 1 + zeros, remaining, mask=lane == 0)
+            tl.debug_barrier()
+
+        pivot = tl.load(shared_scalars_ptr)
+        for t in tl.range(0, tl.cdiv(num_equal, BLOCK_SIZE)):
+            cand_offs = t * BLOCK_SIZE + lane
+            valid = cand_offs < num_equal
+            key = tl.load(g_cand_keys_ptr + cand_offs, mask=valid, other=0)
+            idx = tl.load(g_cand_idx_ptr + cand_offs, mask=valid, other=0)
+            gt = valid & (key > pivot)
+            eq = valid & (key == pivot)
+            gt_pos = tl.atomic_add(
+                g_state_ptr + 3 + zeros, 1, mask=gt, sem="relaxed", scope="gpu"
+            )
+            tl.store(row_output + gt_pos, idx, mask=gt)
+            eq_pos = tl.atomic_add(
+                g_state_ptr + 3 + zeros, 1, mask=eq, sem="relaxed", scope="gpu"
+            )
+            tl.store(row_output + eq_pos, idx, mask=eq & (eq_pos < TOPK))
+
+    return barrier_phase, False
 
 
 # Extracted from persistent_topk.cuh in https://github.com/vllm-project/vllm
@@ -1101,12 +1396,15 @@ def persistent_topk_kernel(
     num_groups,
     g_histogram_ptr,
     g_state_ptr,
+    g_cand_keys_ptr,
+    g_cand_idx_ptr,
     VEC_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     RADIX_THRESHOLD: tl.constexpr = 32768
     RADIX: tl.constexpr = 256
     HIST2048_THRESHOLD: tl.constexpr = 8192
+    CAPACITY: tl.constexpr = 2048
 
     pid = tl.program_id(0)
     group_id = pid // ctas_per_group
@@ -1131,7 +1429,7 @@ def persistent_topk_kernel(
     )
     # TODO:why add 5 in FIXED_SMEM_LARGE
     shared_scalars = tle.gpu.alloc(
-        [4],
+        [8],
         dtype=tl.uint32,
         layout=None,
         scope=tle.gpu.smem,
@@ -1156,7 +1454,9 @@ def persistent_topk_kernel(
     shared_ordered_ptr = tle.gpu.local_ptr(shared_ordered, (0,))
 
     g_histogram_ptr += group_id * 3 * RADIX
-    g_state_ptr += group_id * 4
+    g_state_ptr += group_id * 8
+    g_cand_keys_ptr += group_id * CAPACITY
+    g_cand_idx_ptr += group_id * CAPACITY
     barrier_phase = tl.zeros((), dtype=tl.uint32)
     total_iters = tl.cdiv(num_rows, num_groups)
     for i in tl.range(total_iters):
@@ -1202,7 +1502,7 @@ def persistent_topk_kernel(
                         )
             else:
                 my_chunk_start = cta_in_group * CHUNK_SIZE
-                barrier_phase = _radix_topk(
+                barrier_phase, overflow = _radix_topk_coarse(
                     row_in,
                     row_output,
                     seq_len,
@@ -1214,6 +1514,8 @@ def persistent_topk_kernel(
                     shared_ordered_ptr,
                     g_histogram_ptr,
                     g_state_ptr,
+                    g_cand_keys_ptr,
+                    g_cand_idx_ptr,
                     cta_in_group,
                     ctas_per_group,
                     barrier_phase,
@@ -1222,6 +1524,27 @@ def persistent_topk_kernel(
                     VEC_SIZE,
                     BLOCK_SIZE,
                 )
+                if overflow:
+                    barrier_phase = _radix_topk(
+                        row_in,
+                        row_output,
+                        seq_len,
+                        my_chunk_start,
+                        CHUNK_SIZE,
+                        local_histogram_ptr,
+                        suffix_sum_ptr,
+                        shared_scalars_ptr,
+                        shared_ordered_ptr,
+                        g_histogram_ptr,
+                        g_state_ptr,
+                        cta_in_group,
+                        ctas_per_group,
+                        barrier_phase,
+                        i,
+                        TOPK,
+                        VEC_SIZE,
+                        BLOCK_SIZE,
+                    )
     return
 
 
@@ -2330,19 +2653,24 @@ def persistent_topk(
     #     int arrival_counter;
     #     int output_counter;
     histogram_bytes = RADIX * 3 * 4
-    radix_row_state_bytes = histogram_bytes + 4 * 4
+    state_bytes = 8 * 4
+    cand_bytes = RADIX_CAPACITY * 4
+    radix_row_state_bytes = histogram_bytes + state_bytes + 2 * cand_bytes
     assert workspace.size(0) >= num_groups * radix_row_state_bytes
-    workspace[: (num_groups * radix_row_state_bytes)] = 0
+    workspace[: (num_groups * (histogram_bytes + state_bytes))] = 0
     g_histogram_size = num_groups * histogram_bytes
-    g_state_size = num_groups * 4 * 4
-    g_histogram = (
-        workspace[:g_histogram_size].view(torch.uint32).view(num_groups, 3, RADIX)
+    g_state_size = num_groups * state_bytes
+    g_histogram = workspace[:g_histogram_size].view(torch.uint32)
+    g_state = workspace[g_histogram_size : g_histogram_size + g_state_size].view(
+        torch.int32
     )
-    g_state = (
-        workspace[g_histogram_size : g_histogram_size + g_state_size]
-        .view(torch.int32)
-        .view(num_groups, 4)
+    cand_base = g_histogram_size + g_state_size
+    g_cand_keys = workspace[cand_base : cand_base + num_groups * cand_bytes].view(
+        torch.uint32
     )
+    g_cand_idx = workspace[
+        cand_base + num_groups * cand_bytes : cand_base + 2 * num_groups * cand_bytes
+    ].view(torch.int32)
 
     persistent_topk_kernel[(total_ctas,)](
         logits,
@@ -2357,6 +2685,8 @@ def persistent_topk(
         num_groups,
         g_histogram,
         g_state,
+        g_cand_keys,
+        g_cand_idx,
         VEC_SIZE=vec_size,
         BLOCK_SIZE=THREADS_PER_BLOCK,
         num_warps=THREADS_PER_BLOCK // 32,
