@@ -3216,6 +3216,13 @@ def _tle_desc(t, block):
     return TensorDescriptor.from_tensor(t, list(block))
 
 
+# FlagTree's warp-specialised (SQMMA + TME) path still faults after a few
+# hundred launches on some MoE shapes ("MUSA error: out of bound"), with the
+# narrow tile as well as the wide one, so it is opt-in and the default keeps
+# the portable Triton kernel.
+_TLE_ENABLED = os.environ.get("FLAGGEMS_VLLM_MTHREADS_TLE", "0") == "1"
+
+
 def _tle_ready(w1, w2, total, H, n_inter):
     if not _HAS_TLE:
         return False
@@ -3368,7 +3375,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         num_warps=4,
     )
 
-    use_tle = _tle_ready(w1, w2, total, H, n_inter)
+    use_tle = _TLE_ENABLED and _tle_ready(w1, w2, total, H, n_inter)
     if use_tle:
         _tle_gemm(
             hidden_perm, w1, gate_up, m_indices, E, total, 2 * n_inter, H, STAGES=3
