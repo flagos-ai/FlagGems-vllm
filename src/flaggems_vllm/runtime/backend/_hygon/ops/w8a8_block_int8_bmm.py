@@ -31,11 +31,35 @@ def _scale_flags_or(left, right):
     return left | right
 
 
+# BM, BN, Split-K, warps, combined-exponent validation.
+_H1_TUNED_INTEGER_CONFIGS = {
+    56: (16, 32, 5, 2, False),
+    64: (16, 32, 4, 2, False),
+    72: (16, 64, 4, 2, False),
+    80: (16, 64, 4, 2, False),
+    112: (64, 64, 4, 4, True),
+    136: (32, 64, 4, 2, False),
+    144: (32, 64, 4, 2, False),
+    160: (32, 64, 4, 2, False),
+    400: (64, 64, 2, 4, False),
+    416: (64, 64, 2, 4, False),
+    448: (64, 64, 2, 4, True),
+}
+
+
 @lru_cache(maxsize=16)
 def _single_head_split_workspace(device, raw_stream):
     # Independent streams need separate partials and self-resetting counters.
     partial = torch.empty((2, 80, 64, 64), dtype=torch.int32, device=device)
     counter = torch.zeros((80,), dtype=torch.int32, device=device)
+    return partial, counter
+
+
+@lru_cache(maxsize=16)
+def _single_head_uneven_split_workspace(device, raw_stream):
+    # 128 counters also cover BN=32 tiles; partial storage stays at 5 MiB.
+    partial = torch.empty((5, 64, 64, 64), dtype=torch.int32, device=device)
+    counter = torch.zeros((128,), dtype=torch.int32, device=device)
     return partial, counter
 
 
@@ -706,15 +730,21 @@ def _integer_factor_body(
     ALIGNED: tl.constexpr,
     INNER: tl.constexpr,
     IST: tl.constexpr,
+    WORD0=None,
+    WORD1=None,
+    INLINE_EXPONENTS: tl.constexpr = False,
 ):
     rk = tl.arange(0, 128)
     # Keep activation rows on the dot's column axis to reduce register
     # pressure in the broadcast shift-add and improve the MMAC feed layout.
     acc = tl.zeros((BN, BM), tl.int32)
     for outer in range(8):
-        xp = tl.load(P + rm * 8 + outer, rm < M, other=0).to(tl.uint32)
-        wp = tl.load(P + (M + PN) * 8 + outer).to(tl.uint32)
-        words = xp + wp
+        if INLINE_EXPONENTS:
+            words = tl.where(outer < 4, WORD0, WORD1) >> ((outer % 4) * 8)
+        else:
+            xp = tl.load(P + rm * 8 + outer, rm < M, other=0).to(tl.uint32)
+            wp = tl.load(P + (M + PN) * 8 + outer).to(tl.uint32)
+            words = xp + wp
         for sub in tl.range(4, loop_unroll_factor=INNER, num_stages=IST):
             kk = (outer * 4 + sub) * 128 + rk
             a = tl.load(W + rn[:, None] * 4096 + kk[None, :])
@@ -725,16 +755,21 @@ def _integer_factor_body(
                     A + rm[None, :] * 4096 + kk[:, None], rm[None, :] < M, other=0
                 )
             part = tl.dot(a, w, out_dtype=tl.int32)
+            shifts = words & 3 if INLINE_EXPONENTS else words
             acc = tl.inline_asm_elementwise(
                 "v_lshl_add_u32 $0, $1, $2, $3",
                 "=v,v,v,v",
-                [part, words[None, :], acc],
+                [part, shifts[None, :], acc],
                 dtype=tl.int32,
                 is_pure=True,
                 pack=1,
             )
-            words = words >> 8
-    value = acc.to(tl.float32) * tl.exp2(emin.to(tl.float32) - 127.0)[None, :]
+            words = words >> (2 if INLINE_EXPONENTS else 8)
+    if INLINE_EXPONENTS:
+        scale = (emin << 23).to(tl.float32, bitcast=True)
+        value = acc.to(tl.float32) * scale[None, :]
+    else:
+        value = acc.to(tl.float32) * tl.exp2(emin.to(tl.float32) - 127.0)[None, :]
     if ALIGNED:
         tl.store(O + rm[None, :] * 1024 + rn[:, None], value)
     else:
@@ -830,32 +865,69 @@ def _single_head_integer_body(
     Partial=None,
     Counter=None,
     SPLIT_K: tl.constexpr = 1,
+    A0=None,
+    W0=None,
+    TUNED: tl.constexpr = False,
+    CLAMP_A: tl.constexpr = False,
 ):
     safe_rm = rm if M % BM == 0 else tl.minimum(rm, M - 1)
     acc = tl.zeros((BM, BN), tl.int32)
     rk = tl.arange(0, 128)
     split = tl.program_id(1) if SPLIT_K > 1 else 0
-    for outer in range(2 // SPLIT_K):
-        half = split * (2 // SPLIT_K) + outer
-        words = tl.where(half == 0, word0, word1)
-        for sub in tl.range(16, num_stages=STAGES):
-            kk = (half * 16 + sub) * 128 + rk
-            shift = words & 3
-            if M <= 320:
-                left = tl.load(A + safe_rm[:, None] * 4096 + kk[None, :])
-            else:
-                left = tl.load(A + rm[:, None] * 4096 + kk[None, :], rm[:, None] < M, 0)
+    if SPLIT_K > 2 or TUNED:
+        first = split * 32 // SPLIT_K
+        end = (split + 1) * 32 // SPLIT_K
+        words = (word0.to(tl.uint64) | (word1.to(tl.uint64) << 32)) >> (first * 2)
+        if TUNED and SPLIT_K > 1:
+            words = words.to(tl.uint32)
+        part = tl.dot(A0, W0, out_dtype=tl.int32)
+        acc = tl.inline_asm_elementwise(
+            "v_lshl_add_u32 $0, $1, $2, $3",
+            "=v,v,v,v",
+            [part, (words & 3).to(tl.uint32)[:, None], acc],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+        words = words >> 2
+        for step in tl.range(1, end - first, num_stages=STAGES):
+            kk = (first + step) * 128 + rk
+            left = tl.load(A + safe_rm[:, None] * 4096 + kk[None, :])
             right = tl.load(W + rn[None, :] * 4096 + kk[:, None])
             part = tl.dot(left, right, out_dtype=tl.int32)
             acc = tl.inline_asm_elementwise(
                 "v_lshl_add_u32 $0, $1, $2, $3",
                 "=v,v,v,v",
-                [part, shift[:, None], acc],
+                [part, (words & 3).to(tl.uint32)[:, None], acc],
                 dtype=tl.int32,
                 is_pure=True,
                 pack=1,
             )
             words = words >> 2
+    else:
+        for outer in range(2 // SPLIT_K):
+            half = split * (2 // SPLIT_K) + outer
+            words = tl.where(half == 0, word0, word1)
+            for sub in tl.range(16, num_stages=STAGES):
+                kk = (half * 16 + sub) * 128 + rk
+                shift = words & 3
+                if M <= 320 or CLAMP_A:
+                    left = tl.load(A + safe_rm[:, None] * 4096 + kk[None, :])
+                else:
+                    left = tl.load(
+                        A + rm[:, None] * 4096 + kk[None, :], rm[:, None] < M, 0
+                    )
+                right = tl.load(W + rn[None, :] * 4096 + kk[:, None])
+                part = tl.dot(left, right, out_dtype=tl.int32)
+                acc = tl.inline_asm_elementwise(
+                    "v_lshl_add_u32 $0, $1, $2, $3",
+                    "=v,v,v,v",
+                    [part, shift[:, None], acc],
+                    dtype=tl.int32,
+                    is_pure=True,
+                    pack=1,
+                )
+                words = words >> 2
     if SPLIT_K > 1:
         tile = tl.program_id(0)
         offset = tl.arange(0, BM)[:, None] * BN + tl.arange(0, BN)[None, :]
@@ -897,7 +969,14 @@ def int8_single_head_integer_kernel(
     Partial=None,
     Counter=None,
     SPLIT_K: tl.constexpr = 1,
+    PATH: tl.constexpr = False,
 ):
+    # Keep one specialization argument for legacy and tuned integer paths.
+    # 0: legacy; 1: swapped; 2/3: prefetched; 4: fused sum; 5: clamped A.
+    TUNED: tl.constexpr = PATH == 2 or PATH == 3
+    CLAMP_SCALES: tl.constexpr = TUNED
+    COMBINED_EXP: tl.constexpr = PATH == 3 or PATH == 4
+    SWAP_AB: tl.constexpr = PATH == 1 or PATH == 4
     tl.static_assert(BN <= 128 and 128 % BN == 0)
     pid = tl.program_id(0)
     nm = tl.cdiv(M, BM)
@@ -911,54 +990,114 @@ def int8_single_head_integer_kernel(
     rm = pm * BM + tl.arange(0, BM)
     rn = pn * BN + tl.arange(0, BN)
     kg = tl.arange(0, 32)
-    x = tl.load(XS + rm[:, None] * XSM + kg[None, :] * XSK, rm[:, None] < M, other=1.0)
+    if CLAMP_SCALES:
+        safe_rows = rm if M % BM == 0 else tl.minimum(rm, M - 1)
+        x = tl.load(XS + safe_rows[:, None] * XSM + kg[None, :] * XSK)
+    else:
+        x = tl.load(
+            XS + rm[:, None] * XSM + kg[None, :] * XSK, rm[:, None] < M, other=1.0
+        )
     w = tl.load(WS + (pn * BN // 128) * WSN + kg * WSK)
+    if SPLIT_K > 2 or TUNED:
+        first_k = (tl.program_id(1) * 32 // SPLIT_K) * 128 + tl.arange(0, 128)
+        safe = tl.minimum(rm, M - 1)
+        a0 = tl.load(A + safe[:, None] * 4096 + first_k[None, :])
+        w0 = tl.load(W + rn[None, :] * 4096 + first_k[:, None])
+    else:
+        a0 = None
+        w0 = None
     xb = x.to(tl.int32, bitcast=True)
     wb = w.to(tl.int32, bitcast=True)
     xe = (xb >> 23) & 255
     we = (wb >> 23) & 255
-    xmin = tl.min(xe, 1)
-    xmax = tl.max(xe, 1)
-    wmin = tl.min(we, 0)
-    wmax = tl.max(we, 0)
-    xflags = tl.reduce(xb.to(tl.uint32) & 0x807FFFFF, 1, _scale_flags_or)
-    wflags = tl.reduce(wb.to(tl.uint32) & 0x807FFFFF, 0, _scale_flags_or)
-    xok = (xflags == 0) & (xmin > 0) & (xmax < 255)
-    wok = (wflags == 0) & (wmin > 0) & (wmax < 255)
-    base = xmin + wmin
-    # A shift span of at most three bounds the worst-case INT8 sum by 2**29.
-    # Keep products normal and the final scaled sum within FP32 range.
-    valid = (
-        xok
-        & wok
-        & (xmax - xmin + wmax - wmin <= 3)
-        & (base >= 190)
-        & (xmax + wmax <= 286)
-    )
-    if tl.min(valid | (rm >= M), 0) == 1:
+    if COMBINED_EXP:
+        combined_exp = xe + we[None, :]
+        base = tl.min(combined_exp, 1)
+        maximum = tl.max(combined_exp, 1)
+        xbad = (xb.to(tl.uint32) & 0x807FFFFF) | tl.where(
+            (xe == 0) | (xe == 255), 0x80000000, 0
+        )
+        wbad = (wb.to(tl.uint32) & 0x807FFFFF) | tl.where(
+            (we == 0) | (we == 255), 0x80000000, 0
+        )
+        xflags = tl.reduce(xbad, 1, _scale_flags_or)
+        wflags = tl.reduce(wbad, 0, _scale_flags_or)
+        valid = (
+            (xflags == 0)
+            & (wflags == 0)
+            & (maximum - base <= 3)
+            & (base >= 190)
+            & (maximum <= 286)
+        )
+    else:
+        xmin = tl.min(xe, 1)
+        xmax = tl.max(xe, 1)
+        wmin = tl.min(we, 0)
+        wmax = tl.max(we, 0)
+        xflags = tl.reduce(xb.to(tl.uint32) & 0x807FFFFF, 1, _scale_flags_or)
+        wflags = tl.reduce(wb.to(tl.uint32) & 0x807FFFFF, 0, _scale_flags_or)
+        xok = (xflags == 0) & (xmin > 0) & (xmax < 255)
+        wok = (wflags == 0) & (wmin > 0) & (wmax < 255)
+        base = xmin + wmin
+        # A shift span of at most three bounds the worst-case INT8 sum by 2**29.
+        # Keep products normal and the final scaled sum within FP32 range.
+        valid = (
+            xok
+            & wok
+            & (xmax - xmin + wmax - wmin <= 3)
+            & (base >= 190)
+            & (xmax + wmax <= 286)
+        )
+    if tl.min(valid if CLAMP_SCALES else (valid | (rm >= M)), 0) == 1:
         # Two bits per K group keep all 32 shifts in two registers per row.
         shifts = (xe + we[None, :] - base[:, None]).to(tl.uint32)
         packed = tl.sum(
             tl.reshape(shifts, (BM, 2, 16)) << (tl.arange(0, 16)[None, None, :] * 2), 2
         )
         word0, word1 = tl.split(packed)
-        _single_head_integer_body(
-            A,
-            W,
-            Out,
-            rm,
-            rn,
-            base,
-            word0,
-            word1,
-            M,
-            BM,
-            BN,
-            STAGES,
-            Partial,
-            Counter,
-            SPLIT_K,
-        )
+        if SWAP_AB:
+            tl.static_assert(SPLIT_K == 1)
+            _integer_factor_body(
+                A,
+                W,
+                None,
+                Out,
+                rm,
+                rn,
+                base - 127,
+                M,
+                pn * BN // 128,
+                BM,
+                BN,
+                M % BM == 0,
+                1,
+                STAGES,
+                WORD0=word0,
+                WORD1=word1,
+                INLINE_EXPONENTS=True,
+            )
+        else:
+            _single_head_integer_body(
+                A,
+                W,
+                Out,
+                rm,
+                rn,
+                base,
+                word0,
+                word1,
+                M,
+                BM,
+                BN,
+                STAGES,
+                Partial,
+                Counter,
+                SPLIT_K,
+                A0=a0,
+                W0=w0,
+                TUNED=TUNED,
+                CLAMP_A=PATH == 5,
+            )
     elif SPLIT_K == 1 or tl.program_id(1) == 0:
         _int8_block_bmm_kernel(
             A,
@@ -984,7 +1123,7 @@ def int8_single_head_integer_kernel(
             TILE_K=128,
             UNROLL=1,
             ACC_FP32=True,
-            PACK_SCALES=True,
+            PACK_SCALES=not SWAP_AB and SPLIT_K <= 2 and not TUNED,
             SCALE_GROUPS=2,
         )
 
@@ -1339,6 +1478,91 @@ def _int8_block_bmm(
             )
             return out
         a_scale_stride = A_scale.stride()
+        integer_cfg = _H1_TUNED_INTEGER_CONFIGS.get(m)
+        if (
+            integer_cfg is not None
+            and (batch, n, k, sm, sn, sk) == (1, 1024, 4096, 1, 128, 128)
+            and A.stride()[1:] == (4096, 1)
+            and B.stride()[1:] == (1, 4096)
+            and a_scale_stride[1:] == (32, 1)
+            and B_scale.stride()[1:] == (1, 32)
+            and out.stride()[1:] == (1024, 1)
+            and A_scale.dtype == B_scale.dtype == torch.float32
+            and out_dtype in (torch.bfloat16, torch.float32)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            bm, bn, split, warps, combined = integer_cfg
+            if split > 1:
+                partial, counter = _single_head_uneven_split_workspace(
+                    A.device, torch.cuda.current_stream(A.device).cuda_stream
+                )
+            else:
+                partial, counter = None, None
+            int8_single_head_integer_kernel[(triton.cdiv(m, bm) * (1024 // bn), split)](
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out,
+                m,
+                32,
+                1,
+                32,
+                1,
+                BM=bm,
+                BN=bn,
+                GM=4,
+                STAGES=2,
+                Partial=partial,
+                Counter=counter,
+                SPLIT_K=split,
+                PATH=3 if combined else 2,
+                num_warps=warps,
+                num_stages=1,
+                kpack=2,
+            )
+            return out
+        if (
+            104 < m <= 192
+            and (batch, n, k, sm, sn, sk) == (1, 1024, 4096, 1, 128, 128)
+            and A.dtype == B.dtype == torch.int8
+            and A.stride()[1:] == (4096, 1)
+            and B.stride()[1:] == (1, 4096)
+            and a_scale_stride[1:] == (32, 1)
+            and B_scale.stride()[1:] == (1, 32)
+            and out.stride()[1:] == (1024, 1)
+            and A_scale.dtype == B_scale.dtype == torch.float32
+            and out_dtype in (torch.bfloat16, torch.float32)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            partial, counter = _single_head_uneven_split_workspace(
+                A.device, torch.cuda.current_stream(A.device).cuda_stream
+            )
+            split = 5 if m <= 128 else 3
+            bm = 32 if 128 < m <= 160 else 64
+            int8_single_head_integer_kernel[(triton.cdiv(m, bm) * 16, split)](
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out,
+                m,
+                32,
+                1,
+                32,
+                1,
+                BM=bm,
+                BN=64,
+                GM=4,
+                STAGES=2,
+                Partial=partial,
+                Counter=counter,
+                SPLIT_K=split,
+                num_warps=2 if bm == 32 else 4,
+                num_stages=1,
+                kpack=2,
+            )
+            return out
         if (
             160 < m <= 320
             and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
@@ -1436,7 +1660,13 @@ def _int8_block_bmm(
             )
             return out
         if (
-            m == 1028
+            (
+                m == 1028
+                or (
+                    m in (2048, 3076, 3805, 4100)
+                    and out_dtype in (torch.bfloat16, torch.float32)
+                )
+            )
             and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
             and A.stride()[1:] == (4096, 1)
             and B.stride()[1:] == (1, 4096)
@@ -1460,8 +1690,9 @@ def _int8_block_bmm(
                 BN=128,
                 GM=4,
                 STAGES=2,
+                PATH=(4 if m in (3076, 3805, 4100) else 5 if m == 1028 else True),
                 num_warps=8,
-                num_stages=2,
+                num_stages=1 if m in (2048, 3076, 3805, 4100) else 2,
                 kpack=1,
             )
             return out
@@ -1723,7 +1954,9 @@ def int8_single_head_split_float_kernel(
     asp = XS + row * XSM
     wsp = WS + (pn * BN // 128) * 32
     acc = tl.zeros((16, BN), tl.float32)
-    scale_bits = tl.zeros((16,), tl.int32)
+    # OR only predicates; combining float exponent bits can create false alarms.
+    scale_limit: tl.constexpr = 18446744073709551616.0
+    unsafe_flags = tl.zeros((16,), tl.int32)
     for pair in tl.range(16 // SPLIT, num_stages=2):
         group = split * (32 // SPLIT) + pair * 2
         groups = group + tl.arange(0, 2)
@@ -1733,9 +1966,9 @@ def int8_single_head_split_float_kernel(
             xs = tl.load(asp[:, None] + groups[None, :] * XSK, row[:, None] < M, 0)
         scales = xs * tl.load(wsp + groups)[None, :]
         scale0, scale1 = tl.split(scales)
-        scale_bits |= scale0.to(tl.int32, bitcast=True) | scale1.to(
-            tl.int32, bitcast=True
-        )
+        unsafe_flags |= (~(tl.abs(scale0) < scale_limit)).to(tl.int32) | (
+            ~(tl.abs(scale1) < scale_limit)
+        ).to(tl.int32)
         for sub in tl.static_range(2):
             offset = (group + sub) * 128
             if M % 16 == 0:
@@ -1749,9 +1982,7 @@ def int8_single_head_split_float_kernel(
     offset = tl.arange(0, 16)[:, None] * BN + tl.arange(0, BN)[None, :]
     tl.store(P + (pid * SPLIT + split) * (16 * BN) + offset, acc)
     tl.debug_barrier()
-    unsafe = ((((tl.reduce(scale_bits, 0, _scale_flags_or) >> 23) & 255) >= 191)).to(
-        tl.int32
-    )
+    unsafe = tl.reduce(unsafe_flags, 0, _scale_flags_or)
     ticket = tl.atomic_add(C + pid * 1, 1 + (unsafe.to(tl.int32) << 8), sem="acq_rel")
     if (ticket & 255) == SPLIT - 1:
         if ((ticket >> 8) + unsafe) > 0:
