@@ -189,6 +189,8 @@ class CpGatherIndexerKQuantCacheBenchmark(base.Benchmark):
         return ["gbps"]
 
     def get_gbps(self, args, latency=None):
+        if latency is None:
+            return None
         _, k_fp8, k_fp8_scale, block_table, cu_seqlen = args
         gathered = sum(t.numel() * t.element_size() for t in (k_fp8, k_fp8_scale))
         metadata = sum(t.numel() * t.element_size() for t in (block_table, cu_seqlen))

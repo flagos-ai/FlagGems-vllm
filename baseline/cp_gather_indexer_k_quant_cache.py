@@ -15,6 +15,7 @@
 import torch
 
 OP_NAME = "cp_gather_indexer_k_quant_cache"
+# FP16 is the benchmark's JSON lookup key. build_inputs sets the tensor dtypes.
 DTYPES = [torch.float16]
 IS_INPLACE = True
 MUTATED_INPUTS = (1, 2)
@@ -80,9 +81,9 @@ def key_shape(binding):
 
 def _dimensions(binding):
     dims = dict(binding)
-    dims["blocks_per_seq"] = (
-        dims["seq_len"] + dims["block_size"] - 1
-    ) // dims["block_size"]
+    dims["blocks_per_seq"] = (dims["seq_len"] + dims["block_size"] - 1) // dims[
+        "block_size"
+    ]
     dims["num_blocks"] = dims["batch_size"] * dims["blocks_per_seq"]
     dims["num_tokens"] = dims["batch_size"] * dims["seq_len"]
     dims["num_quant_blocks"] = dims["head_dim"] // dims["quant_block_size"]
@@ -110,9 +111,7 @@ def build_inputs(binding, dtype, device):
         generator=generator,
     )
     flat_cache = k_cache.view(dims["num_blocks"], -1)
-    scales = flat_cache[:, dims["block_size"] * dims["head_dim"] :].view(
-        torch.float32
-    )
+    scales = flat_cache[:, dims["block_size"] * dims["head_dim"] :].view(torch.float32)
     scales.copy_(
         torch.rand(
             dims["num_blocks"],
@@ -133,9 +132,7 @@ def build_inputs(binding, dtype, device):
         dtype=torch.int32,
         device=device,
     )
-    cu_seqlen = torch.zeros(
-        dims["batch_size"] + 1, dtype=torch.int32, device=device
-    )
+    cu_seqlen = torch.zeros(dims["batch_size"] + 1, dtype=torch.int32, device=device)
     cu_seqlen[1:] = torch.cumsum(seq_lens, dim=0)
 
     dst_k = torch.empty(
