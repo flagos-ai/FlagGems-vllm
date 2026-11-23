@@ -30,8 +30,6 @@ INPUT_LAYOUTS = (
 )
 
 BENCHMARK_SHAPES = [
-    (7, 17, 8),
-    (33, 5137, 4),
     (8192, 5120, 4),
     (1, 5120, 4),
     (16, 5120, 4),
@@ -46,6 +44,8 @@ BENCHMARK_SHAPES = [
 
 FUNCTIONAL_SHAPES = [
     *BENCHMARK_SHAPES,
+    (7, 17, 8),
+    (33, 5137, 4),
     (0, 17, 4),
     (1, 513, 1),
     (2, 5120, 8),

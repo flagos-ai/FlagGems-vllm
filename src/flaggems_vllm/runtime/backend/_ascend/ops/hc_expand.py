@@ -26,7 +26,6 @@ _MAX_WORKERS = 40
 _DEFAULT_BLOCK_H = 512
 _WIDE_ROW_BLOCK_H = 1024
 _SMALL_STRIDED_ELEMS = 1024
-_SMALL_ROW_TILE_ELEMS_CAP = 1024
 # Measured UB-safe input tile footprint for this kernel on Ascend910B4.
 _TILE_BYTES_CAP = 64 * 1024
 
@@ -128,33 +127,6 @@ def _hc_expand_persistent_kernel(
             )
 
 
-@triton.jit
-def _hc_expand_small_hidden_kernel(
-    x,
-    out,
-    H: tl.constexpr,
-    N: tl.constexpr,
-    N_PAD: tl.constexpr,
-    STRIDE_M: tl.constexpr,
-    STRIDE_H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_H)
-    hidden_mask = offsets < H
-    value = tl.load(
-        x + row * STRIDE_M + offsets * STRIDE_H,
-        mask=hidden_mask,
-        other=0,
-    )
-
-    streams = tl.arange(0, N_PAD)[:, None]
-    output_offsets = (row * N + streams) * H + offsets[None, :]
-    output_mask = (streams < N) & hidden_mask[None, :]
-    output_value = tl.broadcast_to(value[None, :], (N_PAD, BLOCK_H))
-    tl.store(out + output_offsets, output_value, mask=output_mask)
-
-
 def hc_expand(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     """Expand ``x`` to ``[num_tokens, hc_mult, hidden_size]`` on Ascend.
 
@@ -183,23 +155,6 @@ def hc_expand(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     out = x.new_empty((num_tokens, hc_mult, hidden_size))
     if not out.numel():
         return out
-
-    if hidden_size <= 32 and num_tokens <= _MAX_WORKERS:
-        block_h = triton.next_power_of_2(hidden_size)
-        stream_pad = triton.next_power_of_2(hc_mult)
-        if stream_pad * block_h <= _SMALL_ROW_TILE_ELEMS_CAP:
-            _hc_expand_small_hidden_kernel[(num_tokens,)](
-                x,
-                out,
-                hidden_size,
-                hc_mult,
-                stream_pad,
-                *x.stride(),
-                BLOCK_H=block_h,
-                num_warps=2,
-                num_stages=1,
-            )
-            return out
 
     element_size = x.element_size()
     block_r, block_h = _select_persistent_tile(
