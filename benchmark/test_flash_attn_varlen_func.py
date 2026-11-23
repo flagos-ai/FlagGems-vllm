@@ -172,6 +172,17 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
         all_num_heads = [(16, 2)] * 6 + [(4, 1)] * 6
         all_block_sizes = [32] * 6 + [16] * 6
         all_num_blocks = [73920] * 6 + [605550, 16896] + [605550] * 4
+        if vendor_name == "thead":
+            # The vLLM baseline this benchmark compares against rejects a paged
+            # KV cache block size that is not a multiple of 256 on a PPU
+            # ("Paged KV cache block size must be divisible by 256"), so every
+            # shape above fails there before it is timed. The operator itself
+            # takes these block sizes; only the baseline needs the larger one.
+            # Raise it and scale the block count down by the same factor, which
+            # keeps each shape's cache size effectively unchanged.
+            scale = [256 // b for b in all_block_sizes]
+            all_block_sizes = [256] * len(all_block_sizes)
+            all_num_blocks = [max(1, n // s) for n, s in zip(all_num_blocks, scale)]
 
         head_dim = 256
         alibi = False
