@@ -32,7 +32,7 @@ try:
     )
 
     HAS_VLLM = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_VLLM = False
 
 # Every operator is taken from the package namespace, never from its module path:

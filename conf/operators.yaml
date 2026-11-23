@@ -204,8 +204,8 @@ ops:
   stages:
   - beta: '5.3'
 - id: cast_sigmoid
-  description: 'Element-wise sigmoid with explicit output and compute dtype, used for
-    vLLM grouped-topk gating scores. Precisions: FP16, BF16 and FP32.'
+  description: 'Element-wise sigmoid with explicit output and compute dtype, used
+    for vLLM grouped-topk gating scores. Precisions: FP16, BF16 and FP32.'
   for:
   - None
   labels:
@@ -458,6 +458,19 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: compute_slot_mappings
+  description: 'Parallel slot-mapping computation for paged KV caches: parallelises
+    over (request, token block) instead of launching one program per request, removing
+    the serial token walk on prefill batches with few long requests.'
+  for:
+  - vllm_ascend.ops.triton.compute_slot_mapping._compute_slot_mapping_kernel
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
 - id: compute_topk_scores
   description: Collect sampled and top-k token scores and sampled-token ranks for vLLM.
   for:
@@ -486,7 +499,7 @@ ops:
 - id: cooperative_topk
   description: 'Select exact top-k indices from FP32 logits through vLLM''s in-place
 
-    interface, with Ascend and Iluvatar fast paths. Supports up to 64 rows,
+    interface, with Ascend, Iluvatar, and MThreads fast paths. Supports up to 64 rows,
 
     k in {512, 1024, 2048}, variable lengths, and -1 padding for short rows.
 
@@ -497,6 +510,7 @@ ops:
   - fused
   - NoCPU
   - vLLM
+  - DSA
   kind:
   - NeuralNetwork
   stages:
@@ -536,6 +550,29 @@ ops:
   - LinearAlg
   stages:
   - beta: '5.0'
+- id: deep_gemm_fp8_o_proj
+  description: 'DeepSeek-V4 attention output projection: inverse RoPE, group-wise
+    FP8 quantization, block-wise FP8 einsum over the o-LoRA weights, then wo_b.
+    Precisions: FP8 (E4M3) with 128x128 block scales on Hopper; Hygon, MetaX
+    and PPU transport the same block-quantized values as INT8 (INT8
+    tensor-core GEMM) because their Triton backends have no FP8 dot
+    lowering. Ascend keeps the block-quantized values but transports them
+    as FP16: it has neither an FP8 dot nor a device-side FP8 cast, and
+    folding the block scale into the GEMM K loop drops the throughput to
+    15 TFLOPS there.
+
+    '
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.o_proj.deep_gemm_fp8_o_proj
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - Quantization
+  stages:
+  - beta: '5.4'
 - id: dequantize_and_gather_k_cache
   description: 'Dequantizes FP8 K-cache entries and gathers them into a BF16 tensor
     for DeepSeekV4 attention.
@@ -1047,12 +1084,18 @@ ops:
   stages:
   - alpha: '5.4'
 - id: fused_matmul_reduce_scatter
-  description: |
-    Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
+  description: 'Persistent TLE GEMM overlapped with hierarchical FlagCX reduce-scatter.
+
     Matches the symm_mem argument signature; currently inference-only, NVIDIA SM90+
-    or an experimental HCU descriptor-lowering path (BF16 sum validated on two BW nodes),
+
+    or an experimental HCU descriptor-lowering path (BF16 sum validated on two BW
+    nodes),
+
     FP16/BF16 2D inputs, sum/avg, scatter_dim=0, aligned shapes, eager execution.
+
     Uses process-group-scoped communication resources and explicit configuration.
+
+    '
   for:
   - symm_mem.fused_matmul_reduce_scatter
   labels:
@@ -1074,6 +1117,20 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: fused_q
+  description: |
+    Fuse MQA query RoPE and FP8 packing with indexer query RoPE,
+    UE8M0 quantization, and index-weight scaling. Includes H20 scheduling.
+  for:
+    - vllm.models.deepseek_v32.common.kernels.fused_q
+  labels:
+    - fused
+    - vLLM
+    - KernelGen
+  kind:
+    - NeuralNetwork
+  stages:
+    - alpha: '5.4'
 - id: fused_q_kv_rmsnorm
   description: 'Applies RMSNorm to Q and KV tensors in a single fused kernel for DeepSeekV4
     attention.
@@ -1164,6 +1221,22 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: gather_kda_state
+  description: |
+    Gathers KDA recurrent states from the paged cache into the [N, H, K, V]
+    layout expected by the AscendC chunk operator, zeroing slots without an
+    initial state, with the transpose folded into a single kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream has implemented its own Triton kernel.
+  for:
+    - torch chain (gather -> clear_ssm_states -> transpose-copy)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
 - id: gather_sampler_output
   description: Pack and restore batch-sharded tokens, counts, and logprobs around
     vLLM all-gather.
@@ -1295,13 +1368,13 @@ ops:
 - id: get_num_sampled_and_rejected
   description: Update sampled and rejected token counts per request.
   for:
-    - get_num_sampled_and_rejected
+  - get_num_sampled_and_rejected
   labels:
-    - fused
+  - fused
   kind:
-    - Sampling
+  - Sampling
   stages:
-    - beta: '0.3'
+  - beta: '0.3'
 - id: group_list_cumsum
   description: 'Computes expert token-count offsets (cumsum) for expert-parallel MoE
 
@@ -1533,23 +1606,6 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
-- id: kda_conv_scatter
-  description: 'Restores the staged rows back into the block-strided KDA
-
-    short-convolution state cache after the AscendC conv operator in one
-
-    pass, skipping PAD entries inside the kernel.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
 - id: kda_gate_cumsum
   description: 'Fused Triton replacement for the AscendC kda_gate_cumsum operator:
 
@@ -1558,41 +1614,6 @@ ops:
     in-chunk cumulative sums with one program per (chunk, head) tile
 
     instead of one serial block per sequence.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
-- id: kda_state_gather
-  description: 'Gathers KDA recurrent states from the paged cache into the [N, H,
-    K, V]
-
-    layout expected by the AscendC chunk operator, zeroing slots without an
-
-    initial state, with the transpose folded into a single kernel.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
-- id: kda_state_scatter
-  description: 'Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
-
-    chunk operator back into the paged [H, V, K] cache layout with the
-
-    transpose and dtype cast folded into a single kernel.
 
     '
   for:
@@ -1666,6 +1687,43 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: mamba_mixer
+  description: Triton implementation of the Mamba mixer operator for vLLM inference.
+  for:
+  - mamba_mixer
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
+- id: marlin_gemm
+  description: 'Marlin quantized GEMM supporting W4A16 chunked quantization for efficient
+    inference with quantized weights and FP16/BF16 activations.
+
+    '
+  for:
+  - marlin_gemm
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  kind:
+  - BLAS
+  stages:
+  - alpha: '5.5'
+- id: matmul_persistent
+  description: vLLM batch-invariant matmul with bounded NVIDIA small-matrix optimization.
+  for:
+    - vllm.model_executor.determinism.batch_invariant.matmul_batch_invariant
+  labels:
+    - vLLM
+    - KernelGen
+  kind:
+    - NeuralNetwork
+  stages:
+    - alpha: '5.4'
 - id: megamoe_int8
   description: 'Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
 
@@ -2135,13 +2193,50 @@ ops:
   stages:
   - stable: '4.1'
   cpp: '4.0'
-- id: select_candidate_blocks_cooperative
+- id: scatter_conv_state
   description: |
-    DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM's
+    Restores the staged rows back into the block-strided KDA
+    short-convolution state cache after the AscendC conv operator in one
+    pass, skipping PAD entries inside the kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream has implemented its own Triton kernel.
+  for:
+    - torch chain (arange/masked_fill -> where/zeros_like/sum -> index_copy_)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
+- id: scatter_kda_state
+  description: |
+    Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
+    chunk operator back into the paged [H, V, K] cache layout with the
+    transpose and dtype cast folded into a single kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream use the native op npu_scatter_nd_update_.
+  for:
+    - torch chain (transpose -> contiguous -> cast -> index_put)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
+- id: select_candidate_blocks_cooperative
+  description: 'DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM''s
+
     select_candidate_blocks_cooperative: per-block NaN-propagating max with
-    the newest block pinned, top-k over each row's valid block prefix (the
+
+    the newest block pinned, top-k over each row''s valid block prefix (the
+
     Triton persistent_topk / cooperative_topk in place of the CUDA
+
     cooperative_topk), then -inf / out-of-range ids dropped to -1.
+
+    '
   for:
   - vllm.models.deepseek_v41.nvidia.specialized_decode.attention.candidate_topk.select_candidate_blocks_cooperative
   labels:
@@ -2217,24 +2312,6 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
-- id: slot_mapping_triton
-  description: 'Parallel slot-mapping computation for paged KV caches: parallelises
-    over
-
-    (request, token block) instead of launching one program per request,
-
-    removing the serial token walk on prefill batches with few long requests.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - vLLM
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
 - id: sparse_attn_sharedkv
   description: 'DeepSeekV4 shared-KV sparse attention in three modes: SWA (sliding
 
@@ -2394,7 +2471,8 @@ ops:
   - alpha: '5.4'
 - id: topk_sigmoid
   description: Selects MoE experts using sigmoid scores and optional correction bias.
-    Returns uncorrected weights with optional normalization and scaling and marks padded experts.
+    Returns uncorrected weights with optional normalization and scaling and marks
+    padded experts.
   for:
   - _moe_C.topk_sigmoid
   labels:

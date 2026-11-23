@@ -211,6 +211,12 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py": [
         "tests/test_mhc_shifted_post_pre.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/mhc_shifted_post_pre.py": [
+        "tests/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/mhc_shifted_post_pre.py": [
+        "tests/test_mhc_shifted_post_pre.py",
+    ],
     "src/flaggems_vllm/ops/mhc_with_norm.py": [
         "tests/test_mhc_with_norm.py",
     ],
@@ -382,6 +388,12 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/paged_mqa.py": ["benchmark/test_glm5_cache_perf.py"],
     "src/flaggems_vllm/ops/mhc_with_norm.py": ["benchmark/test_glm5_ops_perf.py"],
     "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py": [
+        "benchmark/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_metax/ops/mhc_shifted_post_pre.py": [
+        "benchmark/test_mhc_shifted_post_pre.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_mthreads/ops/mhc_shifted_post_pre.py": [
         "benchmark/test_mhc_shifted_post_pre.py",
     ],
     "src/flaggems_vllm/runtime/backend/_nvidia/hopper/ops/w8a8_block_fp8_bmm.py": [
