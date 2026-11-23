@@ -458,6 +458,19 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: compute_slot_mappings
+  description: 'Parallel slot-mapping computation for paged KV caches: parallelises
+    over (request, token block) instead of launching one program per request, removing
+    the serial token walk on prefill batches with few long requests.'
+  for:
+  - vllm_ascend.ops.triton.compute_slot_mapping._compute_slot_mapping_kernel
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
 - id: compute_topk_scores
   description: Collect sampled and top-k token scores and sampled-token ranks for vLLM.
   for:
@@ -2280,24 +2293,6 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
-- id: slot_mapping_triton
-  description: 'Parallel slot-mapping computation for paged KV caches: parallelises
-    over
-
-    (request, token block) instead of launching one program per request,
-
-    removing the serial token walk on prefill batches with few long requests.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - vLLM
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
 - id: sparse_attn_sharedkv
   description: 'DeepSeekV4 shared-KV sparse attention in three modes: SWA (sliding
 
