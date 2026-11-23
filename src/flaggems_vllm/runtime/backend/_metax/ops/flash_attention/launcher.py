@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 import triton
@@ -24,7 +25,15 @@ from flaggems_vllm.runtime.backend._metax.ops.flash_attention.common import (
     tn_compile_scenario,
 )
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.direct import (
+    flash_varlen_int8_decode_launch,
+    flash_varlen_int8_decode_merge,
+    flash_varlen_int8_decode_merge_legacy,
     flash_varlen_int8_fwd_kernel,
+    flash_varlen_int8_mixed_main,
+    flash_varlen_int8_mixed_merge,
+    flash_varlen_int8_mixed_short,
+    flash_varlen_int8_residual_flags,
+    flash_varlen_int8_single_value,
     launch_direct,
 )
 from flaggems_vllm.runtime.backend._metax.ops.flash_attention.ragged import (
@@ -57,6 +66,16 @@ D256_TN_SPLITKV_MAX_Q = 132
 
 
 D256_TN_SPLITKV_MAX_TOTAL_Q = 139
+
+
+try:
+    # The native 3.9 compiler benefits from its MMA/min-register schedule for
+    # packed D256. Keep the tuned FlagTree schedule and other compiler builds.
+    _NATIVE_D256_ATTENTION_SCHEDULE = not hasattr(
+        triton, "_flagtree_backend"
+    ) and version("triton").startswith("3.6.0+metax3.9.")
+except PackageNotFoundError:
+    _NATIVE_D256_ATTENTION_SCHEDULE = False
 
 
 def launch_metax_attention(
@@ -316,9 +335,10 @@ def normalize_int8_descale(descale, batch_size, num_heads, nblocks, device, name
         raise ValueError(f"{name} must be on the same device as q")
     if descale.dtype != torch.float32:
         raise TypeError(f"{name} must have dtype torch.float32")
-    if descale.ndim == 0:
+    ndim = descale.ndim
+    if ndim == 0:
         descale = descale.reshape(1, 1, 1).expand(batch_size, num_heads, nblocks)
-    elif descale.ndim == 1:
+    elif ndim == 1:
         if descale.numel() == 1:
             descale = descale.reshape(1, 1, 1).expand(batch_size, num_heads, nblocks)
         else:
@@ -327,12 +347,12 @@ def normalize_int8_descale(descale, batch_size, num_heads, nblocks, device, name
             descale = descale.reshape(1, num_heads, 1).expand(
                 batch_size, num_heads, nblocks
             )
-    elif descale.ndim == 2:
+    elif ndim == 2:
         if descale.shape != (batch_size, num_heads):
             raise ValueError(f"{name} 2D scale must be [B, H]")
         descale = descale[:, :, None].expand(batch_size, num_heads, nblocks)
     else:
-        if descale.ndim != 3 or descale.shape != (
+        if ndim != 3 or descale.shape != (
             batch_size,
             num_heads,
             nblocks,
@@ -430,42 +450,46 @@ def flash_attn_varlen_func_w8a8_int8(
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
     if max_seqlen_q < 0 or max_seqlen_k < 0:
         raise ValueError("max_seqlen_q and max_seqlen_k must be nonnegative")
+    # Reuse immutable metadata within this call; tensor values are not cached.
+    q_shape, q_device = q.shape, q.device
+    input_k_shape, input_v_shape = k.shape, v.shape
     if q.ndim != 3:
         raise ValueError("q must have shape [total_q, heads, head_dim]")
-    if max_seqlen_q == 0 and q.shape[0] != 0:
+    if max_seqlen_q == 0 and q_shape[0] != 0:
         raise ValueError("max_seqlen_q must be positive when q is nonempty")
+    q_strides = q.stride()
     expected_kv_ndim = 4 if block_table is not None else 3
     if k.ndim != expected_kv_ndim or v.ndim != expected_kv_ndim:
         raise ValueError("k and v rank does not match the selected cache layout")
     if q.dtype != torch.int8 or k.dtype != torch.int8 or v.dtype != torch.int8:
         raise TypeError("q, k, and v must have dtype torch.int8 for W8A8-INT8")
-    if q.device != k.device or q.device != v.device:
+    if q_device != k.device or q_device != v.device:
         raise ValueError("q, k, and v must be on the same device")
-    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+    if q_strides[-1] != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise NotImplementedError("q, k, and v must be contiguous in head_dim")
-    if k.shape != v.shape:
+    if input_k_shape != input_v_shape:
         raise ValueError("k and v must have identical shapes")
-    head_size = q.shape[-1]
+    head_size = q_shape[-1]
     if not 8 <= head_size <= 256 or head_size % 8 != 0:
         raise NotImplementedError("head_dim must be a multiple of 8 between 8 and 256")
-    if k.shape[-1] != head_size:
+    if input_k_shape[-1] != head_size:
         raise ValueError("q, k, and v must have the same head_dim")
-    if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_q.device != q.device:
+    if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_q.device != q_device:
         raise ValueError("cu_seqlens_q must be an int32 tensor on q.device")
     if cu_seqlens_k is not None and (
-        cu_seqlens_k.dtype != torch.int32 or cu_seqlens_k.device != q.device
+        cu_seqlens_k.dtype != torch.int32 or cu_seqlens_k.device != q_device
     ):
         raise ValueError("cu_seqlens_k must be an int32 tensor on q.device")
     if seqused_k is not None and (
-        seqused_k.dtype != torch.int32 or seqused_k.device != q.device
+        seqused_k.dtype != torch.int32 or seqused_k.device != q_device
     ):
         raise ValueError("seqused_k must be an int32 tensor on q.device")
     if block_table is not None and (
-        block_table.dtype != torch.int32 or block_table.device != q.device
+        block_table.dtype != torch.int32 or block_table.device != q_device
     ):
         raise ValueError("block_table must be an int32 tensor on q.device")
     if out is not None:
-        if out.shape != q.shape or out.device != q.device:
+        if out.shape != q_shape or out.device != q_device:
             raise ValueError("out must match q shape and device")
         if out.dtype not in (torch.float16, torch.bfloat16):
             raise TypeError("out must have dtype torch.float16 or torch.bfloat16")
@@ -478,14 +502,14 @@ def flash_attn_varlen_func_w8a8_int8(
         ):
             raise ValueError("out must not alias q, k, or v")
 
-    num_heads_k = k.shape[2] if block_table is not None else k.shape[1]
-    if num_heads_k <= 0 or q.shape[1] <= 0 or q.shape[1] % num_heads_k != 0:
+    num_heads_k = input_k_shape[2] if block_table is not None else input_k_shape[1]
+    if num_heads_k <= 0 or q_shape[1] <= 0 or q_shape[1] % num_heads_k != 0:
         raise ValueError("The number of KV heads must divide the number of query heads")
-    if q.shape[1] != num_heads_k and head_size not in (64, 128, 256):
+    if q_shape[1] != num_heads_k and head_size not in (64, 128, 256):
         raise NotImplementedError("GQA supports head dimensions 64, 128 and 256")
 
     if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        softmax_scale = 1.0 / math.sqrt(q_shape[-1])
     if window_size is None:
         real_window_size = (-1, -1)
     else:
@@ -517,23 +541,23 @@ def flash_attn_varlen_func_w8a8_int8(
             "block_table must be contiguous in its last dimension with shape [batch, pages]"
         )
     if alibi_slopes is not None and (
-        alibi_slopes.device != q.device
+        alibi_slopes.device != q_device
         or alibi_slopes.dtype != torch.float32
         or alibi_slopes.stride(-1) != 1
-        or alibi_slopes.shape not in ((q.shape[1],), (batch_size, q.shape[1]))
+        or alibi_slopes.shape not in ((q_shape[1],), (batch_size, q_shape[1]))
     ):
         raise ValueError(
             "alibi_slopes must be FP32 [heads] or [batch, heads] on q.device"
         )
-    if q.shape[0] == 0 or max_seqlen_k == 0:
+    if q_shape[0] == 0 or max_seqlen_k == 0:
         if out is None:
-            out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+            out = torch.empty(q_shape, dtype=torch.bfloat16, device=q_device)
         lse = (
-            torch.empty((q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device)
+            torch.empty((q_shape[1], q_shape[0]), dtype=torch.float32, device=q_device)
             if return_softmax_lse
             else None
         )
-        if q.shape[0] != 0:
+        if q_shape[0] != 0:
             fill_tensor(out, 0.0)
             if return_softmax_lse:
                 fill_tensor(lse, float("inf"))
@@ -546,7 +570,7 @@ def flash_attn_varlen_func_w8a8_int8(
 
     normalized_descales = []
     for descale, heads, max_length, name in (
-        (q_descale, q.shape[1], max_seqlen_q, "q_descale"),
+        (q_descale, q_shape[1], max_seqlen_q, "q_descale"),
         (k_descale, num_heads_k, max_seqlen_k, "k_descale"),
         (v_descale, num_heads_k, max_seqlen_k, "v_descale"),
     ):
@@ -557,23 +581,34 @@ def flash_attn_varlen_func_w8a8_int8(
             else triton.cdiv(max_length, 128)
         )
         normalized_descales.append(
-            normalize_int8_descale(descale, batch_size, heads, blocks, q.device, name)
+            normalize_int8_descale(descale, batch_size, heads, blocks, q_device, name)
         )
     q_descale, k_descale, v_descale = normalized_descales
     batch = cu_seqlens_q.numel() - 1
-    total, heads, dim = q.shape
-    kv_heads = k.shape[-2]
+    total, heads, dim = q_shape
+    kv_heads = input_k_shape[-2]
     group = heads // kv_heads
     paged = block_table is not None
-    page_size = k.shape[1] if paged else 0
+    page_size = input_k_shape[1] if paged else 0
     # Amortize D256 packing over long queries and bound the INT8 K + FP16 V
     # scratch allocation, even when max_seqlen_k is a padded upper bound.
+    # Short KV packing needs enough query/head work to amortize allocation and
+    # packing. Small GQA and heavily padded batches retain the original path.
+    # The existing byte limits still bound packed storage.
+    short_packed_d256 = (
+        _NATIVE_D256_ATTENTION_SCHEDULE
+        and dim == 256
+        and 1024 <= max_seqlen_k < 2048
+        and max_seqlen_q >= 1024
+        and total * heads >= 16384
+        and batch * max_seqlen_q <= 8 * total
+    )
     pack_d256 = (
         dim == 256
-        and batch <= 64
+        and batch <= (128 if short_packed_d256 else 64)
         and (batch <= 16 or batch * max_seqlen_q <= 32 * total)
         and max_seqlen_q >= 1024
-        and max_seqlen_k >= 2048
+        and (max_seqlen_k >= 2048 or short_packed_d256)
         and batch * max_seqlen_k * kv_heads * dim * 3 <= 512 * 1024 * 1024
     )
     # Bound packing by the physical cache size, including shared-page layouts.
@@ -582,17 +617,51 @@ def flash_attn_varlen_func_w8a8_int8(
         and (dim in (64, 128) or pack_d256)
         and max_seqlen_q >= 128
         and max_seqlen_k > 0
-        and k.shape[0] > 0
-        and batch * max_seqlen_k <= k.shape[0] * page_size
+        and input_k_shape[0] > 0
+        and batch * max_seqlen_k <= input_k_shape[0] * page_size
     )
     left, right = real_window_size
     if out is None:
-        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+        out = torch.empty(q_shape, dtype=torch.bfloat16, device=q_device)
     lse = (
-        torch.empty((heads, total), dtype=torch.float32, device=q.device)
+        torch.empty((heads, total), dtype=torch.float32, device=q_device)
         if return_softmax_lse
         else None
     )
+    # A bound of one guarantees that every nonempty request has one KV token.
+    # Its attention output is exactly dequantized V, independent of QK.
+    if (
+        dim == 256
+        and max_seqlen_q == 1
+        and max_seqlen_k == 1
+        and not return_softmax_lse
+        and 1 <= group <= 16
+        and group & (group - 1) == 0
+    ):
+        with torch_device_fn.device(q_device):
+            flash_varlen_int8_single_value[(batch, kv_heads)](
+                v,
+                out,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_k,
+                block_table,
+                v_descale,
+                (
+                    paged,
+                    block_table.stride(0) if paged else 0,
+                    v.stride(0) if paged else 0,
+                    v.stride(-3),
+                    v.stride(-2),
+                    v_descale.stride(0),
+                    v_descale.stride(1),
+                    group,
+                    out.stride(0),
+                    out.stride(1),
+                ),
+                num_warps=4,
+            )
+        return out
     # Folding short queries reuses each KV tile across its grouped query heads.
     fold = max_seqlen_q <= 16 and 1 < group <= 16 and group & (group - 1) == 0
     block_m = 32 if fold and max_seqlen_q > 4 else 16
@@ -635,6 +704,14 @@ def flash_attn_varlen_func_w8a8_int8(
             num_splits, max(1, triton.cdiv(max_seqlen_k, block_n)), workspace_cap
         )
     split_kv = splits > 1
+    # This native C550 schedule preserves the original split-KV grid.
+    active_decode_splits = (
+        _NATIVE_D256_ATTENTION_SCHEDULE
+        and dim == 256
+        and max_seqlen_q == 1
+        and fold
+        and split_kv
+    )
     # The compact mapper reads CUQ on device, including empty and padded requests.
     # The compact mapper's live state makes the wide packed D256 kernel spill
     # heavily. Use a rectangular grid; pack_d256 bounds both batch size
@@ -650,7 +727,7 @@ def flash_attn_varlen_func_w8a8_int8(
         else triton.cdiv(max_seqlen_q, query_tile)
     )
     grid = (tiles * splits, 1 if compact else batch, grid_heads)
-    with torch_device_fn.device(q.device):
+    with torch_device_fn.device(q_device):
         if logical_kv:
             packed_shape = (batch, max_seqlen_k, kv_heads, dim)
             packed_stride = (
@@ -686,84 +763,426 @@ def flash_attn_varlen_func_w8a8_int8(
                 SKIP_SHORT=False,
             )
             k, v = packed_key, packed_value
+            # Layout mode 2 keeps the same packed storage and streams D128
+            # PV slices. Resolve only on the packed path; no extra kernel
+            # argument or compiler-global lookup on short-query launches.
+            # The capacity limit avoids the observed order-sensitive cases.
+            logical_kv = (
+                2
+                if _NATIVE_D256_ATTENTION_SCHEDULE
+                and batch * max_seqlen_k * kv_heads * dim * 3 <= 128 * 1024 * 1024
+                else 1
+            )
         if split_kv:
             kernel_out = torch.empty(
-                (splits, total, heads, dim), dtype=torch.float32, device=q.device
+                (splits, total, heads, dim), dtype=torch.float32, device=q_device
             )
             kernel_stats = torch.empty(
-                (splits, 2, heads, total), dtype=torch.float32, device=q.device
+                (splits, 2, heads, total), dtype=torch.float32, device=q_device
             )
         else:
             kernel_out, kernel_stats = out, lse
-        flash_varlen_int8_fwd_kernel[grid](
-            q,
-            k,
-            v,
-            kernel_out,
-            kernel_stats,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_k,
-            block_table,
-            q_descale,
-            k_descale,
-            v_descale,
-            alibi_slopes,
-            q.stride(0),
-            q.stride(1),
-            k.stride(-3),
-            k.stride(-2),
-            k.stride(0) if paged else 0,
-            v.stride(-3),
-            v.stride(-2),
-            v.stride(0) if paged else 0,
-            kernel_out.stride(-3),
-            kernel_out.stride(-2),
-            *q_descale.stride(),
-            *k_descale.stride(),
-            *v_descale.stride(),
-            block_table.stride(0) if paged else 0,
-            (
-                alibi_slopes.stride(0)
-                if alibi_slopes is not None and alibi_slopes.ndim == 2
-                else 0
-            ),
-            total,
-            group,
-            dim,
-            triton.next_power_of_2(max(dim, 64)),
-            page_size,
-            paged,
-            causal,
-            left,
-            right,
-            softcap,
-            softmax_scale,
-            alibi_slopes is not None,
-            return_softmax_lse or split_kv,
-            KV_SPLITS=splits,
-            OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
-            LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
-            LOGICAL_KV=logical_kv,
-            BATCH=batch,
-            COMPACT=compact,
-            FOLD=fold,
-            # Keep the original schedule for short dense KV and multi-query
-            # tiles; the extra runtime branches can increase register pressure.
-            DECODE_FASTPATH=(
-                dim == 256
-                and max_seqlen_q == 1
-                and (max_seqlen_k == 1 or max_seqlen_k > block_n)
-            ),
-            BM=block_m,
-            BN=block_n,
-            num_warps=num_warps,
-            num_stages=2 if dim == 256 and logical_kv else 1,
-            pipeline="basic",
-            # Restore the opt-in layout used by the published D128 benchmark.
-            scenario="attention-query-warps" if dim == 128 and logical_kv else "",
-        )
-        if split_kv:
+        if dim == 256 and max_seqlen_q == 1:
+            short_decode = (
+                active_decode_splits
+                and parallel_heads >= 512
+                and left < 0
+                and right < 0
+                and softcap <= 0
+                and alibi_slopes is None
+                and v_descale.stride(2) == 0
+            )
+            decode_meta = (
+                q_strides[0],  # sq
+                q_strides[1],  # hq
+                k.stride(-3),  # sk
+                k.stride(-2),  # hk
+                k.stride(0) if paged else 0,  # pk
+                v.stride(-3),  # sv
+                v.stride(-2),  # hv
+                v.stride(0) if paged else 0,  # pv
+                kernel_out.stride(-3),  # so
+                kernel_out.stride(-2),  # ho
+                q_descale.stride(0),  # qs0
+                q_descale.stride(1),  # qs1
+                q_descale.stride(2),  # qs2
+                k_descale.stride(0),  # ks0
+                k_descale.stride(1),  # ks1
+                k_descale.stride(2),  # ks2
+                v_descale.stride(0),  # vs0
+                v_descale.stride(1),  # vs1
+                v_descale.stride(2),  # vs2
+                block_table.stride(0) if paged else 0,  # table_stride
+                (
+                    alibi_slopes.stride(0)
+                    if alibi_slopes is not None and alibi_slopes.ndim == 2
+                    else 0
+                ),  # alibi_stride
+                total,  # TOTAL_Q
+                group,  # GROUP
+                dim,  # HEAD_DIM
+                triton.next_power_of_2(max(dim, 64)),  # D
+                page_size,  # PAGE
+                paged,  # PAGED
+                causal,  # CAUSAL
+                left,  # LEFT
+                right,  # RIGHT
+                softcap,  # CAP
+                softmax_scale,  # SCALE
+                alibi_slopes is not None,  # HAS_ALIBI
+                return_softmax_lse or split_kv,  # WRITE_LSE
+                splits,  # KV_SPLITS
+                kernel_out.stride(0) if split_kv else 0,  # OUT_SPLIT_STRIDE
+                kernel_stats.stride(0) if split_kv else 0,  # LSE_SPLIT_STRIDE
+                False,  # LOGICAL_KV
+                batch,  # BATCH
+                False,  # COMPACT
+                fold,  # FOLD
+                block_m,  # BM
+                block_n,  # BN
+                (
+                    (2 if return_softmax_lse else 3)
+                    if active_decode_splits
+                    else (max_seqlen_k == 1 or max_seqlen_k > block_n)
+                ),  # DECODE_FASTPATH
+                True,  # RESIDUAL_PATH
+                False,  # SELECT_RESIDUAL
+                short_decode,
+            )
+            flash_varlen_int8_decode_launch[grid](
+                q,
+                k,
+                v,
+                kernel_out,
+                kernel_stats,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_k,
+                block_table,
+                q_descale,
+                k_descale,
+                v_descale,
+                alibi_slopes,
+                decode_meta,
+                num_warps=num_warps,
+                num_stages=1,
+                pipeline="basic",
+            )
+        else:
+            # Keep short-query launch overhead small. Long queries with uniform
+            # V scales select their precision path entirely on the device.
+            select_residual = max_seqlen_q >= 128 and v_descale.stride(2) == 0
+            residual_flags = None
+            if select_residual and dim == 256 and _NATIVE_D256_ATTENTION_SCHEDULE:
+                residual_flags = torch.empty(
+                    (kv_heads,), dtype=torch.int32, device=q_device
+                )
+                flash_varlen_int8_residual_flags[(kv_heads,)](
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_k,
+                    v_descale,
+                    residual_flags,
+                    batch,
+                    paged,
+                    v_descale.stride(0),
+                    v_descale.stride(1),
+                    num_warps=4,
+                )
+            # Long-KV short requests otherwise serialize a mostly empty Q tile.
+            # Split only those requests, retaining the existing prefill schedule.
+            # Reserve at least two splits without exceeding 128 MiB of scratch.
+            mixed_short = (
+                _NATIVE_D256_ATTENTION_SCHEDULE
+                and dim == 256
+                and logical_kv
+                and 2 <= batch <= 16
+                and max_seqlen_q >= 1024
+                and max_seqlen_k >= 8192
+                and not split_kv
+                and left < 0
+                and right < 0
+                and softcap <= 0
+                and alibi_slopes is None
+                and batch * 32 * heads * (dim + 2) * 4 * 2 <= 128 * 1024 * 1024
+            )
+            forward_kernel = (
+                flash_varlen_int8_mixed_main
+                if mixed_short
+                else flash_varlen_int8_fwd_kernel
+            )
+            # Interleave a small head group for each prefill tile to reuse packed KV.
+            # Wider head groups retain the original measured schedule.
+            head_first = (
+                _NATIVE_D256_ATTENTION_SCHEDULE
+                and dim == 256
+                and logical_kv
+                and not compact
+                and not fold
+                and not split_kv
+                and heads <= 8
+            )
+            forward_grid = (tiles * heads, batch, 1) if head_first else grid
+            for residual_path in (False, True) if select_residual else (True,):
+                forward_kernel[forward_grid](
+                    q,
+                    k,
+                    v,
+                    kernel_out,
+                    kernel_stats,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_k,
+                    block_table,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    alibi_slopes,
+                    q_strides[0],
+                    q_strides[1],
+                    k.stride(-3),
+                    k.stride(-2),
+                    k.stride(0) if paged else 0,
+                    v.stride(-3),
+                    v.stride(-2),
+                    v.stride(0) if paged else 0,
+                    kernel_out.stride(-3),
+                    kernel_out.stride(-2),
+                    *q_descale.stride(),
+                    *k_descale.stride(),
+                    *v_descale.stride(),
+                    block_table.stride(0) if paged else 0,
+                    (
+                        alibi_slopes.stride(0)
+                        if alibi_slopes is not None and alibi_slopes.ndim == 2
+                        else 0
+                    ),
+                    total,
+                    group,
+                    dim,
+                    triton.next_power_of_2(max(dim, 64)),
+                    page_size,
+                    paged,
+                    causal,
+                    left,
+                    right,
+                    softcap,
+                    softmax_scale,
+                    alibi_slopes is not None,
+                    return_softmax_lse or split_kv,
+                    KV_SPLITS=splits,
+                    OUT_SPLIT_STRIDE=kernel_out.stride(0) if split_kv else 0,
+                    LSE_SPLIT_STRIDE=kernel_stats.stride(0) if split_kv else 0,
+                    LOGICAL_KV=logical_kv,
+                    BATCH=batch,
+                    COMPACT=compact,
+                    FOLD=fold,
+                    # Keep the original schedule for short dense KV and multi-query
+                    # tiles; the extra runtime branches can increase register pressure.
+                    DECODE_FASTPATH=(
+                        2
+                        if active_decode_splits
+                        else (
+                            dim == 256
+                            and max_seqlen_q == 1
+                            and (max_seqlen_k == 1 or max_seqlen_k > block_n)
+                        )
+                    ),
+                    HEAD_FIRST=heads if head_first else 0,
+                    RESIDUAL_PATH=residual_path,
+                    SELECT_RESIDUAL=select_residual,
+                    RESIDUAL_FLAGS=residual_flags if residual_path else None,
+                    BM=block_m,
+                    BN=block_n,
+                    num_warps=num_warps,
+                    num_stages=2 if dim == 256 and logical_kv else 1,
+                    pipeline="basic",
+                    # Restore the opt-in layout used by the published D128 benchmark.
+                    scenario=(
+                        "flashattn-fwd"
+                        if dim == 256 and logical_kv and _NATIVE_D256_ATTENTION_SCHEDULE
+                        else (
+                            "attention-query-warps" if dim == 128 and logical_kv else ""
+                        )
+                    ),
+                )
+            if mixed_short:
+                bytes_per_mixed_split = batch * 32 * heads * (dim + 2) * 4
+                mixed_splits = min(
+                    32, max(2, (128 * 1024 * 1024) // bytes_per_mixed_split)
+                )
+                mixed_partial = torch.empty(
+                    (mixed_splits, batch * 32, heads, dim),
+                    dtype=torch.float32,
+                    device=q_device,
+                )
+                mixed_stats = torch.empty(
+                    (mixed_splits, 2, heads, batch * 32),
+                    dtype=torch.float32,
+                    device=q_device,
+                )
+                flash_varlen_int8_mixed_short[2 * mixed_splits, batch, heads](
+                    q,
+                    k,
+                    v,
+                    mixed_partial,
+                    mixed_stats,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_k,
+                    block_table,
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    alibi_slopes,
+                    q_strides[0],
+                    q_strides[1],
+                    k.stride(-3),
+                    k.stride(-2),
+                    k.stride(0) if paged else 0,
+                    v.stride(-3),
+                    v.stride(-2),
+                    v.stride(0) if paged else 0,
+                    mixed_partial.stride(-3),
+                    mixed_partial.stride(-2),
+                    *q_descale.stride(),
+                    *k_descale.stride(),
+                    *v_descale.stride(),
+                    block_table.stride(0) if paged else 0,
+                    (
+                        alibi_slopes.stride(0)
+                        if alibi_slopes is not None and alibi_slopes.ndim == 2
+                        else 0
+                    ),
+                    total,
+                    group,
+                    dim,
+                    triton.next_power_of_2(max(dim, 64)),
+                    page_size,
+                    paged,
+                    causal,
+                    left,
+                    right,
+                    softcap,
+                    softmax_scale,
+                    alibi_slopes is not None,
+                    True,
+                    KV_SPLITS=mixed_splits,
+                    OUT_SPLIT_STRIDE=mixed_partial.stride(0),
+                    LSE_SPLIT_STRIDE=mixed_stats.stride(0),
+                    LOGICAL_KV=logical_kv,
+                    BATCH=batch,
+                    COMPACT=compact,
+                    FOLD=fold,
+                    DECODE_FASTPATH=(
+                        2
+                        if active_decode_splits
+                        else dim == 256
+                        and max_seqlen_q == 1
+                        and (max_seqlen_k == 1 or max_seqlen_k > block_n)
+                    ),
+                    RESIDUAL_PATH=True,
+                    SELECT_RESIDUAL=False,
+                    RESIDUAL_FLAGS=None,
+                    BM=16,
+                    BN=64,
+                    num_warps=num_warps,
+                    num_stages=1,
+                    pipeline="basic",
+                    scenario="flashattn-fwd",
+                )
+                flash_varlen_int8_mixed_merge[(batch * 32, heads)](
+                    mixed_partial,
+                    mixed_stats,
+                    out,
+                    lse,
+                    cu_seqlens_q,
+                    seqused_k,
+                    total,
+                    heads,
+                    dim,
+                    batch,
+                    mixed_splits,
+                    out.stride(0),
+                    out.stride(1),
+                    return_softmax_lse,
+                    num_warps=4,
+                )
+        if active_decode_splits:
+            if short_decode:
+                flash_varlen_int8_decode_merge[(batch, heads)](
+                    kernel_out,
+                    kernel_stats,
+                    out,
+                    lse,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_k,
+                    v,
+                    v_descale,
+                    block_table,
+                    total,
+                    heads,
+                    dim,
+                    splits,
+                    block_n,
+                    paged,
+                    out.stride(0),
+                    out.stride(1),
+                    return_softmax_lse,
+                    group,
+                    (
+                        v.stride(0) if paged else 0,
+                        v.stride(-3),
+                        v.stride(-2),
+                        v_descale.stride(0),
+                        v_descale.stride(1),
+                        block_table.stride(0) if paged else 0,
+                    ),
+                    q if short_decode else None,
+                    k if short_decode else None,
+                    q_descale if short_decode else None,
+                    k_descale if short_decode else None,
+                    alibi_slopes,
+                    decode_meta if short_decode else None,
+                    num_warps=1 if short_decode else 1,
+                    scenario="flashattn-fwd" if short_decode else "",
+                    pipeline="basic",
+                    num_stages=1,
+                )
+            else:
+                flash_varlen_int8_decode_merge_legacy[(batch, heads)](
+                    kernel_out,
+                    kernel_stats,
+                    out,
+                    lse,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_k,
+                    v,
+                    v_descale,
+                    block_table,
+                    total,
+                    heads,
+                    dim,
+                    splits,
+                    block_n,
+                    paged,
+                    out.stride(0),
+                    out.stride(1),
+                    return_softmax_lse,
+                    group,
+                    (
+                        v.stride(0) if paged else 0,
+                        v.stride(-3),
+                        v.stride(-2),
+                        v_descale.stride(0),
+                        v_descale.stride(1),
+                        block_table.stride(0) if paged else 0,
+                    ),
+                    num_warps=1,
+                )
+        elif split_kv:
             _flash_int8_merge_splits[(total, heads)](
                 kernel_out,
                 kernel_stats,

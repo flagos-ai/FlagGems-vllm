@@ -1,0 +1,17 @@
+{
+  "repository_base_commit": "cff8d900b31ee11ae46ef7416551b035b138e42a",
+  "comparison": "Before is the preceding retained version; after adds short-KV D256 packed dispatch. Not a full PR-head-to-final comparison.",
+  "shapes_sha256": "543386162d804b4f142a2b385510c51303f0e5c62dced45cc60ae2b54093ee7f",
+  "source_hashes": {
+    "before": {
+      "direct": "f8036c448b820a9c5ad8bbd048b792432b88cf501faab2788aba93f38664c102",
+      "launcher": "f31aaa755897199b1e7a367e195c2b19b27b8e669d15f51a2320ef34dc0313f3"
+    },
+    "final": {
+      "direct": "f8036c448b820a9c5ad8bbd048b792432b88cf501faab2788aba93f38664c102",
+      "launcher": "c65707d4b476e198638576fe309322b34aa0eeed0266cff6a48a758eeae4f135"
+    }
+  },
+  "strict_tests": 75,
+  "full_replay_output_checks": 2248
+}
