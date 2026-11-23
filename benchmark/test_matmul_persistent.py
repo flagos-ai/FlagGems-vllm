@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Same-run vLLM port versus the public matmul entry; no Graph timing."""
+"""NVIDIA benchmark with an optional vLLM native reference and baseline fallback."""
 
 import inspect
+import math
+import warnings
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,27 @@ from tests.test_matmul_persistent import assert_case
 
 from . import base, consts
 from .conftest import Config
+from .consts import lookup_base_record_ex
+
+
+def _native_reference():
+    try:
+        from vllm.model_executor.determinism.batch_invariant import (
+            matmul_batch_invariant as native,
+        )
+    except Exception as exc:
+        warnings.warn(
+            f"vLLM matmul_batch_invariant unavailable: {type(exc).__name__}: {exc}; "
+            "using a matching --base-data record or the Python baseline."
+        )
+        return None
+    if not callable(native) or native is gems.matmul_persistent:
+        warnings.warn(
+            "An independent vLLM native reference is unavailable; "
+            "using a matching --base-data record or the Python baseline."
+        )
+        return None
+    return native
 
 
 class MatmulPersistentBenchmark(base.Benchmark):
@@ -44,53 +67,142 @@ class MatmulPersistentBenchmark(base.Benchmark):
 
     def init_user_config(self):
         super().init_user_config()
+        self._native_op = self.torch_op
         if self.mode not in (consts.BenchMode.KERNEL, consts.BenchMode.OPERATOR):
             raise ValueError("Use non-Graph kernel/operator timing")
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             self.binding = workload.binding_from_shape(shape)
-            if Config.base_data is not None:
-                record = (
-                    Config.base_data.get(workload.OP_NAME, {})
-                    .get("shapes", {})
-                    .get(str(workload.key_shape(self.binding)), {})
-                    .get(str(dtype))
-                )
-                if record is not None:
-                    expected = workload.config(self.binding, dtype)
-                    actual = record.get("config", {})
-                    if any(actual.get(k) != expected[k] for k in ("inputs", "outputs")):
-                        raise ValueError("--base-data input/output contract differs")
             args, kwargs = workload.build_inputs(self.binding, dtype, gems.device)
             yield (*args, kwargs)
 
+    def _python_baseline(self):
+        if not hasattr(self, "_baseline_op"):
+            try:
+                reference = workload.native()
+                if not callable(reference) or reference is self.gems_op:
+                    raise RuntimeError("No independent Python baseline callable")
+            except Exception as exc:
+                warnings.warn(
+                    f"Python baseline unavailable: {type(exc).__name__}: {exc}"
+                )
+                reference = None
+            self._baseline_op = reference
+        return self._baseline_op
+
+    def _use_reference(self, kind, reference):
+        self.torch_op = reference
+        self._shape_detail["comparison_source"] = kind
+        self._shape_detail["native_kind"] = (
+            kind if reference is not None else "unavailable"
+        )
+        self._shape_detail["native_source_sha256"] = (
+            workload.NATIVE_SOURCE_SHA256
+            if reference is not None and kind == workload.NATIVE_KIND
+            else None
+        )
+
     def record_shapes(self, *args, **kwargs):
-        return dict(
+        dtype = args[0].dtype
+        # Keep the semantic collector key first for the shared JSON matcher.
+        detail = dict(
             key_shape=torch.Size(workload.key_shape(self.binding)),
             inputs=super().record_shapes(*args, **kwargs),
-            config=workload.config(self.binding, args[0].dtype),
-            native_kind=workload.NATIVE_KIND,
+            config=workload.config(self.binding, dtype),
             candidate_file=inspect.getfile(gems.matmul_persistent),
             graph=False,
         )
+        self._shape_detail = detail
+        self._has_json_reference = False
+        if Config.base_data is not None:
+            record, reason = lookup_base_record_ex(
+                Config.base_data, self.op_name, dtype, detail, self.base_variant
+            )
+            if record is not None and record.get("latency_ms") is not None:
+                actual = record.get("config", {})
+                if any(
+                    actual.get(k) != detail["config"][k] for k in ("inputs", "outputs")
+                ):
+                    raise ValueError("--base-data input/output contract differs")
+                latency = record["latency_ms"]
+                if (
+                    isinstance(latency, bool)
+                    or not isinstance(latency, (int, float))
+                    or not math.isfinite(latency)
+                    or latency <= 0
+                ):
+                    raise ValueError(
+                        "--base-data latency_ms must be finite and positive"
+                    )
+                self._has_json_reference = True
+            else:
+                detail["json_baseline_miss_reason"] = reason or "latency_ms missing"
+        # Reconsider the native reference for every shape and dtype.
+        if self._native_op is not None:
+            self._use_reference("installed_vllm", self._native_op)
+        elif self._has_json_reference:
+            self._use_reference("json_baseline", None)
+        else:
+            reference = self._python_baseline()
+            self._use_reference(
+                workload.NATIVE_KIND if reference is not None else "unavailable",
+                reference,
+            )
+        return detail
 
     def get_latency(self, op, *args, **kwargs):
-        # assert_case uses both public and baseline entries before either timed call.
-        assert_case(*args, **kwargs)
-        return super().get_latency(op, *args, **kwargs)
+        # Candidate correctness errors must never trigger reference fallback.
+        expected = assert_case(*args, **kwargs)
+        is_reference = op is self.torch_op
+        before = [
+            (value, value.clone())
+            for value in (*args, *kwargs.values())
+            if isinstance(value, torch.Tensor)
+        ]
+        try:
+            # Correctness checks and input snapshots stay outside timing.
+            torch.testing.assert_close(
+                op(*args, **kwargs), expected, rtol=0, atol=0, equal_nan=True
+            )
+            assert all(
+                torch.equal(value, saved) for value, saved in before
+            ), "Callable modified inputs"
+            latency = super().get_latency(op, *args, **kwargs)
+            assert all(
+                torch.equal(value, saved) for value, saved in before
+            ), "Timed callable modified inputs"
+            if not math.isfinite(latency) or latency <= 0:
+                raise ValueError(f"Invalid latency: {latency!r}")
+            return latency
+        except Exception as exc:
+            if not is_reference:
+                raise
+            for value, saved in before:
+                value.copy_(saved)
+            kind = self._shape_detail["native_kind"]
+            reason = f"{type(exc).__name__}: {exc}"
+            self._shape_detail.setdefault("reference_failures", {})[kind] = reason
+            warnings.warn(f"{kind} reference failed: {reason}")
+            # A matching JSON record takes priority over timing the Python port.
+            if not self._has_json_reference and op is self._native_op:
+                reference = self._python_baseline()
+                if reference is not None and reference is not op:
+                    self._use_reference(workload.NATIVE_KIND, reference)
+                    return self.get_latency(reference, *args, **kwargs)
+            self._use_reference(
+                "json_baseline" if self._has_json_reference else "unavailable", None
+            )
+            return None
 
 
 @pytest.mark.matmul_persistent
 def test_matmul_persistent_benchmark():
-    if gems.vendor_name != "nvidia" or not torch.cuda.is_available():
-        pytest.skip("NVIDIA CUDA required")
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if "H20" not in props.name.split() or (props.major, props.minor) != (9, 0):
-        pytest.skip("Current performance claim is H20 only")
+    assert gems.vendor_name == "nvidia", "NVIDIA CUDA required"
+    assert torch.cuda.is_available(), "NVIDIA CUDA is unavailable"
     bench = MatmulPersistentBenchmark(
         op_name=workload.OP_NAME,
-        torch_op=workload.native(),
+        torch_op=_native_reference(),
         gems_op=gems.matmul_persistent,
         dtypes=workload.DTYPES,
         is_inplace=False,

@@ -17,9 +17,6 @@ import torch
 
 import flaggems_vllm
 import flaggems_vllm.testing as fg_testing
-from flaggems_vllm.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
-    fused_q_kv_rmsnorm,
-)
 
 pytestmark = pytest.mark.fused_q_kv_rmsnorm
 
@@ -32,31 +29,33 @@ def _rmsnorm_ref(x, weight, eps):
 
 
 @pytest.mark.parametrize(
-    ("tokens", "qdim", "kvdim"),
+    ("tokens", "qdim", "kvdim", "dtype"),
     [
-        (4, 256, 128),
-        (8, 1536, 512),
+        (4, 256, 128, torch.float32),
+        (4, 256, 128, torch.float32),
+        (8, 1536, 512, torch.bfloat16),
+        (8, 1536, 512, torch.bfloat16),
     ],
 )
-def test_fused_q_kv_rmsnorm_accuracy(tokens, qdim, kvdim):
+def test_fused_q_kv_rmsnorm_accuracy(tokens, qdim, kvdim, dtype):
     device = flaggems_vllm.runtime.device.name
-    qr = torch.randn((tokens, qdim), device=device, dtype=torch.bfloat16)
-    kv = torch.randn((tokens, kvdim), device=device, dtype=torch.bfloat16)
-    q_weight = torch.randn((qdim,), device=device, dtype=torch.bfloat16)
-    kv_weight = torch.randn((kvdim,), device=device, dtype=torch.bfloat16)
+    qr = torch.randn((tokens, qdim), device=device, dtype=dtype)
+    kv = torch.randn((tokens, kvdim), device=device, dtype=dtype)
+    q_weight = torch.randn((qdim,), device=device, dtype=dtype)
+    kv_weight = torch.randn((kvdim,), device=device, dtype=dtype)
     eps = 1e-6
 
-    q_out, kv_out = fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps)
+    q_out, kv_out = flaggems_vllm.fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps)
 
     fg_testing.assert_close(
         q_out,
         _rmsnorm_ref(qr, q_weight, eps),
-        dtype=torch.bfloat16,
+        dtype=dtype,
         equal_nan=True,
     )
     fg_testing.assert_close(
         kv_out,
         _rmsnorm_ref(kv, kv_weight, eps),
-        dtype=torch.bfloat16,
+        dtype=dtype,
         equal_nan=True,
     )

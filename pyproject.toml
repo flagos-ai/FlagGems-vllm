@@ -91,7 +91,6 @@ hygon = [
 mthreads = [
     "mate @ https://dl.mthreads.com/repo/api/pypi/pypi/mate/0.2.4/mate-0.2.4-py3-none-any.whl#sha256=3221a86f96dd73e6e0c468cccd5ea962dbeaef2c1f3a21957ba09214fd8e5cce",
     "torchada>=0.1.76",
-    "apache-tvm-ffi==0.1.9.post3+musa.1",
     # tvm_ffi imports ml_dtypes from its Cython init without declaring it, and
     # ml_dtypes 0.7 is built against the NumPy 2 C-API: 0.6 is the newest build
     # that loads on the NumPy 1.26 every MUSA image runs.
@@ -133,7 +132,6 @@ no-build-isolation-package = ["vllm-musa"]
 aiter-dtk = { path = "tools/aiter_wrapper" }
 vllm-musa = { path = "tools/vllm_musa_wrapper" }
 tilelang-musa = { index = "mthreads" }
-apache-tvm-ffi = { index = "mthreads" }
 
 [[tool.uv.index]]
 name = "mthreads"
