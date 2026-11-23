@@ -546,12 +546,6 @@ def matching_targets_for_stem(stem: str, targets: set[str], root: str) -> list[s
     return sorted(set(prefix_matches))
 
 
-def operator_source_stem(path: str) -> str:
-    if path.startswith("src/flaggems_vllm/runtime/backend/_thead/fused/marlin/"):
-        return "fused_marlin_moe"
-    return Path(path).stem
-
-
 def tests_for_source(path: str, tests: set[str]) -> list[str]:
     if path in EXPLICIT_SOURCE_TO_TESTS:
         return [test for test in EXPLICIT_SOURCE_TO_TESTS[path] if test in tests]
@@ -566,7 +560,7 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
 
-    stem = operator_source_stem(path)
+    stem = Path(path).stem
     return matching_targets_for_stem(stem, tests, "tests")
 
 
@@ -593,7 +587,7 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
     if not (is_shared_operator or is_backend_operator) or not path.endswith(".py"):
         return []
 
-    stem = operator_source_stem(path)
+    stem = Path(path).stem
     return matching_targets_for_stem(stem, benchmarks, "benchmark")
 
 
