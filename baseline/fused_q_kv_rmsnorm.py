@@ -41,7 +41,7 @@ def native():
     global NATIVE_UNAVAILABLE_REASON
     NATIVE_UNAVAILABLE_REASON = None
     try:
-        mod = importlib.import_module("vllm.models.deepseek_v4.common.ops")
+        mod = importlib.import_module("vllm.models.common.ops.fused_qk_rmsnorm")
     except (ImportError, OSError) as exc:
         NATIVE_UNAVAILABLE_REASON = str(exc)
         return None
