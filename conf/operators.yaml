@@ -458,6 +458,19 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: compute_slot_mappings
+  description: 'Parallel slot-mapping computation for paged KV caches: parallelises
+    over (request, token block) instead of launching one program per request, removing
+    the serial token walk on prefill batches with few long requests.'
+  for:
+  - vllm_ascend.ops.triton.compute_slot_mapping._compute_slot_mapping_kernel
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
 - id: compute_topk_scores
   description: Collect sampled and top-k token scores and sampled-token ranks for vLLM.
   for:
@@ -1208,6 +1221,22 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: gather_kda_state
+  description: |
+    Gathers KDA recurrent states from the paged cache into the [N, H, K, V]
+    layout expected by the AscendC chunk operator, zeroing slots without an
+    initial state, with the transpose folded into a single kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream has implemented its own Triton kernel.
+  for:
+    - torch chain (gather -> clear_ssm_states -> transpose-copy)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
 - id: gather_sampler_output
   description: Pack and restore batch-sharded tokens, counts, and logprobs around
     vLLM all-gather.
@@ -1577,23 +1606,6 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
-- id: kda_conv_scatter
-  description: 'Restores the staged rows back into the block-strided KDA
-
-    short-convolution state cache after the AscendC conv operator in one
-
-    pass, skipping PAD entries inside the kernel.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
 - id: kda_gate_cumsum
   description: 'Fused Triton replacement for the AscendC kda_gate_cumsum operator:
 
@@ -1602,24 +1614,6 @@ ops:
     in-chunk cumulative sums with one program per (chunk, head) tile
 
     instead of one serial block per sequence.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
-- id: kda_state_gather
-  description: 'Gathers KDA recurrent states from the paged cache into the [N, H,
-    K, V]
-
-    layout expected by the AscendC chunk operator, zeroing slots without an
-
-    initial state, with the transpose folded into a single kernel.
 
     '
   for:
@@ -2216,6 +2210,22 @@ ops:
   stages:
   - stable: '4.1'
   cpp: '4.0'
+- id: scatter_conv_state
+  description: |
+    Restores the staged rows back into the block-strided KDA
+    short-convolution state cache after the AscendC conv operator in one
+    pass, skipping PAD entries inside the kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream has implemented its own Triton kernel.
+  for:
+    - torch chain (arange/masked_fill -> where/zeros_like/sum -> index_copy_)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
 - id: select_candidate_blocks_cooperative
   description: 'DeepSeek-V4.1 decode candidate-block selection. Triton port of vLLM''s
 
@@ -2303,24 +2313,6 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '2.0'
-- id: slot_mapping_triton
-  description: 'Parallel slot-mapping computation for paged KV caches: parallelises
-    over
-
-    (request, token block) instead of launching one program per request,
-
-    removing the serial token walk on prefill batches with few long requests.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - vLLM
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
 - id: sparse_attn_sharedkv
   description: 'DeepSeekV4 shared-KV sparse attention in three modes: SWA (sliding
 

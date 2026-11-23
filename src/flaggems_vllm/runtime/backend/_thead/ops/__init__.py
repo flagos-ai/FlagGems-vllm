@@ -33,6 +33,9 @@ from flaggems_vllm.runtime.backend._thead.ops.gdn_w8a16_int8 import (
     quantize_gdn_state_int8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.gemma_rms_norm import gemma_rms_norm
+from flaggems_vllm.runtime.backend._thead.ops.grouped_gemma_rmsnorm import (
+    grouped_gemma_rmsnorm,
+)
 from flaggems_vllm.runtime.backend._thead.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
@@ -63,6 +66,7 @@ __all__ = [
     "gdn_w8a16_int8",
     "gemma_rms_norm",
     "get_num_sampled_and_rejected",
+    "grouped_gemma_rmsnorm",
     "hc_combine",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
