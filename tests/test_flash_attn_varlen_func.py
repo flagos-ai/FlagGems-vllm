@@ -722,3 +722,49 @@ def test_flash_attn_varlen_func_fa3_matches_fa2(
         )
         torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2)
         torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.flash_attn_varlen_func
+def test_paged_kv_pipeline_options_are_not_inherited_across_backends():
+    """A PPU must not pick up a pipeline option that was tuned on H20.
+
+    ConfigLoader falls back to the NVIDIA heuristics per op name rather than
+    per field, so an ``mha_block_*`` entry gains its pipeline options on every
+    backend that does not override that whole entry. _thead overrides only
+    ``mha_block_128``; the smaller tiles are also the ones whose launch
+    keywords _paged_kv_pipeline_thead() decides, and
+    ``heuristic_pipeline_options`` is applied after it, so an option appearing
+    on one of them would silently override the PPU decision as well.
+    """
+    from flaggems_vllm.ops.flash_api import _paged_kv_pipeline_thead
+    from flaggems_vllm.runtime.backend._nvidia import (
+        heuristics_config_utils as nvidia_heuristics,
+    )
+    from flaggems_vllm.runtime.backend._thead import (
+        heuristics_config_utils as thead_heuristics,
+    )
+
+    decided_by_thead_rule = {
+        name
+        for name in ("mha_block_16", "mha_block_32", "mha_block_64", "mha_block_128")
+        if any(
+            _paged_kv_pipeline_thead(3, block_m, block_k, num_ctas, 64)
+            for block_m in [int(name.rsplit("_", 1)[1])]
+            for block_k in (64, 128, 256)
+            for num_ctas in (1, 10**5)
+        )
+    }
+    for name in sorted(
+        decided_by_thead_rule - set(thead_heuristics.HEURISTICS_CONFIGS)
+    ):
+        tuned_on_h20 = [
+            field
+            for field in nvidia_heuristics.HEURISTICS_CONFIGS[name]
+            if field.startswith("pipeline_")
+        ]
+        assert not tuned_on_h20, (
+            f"{name} carries {tuned_on_h20} tuned on H20 and is not overridden in "
+            "runtime/backend/_thead/heuristics_config_utils.py, so a PPU inherits "
+            "those values and they override _paged_kv_pipeline_thead(); add a "
+            "_thead entry for this tile"
+        )
