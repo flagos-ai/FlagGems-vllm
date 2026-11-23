@@ -710,8 +710,8 @@ DTYPES = [
         torch.float8_e4m3fn,
         id="fp8",
         marks=pytest.mark.skipif(
-            flaggems_vllm.vendor_name != "nvidia",
-            reason="FP8 selection is currently validated on NVIDIA",
+            flaggems_vllm.vendor_name not in ("nvidia", "mthreads"),
+            reason="FP8 selection is currently validated on NVIDIA and MThreads",
         ),
     ),
 ]
@@ -754,10 +754,15 @@ def test_qsa_select_paged_prefill_matches_torch_reference(
 
 @pytest.mark.qsa_select_paged_prefill
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "nvidia"
-    or not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() != (9, 0),
-    reason="Native vLLM QSA comparison requires NVIDIA SM90",
+    flaggems_vllm.vendor_name not in ("nvidia", "mthreads")
+    or (
+        flaggems_vllm.vendor_name == "nvidia"
+        and (
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability() != (9, 0)
+        )
+    ),
+    reason="Native vLLM QSA comparison requires NVIDIA SM90 or MThreads MUSA",
 )
 @pytest.mark.parametrize("settings", CASES)
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -776,7 +781,7 @@ def test_qsa_select_paged_prefill_matches_vllm(
     ):
         pytest.skip("Native cross-check is limited to validated head/dimension pairs")
     if dtype == torch.bfloat16 and case.q.shape[1:] == (8, 256):
-        pytest.skip("Native BF16 H8/D256 exceeds H800 shared memory")
+        pytest.skip("Native BF16 H8/D256 resource guard")
     monkeypatch.setattr(
         reference.envs,
         "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB",
@@ -794,7 +799,8 @@ def test_qsa_select_paged_prefill_matches_vllm(
 
 @pytest.mark.qsa_select_paged_prefill
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "nvidia", reason="NVIDIA wrapper error contract"
+    flaggems_vllm.vendor_name not in ("nvidia", "mthreads"),
+    reason="NVIDIA/MThreads wrapper error contract",
 )
 @pytest.mark.parametrize(
     "case",

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Select compressed QSA key groups for packed BF16/FP8 prefill on NVIDIA SM90.
+"""Select compressed QSA key groups for packed BF16/FP8 prefill on NVIDIA/MUSA.
 
 API and semantics follow vllm-project/vllm commit
 7a877ae34dcf4a7d46de08eb16db4699e1e0047c,
@@ -33,6 +33,34 @@ from flaggems_vllm import runtime
 from flaggems_vllm.ops.persistent_topk import HAS_TLE, persistent_topk
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.libentry import LibEntry
+
+
+_MTHREADS_TILE_CONFIGS = (
+    (4, 64, 1, 4),
+    (8, 64, 4, 4),
+    (16, 64, 4, 4),
+    (32, 64, 4, 4),
+    (32, 128, 4, 8),
+    (64, 64, 16, 4),
+)
+
+
+def _mthreads_score_configs(name):
+    configs = []
+    for tile_r, block_n, k_tiles, num_warps in _MTHREADS_TILE_CONFIGS:
+        meta = {"TILE_R": tile_r, "BLOCK_N": block_n, "K_TILES": k_tiles}
+        if name == "qsa_select_paged_prefill_head_group_score":
+            meta["HEAD_GROUP"] = False
+        if name == "qsa_select_paged_prefill_fp8_store_score":
+            meta["QUERY_PARTS"] = 1
+        configs.append(triton.Config(meta, num_warps=num_warps, num_stages=2))
+    return configs
+
+
+def _score_configs(name):
+    if runtime.device.vendor_name == "mthreads":
+        return _mthreads_score_configs(name)
+    return runtime.get_tuned_config(name)
 
 
 class _QSAScoreEntry(LibEntry):
@@ -105,7 +133,7 @@ def _fp8_bulk_tail_store(ptrs, values, valid_rows, columns, visible, logits_widt
 
 @_QSAScoreEntry
 @libtuner(
-    configs=runtime.get_tuned_config("qsa_select_paged_prefill_fp8_store_score"),
+    configs=_score_configs("qsa_select_paged_prefill_fp8_store_score"),
     key=[
         "num_rows",
         "max_query_len",
@@ -347,7 +375,7 @@ def _select_all_kernel(visible_ptr, output_ptr, K: tl.constexpr, BLOCK: tl.const
 
 @_QSAScoreEntry
 @libtuner(
-    configs=runtime.get_tuned_config("qsa_select_paged_prefill_head_group_score"),
+    configs=_score_configs("qsa_select_paged_prefill_head_group_score"),
     key=[
         "num_rows",
         "max_query_len",
@@ -508,7 +536,7 @@ def _qsa_prefill_score_kernel(
 
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("qsa_select_paged_prefill_score"),
+    configs=_score_configs("qsa_select_paged_prefill_score"),
     key=[
         "num_rows",
         "max_query_len",
@@ -717,11 +745,15 @@ def _validate_inputs(
     max_seq_len,
 ):
     tensors = (q, k_cache, page_table, query_start_loc, visible_blocks, block_indices)
-    if q.device.type != "cuda" or runtime.device.vendor_name != "nvidia":
-        raise NotImplementedError("QSA prefill currently requires NVIDIA CUDA SM90")
+    vendor = runtime.device.vendor_name
+    expected_device = {"nvidia": "cuda", "mthreads": "musa"}.get(vendor)
+    if expected_device is None or q.device.type != expected_device:
+        raise NotImplementedError("QSA prefill requires NVIDIA SM90 or MThreads MUSA")
     if any(t.device != q.device for t in tensors):
         raise ValueError("QSA prefill tensors must be on the same device")
-    if torch.cuda.get_device_capability(q.device) != (9, 0):
+    if runtime.device.vendor_name == "nvidia" and torch.cuda.get_device_capability(
+        q.device
+    ) != (9, 0):
         raise NotImplementedError("QSA prefill currently supports SM90 (H800/H100)")
     if q.dtype != k_cache.dtype:
         raise ValueError("Q and the compressed K cache must match dtype")
@@ -809,7 +841,8 @@ def _prefill_score_metadata(q, k_cache, page_table):
 
 def _fp8_store_eligible(q, logits, logits_width):
     return (
-        q.dtype == torch.float8_e4m3fn
+        runtime.device.vendor_name == "nvidia"
+        and q.dtype == torch.float8_e4m3fn
         and logits.dtype == torch.float32
         and logits.is_contiguous()
         and logits.ndim == 2
@@ -929,7 +962,7 @@ def qsa_select_paged_prefill(
         return
     capacity = page_table.shape[1] * k_cache.shape[1]
     visible_bound = min(capacity, triton.cdiv(max_seq_len, compress_ratio))
-    with torch.cuda.device(q.device):
+    with runtime.torch_device_fn.device(q.device):
         if visible_bound <= k:
             _select_all_kernel[(rows, triton.cdiv(k, 256))](
                 visible_blocks, block_indices, K=k, BLOCK=256, num_warps=4
