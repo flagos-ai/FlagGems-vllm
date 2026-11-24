@@ -179,6 +179,7 @@ jobs:
         if: (success() || failure()) && steps.select-targets.outcome == 'success'
         env:
           CI_TARGETS_JSON: ${{ env.BENCH_TARGETS_JSON }}
+          PYTEST_ADDOPTS: -rs
         run: |
           source "${VENV_DIR}/bin/activate"
           python tools/run_ci_targets.py \
