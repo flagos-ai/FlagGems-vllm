@@ -16,6 +16,8 @@ import triton
 
 from flaggems_vllm.utils import triton_version_utils as _triton_version_utils
 
+from .gemma4_fused_routing_kernel_triton import gemma4_fused_routing_kernel_triton
+
 if triton.__version__ >= "3.4":
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops.deep_gemm_fp8_o_proj import (  # noqa: F401
         deep_gemm_fp8_o_proj,
@@ -26,6 +28,7 @@ if triton.__version__ >= "3.4":
 
 __all__ = [
     "deep_gemm_fp8_o_proj",
+    "gemma4_fused_routing_kernel_triton",
     "w8a8_block_matmul",
 ]
 

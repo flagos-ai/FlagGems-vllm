@@ -2020,3 +2020,25 @@ flash_mla_sparse_fwd:
   - META: {BK: 64, BH: 64}
     num_warps: 8
     num_stages: 4
+
+gemma4_routing_select:
+  - META: {BLOCK_T: 1}
+    num_warps: 1
+    num_stages: 1
+  - META: {BLOCK_T: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_T: 8}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_T: 16}
+    num_warps: 4
+    num_stages: 1
+
+gemma4_routing_partial:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
