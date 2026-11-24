@@ -105,9 +105,12 @@ def sas():
 @pytest.fixture(autouse=True)
 def isolated_launcher_cache(sas, monkeypatch):
     monkeypatch.setattr(sas, "_EAGER_COMPILED_LAUNCHER_CACHE", {})
-    monkeypatch.setattr(
-        torch, "npu", SimpleNamespace(current_device=lambda: 0), raising=False
-    )
+    if hasattr(torch, "npu"):
+        monkeypatch.setattr(torch.npu, "current_device", lambda: 0)
+    else:
+        monkeypatch.setattr(
+            torch, "npu", SimpleNamespace(current_device=lambda: 0), raising=False
+        )
 
 
 OPTIONS_A = {"multibuffer": False, "unit_flag": True}
