@@ -379,8 +379,13 @@ def assert_native_selection(logits, visible, actual, native, *, dtype, head_dim)
 
 def vllm_reference():
     """Import vLLM's own QSA operator when it is available."""
+    module = (
+        "vllm_metax.models.qwen4_exp.metax.ops.qsa_indexer_fallback"
+        if flaggems_vllm.vendor_name == "metax"
+        else "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer"
+    )
     return pytest.importorskip(
-        "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer",
+        module,
         reason="vLLM QSA is required for the native cross-check",
     )
 
@@ -710,8 +715,8 @@ DTYPES = [
         torch.float8_e4m3fn,
         id="fp8",
         marks=pytest.mark.skipif(
-            flaggems_vllm.vendor_name not in ("nvidia", "mthreads"),
-            reason="FP8 selection is currently validated on NVIDIA and MThreads",
+            flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax"),
+            reason="FP8 selection is currently validated on NVIDIA, MThreads, and MetaX",
         ),
     ),
 ]
@@ -754,7 +759,7 @@ def test_qsa_select_paged_prefill_matches_torch_reference(
 
 @pytest.mark.qsa_select_paged_prefill
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("nvidia", "mthreads")
+    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax")
     or (
         flaggems_vllm.vendor_name == "nvidia"
         and (
@@ -762,7 +767,7 @@ def test_qsa_select_paged_prefill_matches_torch_reference(
             or torch.cuda.get_device_capability() != (9, 0)
         )
     ),
-    reason="Native vLLM QSA comparison requires NVIDIA SM90 or MThreads MUSA",
+    reason="Native vLLM QSA comparison requires NVIDIA, MThreads, or MetaX",
 )
 @pytest.mark.parametrize("settings", CASES)
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -782,11 +787,17 @@ def test_qsa_select_paged_prefill_matches_vllm(
         pytest.skip("Native cross-check is limited to validated head/dimension pairs")
     if dtype == torch.bfloat16 and case.q.shape[1:] == (8, 256):
         pytest.skip("Native BF16 H8/D256 resource guard")
-    monkeypatch.setattr(
-        reference.envs,
-        "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB",
-        settings.get("budget_mb", 512),
-    )
+    if flaggems_vllm.vendor_name == "metax":
+        monkeypatch.setenv(
+            "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB",
+            str(settings.get("budget_mb", 512)),
+        )
+    else:
+        monkeypatch.setattr(
+            reference.envs,
+            "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB",
+            settings.get("budget_mb", 512),
+        )
     actual = case.run_kernel()
     expected = case.outputs()
     # Native vLLM indexes page-table columns with unit stride. Keep the
@@ -799,8 +810,8 @@ def test_qsa_select_paged_prefill_matches_vllm(
 
 @pytest.mark.qsa_select_paged_prefill
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("nvidia", "mthreads"),
-    reason="NVIDIA/MThreads wrapper error contract",
+    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax"),
+    reason="NVIDIA/MThreads/MetaX wrapper error contract",
 )
 @pytest.mark.parametrize(
     "case",

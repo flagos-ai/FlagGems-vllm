@@ -20,9 +20,14 @@ import flaggems_vllm
 from . import base
 
 try:
-    from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer import (
-        qsa_select_paged_prefill as vendor_qsa,
-    )
+    if flaggems_vllm.vendor_name == "metax":
+        from vllm_metax.models.qwen4_exp.metax.ops.qsa_indexer_fallback import (
+            qsa_select_paged_prefill as vendor_qsa,
+        )
+    else:
+        from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer import (
+            qsa_select_paged_prefill as vendor_qsa,
+        )
 
     _HAS_VENDOR = True
     _VENDOR_ERROR = ""
