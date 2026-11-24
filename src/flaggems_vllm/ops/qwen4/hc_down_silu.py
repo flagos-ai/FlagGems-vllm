@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 
 import torch
 import triton
@@ -14,6 +15,11 @@ from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 
 logger = logging.getLogger(__name__)
+
+# Triton 3.6 passes constexprs to the compiled CUDA launcher.
+_HOPPER_LAUNCH = (
+    runtime.device.vendor_name == "nvidia" and triton.__version__.startswith("3.6.")
+)
 
 
 @triton.jit
@@ -171,6 +177,25 @@ def _hc_down_silu_wide_gemv(
     tl.store(O + row * N + columns, value, columns < RANK + HC)
 
 
+@lru_cache(maxsize=256)
+def _hopper_dense_launcher(device, m, k, n, rank, hc, sx, sw):
+    # Limit the specialization to short dense projections. Keep arbitrary
+    # strides, wide addresses and larger prefill workloads on their old paths.
+    if not (
+        sx == sw == k
+        and k % 8 == 0
+        and m * n < 2**31
+        and ((k == 10240 and rank + hc == 324) or (k <= 4096 and rank + hc <= 64))
+        and torch.cuda.get_device_capability(device) == (9, 0)
+    ):
+        return None
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.hc_down_silu import (
+        make_dense_launcher,
+    )
+
+    return make_dense_launcher(device, m, k, n, rank, hc)
+
+
 def hc_down_silu(
     x: torch.Tensor, weight: torch.Tensor, rank: int, hc: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -197,7 +222,8 @@ def hc_down_silu(
         raise ValueError("hc_down_silu requires rank-2 inputs")
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise TypeError("hc_down_silu supports only bfloat16 inputs")
-    if x.device != weight.device:
+    device = x.device
+    if device != weight.device:
         raise ValueError("hc_down_silu requires same-device inputs")
     if x.layout != torch.strided or weight.layout != torch.strided:
         raise ValueError("hc_down_silu requires strided inputs")
@@ -210,9 +236,23 @@ def hc_down_silu(
     sx, sw = x.stride(), weight.stride()
     if sx[1] != 1 or sw[1] != 1 or sx[0] < 0 or sw[0] < 0:
         raise ValueError("hc_down_silu requires unit inner and nonnegative row strides")
-    if x.device.type in ("cpu", "meta"):
+    if device.type in ("cpu", "meta"):
         raise NotImplementedError("hc_down_silu requires accelerator inputs")
-    output = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    output = torch.empty((m, n), dtype=x.dtype, device=device)
+    if (
+        _HOPPER_LAUNCH
+        and 0 < m <= 48
+        and device.type == "cuda"
+        and device.index == torch.cuda.current_device()
+        and (x.data_ptr() | weight.data_ptr() | output.data_ptr()) % 16 == 0
+    ):
+        launch = _hopper_dense_launcher(device.index, m, k, n, rank, hc, sx[0], sw[0])
+        if launch is not None:
+            launch(x, weight, output)
+            return (
+                output.as_strided((m, rank), (n, 1), 0),
+                output.as_strided((m, hc), (n, 1), rank),
+            )
     activation, injection_logits = output[:, :rank], output[:, rank : rank + hc]
     if m == 0:
         return activation, injection_logits
