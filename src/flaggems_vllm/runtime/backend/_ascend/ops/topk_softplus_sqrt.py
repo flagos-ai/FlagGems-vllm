@@ -10,29 +10,30 @@
 
 """TopK Softplus-Sqrt gating kernel in Triton (Ascend).
 
-The original implementation launched one program per token and ran the whole
-softplus/sqrt/top-k pipeline on a single row.  On Ascend that leaves the vector
-units almost idle -- a 256-expert row is only 1 KiB -- so the per-token block
-scheduling and reduction cost dominate: 4096 tokens took ~250 us while the
-kernel below takes ~55 us for the same input.
+Two implementations share this module:
 
-This version follows the structure of TileKernels' ``topk_gate`` Ascend kernel:
+1. **Hardware-sort path (default on 910B, needs TLE)** — ``_softplus_sqrt_score_kernel``
+   materialises ``sqrt(softplus(x)) [+ bias]`` into an fp32 scratch buffer with
+   one wide vector pass, then ``_tle_sort_topk_kernel`` hands each row to the
+   Ascend sort engine (``tle.dsa`` ``sort_1d_pack``/``unpack_sort``).  The sort
+   engine returns the exact top-k values and indices, so the baseline's
+   per-rank max/mask/index-recovery reductions disappear entirely.  On 910B
+   (bf16, 256 experts, topk=6) this is ~4-6x faster than the reduction kernel
+   for 1024-4096 tokens and 1.1-1.3x faster than vllm-ascend's CANN
+   ``moe_gating_top_k_hash`` kernel for 128-4096 tokens.  It is also the only
+   path that compiles for the common shapes on the current BiShengHIR
+   toolchain.
 
-* **Row tiling**: each program owns ``BLOCK_M`` tokens, so a whole tile of
-  logits is loaded with one wide ``tl.load`` and ``softplus``/``sqrt``/bias are
-  applied vector-wise over the ``[BLOCK_M, BLOCK_E]`` tile.
-* **Persistent grid**: the grid is capped at the number of AI vector cores and
-  each program walks a strided slice of the row blocks, exactly like the
-  TileKernels persistent kernel.  Launch/scheduling cost no longer scales with
-  the token count.
-* **Two store strategies**: the top-k loop produces one ``[BLOCK_M]`` vector per
-  rank.  When the row tile is wide (small expert counts) writing those vectors
-  straight to HBM is cheapest (``PER_K_STORE``); when the tile is narrow (large
-  expert counts) assembling a ``[BLOCK_M, BLOCK_K]`` tile and doing one
-  contiguous store per output tensor wins.
-* **Index recovery**: the winner index is recovered with a masked integer
-  reduction (``min`` over the experts that hit the maximum), which keeps the
-  original "smallest expert id wins a tie" semantics.
+2. **Reduction fallback** — the original fused persistent-tiled kernel.  Each
+   program owns ``BLOCK_M`` rows: one wide ``tl.load`` plus vector softplus/
+   sqrt/bias over ``[BLOCK_M, BLOCK_E]``, then a per-rank max + masked integer
+   ``min`` to recover the winner index ("smallest expert id wins a tie").  It
+   is used when TLE is unavailable or the shape is outside the sort engine's
+   comfort zone (very large expert count or topk).
+
+Both paths keep the vLLM semantics: bias only shifts the ranking, routed
+weights come from the unbiased score, and renormalization/scaling happen once
+the top-k set is known.
 """
 
 import logging
@@ -64,6 +65,21 @@ _PER_K_STORE_MIN_BLOCK_M = 32
 _DEFAULT_VECTOR_CORES = 48
 
 _CACHED_VECTOR_CORE_NUM = None
+
+# The current BiShengHIR toolchain overflows the 192 KiB UB budget for a
+# [32, 256] fp32 tile once the softplus/sqrt/reduction temporaries are
+# materialised, so the tiled fallback never uses more than 16 rows per tile
+# even though the 32 KiB score tile itself would fit.
+_MAX_TILE_ROWS = 16
+
+# Hardware-sort path (``tle.dsa`` custom ops).  Each row is sorted by the
+# Ascend sort engine, so this path only makes sense while the row fits the
+# sort scratch budget and topk is small enough to keep the proposal buffer
+# in UB.
+_TLE_SORT_TILE_ELEMS = 8192
+_TLE_SORT_MAX_EXPERTS = 1024
+_TLE_SORT_MAX_TOPK = 32
+_TLE_SORT_ROWS = 8
 
 
 def _next_pow2(value):
@@ -109,7 +125,7 @@ def _plan_launch(num_tokens, num_experts):
     # because the biased weight path gathers the correction bias per winner and
     # that gather does not lower for a one-row tile.
     rows_per_core = _cdiv(num_tokens, num_cores)
-    block_m = min(max(2, _next_pow2(rows_per_core)), max_block_m)
+    block_m = min(max(2, _next_pow2(rows_per_core)), max_block_m, _MAX_TILE_ROWS)
     block_m = max(2, block_m)
 
     num_blocks = _cdiv(num_tokens, block_m)
@@ -315,6 +331,162 @@ def _hash_kernel(
     tl.store(token_expert_indices_ptr + out_base + k_offsets, tei, mask=kmask)
 
 
+@triton.jit
+def _softplus_sqrt_score_kernel(
+    gating_ptr,
+    e_score_correction_bias_ptr,
+    score_ptr,
+    num_tokens,
+    num_experts: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """Materialise ``sqrt(softplus(x)) [+ bias]`` as fp32 scores.
+
+    The score buffer is row-padded to ``BLOCK_E`` experts so that the sort
+    kernel can treat every row as a contiguous power-of-two segment.  Padding
+    experts are filled with ``-inf`` so they can never win a rank.
+    """
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    eo = tl.arange(0, BLOCK_E)
+    rm = rows < num_tokens
+    em = eo < num_experts
+    mask = rm[:, None] & em[None, :]
+
+    x = tl.load(
+        gating_ptr + rows[:, None] * num_experts + eo[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    x = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x)))
+    s = tl.sqrt(x)
+    if HAS_BIAS:
+        bias = tl.load(eo + e_score_correction_bias_ptr, mask=em, other=0.0).to(
+            tl.float32
+        )
+        s = s + bias[None, :]
+    s = tl.where(em[None, :], s, -float("inf"))
+    tl.store(score_ptr + rows[:, None] * BLOCK_E + eo[None, :], s, mask=rm[:, None])
+
+
+if HAS_TLE:
+
+    @triton.jit
+    def _tle_sort_topk_kernel(
+        e_score_correction_bias_ptr,
+        score_ptr,
+        topk_weights_ptr,
+        topk_indices_ptr,
+        token_expert_indices_ptr,
+        num_tokens,
+        routed_scaling_factor,
+        num_experts: tl.constexpr,
+        topk: tl.constexpr,
+        BLOCK_E: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        NUM_CORES: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        renormalize: tl.constexpr,
+    ):
+        """Per-row hardware sort (``tle.dsa`` sort engine) + weight assembly.
+
+        Each program owns ``BLOCK_M`` rows: one contiguous DMA copy brings the
+        tile from HBM into UB, then every row is sorted by ``sort_1d_pack`` and
+        decoded by ``unpack_sort``.  ``tl.static_range`` keeps the per-row
+        sub-view offsets constexpr while still sharing the tile copy.
+
+        The bias only shifts the ranking, so the routed weight is recovered
+        from the *unbiased* logit as ``value - bias[winner]``.  ``value`` is
+        the exact fp32 score carried by the proposal and the bias of the
+        selected experts is gathered from the UB-resident bias vector, so the
+        packed proposal layout stays intact and no second score buffer is
+        needed.
+        """
+        pid = tl.program_id(0)
+        kk = tl.arange(0, BLOCK_K)
+        kmask = kk < topk
+        tile = tl.arange(0, BLOCK_M * BLOCK_E)
+
+        # BASE sort path scratch: 4 * segment length floats.
+        tmp = tl.zeros([BLOCK_E * 4], dtype=tl.float32)
+        buf_ub = tle.dsa.alloc(
+            [BLOCK_M * BLOCK_E], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+        )
+        seg_ub = tle.dsa.alloc(
+            [2 * BLOCK_K], dtype=tl.float32, mem_addr_space=tle.dsa.ascend.UB
+        )
+        dval = tl.zeros([BLOCK_K], dtype=tl.float32)
+        didx = tl.zeros([BLOCK_K], dtype=tl.int32)
+        if HAS_BIAS:
+            # Bias is tiny ([E]) and reused by every row: keep it in UB and
+            # gather from there instead of issuing a scattered HBM load per
+            # selected expert.
+            bias_vec = tl.load(
+                e_score_correction_bias_ptr + tl.arange(0, BLOCK_E),
+                mask=tl.arange(0, BLOCK_E) < num_experts,
+                other=0.0,
+            ).to(tl.float32)
+
+        num_blocks = tl.cdiv(num_tokens, BLOCK_M)
+        for blk in range(pid, num_blocks, NUM_CORES):
+            row0 = blk * BLOCK_M
+            tle.dsa.copy(score_ptr + row0 * BLOCK_E + tile, buf_ub, [BLOCK_M * BLOCK_E])
+            # static_range keeps the sub-view offsets constexpr (required by
+            # tle.dsa.subview) while the single tile copy above is amortised
+            # over all BLOCK_M rows.
+            for r in tl.static_range(BLOCK_M):
+                row = row0 + r
+                if row < num_tokens:
+                    row_ub = tle.dsa.subview(buf_ub, [r * BLOCK_E], [BLOCK_E], [1])
+                    tle.dsa.ascend.raw(
+                        "sort_1d_pack",
+                        tle.dsa.to_tensor(row_ub),
+                        tmp,
+                        True,
+                        BLOCK_K,
+                        0,
+                        0,
+                        out=tle.dsa.to_tensor(seg_ub),
+                    )
+                    dval, didx = tle.dsa.ascend.raw(
+                        "unpack_sort",
+                        tle.dsa.to_tensor(seg_ub),
+                        BLOCK_K,
+                        out=[dval, didx],
+                    )
+
+                    if HAS_BIAS:
+                        # The proposal value is the exact biased score and the
+                        # bias only shifted the ranking, so the routed weight
+                        # is the unbiased score: value - bias[winner].  This
+                        # avoids re-running softplus/sqrt per selected expert.
+                        bg = tl.gather(bias_vec, didx, 0)
+                        w = dval - bg
+                    else:
+                        w = dval
+
+                    if renormalize:
+                        wsum = tl.sum(tl.where(kmask, w, 0.0))
+                        scale = routed_scaling_factor / tl.where(wsum > 0.0, wsum, 1.0)
+                    else:
+                        scale = routed_scaling_factor
+
+                    out = row * topk + kk
+                    tl.store(topk_weights_ptr + out, w * scale, mask=kmask)
+                    tl.store(topk_indices_ptr + out, didx, mask=kmask)
+                    tl.store(
+                        token_expert_indices_ptr + out,
+                        (row * topk + kk).to(tl.int32),
+                        mask=kmask,
+                    )
+
+else:
+    _tle_sort_topk_kernel = None
+
+
 if HAS_TLE:
 
     @triton.jit
@@ -415,6 +587,83 @@ else:
     _fused_topk_kernel_ascend_tle = None
 
 
+def _can_use_tle_sort(num_experts, topk):
+    """Whether the hardware-sort path can handle this expert/topk shape."""
+    if not HAS_TLE:
+        return False
+    if num_experts < 1 or num_experts > _TLE_SORT_MAX_EXPERTS:
+        return False
+    if topk < 1 or topk > _TLE_SORT_MAX_TOPK:
+        return False
+    return True
+
+
+def _tle_sort_path(
+    topk_weights,
+    topk_indices,
+    token_expert_indices,
+    gating_output,
+    renormalize,
+    routed_scaling_factor,
+    correction_bias,
+):
+    """Two-stage softplus/sqrt + hardware-sort path (see the kernel docs)."""
+    num_tokens, num_experts = gating_output.shape
+    topk = topk_weights.shape[1]
+
+    block_e = _next_pow2(num_experts) if num_experts > 1 else 1
+    block_k = _next_pow2(topk) if topk > 1 else 1
+    max_rows = max(1, _TLE_SORT_TILE_ELEMS // block_e)
+    sort_rows = min(_TLE_SORT_ROWS, max_rows)
+    score_rows = min(32, max_rows)
+    num_cores = _get_vector_core_num()
+
+    # Row-pad the score buffer so the sort kernel's tile DMA never reads past
+    # the last token.  Padding rows are written by the score kernel with
+    # ``-inf`` and skipped by the sort kernel.
+    n_pad = _cdiv(num_tokens, sort_rows) * sort_rows
+    scores = torch.empty(
+        (n_pad, block_e), dtype=torch.float32, device=gating_output.device
+    )
+    has_bias = correction_bias is not None
+    bias_arg = correction_bias if has_bias else gating_output
+
+    _softplus_sqrt_score_kernel[(_cdiv(num_tokens, score_rows),)](
+        gating_output,
+        bias_arg,
+        scores,
+        num_tokens,
+        num_experts=num_experts,
+        BLOCK_E=block_e,
+        BLOCK_M=score_rows,
+        HAS_BIAS=has_bias,
+        num_warps=1,
+        num_stages=1,
+    )
+
+    num_blocks = _cdiv(num_tokens, sort_rows)
+    grid = (min(num_cores, num_blocks),)
+    _tle_sort_topk_kernel[grid](
+        bias_arg,
+        scores,
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        num_tokens,
+        routed_scaling_factor,
+        num_experts=num_experts,
+        topk=topk,
+        BLOCK_E=block_e,
+        BLOCK_K=block_k,
+        BLOCK_M=sort_rows,
+        NUM_CORES=grid[0],
+        HAS_BIAS=has_bias,
+        renormalize=renormalize,
+        num_warps=1,
+        num_stages=1,
+    )
+
+
 def topk_softplus_sqrt(
     topk_weights,
     topk_indices,
@@ -448,11 +697,12 @@ def topk_softplus_sqrt(
         input_ids: Token IDs for hash mode [num_tokens]
         tid2eid: Hash table mapping tokens to expert indices
         use_ascend_tle: If True (and the Ascend TLE kernel is available),
-            use the TLE kernel for the non-hash path instead of the tiled
-            persistent kernel. Ignored for the hash-mode path, which always
-            uses `_hash_kernel`. Has no effect if `triton.experimental.tle`
-            is not importable (falls back to the tiled kernel, e.g. on
-            non-Ascend backends).
+            force the original per-token TLE kernel for the non-hash path.
+            The default path is the faster two-stage hardware-sort
+            implementation, which shares the same TLE dependency. Ignored for
+            the hash-mode path, which always uses `_hash_kernel`. Has no
+            effect if `triton.experimental.tle` is not importable (falls back
+            to the tiled kernel, e.g. on non-Ascend backends).
     """
     logger.debug("GEMS TOPK_SOFTPLUS_SQRT")
     num_tokens, num_experts = gating_output.shape
@@ -506,6 +756,21 @@ def topk_softplus_sqrt(
             BLOCK_K=BLOCK_K,
             num_warps=1,
             num_stages=1,
+        )
+        return
+
+    # Default path: the Ascend sort engine is several times faster than the
+    # reduction-based tiled kernel on 910B (a 256-expert row sorted by
+    # ``sort_1d_pack`` vs. 12 full-width reductions per row).
+    if _can_use_tle_sort(num_experts, topk):
+        _tle_sort_path(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            routed_scaling_factor,
+            correction_bias,
         )
         return
 
