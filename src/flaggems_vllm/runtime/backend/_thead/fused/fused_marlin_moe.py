@@ -41,6 +41,17 @@ from flaggems_vllm.ops.moe_align_block_size import (
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
+from flaggems_vllm.runtime.backend._thead.fused.marlin_fragments import (
+    byte_permute,
+    decode_fp8_pair,
+    decode_fp8_word,
+    decode_i4_register,
+    decode_int8_fragments,
+    decode_mx_register,
+    fold_fp8_scale_fragment,
+    multiply_bf16_pairs,
+    scale_int8_pair,
+)
 from flaggems_vllm.runtime.backend._thead.tle_utils import supports_tle_primitives
 from flaggems_vllm.utils import libentry
 
@@ -87,22 +98,29 @@ _TL_QUANT_TYPE_FP8_E4M3 = tl.constexpr(QUANT_TYPE_FP8_E4M3)
 
 @triton.jit
 def decode_int8_scaled_bf16(q, scale):
-    return tl.inline_asm_elementwise(
-        "{ .reg .b32 q, l<3>, h<3>, v<2>;\n"
-        "ppu.xor.b32 q,$2,0x80808080;\n"
-        "ppu.prmt.b32 l0,q,0x43,0x4140;\n"
-        "ppu.prmt.b32 h0,q,0x43,0x4342;\n"
-        "ppu.and.b32 l1,l0,0xff7fff7f; ppu.and.b32 h1,h0,0xff7fff7f;\n"
-        "ppu.and.b32 l2,l0,0xff80ff80; ppu.and.b32 h2,h0,0xff80ff80;\n"
-        "ppu.sub.bf16x2 v0,l1,l2; ppu.sub.bf16x2 v1,h1,h2;\n"
-        "ppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4;\n"
-        "ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }",
-        "=r,=r,r,r,r",
-        [q, scale],
+    value = tl.inline_asm_elementwise(
+        (
+            "{ .reg .b32 q, l<3>, h<3>, v<2>;\n"
+            "ppu.xor.b32 q,$2,0x80808080;\n"
+            "ppu.prmt.b32 l0,q,0x43,0x4140;\n"
+            "ppu.prmt.b32 h0,q,0x43,0x4342;\n"
+            "ppu.and.b32 l1,l0,0xff7fff7f;\n"
+            "ppu.and.b32 h1,h0,0xff7fff7f;\n"
+            "ppu.and.b32 l2,l0,0xff80ff80;\n"
+            "ppu.and.b32 h2,h0,0xff80ff80;\n"
+            "ppu.sub.bf16x2 v0,l1,l2;\n"
+            "ppu.sub.bf16x2 v1,h1,h2;\n"
+            "ppu.mov.b32 $0,v0;\n"
+            "ppu.mov.b32 $1,v1;\n"
+            "}\n"
+        ),
+        "=r,=r,r",
+        [q],
         dtype=tl.bfloat16,
         is_pure=True,
         pack=4,
     )
+    return (value * scale).to(tl.bfloat16)
 
 
 @triton.jit
@@ -223,6 +241,7 @@ def dequant_int8(
     num_columns: tl.constexpr,
     compute_type: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    PAIR_K: tl.constexpr = False,
 ):
     tl.static_assert(b.shape[0] == 128 or b.shape[0] == 64)
     group = k_base // GROUP_SIZE
@@ -231,7 +250,19 @@ def dequant_int8(
         mask=ns < num_columns,
         other=0.0,
     )[None, :]
-    if compute_type == tl.bfloat16 and (b.shape[1] <= 128 or b.shape[0] == 64):
+    if PAIR_K and compute_type == tl.bfloat16:
+        # Each pair uses the same group scale; form its register fragment along K.
+        byte0, byte1 = tl.split(
+            tl.reshape(tl.trans(b), (b.shape[1], b.shape[0] // 2, 2))
+        )
+        codes = byte0.to(tl.uint32) | (byte1.to(tl.uint32) << 8)
+        bits = tl.trans(scale).to(tl.uint16, bitcast=True).to(tl.uint32)
+        scales = bits | (bits << 16)
+        values = scale_int8_pair(byte_permute(codes, 0x43, 0x4140), scales)
+        even = values.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+        odd = (values >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+        return tl.trans(tl.reshape(tl.join(even, odd), (b.shape[1], b.shape[0])))
+    elif compute_type == tl.bfloat16 and (b.shape[1] <= 128 or b.shape[0] == 64):
         return decode_int8_scaled_bf16(b.to(tl.uint8), scale)
     else:
         quant = b.to(tl.int32) - 128
@@ -240,31 +271,42 @@ def dequant_int8(
 
 @triton.jit
 def decode_raw_mxfp4_bf16(b, scale):
-    return tl.inline_asm_elementwise(
+    lo, hi = tl.inline_asm_elementwise(
         (
-            (
-                "{ .reg .b32 lo,hi,l<2>,h<2>,m,sgn,bias;\n\nppu.mov.b32 bias,0x7e807e80;"
-                "\n\nppu.and.b32 lo,$4,0x0f0f0f0f;\n ppu.shr.b32 hi,$4,4;"
-                "\n ppu.and.b32 hi,hi,0x0f0f0f0f;\n\nppu.prmt.b32 l0,lo,0,0x4140;"
-                "\n ppu.prmt.b32 l1,lo,0,0x4342;\n\nppu.prmt.b32 h0,hi,0,0x4140;"
-                "\n ppu.prmt.b32 h1,hi,0,0x4342;\n\nppu.mul.lo.u32 l0,l0,0x1040;"
-                " ppu.and.b32 l0,l0,0x81c081c0;\n\nppu.mul.rn.bf16x2 l0,l0,bias;"
-                "\n ppu.mul.rn.bf16x2 l0,l0,$5;\n\nppu.mul.lo.u32 l1,l1,0x1040;"
-                " ppu.and.b32 l1,l1,0x81c081c0;\n\nppu.mul.rn.bf16x2 l1,l1,bias;"
-                "\n ppu.mul.rn.bf16x2 l1,l1,$6;\n\nppu.mul.lo.u32 h0,h0,0x1040;"
-                " ppu.and.b32 h0,h0,0x81c081c0;\n\nppu.mul.rn.bf16x2 h0,h0,bias;"
-                "\n ppu.mul.rn.bf16x2 h0,h0,$5;\n\nppu.mul.lo.u32 h1,h1,0x1040;"
-                " ppu.and.b32 h1,h1,0x81c081c0;\n\nppu.mul.rn.bf16x2 h1,h1,bias;"
-                "\n ppu.mul.rn.bf16x2 h1,h1,$6;\n\nppu.mov.b32 $0,l0;\n ppu.mov.b32 $1,l1;"
-                "\n ppu.mov.b32 $2,h0;\n ppu.mov.b32 $3,h1;\n }"
-            )
+            "{ .reg .b32 lo,hi,l<2>,h<2>,m,sgn,bias;\n"
+            "ppu.mov.b32 bias,0x7e807e80;\n"
+            "ppu.and.b32 lo,$4,0x0f0f0f0f;\n"
+            "ppu.shr.b32 hi,$4,4;\n"
+            "ppu.and.b32 hi,hi,0x0f0f0f0f;\n"
+            "ppu.prmt.b32 l0,lo,0,0x4140;\n"
+            "ppu.prmt.b32 l1,lo,0,0x4342;\n"
+            "ppu.prmt.b32 h0,hi,0,0x4140;\n"
+            "ppu.prmt.b32 h1,hi,0,0x4342;\n"
+            "ppu.mul.lo.u32 l0,l0,0x1040;\n"
+            "ppu.and.b32 l0,l0,0x81c081c0;\n"
+            "ppu.mul.rn.bf16x2 l0,l0,bias;\n"
+            "ppu.mul.lo.u32 l1,l1,0x1040;\n"
+            "ppu.and.b32 l1,l1,0x81c081c0;\n"
+            "ppu.mul.rn.bf16x2 l1,l1,bias;\n"
+            "ppu.mul.lo.u32 h0,h0,0x1040;\n"
+            "ppu.and.b32 h0,h0,0x81c081c0;\n"
+            "ppu.mul.rn.bf16x2 h0,h0,bias;\n"
+            "ppu.mul.lo.u32 h1,h1,0x1040;\n"
+            "ppu.and.b32 h1,h1,0x81c081c0;\n"
+            "ppu.mul.rn.bf16x2 h1,h1,bias;\n"
+            "ppu.mov.b32 $0,l0;\n"
+            "ppu.mov.b32 $1,l1;\n"
+            "ppu.mov.b32 $2,h0;\n"
+            "ppu.mov.b32 $3,h1;\n"
+            "}\n"
         ),
-        "=r,=r,=r,=r,r,r,r",
-        [b, scale],
+        "=r,=r,=r,=r,r",
+        [b],
         dtype=(tl.bfloat16, tl.bfloat16),
         is_pure=True,
         pack=4,
     )
+    return (lo * scale).to(tl.bfloat16), (hi * scale).to(tl.bfloat16)
 
 
 @triton.jit
@@ -382,6 +424,7 @@ def dequant_weight(
     compute_type: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     QUANT_TYPE: tl.constexpr,
+    PAIR_INT8_K: tl.constexpr = False,
 ):
     if QUANT_TYPE == _TL_QUANT_TYPE_UINT4B8:
         return dequant_int4(
@@ -410,6 +453,7 @@ def dequant_weight(
             num_columns,
             compute_type,
             GROUP_SIZE,
+            PAIR_K=PAIR_INT8_K,
         )
     elif QUANT_TYPE == _TL_QUANT_TYPE_FP4_E2M1:
         return dequant_mxfp4(
@@ -473,96 +517,28 @@ def write_fp8_expert_scale_safety(
 
 @triton.jit
 def decode_int8_fragment_bf16(q, s0, s1):
-    return tl.inline_asm_elementwise(
+    low, high = tl.inline_asm_elementwise(
         (
-            (
-                "{ .reg .b32 l<3>, h<3>, v<2>;\n\nppu.prmt.b32 l0,$2,0x43,0x4140;"
-                "\nppu.prmt.b32 h0,$2,0x43,0x4342;\nppu.and.b32 l1,l0,0xff7fff7f;"
-                " ppu.and.b32 h1,h0,0xff7fff7f;\nppu.lop3.b32 l2,l0,0xff80ff80,0x00800080,0x6a;"
-                " ppu.lop3.b32 h2,h0,0xff80ff80,0x00800080,0x6a;\nppu.sub.bf16x2 v0,l1,l2;"
-                " ppu.sub.bf16x2 v1,h1,h2;\nppu.mul.rn.bf16x2 v0,v0,$3;"
-                " ppu.mul.rn.bf16x2 v1,v1,$4;\nppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
-            )
+            "{ .reg .b32 l<3>, h<3>, v<2>;\n"
+            "ppu.prmt.b32 l0,$2,0x43,0x4140;\n"
+            "ppu.prmt.b32 h0,$2,0x43,0x4342;\n"
+            "ppu.and.b32 l1,l0,0xff7fff7f;\n"
+            "ppu.and.b32 h1,h0,0xff7fff7f;\n"
+            "ppu.lop3.b32 l2,l0,0xff80ff80,0x00800080,0x6a;\n"
+            "ppu.lop3.b32 h2,h0,0xff80ff80,0x00800080,0x6a;\n"
+            "ppu.sub.bf16x2 v0,l1,l2;\n"
+            "ppu.sub.bf16x2 v1,h1,h2;\n"
+            "ppu.mov.b32 $0,v0;\n"
+            "ppu.mov.b32 $1,v1;\n"
+            "}\n"
         ),
-        "=r,=r,r,r,r",
-        [q, s0, s1],
+        "=r,=r,r",
+        [q],
         dtype=(tl.uint32, tl.uint32),
         is_pure=True,
         pack=1,
     )
-
-
-PAIR_PERMUTE = (
-    "{ .reg .b32 mag_0,inc_0,mask_0,hi_0,lo_0,tmp_0,v0_0,v1_0,bias_0;"
-    " .reg .b32 mag_1,inc_1,mask_1,hi_1,lo_1,tmp_1,v0_1,v1_1,bias_1;"
-    " ppu.and.b32 mag_0,$4,0x7f7f7f7f;"
-    " ppu.and.b32 mag_1,$5,0x7f7f7f7f;"
-    " ppu.add.u32 inc_0,mag_0,0x01010101;"
-    " ppu.add.u32 inc_1,mag_1,0x01010101;"
-    " ppu.prmt.b32 mask_0,inc_0,0,0xba98;"
-    " ppu.prmt.b32 mask_1,inc_1,0,0xba98;"
-    " ppu.lop3.b32 hi_0,$4,mask_0,0x80808080,0xe4;"
-    " ppu.lop3.b32 hi_1,$5,mask_1,0x80808080,0xe4;"
-    " ppu.shr.b32 tmp_0,$4,4;"
-    " ppu.shr.b32 tmp_1,$5,4;"
-    " ppu.lop3.b32 hi_0,hi_0,tmp_0,0x07070707,0xf8;"
-    " ppu.lop3.b32 hi_1,hi_1,tmp_1,0x07070707,0xf8;"
-    " ppu.shl.b32 lo_0,$4,4;"
-    " ppu.shl.b32 lo_1,$5,4;"
-    " ppu.and.b32 lo_0,lo_0,0xf0f0f0f0;"
-    " ppu.and.b32 lo_1,lo_1,0xf0f0f0f0;"
-    " ppu.prmt.b32 v0_0,lo_0,hi_0,0x5140;"
-    " ppu.prmt.b32 v0_1,lo_1,hi_1,0x5140;"
-    " ppu.prmt.b32 v1_0,lo_0,hi_0,0x7362;"
-    " ppu.prmt.b32 v1_1,lo_1,hi_1,0x7362;"
-)
-PAIR_EXPONENT_BIAS = (
-    " ppu.mov.b32 bias_0,0x7b807b80;"
-    " ppu.mov.b32 bias_1,0x7b807b80;"
-    " ppu.mul.rn.bf16x2 v0_0,v0_0,bias_0;"
-    " ppu.mul.rn.bf16x2 v0_1,v0_1,bias_1;"
-    " ppu.mul.rn.bf16x2 v1_0,v1_0,bias_0;"
-    " ppu.mul.rn.bf16x2 v1_1,v1_1,bias_1;"
-)
-PAIR_MUL_STORE = (
-    " ppu.mul.rn.bf16x2 v0_0,v0_0,$6;"
-    " ppu.mul.rn.bf16x2 v0_1,v0_1,$7;"
-    " ppu.mul.rn.bf16x2 v1_0,v1_0,$6;"
-    " ppu.mul.rn.bf16x2 v1_1,v1_1,$7;"
-    " ppu.mov.b32 $0,v0_0;"
-    " ppu.mov.b32 $2,v0_1;"
-    " ppu.mov.b32 $1,v1_0;"
-    " ppu.mov.b32 $3,v1_1;"
-    " }"
-)
-FOLDED_PAIR_ASM = tl.constexpr(PAIR_PERMUTE + PAIR_MUL_STORE)
-ROBUST_PAIR_ASM = tl.constexpr(PAIR_PERMUTE + PAIR_EXPONENT_BIAS + PAIR_MUL_STORE)
-
-
-@triton.jit
-def decode_fp8_pair(q0, q1, s0, s1, FAST: tl.constexpr):
-    return tl.inline_asm_elementwise(
-        FOLDED_PAIR_ASM if FAST else ROBUST_PAIR_ASM,
-        "=r,=r,=r,=r,r,r,r,r",
-        [q0, q1, s0, s1],
-        dtype=(tl.uint32,) * 4,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def fold_fp8_scale_fragment(s):
-    return tl.inline_asm_elementwise(
-        (
-            "{ .reg .b32 bias; ppu.mov.b32 bias,0x7b807b80; ppu.mul.rn.bf16x2 $0,$1,bias; }"
-        ),
-        "=r,r",
-        [s],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
+    return multiply_bf16_pairs(low, s0), multiply_bf16_pairs(high, s1)
 
 
 @triton.jit
@@ -693,24 +669,20 @@ def commit_w8_tile(copy_token):
 
 @triton.jit
 def wait_w8_tile(copy_token, KEEP: tl.constexpr):
-    if KEEP:
-        return tl.inline_asm_elementwise(
-            ("ppu.cp.async.wait_group 1; bar.sync 0; ppu.mov.b32 $0,$1;"),
-            "=r,r,~{memory}",
-            [copy_token],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-    else:
-        return tl.inline_asm_elementwise(
-            ("ppu.cp.async.wait_group 0; bar.sync 0; ppu.mov.b32 $0,$1;"),
-            "=r,r,~{memory}",
-            [copy_token],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
+    token = tl.inline_asm_elementwise(
+        (
+            "ppu.cp.async.wait_group 1; ppu.mov.b32 $0,$1;"
+            if KEEP
+            else "ppu.cp.async.wait_group 0; ppu.mov.b32 $0,$1;"
+        ),
+        "=r,r,~{memory}",
+        [copy_token],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    tl.debug_barrier()
+    return token
 
 
 @triton.jit
@@ -741,46 +713,6 @@ def load_matrix_x4(shared, row, CW: tl.constexpr, channel, copy_token):
         [shared, 0, row, 1, CW, 1, channel, copy_token],
         dtype=(tl.uint32,) * 4,
         is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def decode_i4_register(q, s0, s1):
-    return tl.inline_asm_elementwise(
-        (
-            "{ .reg .b32 mag,shifted,v0,v1,bias; ppu.mov.b32 bias,0x43084308;"
-            " ppu.shr.b32 shifted,$2,4; ppu.prmt.b32 mag,$2,shifted,0x5140;"
-            " ppu.and.b32 mag,mag,0x0f0f0f0f; ppu.prmt.b32 v0,mag,0x43,0x4140;"
-            " ppu.prmt.b32 v1,mag,0x43,0x4342; ppu.sub.bf16x2 v0,v0,bias;"
-            " ppu.sub.bf16x2 v1,v1,bias; ppu.mul.rn.bf16x2 v0,v0,$3;"
-            " ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0; ppu.mov.b32 $1,v1; }"
-        ),
-        "=r,=r,r,r,r",
-        [q, s0, s1],
-        dtype=(tl.uint32, tl.uint32),
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def decode_mx_register(q, s0, s1):
-    return tl.inline_asm_elementwise(
-        (
-            "{ .reg .b32 ctrl,low,high,sign,v0,v1; ppu.and.b32 ctrl,$2,0x7777;"
-            " ppu.prmt.b32 low,0xc0800000,0xc0804000,ctrl;"
-            " ppu.prmt.b32 high,0x3f3f3f00,0x40404040,ctrl;"
-            " ppu.prmt.b32 sign,0x80808080,0x80808080,$2; ppu.shl.b32 sign,sign,1;"
-            " ppu.and.b32 sign,sign,0x80808080; ppu.or.b32 high,high,sign;"
-            " ppu.prmt.b32 v0,low,high,0x5140; ppu.prmt.b32 v1,low,high,0x7362;"
-            " ppu.mul.rn.bf16x2 v0,v0,$3; ppu.mul.rn.bf16x2 v1,v1,$4; ppu.mov.b32 $0,v0;"
-            " ppu.mov.b32 $1,v1; }"
-        ),
-        "=r,=r,r,r,r",
-        [q, s0, s1],
-        dtype=(tl.uint32, tl.uint32),
-        is_pure=True,
         pack=1,
     )
 
@@ -818,8 +750,11 @@ def decode_w4_fragment_pair(q0, q8, s0, s1, half: tl.constexpr, MX: tl.constexpr
         a0, a1 = decode_mx_register(lo, s0, s0)
         a2, a3 = decode_mx_register(hi, s1, s1)
     else:
-        a0, a1 = decode_i4_register(lo, s0, s0)
-        a2, a3 = decode_i4_register(hi, s1, s1)
+        codes = tl.join(lo, hi)
+        scales = tl.join(s0, s1)
+        low, high = decode_i4_register(codes, scales, scales)
+        a0, a2 = tl.split(low)
+        a1, a3 = tl.split(high)
     return a0, a1, a2, a3
 
 
@@ -1689,6 +1624,7 @@ def decode_bank(
     QTYPE: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    PAIR_FP8: tl.constexpr = False,
 ):
     FP8: tl.constexpr = QTYPE == _TL_QUANT_TYPE_FP8_E4M3
     W4: tl.constexpr = (
@@ -1712,7 +1648,14 @@ def decode_bank(
                 ns < num_columns,
                 other=0,
             )[:, None]
-            lo, hi = decode_raw_int4_bf16(q, scale)
+            low_bits = (q & 15).to(tl.uint16) | 0x4300
+            high_bits = (q >> 4).to(tl.uint16) | 0x4300
+            lo = ((low_bits.to(tl.bfloat16, bitcast=True) - 136.0) * scale).to(
+                tl.bfloat16
+            )
+            hi = ((high_bits.to(tl.bfloat16, bitcast=True) - 136.0) * scale).to(
+                tl.bfloat16
+            )
         else:
             gs = k_base // 32 + tl.arange(0, BK // 32)
             byte = tl.load(
@@ -1725,7 +1668,24 @@ def decode_bank(
             scale = tl.reshape(
                 tl.broadcast_to(scale[:, :, None], (BN, BK // 32, 16)), (BN, BK // 2)
             )
-            lo, hi = decode_raw_mxfp4_bf16(q, scale)
+            if reduction_size >= num_columns:
+                # Embed each E2M1 nibble in BF16 before correcting the exponent.
+                low_bits = ((q & 15).to(tl.uint16) * 0x1040) & 0x81C0
+                high_bits = ((q >> 4).to(tl.uint16) * 0x1040) & 0x81C0
+                lo = (
+                    low_bits.to(tl.bfloat16, bitcast=True).to(tl.float32) * (2.0**126)
+                ).to(tl.bfloat16)
+                hi = (
+                    high_bits.to(tl.bfloat16, bitcast=True).to(tl.float32) * (2.0**126)
+                ).to(tl.bfloat16)
+                lo = (lo * scale).to(tl.bfloat16)
+                hi = (hi * scale).to(tl.bfloat16)
+            else:
+                bits = scale.to(tl.uint16, bitcast=True).to(tl.uint32)
+                pair_scale = bits | (bits << 16)
+                pair, _ = decode_mx_register(q.to(tl.uint32), pair_scale, pair_scale)
+                lo = pair.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+                hi = (pair >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
         value = tl.reshape(tl.join(lo, hi), (BN, BK))
     else:
         q = tl.load(
@@ -1738,11 +1698,19 @@ def decode_bank(
             ns < num_columns,
             other=0,
         )[:, None]
-        if FP8:
+        if FP8 and PAIR_FP8:
+            q0, q1 = tl.split(tl.reshape(q, (BN, BK // 2, 2)))
+            word = q0.to(tl.uint32) | (q1.to(tl.uint32) << 8)
+            bits = scale.to(tl.uint16, bitcast=True).to(tl.uint32)
+            pair, _ = decode_fp8_word(word, bits | (bits << 16))
+            lo = pair.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+            hi = (pair >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+            value = tl.reshape(tl.join(lo, hi), (BN, BK))
+        elif FP8:
             # Normalize the FP8 value before multiplying by the original scale.
             value = decode_fp8_scaled_bf16_normalized(q, scale)
         else:
-            value = decode_int8_scaled_bf16(q, scale)
+            value = ((q.to(tl.int32) - 128).to(tl.bfloat16) * scale).to(tl.bfloat16)
     tl.store(
         decoded
         + expert * num_columns * reduction_size
@@ -2064,6 +2032,8 @@ def decode_dense_bank(
     scales: torch.Tensor,
     destination: torch.Tensor,
     quant_type_id: int,
+    *,
+    pair_fp8: bool = False,
 ) -> None:
     experts, width, packed_k = weight.shape
     reduction = (
@@ -2083,6 +2053,7 @@ def decode_dense_bank(
         quant_type_id,
         columns,
         128,
+        PAIR_FP8=pair_fp8,
         num_warps=8 if columns == 128 else 4,
         num_stages=1,
     )
@@ -2379,7 +2350,13 @@ def run_dense_wna16(
             stop = min(col + tile, output_size)
             width = stop - col
             qw, ss = weight[:, col:stop], scales[:, col:stop]
-            decode_dense_bank(qw, ss, scratch, quant_type_id)
+            decode_dense_bank(
+                qw,
+                ss,
+                scratch,
+                quant_type_id,
+                pair_fp8=quant_type_id == QUANT_TYPE_FP8_E4M3,
+            )
             decoded = (
                 scratch[: e * reduction * width]
                 .view(e, reduction, width)
@@ -2893,6 +2870,7 @@ def marlin_moe_matvec_direct_kernel(
             compute_type,
             GROUP_SIZE_K,
             QUANT_TYPE,
+            PAIR_INT8_K=True,
         )
         acc += tl.sum(a[:, None].to(tl.float32) * b.to(tl.float32), axis=0)
         b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K_WEIGHT, 0))
@@ -3728,8 +3706,8 @@ def square_accumulate(
                     (b0, b1, b2, b3) = load_matrix_x4(
                         ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, copy_token
                     )
-                    (a0, a1) = decode_int8_fragment_bf16(q0, s0, s0)
-                    (a2, a3) = decode_int8_fragment_bf16(q8, s1, s1)
+                    a0, a1 = decode_int8_fragment_bf16(q0, s0, s0)
+                    a2, a3 = decode_int8_fragment_bf16(q8, s1, s1)
                 (c0, c1, c2, c3, c4, c5, c6, c7) = mma_bf16_square(
                     a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7
                 )
@@ -4367,8 +4345,11 @@ def w8_narrow_accumulate(
                     (b0, b1) = load_activation_fragment_x2(
                         ahere + sub // 4 * 1024, sub % 4 * 32, copy_token
                     )
-                    (a0, a2) = decode_int8_fragment_bf16(q0, s0, s0)
-                    (a1, a3) = decode_int8_fragment_bf16(q8, s1, s1)
+                    if IS_SPLIT_Q:
+                        a0, a2 = decode_int8_fragment_bf16(q0, s0, s0)
+                        a1, a3 = decode_int8_fragment_bf16(q8, s1, s1)
+                    else:
+                        a0, a2, a1, a3 = decode_int8_fragments(q0, q8, s0, s1)
                 (c0, c1, c2, c3) = mma_bf16_m16n8(
                     a0, a1, a2, a3, b0, b1, c0, c1, c2, c3
                 )
@@ -4661,9 +4642,13 @@ def accumulate_quantized_wide_tile(
                 for half in tl.static_range(2 if W4 else 1):
                     if W4:
                         sub = group * 4 + part * 2 + half
-                        a0, a1, a2, a3 = decode_w4_fragment_pair(
-                            q0, q8, s0, s1, half, MX
-                        )
+                        lo, hi = q0 >> (half * 16), q8 >> (half * 16)
+                        if MX:
+                            a2, a3 = decode_mx_register(hi, s1, s1)
+                            a0, a1 = decode_mx_register(lo, s0, s0)
+                        else:
+                            a2, a3 = decode_i4_register(hi, s1, s1)
+                            a0, a1 = decode_i4_register(lo, s0, s0)
                     else:
                         sub = group * 2 + part
                         if QTYPE == _TL_QUANT_TYPE_UINT8B128:
