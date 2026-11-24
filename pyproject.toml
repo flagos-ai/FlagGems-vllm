@@ -63,9 +63,22 @@ nvidia = [
 metax = [
     "mcoplib @ https://repos.metax-tech.com/r/maca-pypi/packages/mcoplib/0.4.9+g8b5bd8b.maca3.8.0.25.torch2.10/mcoplib-0.4.9+g8b5bd8b.maca3.8.0.25.torch2.10-cp312-cp312-linux_x86_64.whl",
     "vllm-metax @ https://repos.metax-tech.com/r/maca-pypi/packages/vllm-metax/0.24.0+g436274.d20260813.maca3.8.2.5.torch2.10.0/vllm_metax-0.24.0+g436274.d20260813.maca3.8.2.5.torch2.10.0-cp312-cp312-linux_x86_64.whl",
+    "scikit-learn>=1.4,<2.0",
+    "xgboost==3.3.0",
 ]
 ascend = [
     "vllm-ascend==0.24.0rc1",
+    "scikit-learn>=1.4,<2.0",
+    "xgboost==3.3.0",
+]
+mthreads = [
+    "scikit-learn>=1.4,<2.0",
+    "torchada==0.1.54",
+    "xgboost==3.3.0",
+]
+hygon = [
+    "scikit-learn>=1.4,<2.0",
+    "xgboost==3.3.0",
 ]
 iluvatar = [
     "vllm @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/vllm/0.24.0+flagos/vllm-0.24.0+flagos-cp312-cp312-linux_x86_64.whl#sha256=ca0450ff49eecb2c2954edd6e2350fb4a5bbe63f1512b6160aac8a798440010c",
@@ -75,7 +88,8 @@ iluvatar = [
 
 thead = [
     "vllm @ https://pkg.flytiger-eco.com/artifactory/pypi_generic/vllm/0.23.0+v0.2.0.ppu2.2.0/vllm-0.23.0+cu130torch2.10.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl",
-    "scikit-learn>=1.5",
+    "scikit-learn>=1.5,<2.0",
+    "xgboost==3.3.0",
 ]
 
 [tool.uv]
