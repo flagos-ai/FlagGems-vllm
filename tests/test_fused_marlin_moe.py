@@ -1776,16 +1776,37 @@ def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
 
 
 @pytest.mark.fused_marlin_moe_w4a16
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head MXFP4")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("thead", "hygon"),
+    reason="T-Head or Hygon W4A16 scale updates",
+)
+@pytest.mark.parametrize(
+    "precision",
+    [
+        "mxfp4",
+        pytest.param(
+            "int4",
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "hygon", reason="Hygon INT4 scale updates"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("num_tokens", [1, 33])
 @pytest.mark.parametrize("updated_tensor", ["w1_scale", "w2_scale"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
-def test_fused_marlin_moe_mxfp4_scale_updates_ppu(
-    num_tokens, updated_tensor, dtype, capture
+def test_fused_marlin_moe_w4a16_scale_updates(
+    precision, num_tokens, updated_tensor, dtype, capture
 ):
+    if precision == "mxfp4":
+        make_inputs = _make_inputs_w4a16_mxfp4
+        quant_type, group_size = QUANT_TYPE_FP4_E2M1, MXFP4_GROUP_SIZE
+    else:
+        make_inputs = _make_inputs_w4a16_int4
+        quant_type, group_size = QUANT_TYPE_UINT4B8, GROUP_SIZE
     with torch.inference_mode(not capture):
-        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_w4a16_mxfp4(
+        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
             num_tokens, 4, 128, 256, 2, dtype, flaggems_vllm.device
         )
         kwargs = dict(
@@ -1798,29 +1819,31 @@ def test_fused_marlin_moe_mxfp4_scale_updates_ppu(
             w2_scale=s2,
             topk_weights=tw,
             topk_ids=ti,
-            quant_type_id=QUANT_TYPE_FP4_E2M1,
-            group_size=MXFP4_GROUP_SIZE,
+            quant_type_id=quant_type,
+            group_size=group_size,
         )
         scale = kwargs[updated_tensor]
-        flaggems_vllm.fused_marlin_moe(**kwargs)
         if capture:
-            backend = importlib.import_module(
-                "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
-            )
-            version = scale._version
-            cached = backend._SCALE_CACHE.get(scale)
-            assert cached is not None and cached[0] == version
-            torch.cuda.synchronize()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            # Warm the same stream so a stream-keyed cache can be hit in capture.
+            with torch.cuda.stream(stream):
+                flaggems_vllm.fused_marlin_moe(**kwargs)
+            stream.synchronize()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, stream=stream):
                 actual = flaggems_vllm.fused_marlin_moe(**kwargs)
-        scale.view(torch.uint8).add_(1)
+        else:
+            flaggems_vllm.fused_marlin_moe(**kwargs)
+        if precision == "mxfp4":
+            scale.view(torch.uint8).add_(1)
+        else:
+            scale.mul_(2)
         if updated_tensor == "w1_scale":
             ref1 = ref1 * 2
         else:
             ref2 = ref2 * 2
         if capture:
-            assert scale._version > version
             graph.replay()
         else:
             actual = flaggems_vllm.fused_marlin_moe(**kwargs)
@@ -1980,6 +2003,14 @@ _W4A16_CASES += _cases(
         reason="T-Head grouped/reduce-direct coverage",
     ),
     id_prefix="ppu-",
+)
+_W4A16_CASES += _cases(
+    "mxfp4",
+    [(1, 4, 96, 160, 2), (33, 4, 96, 160, 2)],
+    marks=pytest.mark.skipif(
+        flaggems_vllm.vendor_name != "hygon", reason="Hygon MXFP4 group-32 tails"
+    ),
+    id_prefix="hygon-tail-",
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(

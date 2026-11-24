@@ -43,10 +43,10 @@ no ``scale_perm`` scale shuffle):
     MXFP4 scales E8M0 bytes (255 encodes NaN).
   - K = hidden_size, I = intermediate_size, E = num_experts.
 
-Decoding uses portable Triton arithmetic, with no PTX, PPU TLE instructions,
-or floating-point weight expansion. Expert IDs must be in [0, E). Nonfinite
-values follow floating point arithmetic; backward, expert parallelism, and
-Marlin int32 layouts are unsupported.
+GEMM tiles decode weights directly from the caller's quantized storage.
+Expert IDs must be in [0, E). Nonfinite values follow floating point
+arithmetic. Backward, expert parallelism, and Marlin int32 layouts are
+unsupported.
 """
 
 from typing import Any, Callable, Optional
@@ -54,7 +54,6 @@ from typing import Any, Callable, Optional
 import torch
 import triton
 import triton.language as tl
-from torch.utils.weak import WeakTensorKeyDictionary
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
@@ -64,96 +63,6 @@ QUANT_TYPE_UINT8B128 = 1
 QUANT_TYPE_FP8_E4M3 = 2
 QUANT_TYPE_FP4_E2M1 = 6
 _SUPPORTED_QUANT_TYPES = {0, 1, 2, 6}
-
-
-# Weak keys avoid retaining model weights. Values contain no reference to the
-# source tensor. A different stream repacks to avoid reading an unfinished copy.
-_TRANSPOSE_CACHE = WeakTensorKeyDictionary()
-
-
-@triton.jit
-def _transpose_kernel(
-    X,
-    Y,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    SE: tl.constexpr,
-    SN: tl.constexpr,
-    SK: tl.constexpr,
-    B: tl.constexpr,
-    TRANSFORM: tl.constexpr,
-):
-    e = tl.program_id(2).to(tl.int64)
-    n = (tl.program_id(0) * B + tl.arange(0, B)).to(tl.int64)
-    k = (tl.program_id(1) * B + tl.arange(0, B)).to(tl.int64)
-    values = tl.load(
-        X
-        + e * SE
-        + n[:, None] * SN
-        + (k[None, :] // 2 if TRANSFORM == 1 else k[None, :]) * SK,
-        (n[:, None] < N) & (k[None, :] < K),
-        other=0,
-    )
-    if TRANSFORM == 1:
-        code = (values.to(tl.int32) >> (4 * (k[None, :] % 2))) & 15
-        mag = code & 7
-        integer = tl.where(mag < 4, mag, (2 + (mag & 1)) << ((mag >> 1) - 1))
-        integer = tl.where(code < 8, integer, -integer)
-        values = tl.where(code == 8, 128, integer).to(tl.uint8)
-    elif TRANSFORM == 2:
-        sb = values.to(tl.uint32)
-        scale = (sb << 23).to(tl.float32, bitcast=True)
-        scale = tl.where(sb == 0, 5.877471754111438e-39, scale)
-        values = tl.where(sb == 255, float("nan"), scale * 0.5)
-    tl.store(
-        Y + e * N * K + k[None, :] * N + n[:, None],
-        values,
-        (n[:, None] < N) & (k[None, :] < K),
-    )
-
-
-def _cached_transpose(tensor, transform=0):
-    try:
-        version = tensor._version
-    except RuntimeError:
-        # Inference tensors have no version counter: never cache them.
-        version = None
-    stream = torch.cuda.current_stream(tensor.device).cuda_stream
-    key = (
-        transform,
-        version,
-        tensor.shape,
-        tensor.stride(),
-        tensor.dtype,
-        tensor.device,
-        tensor.data_ptr(),
-        stream,
-    )
-    if version is not None:
-        entry = _TRANSPOSE_CACHE.get(tensor)
-        if entry is not None and entry[0] == key:
-            return entry[1]
-    source = tensor
-    if tensor.dtype in (
-        getattr(torch, "float8_e4m3fn", None),
-        getattr(torch, "float8_e8m0fnu", None),
-    ):
-        source = tensor.view(torch.uint8)
-    e, n, k = source.shape
-    if transform == 1:
-        k *= 2
-    packed = torch.empty(
-        (e, k, n),
-        device=source.device,
-        dtype=torch.bfloat16 if transform == 2 else source.dtype,
-    )
-    _transpose_kernel[(triton.cdiv(n, 32), triton.cdiv(k, 32), e)](
-        source, packed, n, k, *source.stride(), 32, transform, num_warps=4
-    )
-    result = packed.transpose(1, 2)
-    if version is not None and not torch.cuda.is_current_stream_capturing():
-        _TRANSPOSE_CACHE[tensor] = (key, result)
-    return result
 
 
 @triton.jit
@@ -220,11 +129,6 @@ def _decode_scaled(
         v = (q - 8).to(tl.float32)
     elif Q == 1:
         v = (q - 128).to(tl.float32)
-    elif Q == 7:
-        signed = q.to(tl.int8).to(tl.float32)
-        v = tl.where(q == 128, 0x80000000, signed.to(tl.uint32, bitcast=True)).to(
-            tl.float32, bitcast=True
-        )
     elif Q == 6:
         mag = q & 7
         bits = tl.where(
@@ -236,11 +140,11 @@ def _decode_scaled(
         v = bits.to(tl.float32, bitcast=True) * 1.329227995784916e36
         v = tl.where((q & 127) == 127, float("nan"), v)
     value = (v * s).to(DTYPE)
-    if Q == 7 and DTYPE == tl.float16:
-        # Preserve cached E2M1 negative zero through the FP16 conversion.
-        value = (
-            value.to(tl.uint16, bitcast=True) | ((q == 128).to(tl.uint16) << 15)
-        ).to(DTYPE, bitcast=True)
+    if Q == 6 and DTYPE == tl.float16:
+        # Preserve E2M1 negative zero through the FP16 conversion.
+        value = (value.to(tl.uint16, bitcast=True) | ((q == 8).to(tl.uint16) << 15)).to(
+            DTYPE, bitcast=True
+        )
     return value
 
 
@@ -746,16 +650,10 @@ def _fused_marlin_moe_impl(
             (hidden_states, w1, w1_scale, intermediate, True, n, k),
             (intermediate, w2, w2_scale, result, False, k, n),
         ):
-            kernel_q = quant_type_id
-            if quant_type_id == QUANT_TYPE_FP4_E2M1:
-                w = _cached_transpose(w, 1)
-                s = _cached_transpose(s, 2)
-                kernel_q = 7
-            if quant_type_id == QUANT_TYPE_UINT4B8:
-                w = _cached_transpose(w)
-                s = _cached_transpose(s)
             if quant_type_id == QUANT_TYPE_FP8_E4M3:
                 w = w.view(torch.uint8)
+            elif quant_type_id == QUANT_TYPE_FP4_E2M1:
+                s = s.view(torch.uint8)
             if direct and quant_type_id == QUANT_TYPE_UINT8B128:
                 _gemv[lambda meta: (r, triton.cdiv(nk, meta["BN"]))](
                     a,
@@ -770,7 +668,7 @@ def _fused_marlin_moe_impl(
                     topk,
                     *w.stride(),
                     *s.stride(),
-                    kernel_q,
+                    quant_type_id,
                     group_size,
                     first,
                     apply_router_weight_on_input,
@@ -802,7 +700,7 @@ def _fused_marlin_moe_impl(
                 cap,
                 *w.stride(),
                 *s.stride(),
-                kernel_q,
+                quant_type_id,
                 group_size,
                 first,
                 apply_router_weight_on_input,
