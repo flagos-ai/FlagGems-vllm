@@ -21,6 +21,9 @@ from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
 from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
+from flaggems_vllm.runtime.backend._metax.ops.deep_gemm_fp8_o_proj import (
+    deep_gemm_fp8_o_proj,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,
 )
@@ -42,6 +45,7 @@ from flaggems_vllm.runtime.backend._metax.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.runtime.backend._metax.ops.ple_conv import ple_conv
 from flaggems_vllm.runtime.backend._metax.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._metax.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._metax.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
@@ -62,6 +66,7 @@ else:
 
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
+    "deep_gemm_fp8_o_proj",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
@@ -73,6 +78,7 @@ __all__ = [
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "ple_conv",
     "ple_state_scatter_",
     "qsa_prepare",
     "qwen4_compress_norm_mrope_store_groups",

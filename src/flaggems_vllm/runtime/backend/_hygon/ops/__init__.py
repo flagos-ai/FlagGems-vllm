@@ -15,9 +15,14 @@
 from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # noqa: F401
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.cooperative_topk import cooperative_topk
+from flaggems_vllm.runtime.backend._hygon.ops.deep_gemm_fp8_o_proj import (
+    deep_gemm_fp8_o_proj,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.dsv41_o_proj import dsv41_o_proj
 from flaggems_vllm.runtime.backend._hygon.ops.fused_add_rms_norm import (
     fused_add_rms_norm,
 )
@@ -73,6 +78,9 @@ from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_matmul import w8a8_bloc
 __all__ = [
     "chunk_gated_delta_rule_w8a16",
     "chunk_gated_delta_rule_w8a16_int8",
+    "cooperative_topk",
+    "deep_gemm_fp8_o_proj",
+    "dsv41_o_proj",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_indexer_weight_scale",

@@ -113,6 +113,15 @@ FUSED_INV_ROPE_FP8_QUANT_SHAPES = {
     "TMA_ALIGNED_SCALES": [False, True],
     "SEEDS": [0, 42],
 }
+DEEP_GEMM_FP8_O_PROJ_SHAPES = {
+    # (num_tokens, num_heads, n_groups, o_lora_rank, hidden_size)
+    "CONFIGS": (
+        [(16, 64, 8, 1024, 7168)]
+        if QUICK_MODE
+        else [(1, 8, 1, 1024, 7168), (16, 64, 8, 1024, 7168)]
+    ),
+    "SEEDS": [0],
+}
 DISTRIBUTION_SHAPES = [(20, 320, 15)]
 REDUCTION_SHAPES = [(2, 32)] if QUICK_MODE else [(1, 2), (4096, 256), (200, 40999, 3)]
 REDUCTION_SMALL_SHAPES = (
@@ -298,10 +307,18 @@ def to_cpu(res, ref):
     return res
 
 
-def gems_assert_close(res, ref, dtype, equal_nan=False, reduce_dim=1, atol=1e-4):
+def gems_assert_close(
+    res, ref, dtype, equal_nan=False, reduce_dim=1, atol=1e-4, rtol=None
+):
     res = to_cpu(res, ref)
     flaggems_vllm.testing.assert_close(
-        res, ref, dtype, equal_nan=equal_nan, reduce_dim=reduce_dim, atol=atol
+        res,
+        ref,
+        dtype,
+        equal_nan=equal_nan,
+        reduce_dim=reduce_dim,
+        atol=atol,
+        rtol=rtol,
     )
 
 
