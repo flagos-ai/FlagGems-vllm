@@ -909,17 +909,37 @@ def main(*, rows=None, public_entry=False):
 
     load_general_plugins()
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.fla.ops import chunk_delta_h
-    from vllm.model_executor.layers.fla.ops.fused_recurrent import (
-        fused_recurrent_gated_delta_rule_packed_decode,
-    )
-    from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
-        fused_sigmoid_gating_delta_rule_update,
-    )
-    from vllm.model_executor.layers.fla.ops.index import (
-        prepare_chunk_indices,
-        prepare_chunk_offsets,
-    )
+
+    try:
+        from vllm.third_party.flash_linear_attention.ops import chunk_delta_h
+        from vllm.third_party.flash_linear_attention.ops.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+        from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+        from vllm.third_party.flash_linear_attention.ops.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name not in {
+            "vllm.third_party",
+            "vllm.third_party.flash_linear_attention",
+            "vllm.third_party.flash_linear_attention.ops",
+        }:
+            raise
+        from vllm.model_executor.layers.fla.ops import chunk_delta_h
+        from vllm.model_executor.layers.fla.ops.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+        from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+        from vllm.model_executor.layers.fla.ops.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         ChunkGatedDeltaRule,
     )

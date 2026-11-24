@@ -500,6 +500,14 @@ def _detect_self_chip():
         return ""
 
 
+# Device-level achievable bandwidth ratio vs the baseline reference, measured
+# with the same 512 MiB copy kernel on both chips (do_bench, 2026-11-20):
+# C550 1396.4 GB/s, H800-class H100 3001.4 GB/s.  The peak-to-peak ratio
+# (0.4725) describes the memory system's theoretical gap; this one describes
+# what a streaming workload actually reaches, and wins for mem records.
+_ACHIEVABLE_BW_RATIO = {"metax C550": 0.46525}
+
+
 # Cache the device name once; it doesn't change within a run.
 _SELF_CHIP = _detect_self_chip()
 
@@ -520,7 +528,9 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
     Factor comes from base_data["_scaling_factors"] (written by the collector
     into the same file as the latencies). Matching is by vendor AND concrete
     chip model, so that e.g. nvidia H800 and H100 don't collide. Prefers
-    measured over nominal. Returns None when the vendor / chip / resource /
+    measured-achievable over nominal. A chip entry may also carry an
+    ``achievable`` block with device-level measurements (e.g. a copy
+    kernel's streaming bandwidth), which is consulted first. Returns None when the vendor / chip / resource /
     dtype isn't covered, so the caller falls back to the raw latency ratio.
 
     The reference chip (e.g. the H800 the baseline was collected on) is itself
@@ -546,7 +556,11 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
             chip = candidates[0] if len(candidates) == 1 else None
         if chip is None:
             return None
-        for prefer in ("measured", "nominal"):
+        if resource == "bandwidth_gbps":
+            key = f"{chip.get('vendor')} {chip.get('chip')}"
+            if key in _ACHIEVABLE_BW_RATIO:
+                return _ACHIEVABLE_BW_RATIO[key]
+        for prefer in ("achievable", "measured", "nominal"):
             block = chip.get(prefer)
             if not block:
                 continue
