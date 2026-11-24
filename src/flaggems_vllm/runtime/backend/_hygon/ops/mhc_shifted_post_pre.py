@@ -41,7 +41,12 @@ This module keeps the arithmetic verbatim and changes the dataflow:
    trade-off is that each CTA re-reads ``fn`` from L2, which is cheaper than a
    launch until the batch (or the row) is large enough that the per-CTA re-read
    dominates.
-5. after the first (tuning) call the kernels are launched through a cached
+5. the wide-row token kernel stages the collapsed row in shared memory with
+   ``tle.gpu.alloc`` / ``tle.gpu.local_ptr`` when the FlagTree TLE surface is
+   available, so the RMSNorm's second pass reads LDS instead of the raw
+   ``layer_input`` it just wrote.  The row is padded to a power of two and the
+   path is skipped above 16 KB (``H > 8192``) or when TLE is unavailable.
+6. after the first (tuning) call the kernels are launched through a cached
    compiled-kernel path that skips LibEntry's per-call key reconstruction and
    the driver's stream lookup (~10 us -> ~6 us per launch here).
 
@@ -66,7 +71,27 @@ import triton.language as tl
 from triton.runtime import driver
 
 from flaggems_vllm import runtime
-from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils import has_triton_tle, libentry, libtuner
+
+# The hcu backend whitelists exactly these TLE primitives: cumsum, gpu.alloc,
+# gpu.copy, gpu.local_ptr and extract_tile.  The wide-row norm below uses the
+# shared-memory pair (alloc/local_ptr) to stage the collapsed row across its
+# two passes; everything else stays plain Triton.
+if has_triton_tle(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
+
+        _HAS_TLE_GPU = (
+            hasattr(tle, "gpu")
+            and hasattr(tle.gpu, "alloc")
+            and hasattr(tle.gpu, "local_ptr")
+        )
+    except ImportError:
+        tle = None
+        _HAS_TLE_GPU = False
+else:
+    tle = None
+    _HAS_TLE_GPU = False
 
 _FN_PACK_CACHE: dict = {}
 _FN_STRIDE = 32
@@ -99,6 +124,13 @@ _ONE_LAUNCH_MAX_TOKENS = 64
 # from L2; past a handful of tokens the split-K project wins even with the
 # extra launch.
 _ONE_LAUNCH_MAX_TOKENS_WIDE = 16
+
+# The wide-row norm is a two-pass kernel: the collapsed row is stored and then
+# reloaded to apply the scale.  Staging it in shared memory removes both the
+# raw global store and the reload.  ``tle.gpu.alloc`` needs a power-of-two
+# shape and the buffer shares the 64 KB block budget with the reduction
+# scratch, so the padded row is capped at 16 KB (H <= 8192).
+_TLE_STAGE_MAX_HIDDEN = 8192
 
 _COUNTER_CACHE: dict = {}
 
@@ -496,11 +528,15 @@ def _mhc_shifted_post_collapse_norm_loop_hygon_kernel(
     WRITE_AUX: tl.constexpr,
     HAS_W: tl.constexpr,
     EPS: tl.constexpr,
+    TLE_STAGE: tl.constexpr,
+    STAGE_BLOCK: tl.constexpr,
 ):
     """One CTA per token, H streamed in tiles (wide rows).
 
     Only ``BLOCK_H`` stays live; the norm needs the full row's sum of squares,
-    so it runs a second pass over the stored bf16 ``layer_input``.
+    so it runs a second pass over the bf16 collapsed row.  ``TLE_STAGE`` keeps
+    that row in shared memory (``tle.gpu.alloc``/``local_ptr``) instead of
+    writing it to ``layer_input`` and reading it back.
     """
     pid_n = tl.program_id(0)
 
@@ -509,6 +545,9 @@ def _mhc_shifted_post_collapse_norm_loop_hygon_kernel(
     b_base = pid_n * 4 * H
     d_base = pid_n * H
     out_base = pid_n * 4 * H
+
+    if TLE_STAGE:
+        row_ub = tle.gpu.alloc([STAGE_BLOCK], dtype=tl.bfloat16, scope=tle.gpu.smem)
 
     sq = 0.0
     layer_sq = tl.zeros((1,), dtype=tl.float32)
@@ -540,9 +579,15 @@ def _mhc_shifted_post_collapse_norm_loop_hygon_kernel(
             WRITE_AUX,
             HAS_W,
             EPS,
-            STORE_RAW=True,
+            STORE_RAW=not TLE_STAGE,
             HC=4,
         )
+        if TLE_STAGE:
+            tl.store(
+                tle.gpu.local_ptr(row_ub, (h_off,)),
+                col_bf,
+                mask=h_mask,
+            )
         sq += tl.sum(f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3)
         if HAS_W:
             layer_sq += part_sq
@@ -557,9 +602,16 @@ def _mhc_shifted_post_collapse_norm_loop_hygon_kernel(
         for h0 in range(0, H, BLOCK_H):
             h_off = h0 + tl.arange(0, BLOCK_H)
             h_mask = h_off < H
-            value = tl.load(layer_ptr + pid_n * H + h_off, mask=h_mask, other=0.0).to(
-                tl.float32
-            )
+            if TLE_STAGE:
+                value = tl.load(
+                    tle.gpu.local_ptr(row_ub, (h_off,)),
+                    mask=h_mask,
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                value = tl.load(
+                    layer_ptr + pid_n * H + h_off, mask=h_mask, other=0.0
+                ).to(tl.float32)
             weight = tl.load(w_ptr + h_off, mask=h_mask, other=0.0).to(tl.float32)
             tl.store(
                 layer_ptr + pid_n * H + h_off,
@@ -1271,6 +1323,22 @@ def mhc_shifted_post_collapse_norm(
     return residual_cur, layer_input, aux, ssq
 
 
+def _tle_stage_for(hidden_size, norm_weight):
+    """Whether the wide-row norm can keep its collapsed row in shared memory.
+
+    The padded buffer must stay inside the block's shared-memory budget.  The
+    one-launch decode kernel (``_mhc_shifted_all_loop_hygon_kernel``) keeps the
+    plain store/reload path: it is latency-bound at N <= 16 and measured ~2.5%
+    slower with the staging on BW1000, while the two-launch kernel gains 4% at
+    N=512 and 16% at N=4096.
+    """
+    if not (_HAS_TLE_GPU and norm_weight is not None):
+        return False, 0
+    if hidden_size > _TLE_STAGE_MAX_HIDDEN:
+        return False, 0
+    return True, triton.next_power_of_2(hidden_size)
+
+
 def mhc_shifted_post_collapse_norm_loop(
     x,
     residual,
@@ -1324,12 +1392,15 @@ def mhc_shifted_post_collapse_norm_loop(
         a_si,
         num_tokens,
     )
+    tle_stage, stage_block = _tle_stage_for(hidden_size, norm_weight)
     kwargs = dict(
         H=hidden_size,
         USE_PRE=pre_mix is not None,
         WRITE_AUX=capture_aux,
         HAS_W=norm_weight is not None,
         EPS=norm_eps,
+        TLE_STAGE=tle_stage,
+        STAGE_BLOCK=stage_block,
     )
     _FAST_TOKEN_LOOP(
         (
@@ -1342,6 +1413,8 @@ def mhc_shifted_post_collapse_norm_loop(
             capture_aux,
             norm_weight is not None,
             norm_eps,
+            tle_stage,
+            stage_block,
         ),
         (num_tokens,),
         args,
