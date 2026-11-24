@@ -3216,14 +3216,12 @@ def _tle_desc(t, block):
     return TensorDescriptor.from_tensor(t, list(block))
 
 
-# FlagTree's warp-specialised (SQMMA + TME) path still faults after a few
-# hundred launches on some MoE shapes ("MUSA error: out of bound"), with the
-# narrow tile as well as the wide one, so it is opt-in and the default keeps
-# the portable Triton kernel.
-_TLE_ENABLED = os.environ.get("FLAGGEMS_VLLM_MTHREADS_TLE", "0") == "1"
-
-
 def _tle_ready(w1, w2, total, H, n_inter):
+    # FlagTree miscompiles multi-stage TLE pipes when the MUSA backend compiles
+    # with TRITON_MUSA_ENABLE_LLC_OPT=1, which flaggems_vllm.ops.mhc sets
+    # process-wide at import: the kernel then reports "MUSA error: out of
+    # bound" after a few hundred launches. Export
+    # TRITON_MUSA_ENABLE_LLC_OPT=0 until that is fixed upstream.
     if not _HAS_TLE:
         return False
     if not (w1.is_contiguous() and w2.is_contiguous()):
@@ -3240,13 +3238,23 @@ def _tle_ready(w1, w2, total, H, n_inter):
     return True
 
 
-def _tle_gemm(a_buf, w, out, m_indices, E, total, N, K, STAGES):
+def _tle_gemm(a_buf, w, out, m_indices, E, total, N, K, STAGES, BN=128, NUM_WARPS=4):
     b2 = w.view(E * N, K)
     A = _tle_desc(a_buf, (128, 64))
-    B = _tle_desc(b2, (128, 64))
-    grid = ((total // 128) * triton.cdiv(N, 128),)
+    B = _tle_desc(b2, (BN, 64))
+    grid = ((total // 128) * triton.cdiv(N, BN),)
     _tle_grouped_gemm_kernel[grid](
-        A, B, out, m_indices, N, K, BM=128, BN=128, TK=64, STAGES=STAGES
+        A,
+        B,
+        out,
+        m_indices,
+        N,
+        K,
+        BM=128,
+        BN=BN,
+        TK=64,
+        STAGES=STAGES,
+        num_warps=NUM_WARPS,
     )
 
 
@@ -3375,10 +3383,30 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         num_warps=4,
     )
 
-    use_tle = _TLE_ENABLED and _tle_ready(w1, w2, total, H, n_inter)
+    use_tle = _tle_ready(w1, w2, total, H, n_inter)
     if use_tle:
+        # The consumer of the TLE pipeline is the default warp-specialize
+        # partition, so its warp count comes from the launch, not from
+        # worker_num_warps. A 128x256 tile at 8 warps keeps the accumulator at
+        # 128 registers per thread and is ~1.3x faster than 128x128 at 4 warps;
+        # it needs N % 256 == 0, and 3 stages already use 144 of the 192 KiB
+        # of shared memory.
+        # Keep the wide tile on the N range it is verified for; a Mixtral-like
+        # shard (E=8, N=28672) has not been re-checked since the LLC miscompile
+        # above was found, so N > 4096 stays on the narrow tile for now.
+        wide = (2 * n_inter) % 256 == 0 and 2 * n_inter <= 4096
         _tle_gemm(
-            hidden_perm, w1, gate_up, m_indices, E, total, 2 * n_inter, H, STAGES=3
+            hidden_perm,
+            w1,
+            gate_up,
+            m_indices,
+            E,
+            total,
+            2 * n_inter,
+            H,
+            STAGES=3,
+            BN=256 if wide else 128,
+            NUM_WARPS=8 if wide else 4,
         )
     else:
         w1t = _dense_transpose_weights(w1)
