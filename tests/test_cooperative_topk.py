@@ -684,13 +684,13 @@ def test_export_and_vendor_dispatch():
         )
 
         assert flaggems_vllm.cooperative_topk is hygon_cooperative_topk
-    if flaggems_vllm.vendor_name == "thead":
+    elif flaggems_vllm.vendor_name == "thead":
         from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import (
             cooperative_topk as thead_cooperative_topk,
         )
 
         assert flaggems_vllm.cooperative_topk is thead_cooperative_topk
-    if flaggems_vllm.vendor_name == "ascend":
+    elif flaggems_vllm.vendor_name == "ascend":
         from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import (
             cooperative_topk as ascend_cooperative_topk,
         )
