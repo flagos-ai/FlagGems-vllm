@@ -63,6 +63,39 @@ _NATIVE_MODULE = "vllm.model_executor.kernels.mhc.tilelang"
 _NATIVE_ATTR = "mhc_pre_broadcast_tilelang"
 
 
+def _wrap_vllm_native(op):
+    """vLLM's mhc_pre_broadcast_tilelang has n_splits before norm_weight,
+    so the 10th positional arg would be taken as n_splits. Pass
+    norm_weight by keyword instead."""
+
+    def _adapter(
+        residual,
+        fn_broadcast,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+    ):
+        return op(
+            residual,
+            fn_broadcast,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight=norm_weight,
+        )
+
+    return _adapter
+
+
 def native():
     """Resolve the NV-native mhc_pre_broadcast_tilelang kernel; None if
     unavailable. Unlike the pytest benchmark, this baseline does not fall
@@ -74,7 +107,7 @@ def native():
     except ImportError:
         return None
     op = getattr(mod, _NATIVE_ATTR, None)
-    return op if callable(op) else None
+    return _wrap_vllm_native(op) if callable(op) else None
 
 
 def grid():
