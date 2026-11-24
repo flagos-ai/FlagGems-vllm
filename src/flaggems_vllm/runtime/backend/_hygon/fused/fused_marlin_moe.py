@@ -67,6 +67,8 @@ QUANT_TYPE_FP4_E2M1 = 6
 _SUPPORTED_QUANT_TYPES = {0, 1, 2, 6}
 _SHARED_ROUTING_MIN_ROUTES = 1024
 _SHARED_ROUTING_MIN_ROUTES_PER_EXPERT = 4
+# Resident inputs and the caller-visible output are outside the scratch budget.
+_MAX_WORKSPACE_BYTES = 2 << 30
 
 
 @triton.jit
@@ -613,17 +615,82 @@ def _fused_marlin_moe_impl(
         out = torch.empty_like(hidden_states)
     if m == 0:
         return out
-    r = m * topk
-    # Both projections still allocate workspace for every route in the call.
-    if r > 16384 or e > 1024:
-        raise NotImplementedError(
-            "Hygon Marlin MoE supports at most 16384 routes and 1024 experts"
+    if e > 1024:
+        raise NotImplementedError("Hygon Marlin MoE supports at most 1024 experts")
+
+    element_size = hidden_states.element_size()
+    projection_bytes_per_token = topk * (n + k) * element_size
+    large_projection = max(k, n) >= 4096
+
+    def auxiliary_workspace_bytes(tokens):
+        if tokens == 0:
+            return 0
+        r = tokens * topk
+        direct, bm, shared, split_k = _batch_config(
+            r, e, large_projection, apply_router_weight_on_input
         )
+        if direct:
+            routing = 0
+        elif shared:
+            blocks = triton.cdiv(r + e * (bm - 1), bm)
+            routing = blocks * (bm + 1) + (e + 1) ** 2 + 1
+        else:
+            routing = e * triton.cdiv(r, bm) * bm + 2 * e + 1
+        split = 0
+        if split_k > 1 and not (direct and quant_type_id == QUANT_TYPE_UINT8B128):
+            split = split_k * r * max(2 * n, k)
+        return 4 * (routing + split)
+
+    batch_tokens = m
+    while (
+        batch_tokens * projection_bytes_per_token
+        + max(
+            auxiliary_workspace_bytes(batch_tokens),
+            auxiliary_workspace_bytes(m % batch_tokens),
+        )
+        > _MAX_WORKSPACE_BYTES
+    ):
+        if batch_tokens == 1:
+            raise NotImplementedError(
+                "One token exceeds the Hygon MoE workspace budget"
+            )
+        batch_tokens = triton.cdiv(batch_tokens, 2)
+
+    starts = range(0, m, batch_tokens)
+    # Preserve the output alias contract when a shifted output overlaps input.
+    if batch_tokens < m and (
+        0 < out.data_ptr() - hidden_states.data_ptr() < m * k * element_size
+    ):
+        starts = reversed(starts)
+    intermediate = torch.empty(
+        (batch_tokens * topk, n), dtype=out.dtype, device=out.device
+    )
+    result = torch.empty((batch_tokens * topk, k), dtype=out.dtype, device=out.device)
+    for start in starts:
+        batch = slice(start, start + batch_tokens)
+        _run_moe_batch(
+            hidden_states[batch],
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights[batch],
+            topk_ids[batch],
+            out[batch],
+            intermediate,
+            result,
+            apply_router_weight_on_input,
+            group_size,
+            quant_type_id,
+        )
+    return out
+
+
+def _batch_config(r, e, large_projection, apply_router_weight_on_input):
     # Reuse expert weights when routes repeat; large banks make repeated
     # direct loads more expensive than the small route-alignment kernels.
-    direct = r <= (2 if max(k, n) >= 4096 else 16)
+    direct = r <= (2 if large_projection else 16)
     bm = 64 if r >= 32 * e else 32 if r >= 16 * e else 16
-    cap = triton.cdiv(r, bm) * bm
     # The shared aligner has four stages and a quadratic expert-count buffer.
     # Amortize that overhead on grouped batches with enough routes per expert.
     shared_routing = r >= max(
@@ -632,8 +699,35 @@ def _fused_marlin_moe_impl(
     # Keep the original accumulation order when routing weights precede
     # activation: rounding differences can be amplified by the gated product.
     split_k = (
-        8 if max(k, n) >= 4096 and r <= 32 and not apply_router_weight_on_input else 1
+        8 if large_projection and r <= 32 and not apply_router_weight_on_input else 1
     )
+    return direct, bm, shared_routing, split_k
+
+
+def _run_moe_batch(
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    topk_weights,
+    topk_ids,
+    out,
+    intermediate,
+    result,
+    apply_router_weight_on_input,
+    group_size,
+    quant_type_id,
+):
+    m, k = hidden_states.shape
+    e, n2, _ = w1.shape
+    n = n2 // 2
+    topk = topk_ids.shape[1]
+    r = m * topk
+    direct, bm, shared_routing, split_k = _batch_config(
+        r, e, max(k, n) >= 4096, apply_router_weight_on_input
+    )
+    cap = triton.cdiv(r, bm) * bm
     with torch.cuda.device(hidden_states.device):
         expert_ids = topk_ids
         if direct:
@@ -664,8 +758,6 @@ def _fused_marlin_moe_impl(
             _prefix[(1,)](
                 counts, route_metadata, e, triton.next_power_of_2(e), num_warps=4
             )
-        intermediate = torch.empty((r, n), dtype=out.dtype, device=out.device)
-        result = torch.empty((r, k), dtype=out.dtype, device=out.device)
         blocks = r if direct else min(r, triton.cdiv(r, bm) + e - 1)
         for a, w, s, c, first, nk, kk in (
             (hidden_states, w1, w1_scale, intermediate, True, n, k),
@@ -743,8 +835,8 @@ def _fused_marlin_moe_impl(
                     256,
                     num_warps=4,
                 )
+                del partial
         _sum[(m, triton.cdiv(k, 256))](result, out, k, topk, 256, num_warps=4)
-    return out
 
 
 def _validate_inputs(

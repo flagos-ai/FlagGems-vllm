@@ -370,13 +370,6 @@ class FusedMarlinMoEW4A16INT4Benchmark(base.Benchmark):
         weights = None
         for config in self.shapes:
             num_tokens, num_experts, hidden_size, intermediate_size, top_k = config
-            if num_tokens * top_k > 16384:
-                # The Hygon kernel allocates route workspaces of O(E * routes).
-                print(
-                    f"Skipping {config}: Hygon fused Marlin MoE supports at "
-                    "most 16384 routes"
-                )
-                continue
             next_geometry = (num_experts, hidden_size, intermediate_size)
             if geometry != next_geometry:
                 # Drop the previous geometry's tensors before allocating the new
