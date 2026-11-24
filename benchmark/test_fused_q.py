@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NVIDIA benchmark with an optional vLLM native reference and baseline fallback."""
+"""Benchmark the shared fused_q workload on NVIDIA and Ascend."""
 
 import inspect
 import math
@@ -25,6 +25,7 @@ import torch
 import flaggems_vllm as gems
 from baseline import fused_q as workload
 from tests.test_fused_q import assert_benchmark_case
+from tests.test_fused_q_ascend import assert_ascend_outputs, build_ascend_inputs
 
 from . import base, consts
 from .conftest import Config
@@ -193,9 +194,53 @@ class FusedQBenchmark(base.Benchmark):
             return None
 
 
+class AscendFusedQBenchmark(FusedQBenchmark):
+    """Benchmark the public Ascend entry using the shared CPU golden."""
+
+    DEFAULT_METRICS = ["latency"]
+
+    def _python_baseline(self):
+        # The ported vLLM Triton reference is NVIDIA-specific.
+        return None
+
+    def get_input_iter(self, dtype):
+        for shape in self.shapes:
+            self.binding = workload.binding_from_shape(shape)
+            self._cpu_inputs, values = build_ascend_inputs(self.binding, dtype)
+            yield (values,)
+
+    def record_shapes(self, *args, **kwargs):
+        detail = super().record_shapes(*args, **kwargs)
+        if Config.base_data is not None and not self._has_json_reference:
+            reason = detail.get("json_baseline_miss_reason", "unknown")
+            raise ValueError(f"No matching fused_q --base-data record: {reason}")
+        return detail
+
+    def get_latency(self, op, *args, **kwargs):
+        assert_ascend_outputs(self._cpu_inputs, kwargs, op(*args, **kwargs))
+        latency = base.Benchmark.get_latency(self, op, *args, **kwargs)
+        if not math.isfinite(latency) or latency <= 0:
+            raise ValueError(f"Invalid Ascend latency: {latency!r}")
+        return latency
+
+
 @pytest.mark.fused_q
 def test_fused_q_benchmark():
-    assert gems.vendor_name == "nvidia", "NVIDIA CUDA required"
+    if gems.vendor_name == "ascend":
+        if not torch.npu.is_available():
+            pytest.fail("Ascend backend selected, but no NPU is available")
+        if not torch.npu.get_device_name().startswith("Ascend910B4"):
+            pytest.skip("requires Ascend 910B4")
+        AscendFusedQBenchmark(
+            op_name="fused_q",
+            torch_op=None,
+            gems_op=gems.fused_q,
+            dtypes=workload.DTYPES,
+            is_inplace=workload.IS_INPLACE,
+        ).run()
+        return
+    if gems.vendor_name != "nvidia":
+        pytest.skip("requires NVIDIA or Ascend")
     assert torch.cuda.is_available(), "NVIDIA CUDA is unavailable"
     bench = FusedQBenchmark(
         op_name="fused_q",
