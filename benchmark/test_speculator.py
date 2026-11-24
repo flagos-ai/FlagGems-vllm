@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 import triton
-import triton.language as tl
+from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
+    _pad_trailing_draft_slots_kernel as vllm_reference_kernel,
+)
 
 from benchmark import base
 from flaggems_vllm import device as DEVICE
@@ -22,30 +24,6 @@ pytestmark = [
         reason=f"requires an available {DEVICE} accelerator",
     ),
 ]
-
-
-# Unchanged kernel from vLLM 947dd62c, multi_module_mtp/speculator.py.
-@triton.jit
-def _pad_trailing_draft_slots_kernel(
-    slot_mappings_ptr,
-    slot_mappings_stride0,
-    query_start_loc_ptr,
-    last_token_indices_ptr,
-    PAD_ID,
-    BLOCK_SIZE: tl.constexpr,
-):
-    group_idx = tl.program_id(0)
-    req_idx = tl.program_id(1)
-    # Slots computed from stale token positions in the range
-    # [last_token_index + 1, query_end) can result in writes to blocks.
-    # Pad these slot values so that attention kernels ignore them.
-    start = tl.load(last_token_indices_ptr + req_idx) + 1
-    end = tl.load(query_start_loc_ptr + req_idx + 1)
-    base = slot_mappings_ptr + group_idx * slot_mappings_stride0
-    for i in range(start, end, BLOCK_SIZE):
-        offs = i + tl.arange(0, BLOCK_SIZE)
-        mask = offs < end
-        tl.store(base + offs, PAD_ID, mask=mask)
 
 
 PRIMARY_SHAPES = [
@@ -121,7 +99,7 @@ def make_case(
 def run_reference(case):
     slots, query, last, n = case.args
     if slots.shape[0] and n:
-        _pad_trailing_draft_slots_kernel[(slots.shape[0], n)](
+        vllm_reference_kernel[(slots.shape[0], n)](
             slots,
             slots.stride(0),
             query,
