@@ -633,25 +633,26 @@ def prefetch_w8_tile(
     row_tile,
     k_tile,
     copy_token,
+    ROWS: tl.constexpr,
     IS_SPLIT_Q: tl.constexpr = False,
 ):
     activation_base = (
         activations.to(tl.pointer_type(tl.uint8))
-        + row_tile.to(tl.int64) * 8 * reduction_size * 2
+        + row_tile.to(tl.int64) * ROWS * reduction_size * 2
     )
     copy_token = copy_w8_tile_async(
         activation_smem,
         activation_base,
-        8,
+        ROWS,
         reduction_size * 2,
         128,
         k_tile * 256,
         copy_token,
     )
     copy_token = copy_w8_tile_async(
-        activation_smem + 1024,
+        activation_smem + ROWS * 128,
         activation_base,
-        8,
+        ROWS,
         reduction_size * 2,
         128,
         k_tile * 256 + 128,
@@ -726,55 +727,6 @@ def mma_bf16_square(a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, 
         is_pure=False,
         pack=1,
     )
-
-
-@triton.jit
-def prefetch_square(
-    weight_smem,
-    activation_smem,
-    weight_bytes,
-    activations,
-    QN,
-    reduction_size: tl.constexpr,
-    row_tile,
-    k_tile,
-    copy_token,
-):
-    activation_base = (
-        activations.to(tl.pointer_type(tl.uint8))
-        + row_tile.to(tl.int64) * 16 * reduction_size * 2
-    )
-    copy_token = copy_w8_tile_async(
-        activation_smem,
-        activation_base,
-        16,
-        reduction_size * 2,
-        128,
-        k_tile * 256,
-        copy_token,
-    )
-    copy_token = copy_w8_tile_async(
-        activation_smem + 2048,
-        activation_base,
-        16,
-        reduction_size * 2,
-        128,
-        k_tile * 256 + 128,
-        copy_token,
-    )
-    copy_token = copy_w8_tile_async(
-        weight_smem, weight_bytes, 64, QN, 128, k_tile * 128, copy_token
-    )
-    copy_token = copy_w8_tile_async(
-        weight_smem + W8_HALF_TILE_BYTES,
-        weight_bytes + 64 * QN,
-        64,
-        QN,
-        128,
-        k_tile * 128,
-        copy_token,
-    )
-    return commit_w8_tile(copy_token)
 
 
 @triton.jit
@@ -3698,7 +3650,7 @@ def square_accumulate(
 ):
     if initial_dep is None:
         copy_token = tl.full((256,), 0, tl.int32)
-        copy_token = prefetch_square(
+        copy_token = prefetch_w8_tile(
             weight_smem,
             activation_smem,
             weight_bytes,
@@ -3708,6 +3660,8 @@ def square_accumulate(
             row_tile,
             0,
             copy_token,
+            16,
+            IS_SPLIT_Q=True,
         )
     else:
         copy_token = initial_dep
@@ -3728,7 +3682,7 @@ def square_accumulate(
             scale0 = tl.load(scales + expert * SE + k_tile * SG + n0 * SN)
             scale1 = tl.load(scales + expert * SE + k_tile * SG + (n0 + 8) * SN)
         if k_tile + 1 < reduction_size // 128:
-            copy_token = prefetch_square(
+            copy_token = prefetch_w8_tile(
                 weight_smem + (k_tile + 1) % 2 * W8_TILE_BYTES,
                 activation_smem + (k_tile + 1) % 2 * 4096,
                 weight_bytes,
@@ -3738,6 +3692,8 @@ def square_accumulate(
                 row_tile,
                 k_tile + 1,
                 copy_token,
+                16,
+                IS_SPLIT_Q=True,
             )
             copy_token = wait_w8_tile(copy_token, True)
         else:
@@ -3858,6 +3814,7 @@ def marlin_moe_gemm_grouped_square_kernel(
                 row_tile * 2,
                 0,
                 copy_token,
+                8,
                 True,
             )
         else:
@@ -3975,7 +3932,7 @@ def marlin_moe_gemm_grouped_square_kernel(
         return
     if PREFETCH_BEFORE_SCALE:
         copy_token = tl.full((256,), 0, tl.int32)
-        copy_token = prefetch_square(
+        copy_token = prefetch_w8_tile(
             weight_smem,
             activation_smem,
             weight_base,
@@ -3985,6 +3942,8 @@ def marlin_moe_gemm_grouped_square_kernel(
             row_tile,
             0,
             copy_token,
+            16,
+            IS_SPLIT_Q=True,
         )
     else:
         copy_token = None
@@ -4335,6 +4294,7 @@ def w8_narrow_accumulate(
             row_tile,
             0,
             copy_token,
+            8,
             IS_SPLIT_Q,
         )
     else:
@@ -4362,6 +4322,7 @@ def w8_narrow_accumulate(
                 row_tile,
                 k_tile + 1,
                 copy_token,
+                8,
                 IS_SPLIT_Q,
             )
             copy_token = wait_w8_tile(copy_token, True)
@@ -4484,6 +4445,7 @@ def marlin_moe_gemm_grouped_narrow_kernel(
                 row_tile,
                 0,
                 copy_token,
+                8,
             )
         else:
             copy_token = None
