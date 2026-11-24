@@ -356,3 +356,30 @@ def test_grouped_topk_padding_benchmark():
     )
     bench.set_gems(flaggems_vllm.grouped_topk)
     bench.run()
+
+
+class GroupedTopKGenericBenchmark(GroupedTopKBenchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (rows, experts, groups, keep, topk)
+            for rows in (1, 64, 4096)
+            for experts, groups, keep, topk in (
+                (384, 3, 2, 4),
+                (512, 8, 4, 8),
+                (1024, 8, 4, 16),
+            )
+        ]
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA generic routing sweep")
+def test_grouped_topk_generic_sigmoid_benchmark():
+    bench = GroupedTopKGenericBenchmark(
+        op_name="grouped_topk_generic",
+        torch_op=ref_grouped_topk,
+        dtypes=[torch.bfloat16],
+        renormalize=True,
+        scoring_func=1,
+    )
+    bench.set_gems(flaggems_vllm.grouped_topk)
+    bench.run()

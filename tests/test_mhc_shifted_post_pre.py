@@ -82,7 +82,17 @@ try:  # vLLM ships the torch reference for the same mHC math
 except ImportError:
     HAS_VLLM_REF = False
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+
+def _accelerator_available():
+    """Torch exposes the active backend as torch.<device> (torch.musa, ...)."""
+    for name in ("cuda", "musa", "npu", "xpu"):
+        mod = getattr(torch, name, None)
+        if mod is not None and getattr(mod, "is_available", lambda: False)():
+            return True
+    return False
+
+
+pytestmark = pytest.mark.skipif(not _accelerator_available(), reason="GPU required")
 
 MIX_EPS = 2e-3
 COLLAPSE_EPS = 1e-2
@@ -98,6 +108,8 @@ _SHAPE_CASES = (
         (256, 5120, 4),
         (64, 4096, 4),
         (256, 7168, 4),
+        # Small-token wide row: the vendor tiled post + norm-in-reduce path.
+        (128, 5120, 4),
         (3, 127, 4),
         (5, 257, 2),
         (7, 5120, 4),
@@ -469,7 +481,8 @@ def test_2d_post_mix_is_accepted():
 @pytest.mark.mhc_shifted_post_pre
 def test_stream_is_accepted_and_ignored():
     data = _inputs(num_tokens=8, hidden=1024)
-    side = torch.cuda.Stream()
+    device_mod = getattr(torch, gems.device, None) or torch.cuda
+    side = device_mod.Stream()
     a = _call(data)
     b = mhc_shifted_post_pre(
         data["x"],
@@ -490,7 +503,7 @@ def test_stream_is_accepted_and_ignored():
         capture_aux=True,
         stream=side,
     )
-    torch.cuda.synchronize()
+    device_mod.synchronize()
     torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
 
 
@@ -604,8 +617,11 @@ def test_production_path_has_no_torch_compute():
     root = Path(__file__).resolve().parents[1]
     paths = [
         root / "src/flaggems_vllm/ops/mhc/mhc_shifted_post_pre.py",
-        # Vendor path: same production contract as the generic module.
+        # Vendor paths: same production contract as the generic module.
         root / "src/flaggems_vllm/runtime/backend/_thead/ops/mhc_shifted_post_pre.py",
+        root / "src/flaggems_vllm/runtime/backend/_metax/ops/mhc_shifted_post_pre.py",
+        root
+        / "src/flaggems_vllm/runtime/backend/_mthreads/ops/mhc_shifted_post_pre.py",
     ]
     # The whole modules are production; the torch reference lives in this test.
     allowed = {
