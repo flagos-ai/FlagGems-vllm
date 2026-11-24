@@ -15,7 +15,16 @@ def torch_concat_mla_q(ql_nope, q_pe, q_out):
 
 
 class ConcatMLAQBenchmark(base.GenericBenchmark):
-    DEFAULT_SHAPES = [(t, 64, 512, 64) for t in (1, 7, 128, 8192)]
+    # 285B production shapes added: tokens=8192 (prefill) and 128 (decode),
+    # heads=16, nope=512, rope=64 — from CSV [[8192,16,512],[8192,16,64],[8192,16,576]].
+    DEFAULT_SHAPES = [
+        (1, 64, 512, 64),
+        (7, 64, 512, 64),
+        (128, 64, 512, 64),
+        (128, 16, 512, 64),
+        (8192, 64, 512, 64),
+        (8192, 16, 512, 64),
+    ]
     DEFAULT_SHAPE_DESC = "tokens, heads, nope_width, rope_width"
 
     def set_more_shapes(self):

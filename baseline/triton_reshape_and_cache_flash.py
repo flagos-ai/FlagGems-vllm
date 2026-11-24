@@ -19,6 +19,25 @@ SAMPLED_SHA256 = "f18224e51162e37c14a2e2b3045bca55baf0b207b1d203ad6ee7d8ed417139
 NATIVE_UNAVAILABLE_REASON = None
 NATIVE_PROVENANCE = None
 
+SHAPE_FIELDS = ("T", "H", "D", "BS", "layout", "padding", "distribution", "cache")
+# Decode and prefill representatives for the two layouts and three cache formats.
+CORE_SHAPES = (
+    (1, 8, 128, 16, "flash", 0, "contiguous", "auto"),
+    (1, 8, 128, 16, "flash", 0, "contiguous", "fp8"),
+    (128, 8, 128, 16, "flash", 0, "contiguous", "auto"),
+    (128, 8, 128, 16, "flash", 0, "random", "uint8"),
+    (128, 8, 128, 16, "head_major", 0, "contiguous", "auto"),
+    (128, 8, 128, 16, "head_major", 0, "random", "fp8"),
+    (1024, 8, 128, 32, "flash", 0, "contiguous", "auto"),
+    (1024, 8, 128, 32, "flash", 0, "contiguous", "fp8"),
+)
+# Retain padded strides and a large scattered write in the alternate layout.
+COMPREHENSIVE_EXTRA_SHAPES = (
+    (17, 3, 80, 7, "flash", 13, "random", "fp8"),
+    (17, 3, 80, 7, "head_major", 13, "random", "uint8"),
+    (1024, 8, 128, 32, "head_major", 0, "random", "auto"),
+)
+
 
 def native():
     global NATIVE_UNAVAILABLE_REASON, NATIVE_PROVENANCE
@@ -58,31 +77,27 @@ def native():
         "v_scale",
     ):
         raise RuntimeError("native signature drift: diff before benchmarking")
+    platform = module.current_platform
+    # The audited native launch has ROCm/XPU branches and otherwise queries
+    # torch.cuda.get_device_capability, including for ordinary (non-FP8) caches.
+    if (
+        not platform.is_rocm()
+        and not platform.is_xpu()
+        and not torch.cuda.is_available()
+    ):
+        NATIVE_UNAVAILABLE_REASON = (
+            "installed native requires a CUDA-capable Torch runtime outside "
+            "its ROCm/XPU paths"
+        )
+        return None
     return op
 
 
 def grid():
-    """One matrix shared by baseline and standard benchmark; no random duplicates."""
+    """Collect native timings for the selected core and comprehensive shapes."""
     return [
-        dict(
-            T=t,
-            H=h,
-            D=d,
-            BS=bs,
-            layout=layout,
-            padding=padding,
-            distribution=distribution,
-            cache=cache,
-        )
-        for t, h, d, bs, padding in (
-            (1, 8, 128, 16, 0),
-            (17, 3, 80, 7, 13),
-            (128, 8, 128, 16, 0),
-            (1024, 8, 128, 32, 0),
-        )
-        for layout in ("flash", "head_major")
-        for distribution in ("contiguous", "random")
-        for cache in ("auto", "fp8", "uint8")
+        dict(zip(SHAPE_FIELDS, shape))
+        for shape in CORE_SHAPES + COMPREHENSIVE_EXTRA_SHAPES
     ]
 
 
