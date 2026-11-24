@@ -441,3 +441,78 @@ cooperative_topk_hygon_suffix_finish:
   - META: {BLOCK: 1024, TILE: 4}
     num_warps: 1
     num_stages: 1
+
+# mhc_shifted_post_pre (gfx93x): the boundary is host-bound on this platform,
+# so the tune space keeps the kernel count low and only varies the tile shape.
+# The flat token kernels take BLOCK_H = next_power_of_2(H) from the host; only
+# the launch shape is tuned there.  H is the constexpr row width.
+mhc_shifted_post_collapse_norm_hygon:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+# Wide-row variant: H is streamed in BLOCK_H tiles and the norm runs a second
+# pass over the stored bf16 row.
+mhc_shifted_post_collapse_norm_loop_hygon:
+  - gen: true
+    param_map:
+      META: {BLOCK_H: bh}
+      num_warps: w
+      num_stages: s
+    bh: [512, 1024, 2048]
+    w: [4, 8]
+    s: [1, 2]
+
+# Decode-sized batches: post + collapse + norm + project + coefficients in one
+# launch.  BLOCK_H comes from the host; BLOCK_F is the projection K tile.
+mhc_shifted_all_hygon:
+  - META: {BLOCK_F: 512}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_F: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_F: 1024}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK_F: 2048}
+    num_warps: 8
+    num_stages: 1
+
+# Wide-row one-launch variant: both the row tile and the projection tile move.
+mhc_shifted_all_loop_hygon:
+  - gen: true
+    param_map:
+      META: {BLOCK_H: bh, BLOCK_F: bf}
+      num_warps: w
+      num_stages: s
+    bh: [1024, 2048]
+    bf: [512, 1024]
+    w: [4, 8]
+    s: [1]
+
+# Split-K projection over the packed (32, hc*H) bf16 weight plus the fused
+# reduce/Sinkhorn epilogue.  The skinny N=32 GEMM prefers the fat M tile; the
+# K loop has no fused reduction, so num_stages 2/3 are safe.
+mhc_shifted_project_coeff_hygon:
+  - META: {BLOCK_M: 16, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_K: 128, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 2
+  - META: {BLOCK_M: 64, BLOCK_K: 256, BLOCK_N: 32}
+    num_warps: 8
+    num_stages: 3

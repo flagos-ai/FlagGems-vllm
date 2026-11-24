@@ -98,6 +98,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.matmul_persistent import (
+    matmul_persistent,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre_clamp_sinkhorn
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
@@ -184,6 +187,7 @@ __all__ = [
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",
+    "matmul_persistent",
     "mhc_post",
     "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
