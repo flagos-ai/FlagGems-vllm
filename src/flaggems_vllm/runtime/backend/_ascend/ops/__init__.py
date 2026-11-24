@@ -109,6 +109,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.persistent_topk import persistent
 from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._ascend.ops.rejection_sampler import rejection_sample
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -185,6 +186,7 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
+    "rejection_sample",
     "scaled_int8_quant",
     "scatter_conv_state",
     "scatter_kda_state",

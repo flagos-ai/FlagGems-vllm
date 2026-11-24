@@ -1798,6 +1798,18 @@ ops:
   stages:
   - alpha: '4.2'
   - beta: '5.3'
+- id: rejection_sample
+  description: 'Ordinary chain speculative decoding rejection verification with residual and bonus sampling.'
+  for:
+  - vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils.rejection_sample
+  labels:
+  - fused
+  - vLLM
+  - speculative-decoding
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.5'
 - id: reshape_and_cache
   description: Store the key/value token states into the pre-allcated kv_cache buffers
     of paged attention.

@@ -178,6 +178,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
+from flaggems_vllm.ops.rejection_sampler import rejection_sample
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
 from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
@@ -403,6 +404,7 @@ __all__ = [
     "qwen4_vendor_store_qsa_rows",
     "recurrent_kda",
     "reglu",
+    "rejection_sample",
     "reshape_and_cache",
     "reshape_and_cache_flash",
     "router_gemm",

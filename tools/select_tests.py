@@ -89,6 +89,12 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/rejection_sampler.py": [
+        "tests/test_rejection_sample.py",
+    ],
+    "src/flaggems_vllm/ops/rejection_sampler.py": [
+        "tests/test_rejection_sample.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
         "tests/test_gdn_w8a16.py"
     ],
@@ -259,6 +265,12 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_ascend/ops/rejection_sampler.py": [
+        "benchmark/test_rejection_sample.py",
+    ],
+    "src/flaggems_vllm/ops/rejection_sampler.py": [
+        "benchmark/test_rejection_sample.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_ascend/ops/gdn_w8a16_int8.py": [
         "benchmark/test_gdn_w8a16.py"
     ],
