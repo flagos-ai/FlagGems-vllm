@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit(do_not_specialize=["H", "K", "V"])
-def _kda_state_scatter_kernel(
+def _scatter_kda_state_kernel(
     cache,
     state_indices,
     final,
@@ -82,7 +82,7 @@ def scatter_kda_state(
 
     Negative slot ids are skipped.  Values are cast to the cache dtype.
     """
-    logger.debug("GEMS_ASCEND KDA_STATE_SCATTER")
+    logger.debug("GEMS_ASCEND SCATTER_KDA_STATE")
     n = state_indices.shape[0]
     if n == 0:
         return
@@ -95,7 +95,7 @@ def scatter_kda_state(
 
     BK = triton.next_power_of_2(K)
     BV = 64 if BK >= 64 else triton.next_power_of_2(V)
-    _kda_state_scatter_kernel[(n, H, triton.cdiv(V, BV))](
+    _scatter_kda_state_kernel[(n, H, triton.cdiv(V, BV))](
         cache,
         state_indices,
         final,
