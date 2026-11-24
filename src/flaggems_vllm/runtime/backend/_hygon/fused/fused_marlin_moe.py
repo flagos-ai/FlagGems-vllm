@@ -54,8 +54,10 @@ from typing import Any, Callable, Optional
 import torch
 import triton
 import triton.language as tl
+from flag_gems import zeros
 
 from flaggems_vllm import runtime
+from flaggems_vllm.ops.moe_align_block_size import moe_align_block_size_no_tle
 from flaggems_vllm.utils import libentry, libtuner
 
 QUANT_TYPE_UINT4B8 = 0
@@ -63,6 +65,8 @@ QUANT_TYPE_UINT8B128 = 1
 QUANT_TYPE_FP8_E4M3 = 2
 QUANT_TYPE_FP4_E2M1 = 6
 _SUPPORTED_QUANT_TYPES = {0, 1, 2, 6}
+_SHARED_ROUTING_MIN_ROUTES = 1024
+_SHARED_ROUTING_MIN_ROUTES_PER_EXPERT = 4
 
 
 @triton.jit
@@ -207,7 +211,7 @@ def _prefix(Counts, Starts, E: tl.constexpr, B: tl.constexpr):
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("hygon_marlin_gemm"),
-    key=["N", "K", "R", "E", "Q", "FIRST", "DIRECT", "SPLIT_K", "BM"],
+    key=["N", "K", "R", "E", "Q", "FIRST", "DIRECT", "SHARED_ROUTING", "SPLIT_K", "BM"],
 )
 @triton.jit
 def _gemm(
@@ -215,9 +219,9 @@ def _gemm(
     W,
     S,
     Tw,
-    Ids,
+    ExpertIds,
     Routes,
-    Starts,
+    RouteMetadata,
     C,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -236,6 +240,7 @@ def _gemm(
     FIRST: tl.constexpr,
     ROUTER_INPUT: tl.constexpr,
     DIRECT: tl.constexpr,
+    SHARED_ROUTING: tl.constexpr,
     SPLIT_K: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
@@ -244,10 +249,16 @@ def _gemm(
     block = tl.program_id(1)
     n = tl.program_id(0) * BN + tl.arange(0, BN)
     if DIRECT:
-        expert = tl.load(Ids + block)
+        expert = tl.load(ExpertIds + block)
         route = tl.where(tl.arange(0, BM) == 0, block, R)
+    elif SHARED_ROUTING:
+        first_route = block * BM
+        if first_route >= tl.load(RouteMetadata):
+            return
+        expert = tl.load(ExpertIds + block)
+        route = tl.load(Routes + first_route + tl.arange(0, BM))
     else:
-        total = tl.load(Starts + E)
+        total = tl.load(RouteMetadata + E)
         if block >= total:
             return
         # Upper bound search also handles empty experts (repeated starts).
@@ -255,12 +266,12 @@ def _gemm(
         hi = E
         while lo < hi:
             mid = (lo + hi) // 2
-            start = tl.load(Starts + mid)
+            start = tl.load(RouteMetadata + mid)
             take = start <= block
             lo = tl.where(take, mid + 1, lo)
             hi = tl.where(take, hi, mid)
         expert = lo - 1
-        start = tl.load(Starts + expert)
+        start = tl.load(RouteMetadata + expert)
         row = (block - start) * BM + tl.arange(0, BM)
         route = tl.load(Routes + expert * CAP + row)
     route = route.to(tl.int64)
@@ -603,8 +614,7 @@ def _fused_marlin_moe_impl(
     if m == 0:
         return out
     r = m * topk
-    # Route workspaces are O(E * R). Bound memory until a streaming aligner
-    # is provided; no hidden host synchronization or CPU routing is used.
+    # Both projections still allocate workspace for every route in the call.
     if r > 16384 or e > 1024:
         raise NotImplementedError(
             "Hygon Marlin MoE supports at most 16384 routes and 1024 experts"
@@ -614,23 +624,32 @@ def _fused_marlin_moe_impl(
     direct = r <= (2 if max(k, n) >= 4096 else 16)
     bm = 64 if r >= 32 * e else 32 if r >= 16 * e else 16
     cap = triton.cdiv(r, bm) * bm
+    # The shared aligner has four stages and a quadratic expert-count buffer.
+    # Amortize that overhead on grouped batches with enough routes per expert.
+    shared_routing = r >= max(
+        _SHARED_ROUTING_MIN_ROUTES, _SHARED_ROUTING_MIN_ROUTES_PER_EXPERT * e
+    )
     # Keep the original accumulation order when routing weights precede
     # activation: rounding differences can be amplified by the gated product.
     split_k = (
         8 if max(k, n) >= 4096 and r <= 32 and not apply_router_weight_on_input else 1
     )
     with torch.cuda.device(hidden_states.device):
-        routes = (
-            torch.empty((e, cap), device=out.device, dtype=torch.int32)
-            if not direct
-            else topk_ids
-        )
-        starts = (
-            torch.empty((e + 1,), device=out.device, dtype=torch.int32)
-            if not direct
-            else topk_ids
-        )
-        if not direct:
+        expert_ids = topk_ids
+        if direct:
+            routes = route_metadata = topk_ids
+        elif shared_routing:
+            workspace = zeros(((e + 1) ** 2,), device=out.device, dtype=torch.int32)
+            routes, expert_ids, route_metadata = moe_align_block_size_no_tle(
+                topk_ids,
+                bm,
+                e,
+                pad_sorted_ids=True,
+                workspace=(workspace[: e + 1], workspace[e + 1 :]),
+            )
+        else:
+            routes = torch.empty((e, cap), device=out.device, dtype=torch.int32)
+            route_metadata = torch.empty((e + 1,), device=out.device, dtype=torch.int32)
             counts = torch.empty((e,), device=out.device, dtype=torch.int32)
             _routes[(e,)](
                 topk_ids,
@@ -642,7 +661,9 @@ def _fused_marlin_moe_impl(
                 triton.next_power_of_2(r),
                 num_warps=4,
             )
-            _prefix[(1,)](counts, starts, e, triton.next_power_of_2(e), num_warps=4)
+            _prefix[(1,)](
+                counts, route_metadata, e, triton.next_power_of_2(e), num_warps=4
+            )
         intermediate = torch.empty((r, n), dtype=out.dtype, device=out.device)
         result = torch.empty((r, k), dtype=out.dtype, device=out.device)
         blocks = r if direct else min(r, triton.cdiv(r, bm) + e - 1)
@@ -688,9 +709,9 @@ def _fused_marlin_moe_impl(
                 w,
                 s,
                 topk_weights,
-                topk_ids,
+                expert_ids,
                 routes,
-                starts,
+                route_metadata,
                 partial,
                 nk,
                 kk,
@@ -705,6 +726,7 @@ def _fused_marlin_moe_impl(
                 first,
                 apply_router_weight_on_input,
                 direct,
+                shared_routing,
                 split_k,
                 bm,
             )
