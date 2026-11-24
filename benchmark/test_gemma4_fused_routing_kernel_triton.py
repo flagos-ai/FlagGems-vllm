@@ -44,20 +44,26 @@ class Gemma4RoutingBenchmark(base.Benchmark):
 
 @pytest.mark.gemma4_fused_routing_kernel_triton
 @pytest.mark.skipif(
-    flaggems_vllm.device != "cuda" or not torch.cuda.is_available(),
-    reason="requires CUDA-compatible tensors",
+    flaggems_vllm.vendor_name != "ascend"
+    and (flaggems_vllm.device != "cuda" or not torch.cuda.is_available()),
+    reason="requires Ascend or CUDA-compatible tensors",
 )
 def test_gemma4_fused_routing_kernel_triton_perf():
-    try:
-        from vllm.model_executor.models.gemma4 import (
-            gemma4_fused_routing_kernel_triton as vllm_reference,
+    if flaggems_vllm.vendor_name == "ascend":
+        from baseline.gemma4_fused_routing_kernel_triton import (
+            gemma4_fused_routing_kernel_triton as reference,
         )
-    except ImportError as exc:
-        pytest.skip(f"vLLM Gemma 4 routing is unavailable: {exc}")
+    else:
+        try:
+            from vllm.model_executor.models.gemma4 import (
+                gemma4_fused_routing_kernel_triton as reference,
+            )
+        except ImportError as exc:
+            pytest.skip(f"vLLM Gemma 4 routing is unavailable: {exc}")
 
     bench = Gemma4RoutingBenchmark(
         op_name="gemma4_fused_routing_kernel_triton",
-        torch_op=vllm_reference,
+        torch_op=reference,
         gems_op=flaggems_vllm.gemma4_fused_routing_kernel_triton,
         dtypes=[torch.float16, torch.bfloat16, torch.float32],
     )

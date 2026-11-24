@@ -69,6 +69,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.gdn_w8a16_int8 import (
     gdn_w8a16_int8,
     quantize_gdn_state_int8,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.gemma4_fused_routing_kernel_triton import (
+    gemma4_fused_routing_kernel_triton,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
     group_list_cumsum,
@@ -174,6 +177,7 @@ __all__ = [
     "gather_conv_state",
     "gather_kda_state",
     "gdn_w8a16_int8",
+    "gemma4_fused_routing_kernel_triton",
     "gemma_rms_norm",
     "group_list_cumsum",
     "grouped_topk",
