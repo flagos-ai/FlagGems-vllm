@@ -1852,6 +1852,16 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: minimax_qknorm_rope_cache
+  description: MiniMax M3 Gemma RMSNorm, NeoX RoPE and separate paged cache insertion.
+  for:
+  - vllm_ascend.ops.triton.msa.minimax_qknorm_rope_cache.minimax_qknorm_rope_cache
+  labels:
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: moe_align_block_size_triton
   description: 'Aligns the token distribution across experts to be compatible with
     block size
