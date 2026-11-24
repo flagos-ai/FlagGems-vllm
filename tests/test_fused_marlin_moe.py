@@ -1623,34 +1623,37 @@ def test_fused_marlin_moe_w8a16_inference_updates(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
-@pytest.mark.parametrize("unsafe_case", ["mismatched_blocks", "shifted_output"])
-def test_fused_marlin_moe_w8a16_rejects_unsafe_dense_call_ppu(monkeypatch, unsafe_case):
-    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+def test_fused_marlin_moe_w8a16_dense_stage_blocks_ppu(monkeypatch):
     kernels = importlib.import_module(
         "flaggems_vllm.runtime.backend._thead.ops.fused_moe"
     )
     hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w8a16_int8(
         4096, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
     )
+    args = (hs, w1, w2, None, None, s1, s2, tw, ti, QUANT_TYPE_UINT8B128)
+    reference = flaggems_vllm.fused_marlin_moe(*args)
+    get_config = kernels.get_default_config
+
+    def tuned_config(*args, gemm_stage):
+        config = get_config(*args, gemm_stage=gemm_stage)
+        return dict(config, BLOCK_SIZE_M=32) if gemm_stage == "gemm2" else config
+
+    monkeypatch.setattr(kernels, "get_default_config", tuned_config)
+    gems_assert_equal(flaggems_vllm.fused_marlin_moe(*args), reference)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
+def test_fused_marlin_moe_w8a16_shifted_chunk_output_ppu(monkeypatch):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w8a16_int8(
+        4096, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
     storage = hs.new_full((hs.size(0) + 1, hs.size(1)), 7)
-    if unsafe_case == "mismatched_blocks":
-        get_config = kernels.get_default_config
-
-        def tuned_config(*args, gemm_stage):
-            config = get_config(*args, gemm_stage=gemm_stage)
-            if gemm_stage == "gemm2":
-                config = dict(config, BLOCK_SIZE_M=32)
-            return config
-
-        monkeypatch.setattr(kernels, "get_default_config", tuned_config)
-        error = "BLOCK_SIZE_M"
-    else:
-        monkeypatch.setattr(backend, "_PPU_DENSE_MAX_WORKSPACE_BYTES", 4 << 20)
-        hs = storage[:-1]
-        error = "partially overlap"
-    with pytest.raises(ValueError, match=error):
+    monkeypatch.setattr(backend, "_PPU_DENSE_MAX_WORKSPACE_BYTES", 4 << 20)
+    with pytest.raises(ValueError, match="partially overlap"):
         flaggems_vllm.fused_marlin_moe(
-            hs,
+            storage[:-1],
             w1,
             w2,
             None,

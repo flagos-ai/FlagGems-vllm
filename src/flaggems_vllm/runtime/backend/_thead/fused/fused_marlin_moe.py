@@ -34,19 +34,20 @@ from flaggems_vllm.ops.fused_marlin_moe import (
     fused_marlin_moe as generic_fused_marlin_moe,
 )
 from flaggems_vllm.ops.moe_align_block_size import (
+    _moe_align_block_size_triton_4stage,
     moe_align_block_size_no_tle,
     moe_align_block_size_singleton,
     moe_align_block_size_small_grouped,
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
 from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
+from flaggems_vllm.runtime.backend._thead.tle_utils import supports_tle_primitives
 from flaggems_vllm.utils import libentry
 
 try:
-    import triton.experimental.tle as tle_api
     from triton.experimental.tle import language as tle_async
 except ImportError:
-    tle_api = tle_async = None
+    tle_async = None
 
 _SCALE_CACHE = WeakTensorKeyDictionary()
 
@@ -76,8 +77,7 @@ W8_HALF_TILE_BYTES = tl.constexpr(64 * 128)
 EXPERT_ID_MASK = tl.constexpr(0x3FFFFFFF)
 SHORT_TILE_FLAG = tl.constexpr(0x40000000)
 OVERLAP_BLOCK_ROWS = 64
-ALLOCATOR_MIN_BLOCK = 512
-ALLOCATOR_SMALL_POOL_LIMIT = 1 << 20
+DENSE_WORKSPACE_HEADROOM_BYTES = 16 << 20
 _PPU_DENSE_MIN_TOKENS = 4096
 _TL_QUANT_TYPE_UINT4B8 = tl.constexpr(QUANT_TYPE_UINT4B8)
 _TL_QUANT_TYPE_UINT8B128 = tl.constexpr(QUANT_TYPE_UINT8B128)
@@ -1545,13 +1545,18 @@ def raw_tile_modes(call: MarlinCall, use_wide_tile: bool) -> Tuple[bool, bool]:
         or not (tokens * top_k <= 16 * experts or use_wide_tile)
     ):
         return False, False
-    if call.quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1):
-        return False, True
-    raw_w8 = (
+    bf16_group = (
         call.group_size == 128
         and call.w1_scale.dtype == call.w2_scale.dtype == torch.bfloat16
     )
-    return raw_w8, False
+    raw_w8 = bf16_group and call.quant_type_id in (
+        QUANT_TYPE_UINT8B128,
+        QUANT_TYPE_FP8_E4M3,
+    )
+    raw_w4 = (bf16_group and call.quant_type_id == QUANT_TYPE_UINT4B8) or (
+        call.group_size == 32 and call.quant_type_id == QUANT_TYPE_FP4_E2M1
+    )
+    return raw_w8, raw_w4
 
 
 def direct_schedule(
@@ -1682,8 +1687,8 @@ def eligible_for_dense(call: MarlinCall) -> bool:
             )
             or call.quant_type_id == QUANT_TYPE_FP4_E2M1
         )
-        # The decoded BF16 gate/up bank [E, 2N, K] is the larger projection.
-        and 4 * call.shape.experts * call.shape.intermediate * call.shape.hidden
+        and max(call.w1.numel(), call.w2.numel())
+        * (4 if call.quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1) else 2)
         <= _PPU_DENSE_MAX_DECODE_BYTES
     )
 
@@ -2053,9 +2058,20 @@ def dense_align_count_histogram(
     tl.store(sorted_routes + o, NUM_ROUTES, o < EM)
 
 
+def dense_routing_sizes(routes: int, experts: int, block_m: int) -> Tuple[int, ...]:
+    padded = routes + min(routes, experts) * (block_m - 1)
+    return padded, triton.cdiv(padded, block_m), 1, (experts + 1) * experts, experts + 1
+
+
 def align_dense_fp8_histogram(
-    ids: torch.Tensor, num_experts: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ids: torch.Tensor,
+    num_experts: int,
+    sorted_ids: torch.Tensor,
+    experts: torch.Tensor,
+    post: torch.Tensor,
+    count: torch.Tensor,
+    prefix: torch.Tensor,
+) -> None:
     from flaggems_vllm.ops.moe_align_block_size import (
         moe_align_block_size_stage2_vec,
         moe_align_block_size_stage3,
@@ -2064,14 +2080,8 @@ def align_dense_fp8_histogram(
 
     r = ids.numel()
     e = num_experts
-    em = r + (OVERLAP_BLOCK_ROWS - 1) * e
-    mb = triton.cdiv(em, OVERLAP_BLOCK_ROWS)
+    em = sorted_ids.numel()
     rb = triton.next_power_of_2(triton.cdiv(r, e))
-    sorted_ids = torch.empty((em,), device=ids.device, dtype=torch.int32)
-    experts = torch.empty((mb,), device=ids.device, dtype=torch.int32)
-    post = torch.empty((1,), device=ids.device, dtype=torch.int32)
-    count = torch.empty((e + 1, e), device=ids.device, dtype=torch.int32)
-    prefix = torch.empty((e + 1,), device=ids.device, dtype=torch.int32)
     dense_align_count_histogram[(e,)](
         ids,
         count,
@@ -2090,7 +2100,6 @@ def align_dense_fp8_histogram(
     moe_align_block_size_stage4[(e,)](
         ids, sorted_ids, experts, count, prefix, e, OVERLAP_BLOCK_ROWS, r, rb
     )
-    return sorted_ids, experts, post, prefix
 
 
 @lru_cache(maxsize=16)
@@ -2141,6 +2150,8 @@ def run_fp8_ordered_overlap(
     gateup: torch.Tensor,
     middle: torch.Tensor,
     down: torch.Tensor,
+    routing: Tuple[torch.Tensor, ...],
+    side: torch.cuda.Stream,
 ) -> torch.Tensor:
     m, k = hidden.shape
     experts_count, n2, _ = w1.shape
@@ -2154,12 +2165,7 @@ def run_fp8_ordered_overlap(
     down_tile = down.size(-1)
 
     main = torch.cuda.current_stream(hidden.device)
-    # Eager callers can share a work queue; graph capture needs its own fork/join stream.
-    if torch.cuda.is_current_stream_capturing():
-        side = torch.cuda.Stream(device=hidden.device, priority=-1)
-    else:
-        side = eager_decode_stream(hidden.device)
-    for operand in (banks, w1, w2, w1_scale, w2_scale, ids):
+    for operand in (w1, w2, w1_scale, w2_scale, ids):
         operand.record_stream(side)
 
     first, second = slice(half, experts_count), slice(0, half)
@@ -2167,15 +2173,12 @@ def run_fp8_ordered_overlap(
     up_weight, up_scale = w1[:, n:], w1_scale[:, n:]
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        sorted_ids, experts, padded, prefix = align_dense_fp8_histogram(
-            ids, experts_count
-        )
+        align_dense_fp8_histogram(ids, experts_count, *routing)
+    sorted_ids, experts, padded, _, prefix = routing
     decode_dense_bank(
         gate_weight[first], gate_scale[first], gate_bank, QUANT_TYPE_FP8_E4M3
     )
     main.wait_stream(side)
-    for metadata in (sorted_ids, experts, padded, prefix):
-        metadata.record_stream(main)
     em = sorted_ids.numel()
     row_tiles = triton.cdiv(em, OVERLAP_BLOCK_ROWS)
 
@@ -2364,8 +2367,11 @@ def run_dense_wna16(
     *,
     gate_tile: int,
     down_tile: int,
-    decode_elements: int,
-    projection_width: int,
+    scratch: torch.Tensor,
+    cache: torch.Tensor,
+    activations: torch.Tensor,
+    route_storage: torch.Tensor,
+    side: Optional[torch.cuda.Stream],
     configs: Tuple[Dict[str, int], Dict[str, int]],
 ) -> torch.Tensor:
     from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
@@ -2375,30 +2381,15 @@ def run_dense_wna16(
     m, k = hidden_states.shape
     e, n2, _ = w1.shape
     n, topk = n2 // 2, topk_ids.shape[1]
-    is_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
     is_w4 = quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
     routes = m * topk
-    scratch = torch.empty(
-        decode_elements, device=hidden_states.device, dtype=torch.bfloat16
-    )
-    # Gate/up and down do not overlap in time; only the activation survives both GEMMs.
-    cache = hidden_states.new_empty((routes * projection_width,))
     gateup = cache[: routes * n2].view(m, topk, n2)
-    intermediate = hidden_states.new_empty((routes, n))
+    intermediate = activations[: routes * n].view(routes, n)
     down = cache[: routes * down_tile].view(m, topk, down_tile)
-    if (
-        is_fp8
-        and configs[0]["BLOCK_SIZE_M"] == OVERLAP_BLOCK_ROWS
-        and m >= MIN_OVERLAP_TOKENS
-        and e in (128, 256)
-        and k == 4096
-        and n == 256
-        and 4 <= topk <= 8
-        and gate_tile == n
-        and down_tile <= k // 2
-        and k % down_tile == 0
-        and down_tile % 256 == 0
-    ):
+    block_m = OVERLAP_BLOCK_ROWS if side is not None else configs[0]["BLOCK_SIZE_M"]
+    sizes = dense_routing_sizes(routes, e, block_m)
+    routing_buffers = route_storage[: sum(sizes)].split(sizes)
+    if side is not None:
         return run_fp8_ordered_overlap(
             hidden_states,
             w1,
@@ -2413,7 +2404,16 @@ def run_dense_wna16(
             gateup,
             intermediate,
             down,
+            routing_buffers,
+            side,
         )
+    sorted_ids, experts, padded, counts, prefix = routing_buffers
+    # The ordinary alignment accumulates into counts and reads prefix[0].
+    counts.zero_()
+    prefix[0].zero_()
+    _moe_align_block_size_triton_4stage(
+        topk_ids, e, block_m, sorted_ids, experts, padded, workspace=(prefix, counts)
+    )
     if quant_type_id == QUANT_TYPE_FP4_E2M1:
         w1_scale, w2_scale = w1_scale.view(torch.uint8), w2_scale.view(torch.uint8)
     for index, (weight, scales) in enumerate(((w1, w1_scale), (w2, w2_scale))):
@@ -2422,10 +2422,6 @@ def run_dense_wna16(
         if is_w4:
             reduction *= 2
         config = configs[index]
-        if first:
-            sorted_ids, experts, padded = align_grouped_tokens(
-                topk_ids, config["BLOCK_SIZE_M"], e
-            )
         tile = gate_tile if first else down_tile
         for col in range(0, output_size, tile):
             stop = min(col + tile, output_size)
@@ -2491,50 +2487,52 @@ def run_dense_batches(
     projection_width = max(2 * call.shape.intermediate, down_tile)
     tokens, k, n, experts, top_k = call.shape
     config_tokens = max(tokens, _PPU_DENSE_MIN_TOKENS)
-    configs = (
-        get_default_config(
-            config_tokens, experts, 2 * n, k, top_k, "bf16", gemm_stage="gemm1"
-        ),
-        get_default_config(
-            config_tokens, experts, k, n, top_k, "bf16", gemm_stage="gemm2"
-        ),
+    gate_config = get_default_config(
+        config_tokens, experts, 2 * n, k, top_k, "bf16", gemm_stage="gemm1"
     )
-    block_m = configs[0]["BLOCK_SIZE_M"]
-    if block_m != configs[1]["BLOCK_SIZE_M"]:
-        raise ValueError(
-            "Dense GEMM stages must use the same BLOCK_SIZE_M for shared routing"
-        )
+    down_config = get_default_config(
+        config_tokens, experts, k, n, top_k, "bf16", gemm_stage="gemm2"
+    )
+    block_m = gate_config["BLOCK_SIZE_M"]
+    # Both projections consume routes grouped by the gate's row block.
+    configs = (gate_config, dict(down_config, BLOCK_SIZE_M=block_m))
+    can_overlap = (
+        call.quant_type_id == QUANT_TYPE_FP8_E4M3
+        and experts in (128, 256)
+        and k == 4096
+        and n == 256
+        and 4 <= top_k <= 8
+        and gate_tile == n
+        and down_tile <= k // 2
+        and k % down_tile == 0
+        and down_tile % 256 == 0
+    )
 
-    def workspace_bytes(batch: int) -> int:
+    def workspace_words(batch: int) -> Tuple[int, int, int, int]:
         routes = batch * top_k
-        padded = routes + min(routes, experts) * (block_m - 1)
-        # Both dense paths allocate BF16 decode/projection/activation storage and
-        # int32 sorted ids, expert blocks, post-pad length, counts and prefix sums.
-        sizes = (
-            2 * decode_elements,
-            2 * routes * projection_width,
-            2 * routes * n,
-            4 * padded,
-            4 * triton.cdiv(padded, block_m),
-            4,
-            4 * (experts + 1) * experts,
-            4 * (experts + 1),
+        routing = sum(dense_routing_sizes(routes, experts, block_m))
+        if can_overlap and batch >= MIN_OVERLAP_TOKENS:
+            # The tail may use ordinary GEMMs with a different expert-block count.
+            routing = max(
+                routing, sum(dense_routing_sizes(routes, experts, OVERLAP_BLOCK_ROWS))
+            )
+        # Each int32 word holds two BF16 elements; both projection widths are even.
+        return (
+            decode_elements // 2,
+            routes * projection_width // 2,
+            routes * n // 2,
+            routing,
         )
-        # The SDK caching allocator can leave up to 1 MiB unsplit in each large
-        # block. Graph capture also allocates two minimum-size RNG state blocks.
-        allocated = 2 * ALLOCATOR_MIN_BLOCK
-        for size in sizes:
-            allocated += triton.cdiv(size, ALLOCATOR_MIN_BLOCK) * ALLOCATOR_MIN_BLOCK
-            if size > ALLOCATOR_SMALL_POOL_LIMIT:
-                allocated += ALLOCATOR_SMALL_POOL_LIMIT
-        return allocated
 
+    # Leave room for allocation and capture overhead even when a chunk fills the budget.
+    headroom = min(DENSE_WORKSPACE_HEADROOM_BYTES, workspace_limit // 4)
+    usable_words = (workspace_limit - headroom) // 4
     batch_tokens = tokens
-    if workspace_bytes(tokens) > workspace_limit:
+    if sum(workspace_words(tokens)) > usable_words:
         low, high = 0, tokens - 1
         while low < high:
             mid = (low + high + 1) // 2
-            if workspace_bytes(mid) <= workspace_limit:
+            if sum(workspace_words(mid)) <= usable_words:
                 low = mid
             else:
                 high = mid - 1
@@ -2542,12 +2540,28 @@ def run_dense_batches(
     if batch_tokens < 1:
         raise NotImplementedError("PPU dense MoE workspace exceeds its budget")
     if batch_tokens < call.shape.tokens and call.out is not call.hidden_states:
-        # An earlier output chunk can overwrite a later chunk's activations.
+        # Both views are contiguous with equal byte length after input validation.
         distance = abs(call.out.data_ptr() - call.hidden_states.data_ptr())
         if 0 < distance < call.hidden_states.nbytes:
             raise ValueError(
                 "output must not partially overlap hidden_states in chunked dense MoE"
             )
+    sizes = workspace_words(batch_tokens)
+    # One main-stream allocation survives every chunk. The side stream waits on
+    # main before reusing it, and main joins all side-stream work before return.
+    storage = call.hidden_states.new_empty(sum(sizes), dtype=torch.int32)
+    banks, projections, middle, route_storage = storage.split(sizes)
+    scratch = banks.view(torch.bfloat16)
+    cache = projections.view(torch.bfloat16)
+    activations = middle.view(torch.bfloat16)
+    side = None
+    if can_overlap and batch_tokens >= MIN_OVERLAP_TOKENS:
+        device = call.hidden_states.device
+        side = (
+            torch.cuda.Stream(device=device, priority=-1)
+            if torch.cuda.is_current_stream_capturing()
+            else eager_decode_stream(device)
+        )
     for start in range(0, call.shape.tokens, batch_tokens):
         end = min(start + batch_tokens, call.shape.tokens)
         run_dense_wna16(
@@ -2563,8 +2577,11 @@ def run_dense_batches(
             call.apply_router_weight_on_input,
             gate_tile=gate_tile,
             down_tile=down_tile,
-            decode_elements=decode_elements,
-            projection_width=projection_width,
+            scratch=scratch,
+            cache=cache,
+            activations=activations,
+            route_storage=route_storage,
+            side=side if end - start >= MIN_OVERLAP_TOKENS else None,
             configs=configs,
         )
 
@@ -5180,7 +5197,10 @@ def stage_grouped_activations(
     )
     if (
         use_packed_gather
+        and (permute_k16 or permute_k32)
+        and activations.dtype == torch.bfloat16
         and activations.size(1) >= 1024
+        and activations.size(1) % (32 if permute_k32 else 16) == 0
         and activations.data_ptr() % 4 == 0
     ):
         k_pairs = activations.size(1) // 2
@@ -5874,19 +5894,10 @@ _VLLM_QUANT_TYPE_FP8_E4M3 = 2814749767172868
 
 @lru_cache(maxsize=16)
 def supports_marlin_tle(device: torch.device) -> bool:
-    if tle_api is None:
-        return False
-    features = ("load", "gpu.alloc", "gpu.local_ptr")
     with torch.cuda.device(device):
-        if hasattr(tle_api, "is_tle_supported"):
-            return tle_api.is_tle_supported(features)
-        if hasattr(tle_api, "get_supported_primitives"):
-            from triton.compiler.compiler import make_backend
-
-            target = triton.runtime.driver.active.get_current_target()
-            backend = type(make_backend(target)).__module__.split(".")[-2]
-            return set(features) <= tle_api.get_supported_primitives(backend)
-    return False
+        return tle_async is not None and supports_tle_primitives(
+            ("load", "gpu.alloc", "gpu.local_ptr")
+        )
 
 
 def dispatch_marlin_call(call: MarlinCall) -> None:
@@ -6019,13 +6030,13 @@ def fused_marlin_moe(
         quant_type_id = QUANT_TYPE_FP8_E4M3
     if quant_type_id not in _PPU_QUANT_TYPES:
         return generic_fused_marlin_moe(**locals())
-    if isinstance(activation, Enum) and activation.name.lower() == "silu":
-        activation = activation.name
-    else:
-        activation = getattr(
-            activation, "value", getattr(activation, "name", activation)
-        )
-    if activation is not None and str(activation).lower() != "silu":
+    if isinstance(activation, Enum):
+        if (
+            activation.name.lower() != "silu"
+            and str(activation.value).lower() != "silu"
+        ):
+            raise NotImplementedError("PPU fused Marlin MoE supports only SiLU")
+    elif activation is not None and str(activation).lower() != "silu":
         raise NotImplementedError("PPU fused Marlin MoE supports only SiLU")
     if any(
         value is not None for value in (g_idx1, g_idx2, sort_indices1, sort_indices2)
