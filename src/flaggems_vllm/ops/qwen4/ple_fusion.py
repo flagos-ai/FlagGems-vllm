@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import triton
@@ -14,21 +15,72 @@ HAS_TRITON = True
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
+def _detect_target_programs() -> int:
+    """Total-program budget, roughly matched to physical vector core count."""
+    env = os.environ.get("PLE_GATE_TARGET_PROGRAMS")
+    if env is not None:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    try:
+        import torch_npu  # noqa: F401
+
+        props = torch.npu.get_device_properties(torch.npu.current_device())
+        for attr in (
+            "num_aicore",
+            "aicore_num",
+            "aivector_num",
+            "num_vector_core",
+            "multi_processor_count",
+        ):
+            if hasattr(props, attr):
+                val = int(getattr(props, attr))
+                if val > 0:
+                    return val
+    except Exception:
+        pass
+    return 48
+
+
+def _pick_chunk_h(h: int) -> int:
+    """Power-of-2 divisor of H used to tile H without padding."""
+    env = os.environ.get("PLE_GATE_CHUNK_H")
+    if env is not None:
+        return max(1, int(env))
+    for cand in (256, 512, 1024, 128):
+        if cand <= h and h % cand == 0:
+            return cand
+    return min(512, triton.next_power_of_2(h))
+
+
+def _pick_block_t() -> int:
+    """Tokens processed per program per loop iteration.
+
+    BLOCK_T>=3 overflows the 192KB UB on this buffer layout with auto
+    multi-buffering on; 2 is the confirmed sweet spot.
+    """
+    env = os.environ.get("PLE_GATE_BLOCK_T")
+    if env is not None:
+        return max(1, int(env))
+    return 2
+
+
+_TARGET_PROGRAMS = _detect_target_programs()
+
+
 def _default_prefill_conv_config(device: torch.device) -> tuple[int, int]:
     """Return a measured Hopper config with a portable fallback."""
-
     if device.type == "cuda" and torch.version.hip is None:
         try:
             if torch.cuda.get_device_capability(device)[0] >= 9:
                 return 8, 256
         except (AssertionError, RuntimeError):
-            # Capability probing may be unavailable during import/preflight;
-            # the conservative launch below still applies.
             pass
     return 16, 128
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens", "num_groups", "num_token_groups"])
 def _ple_gate_norm_kernel(
     key_ptr,
     query_ptr,
@@ -38,72 +90,102 @@ def _ple_gate_norm_kernel(
     conv_weight_ptr,
     gated_ptr,
     normalized_ptr,
+    num_tokens,
+    num_groups,
+    num_token_groups,
     hidden_size: tl.constexpr,
     hc_count: tl.constexpr,
     eps: tl.constexpr,
     inv_sqrt_hidden: tl.constexpr,
-    block_h: tl.constexpr,
+    chunk_h: tl.constexpr,
+    nchunks: tl.constexpr,
+    block_t: tl.constexpr,
 ) -> None:
-    """Fuse three grouped RMS norms and the complete PLE gate chain.
+    """Fused PLE gate + three grouped RMS norms, persistent over tokens.
 
-    A program owns one ``(token, HC branch)`` row.  Reductions accumulate in
-    FP32, while explicit casts preserve the reference path's low-precision
-    materialization points (normalized key/query, gate, and gated value).
+    Key/query/value are viewed as [T, HC, H]; each program owns one HC branch
+    ``s = program_id(1)`` and loops over BLOCK_T token groups internally.
+    Reductions accumulate in FP32, explicit casts preserve the reference
+    path's low-precision materialization points.
     """
+    g0 = tl.program_id(0).to(tl.int64)
+    s = tl.program_id(1)
+    base = s * hidden_size
+    dtype: tl.constexpr = key_ptr.dtype.element_ty
+    inv_h: tl.constexpr = 1.0 / hidden_size
+    exact: tl.constexpr = hidden_size == nchunks * chunk_h
 
-    group_row = tl.program_id(0)
-    token = group_row // hc_count
-    branch = group_row % hc_count
-    offsets = tl.arange(0, block_h)
-    mask = offsets < hidden_size
-    row_offsets = group_row * hidden_size + offsets
-    value_offsets = token * hidden_size + offsets
-    weight_offsets = branch * hidden_size + offsets
+    row = tl.arange(0, nchunks)[:, None]
+    col = tl.arange(0, chunk_h)[None, :]
+    offs2d = row * chunk_h + col
 
-    key = tl.load(key_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
-    query = tl.load(query_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
-    key_weight = tl.load(key_weight_ptr + weight_offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    query_weight = tl.load(query_weight_ptr + weight_offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    if exact:
+        nk_f = tl.load(key_weight_ptr + base + offs2d).to(tl.float32)
+        nq_f = tl.load(query_weight_ptr + base + offs2d).to(tl.float32)
+        ncw_f = tl.load(conv_weight_ptr + base + offs2d).to(tl.float32)
+    else:
+        hmask = offs2d < hidden_size
+        nk_f = tl.load(key_weight_ptr + base + offs2d, mask=hmask, other=0.0).to(
+            tl.float32
+        )
+        nq_f = tl.load(query_weight_ptr + base + offs2d, mask=hmask, other=0.0).to(
+            tl.float32
+        )
+        ncw_f = tl.load(conv_weight_ptr + base + offs2d, mask=hmask, other=0.0).to(
+            tl.float32
+        )
 
-    key_inv_rms = tl.rsqrt(tl.sum(key * key, axis=0) / hidden_size + eps)
-    query_inv_rms = tl.rsqrt(tl.sum(query * query, axis=0) / hidden_size + eps)
+    num_tokens64 = num_tokens.to(tl.int64)
+    num_groups64 = num_groups.to(tl.int64)
+    num_token_groups64 = num_token_groups.to(tl.int64)
+    h_offs = offs2d[None, :, :]
+    hc_h: tl.constexpr = hc_count * hidden_size
 
-    # The eager reference stores both norm results in the source dtype before
-    # multiplying them.  Preserve those rounding points instead of feeding an
-    # all-FP32 dot product into the nonlinear gate.
-    source_dtype: tl.constexpr = key_ptr.dtype.element_ty
-    norm_key = (key * key_inv_rms * (1.0 + key_weight)).to(source_dtype)
-    norm_query = (query * query_inv_rms * (1.0 + query_weight)).to(source_dtype)
-    products = (norm_key * norm_query).to(source_dtype)
-    gate_linear = (tl.sum(products.to(tl.float32), axis=0) * inv_sqrt_hidden).to(
-        source_dtype
-    )
-    gate_linear_fp32 = gate_linear.to(tl.float32)
-    gate_sign = tl.where(
-        gate_linear_fp32 > 0.0,
-        1.0,
-        tl.where(gate_linear_fp32 < 0.0, -1.0, 0.0),
-    )
-    signed_root = (
-        gate_sign * tl.sqrt(tl.maximum(tl.abs(gate_linear_fp32), 1.0e-6))
-    ).to(source_dtype)
-    gate = tl.sigmoid(signed_root.to(tl.float32)).to(source_dtype)
+    for tg in tl.range(g0, num_token_groups64, num_groups64):
+        t_idx = tg * block_t + tl.arange(0, block_t).to(tl.int64)
+        tmask = t_idx < num_tokens64
+        tok3 = t_idx[:, None, None]
 
-    value = tl.load(value_ptr + value_offsets, mask=mask, other=0.0)
-    gated = (gate * value).to(source_dtype)
-    gated_fp32 = gated.to(tl.float32)
-    conv_weight = tl.load(conv_weight_ptr + weight_offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    conv_inv_rms = tl.rsqrt(tl.sum(gated_fp32 * gated_fp32, axis=0) / hidden_size + eps)
-    normalized = gated_fp32 * conv_inv_rms * (1.0 + conv_weight)
+        if exact:
+            lmask = tmask[:, None, None]
+        else:
+            hmask = offs2d < hidden_size
+            lmask = tmask[:, None, None] & hmask[None, :, :]
 
-    tl.store(gated_ptr + row_offsets, gated, mask=mask)
-    tl.store(normalized_ptr + row_offsets, normalized, mask=mask)
+        # [T, HC, H] contiguous: token stride is HC*H, HC branch offset is base.
+        k = tl.load(key_ptr + tok3 * hc_h + base + h_offs, mask=lmask, other=0.0)
+        q = tl.load(query_ptr + tok3 * hc_h + base + h_offs, mask=lmask, other=0.0)
+        v = tl.load(value_ptr + tok3 * hidden_size + h_offs, mask=lmask, other=0.0)
+
+        k_f = k.to(tl.float32)
+        q_f = q.to(tl.float32)
+
+        sumsq_k = tl.sum(tl.sum(k_f * k_f, axis=2), axis=1)
+        sumsq_q = tl.sum(tl.sum(q_f * q_f, axis=2), axis=1)
+        rms_k = tl.rsqrt(sumsq_k * inv_h + eps)
+        rms_q = tl.rsqrt(sumsq_q * inv_h + eps)
+
+        k_n = (k_f * rms_k[:, None, None] * (1.0 + nk_f[None, :, :])).to(dtype)
+        q_n = (q_f * rms_q[:, None, None] * (1.0 + nq_f[None, :, :])).to(dtype)
+
+        products = (k_n.to(tl.float32) * q_n.to(tl.float32)).to(dtype)
+        dot = tl.sum(tl.sum(products.to(tl.float32), axis=2), axis=1)
+        d = (dot * inv_sqrt_hidden).to(dtype).to(tl.float32)
+
+        sign = tl.where(d < 0, -1.0, 0.0)
+        sign = tl.where(d > 0, 1.0, sign)
+        magnitude = tl.sqrt(tl.maximum(tl.abs(d), 1e-6)).to(dtype)
+        g = tl.sigmoid(sign * magnitude).to(dtype).to(tl.float32)
+
+        gated = (g[:, None, None] * v.to(tl.float32)).to(dtype)
+        gf = gated.to(tl.float32)
+        sumsq_g = tl.sum(tl.sum(gf * gf, axis=2), axis=1)
+        rms_g = tl.rsqrt(sumsq_g * inv_h + eps)
+        normalized = gf * rms_g[:, None, None] * (1.0 + ncw_f[None, :, :])
+
+        out_offs = tok3 * hc_h + base + h_offs
+        tl.store(gated_ptr + out_offs, gated, mask=lmask)
+        tl.store(normalized_ptr + out_offs, normalized, mask=lmask)
 
 
 @triton.jit
@@ -206,8 +288,6 @@ def _ple_prefill_dilated_conv_kernel(
             )
         else:
             state_values = tl.zeros((block_t, block_c), dtype=x_ptr.dtype.element_ty)
-        # The masks are disjoint, avoiding a load-dependent tl.where and its
-        # known ordering hazard on affected Triton versions.
         source_values = token_values + state_values
         conv_weight = tl.load(
             weight_ptr
@@ -328,8 +408,6 @@ def _ple_prefill_state_update_kernel(
         + channel_offsets * stride_state_channel
         + state_offsets * stride_state_token
     )
-    # A short query makes load addresses (query_len + s) overlap store
-    # addresses (s) inside this CTA. Finish every old-state load first.
     tl.debug_barrier()
     tl.store(
         state_output_ptrs,
@@ -412,10 +490,20 @@ def ple_gate_norm_(
     if not key.numel():
         return
 
+    num_tokens = key.shape[0]
     hidden_size = key.shape[-1]
-    block_h = triton.next_power_of_2(hidden_size)
-    rows = key.shape[0] * hc_count
-    _ple_gate_norm_kernel[(rows,)](
+
+    chunk_h = _pick_chunk_h(hidden_size)
+    nchunks = (hidden_size + chunk_h - 1) // chunk_h
+    block_t = _pick_block_t()
+    block_t = max(1, min(block_t, num_tokens))
+    num_token_groups = (num_tokens + block_t - 1) // block_t
+
+    target = _TARGET_PROGRAMS
+    num_groups = max(1, target // hc_count)
+    num_groups = min(num_groups, num_token_groups)
+
+    _ple_gate_norm_kernel[(num_groups, hc_count)](
         key,
         query,
         value,
@@ -424,12 +512,16 @@ def ple_gate_norm_(
         conv_weight,
         gated,
         normalized,
+        num_tokens,
+        num_groups,
+        num_token_groups,
         hidden_size=hidden_size,
         hc_count=hc_count,
         eps=eps,
         inv_sqrt_hidden=1.0 / math.sqrt(hidden_size),
-        block_h=block_h,
-        num_warps=8 if block_h > 2048 else 4,
+        chunk_h=chunk_h,
+        nchunks=nchunks,
+        block_t=block_t,
     )
 
 
@@ -616,8 +708,6 @@ def ple_prefill_short_conv_(
         block_c=block_c,
         num_warps=8,
     )
-    # State writes must be a second launch: updating in a peer CTA of the
-    # output launch would race output CTAs that still consume the old state.
     if has_state:
         block_s = triton.next_power_of_2(state_len)
         _ple_prefill_state_update_kernel[
