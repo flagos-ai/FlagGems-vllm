@@ -72,6 +72,7 @@ def _make_inputs(batch_size, seq_len, dtype):
     return kv, gamma, cos, sin, k_cache, ckv_cache, index
 
 
+@pytest.mark.kv_rmsnorm_rope_cache
 @pytest.mark.parametrize(
     "batch_size, seq_len, dtype",
     [

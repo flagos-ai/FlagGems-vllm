@@ -40,6 +40,28 @@ Benchmarks are controlled via pytest options (defined in `benchmark/conftest.py`
 
 - `--level core` (default): Core shapes from `benchmark/core_shapes.yaml`
 - `--level comprehensive`: Extended shape coverage
+- `--shape_file FILE`: Override with a custom shapes YAML
+
+### Model-Profile Mode
+
+`--model-profile FILE` loads a model-profiling shapes YAML
+(e.g. `benchmark/model_shapes/285B.yaml`) and does two things at once:
+
+1. Overrides `--shape_file` with the YAML, so only the shapes defined
+   there are benchmarked — no changes to individual test files required.
+2. Attaches each operator's `profiling:` metadata to the result table as
+   a **Time Share** column (`pf 1.44%/3240x | dc 0.86%/7200x`), letting
+   you compare FlagGems kernel latency directly against the operator's
+   weight in a real production trace.
+
+```bash
+PYTHONPATH=src pytest -q benchmark/test_fused_add_rms_norm.py \
+    --model-profile benchmark/model_shapes/285B.yaml \
+    --level core --iter 10 --warmup 5
+```
+
+The column only appears when profiling data is loaded; existing benchmark
+output is unchanged when `--model-profile` is not passed.
 
 ### Iteration Control
 
@@ -136,16 +158,44 @@ grouped_topk:
   - [32, 32, 8, 4, 4]
 ```
 
+## Model-Profile Shapes (`benchmark/model_shapes/`)
+
+In addition to the hand-curated `core_shapes.yaml`, the benchmark suite can
+be driven by shapes captured from a real model profiling trace. These
+shape files live under `benchmark/model_shapes/` (e.g. `285B.yaml`, the
+operators called by a 285B-parameter model run on 8×H100, TP=8).
+
+Each entry carries a `profiling:` sub-block with the operator's GPU time
+share and call counts, alongside the `shapes` and `shape_desc` blocks
+already used by `core_shapes.yaml`:
+
+```yaml
+flash_mla_sparse_fwd:
+  profiling:
+    prefill: {pct: 38.55, calls: 12960}
+    decode:  {pct:  8.55, calls: 28800}
+  shapes:
+    - [8192, 64, 576, 83264, 1, 2048, 512]   # prefill
+    - [ 128, 64, 576, 83264, 1, 2048, 512]   # decode
+  shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
+```
+
+Load such a file with `--model-profile` (see the option above); the
+profiling metadata surfaces as a **Time Share** column so you can weigh
+FlagGems kernel latency against the operator's real workload weight.
+Capture traces for new models with the procedure documented in the
+shape file's header comment.
+
 ## SpeedUp Calculation
 
-Benchmarks compute speedup relative to a torch baseline:
+Benchmarks compute speedup relative to the vLLM baseline implementation:
 
 ```
-SpeedUp = latency_torch_baseline / latency_flaggems_vllm
+SpeedUp = latency_vllm_baseline / latency_flaggems_vllm
 ```
 
 - **SpeedUp > 1.0**: FlagGems-vllm is faster
-- **SpeedUp < 1.0**: Torch baseline is faster
+- **SpeedUp < 1.0**: vLLM baseline is faster
 - **Target**: SpeedUp ≥ 0.9 for core shapes
 
 ## Result Format

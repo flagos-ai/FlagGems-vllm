@@ -756,6 +756,7 @@ class LibEntry(triton.KernelInterface):
         ]
         self.lock = multiprocessing.Lock()
         self.signature = fn.signature
+        self._kernel_params = frozenset(p.name for p in self.jit_function.params)
 
     @staticmethod
     def _contains_flagtune_tuner(fn):
@@ -817,6 +818,28 @@ class LibEntry(triton.KernelInterface):
         # const args passed by position
         return tuple(spec_key + dns_key + const_args)
 
+    def _launch_options_key(self, kwargs):
+        """Key the launch keywords that are compile options.
+
+        A hit below returns the cached kernel without reaching `JITFunction`,
+        whose own cache keys on these options. Leaving them out of the entry key
+        hands a launch asking for one `num_stages` a kernel built with another.
+        Results stay correct, but the requested option silently stops applying.
+
+        Anything that is not a kernel parameter is an option. `grid` and
+        `warmup` steer the launch rather than the build, as in `JITFunction.run`.
+        Values are keyed by `repr`, the way `JITFunction` stringifies its
+        options, which also keeps list-valued options hashable.
+        """
+        kernel_params = self._kernel_params
+        options = [
+            (name, repr(value))
+            for name, value in kwargs.items()
+            if name not in kernel_params and name != "grid" and name != "warmup"
+        ]
+        options.sort()
+        return tuple(options)
+
     def run(self, *args, **kwargs):
         grid = kwargs["grid"]
         if self._has_flagtune_tuner:
@@ -850,7 +873,7 @@ class LibEntry(triton.KernelInterface):
                 k_args[param_names[i]] = arg
                 dns_args.append(hashable_arg)
             else:
-                if major_version == 3 and 3 <= minor_version <= 6:
+                if (3, 3) <= (major_version, minor_version) <= (3, 9):
                     k_args[param_names[i]] = arg
                 const_args.append(hashable_arg)
         for p in self.jit_function.params[len(args) :]:
@@ -863,7 +886,7 @@ class LibEntry(triton.KernelInterface):
 
             if p.is_constexpr:
                 const_args.append(val)
-                if major_version == 3 and 3 <= minor_version <= 6:
+                if (3, 3) <= (major_version, minor_version) <= (3, 9):
                     k_args[p.name] = val
             elif p.do_not_specialize:
                 dns_args.append(val)
@@ -872,7 +895,11 @@ class LibEntry(triton.KernelInterface):
                 spec_args.append(val)
                 k_args[p.name] = val
 
-        entry_key = self.key(spec_args, dns_args, const_args)
+        # The options are appended here, not inside `key`, which other modules
+        # call to rebuild the option-free part of an entry key.
+        entry_key = self.key(
+            spec_args, dns_args, const_args
+        ) + self._launch_options_key(kwargs)
         device = torch_device_fn.current_device()
         # CPU has one device per process and `current_device()` returns the
         # string "cpu" (can't index into the int-keyed `kernel_cache` tuple).
@@ -959,7 +986,7 @@ class LibEntry(triton.KernelInterface):
             for pre_hook, hook_kwargs in launch_pre_hooks:
                 pre_hook({**hook_nargs, **hook_kwargs})
 
-        if major_version == 3 and 3 <= minor_version <= 6:
+        if (3, 3) <= (major_version, minor_version) <= (3, 9):
             all_args = []
             missing_keys = []
             for key in list(self.signature.parameters.keys()):

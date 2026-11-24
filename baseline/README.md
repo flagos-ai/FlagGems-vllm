@@ -5,7 +5,7 @@ test, benchmark and baseline modules.
 
 | Operator | Native vLLM function | Grid |
 | --- | --- | --- |
-| `fused_recurrent_gated_delta_rule_fwd` | `fla.ops.fused_recurrent.fused_recurrent_gated_delta_rule` | 8 bindings × 3 dtypes |
+| `fused_recurrent_gated_delta_rule` | `fla.ops.fused_recurrent.fused_recurrent_gated_delta_rule` | 8 bindings × 3 dtypes |
 | `fused_recurrent_gated_delta_rule_packed_decode` | `fla.ops.fused_recurrent.fused_recurrent_gated_delta_rule_packed_decode` | 8 bindings × 3 dtypes |
 
 Native paths above are relative to `vllm.model_executor.layers`. Resolvers return

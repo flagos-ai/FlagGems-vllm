@@ -26,16 +26,23 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
 
 from .conftest import QUICK_MODE
 
-torch_npu = pytest.importorskip("torch_npu")
+try:
+    import torch_npu
+
+    from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
+
+    HAS_NPU = True
+except ImportError:  # pragma: no cover - non-NPU environment
+    torch_npu = None  # noqa: F841
+    HAS_NPU = False
 
 device = flaggems_vllm.device
 
 pytestmark = pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "ascend",
+    not HAS_NPU or flaggems_vllm.vendor_name != "ascend",
     reason="the optimized top_k_top_p targets Ascend",
 )
 

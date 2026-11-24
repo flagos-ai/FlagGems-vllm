@@ -23,77 +23,36 @@ import flaggems_vllm
 from . import base
 
 vendor = flaggems_vllm.vendor_name
-topk_softplus_sqrt = flaggems_vllm.topk_softplus_sqrt
 
 # ---------------------------------------------------------------------------
-# Per-vendor TLE / baseline entry points.
+# Per-vendor baseline (plain Triton) entry point.
 #
-# HAS_TLE           : this vendor's TLE-optimized kernel is usable here.
-# HAS_TLE_HASH      : the TLE-optimized hash-mode kernel is usable here
-#                     (mthreads / thead / hygon / iluvatar, for now).
-# _gems_tle_op      : callable forcing the TLE kernel.
 # _gems_baseline_op : callable forcing the plain Triton kernel.
 # ---------------------------------------------------------------------------
-HAS_TLE = False
-HAS_TLE_HASH = False
-_gems_tle_op = None
-_gems_baseline_op = topk_softplus_sqrt
+_gems_baseline_op = flaggems_vllm.topk_softplus_sqrt
 
 if vendor == "ascend":
-    try:
-        from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import HAS_TLE
-
-        # `use_ascend_tle` is pinned via functools.partial so the callable
-        # drops into the benchmark framework's `gems_op` slot unchanged.
-        _gems_tle_op = functools.partial(topk_softplus_sqrt, use_ascend_tle=True)
-        _gems_baseline_op = functools.partial(topk_softplus_sqrt, use_ascend_tle=False)
-    except ImportError:
-        pass
+    # `use_ascend_tle` is pinned via functools.partial so the callable
+    # drops into the benchmark framework's `gems_op` slot unchanged.
+    _gems_baseline_op = functools.partial(
+        flaggems_vllm.topk_softplus_sqrt, use_ascend_tle=False
+    )
 elif vendor == "mthreads":
-    from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import HAS_TLE
     from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
         topk_softplus_sqrt_baseline as _gems_baseline_op,
     )
-    from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
-        topk_softplus_sqrt_tle as _gems_tle_op,
-    )
-
-    # mthreads has a dedicated shared-memory kernel for hash mode too
-    # (ascend's hash path is TLE-agnostic, so this only applies here).
-    HAS_TLE_HASH = HAS_TLE
 elif vendor == "thead":
-    from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import HAS_TLE
     from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
         topk_softplus_sqrt_baseline as _gems_baseline_op,
     )
-    from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
-        topk_softplus_sqrt_tle as _gems_tle_op,
-    )
-
-    # thead also has a dedicated shared-memory kernel for hash mode.
-    HAS_TLE_HASH = HAS_TLE
 elif vendor == "hygon":
-    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import HAS_TLE
     from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
         topk_softplus_sqrt_baseline as _gems_baseline_op,
     )
-    from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
-        topk_softplus_sqrt_tle as _gems_tle_op,
-    )
-
-    # hygon also has a dedicated shared-memory kernel for hash mode.
-    HAS_TLE_HASH = HAS_TLE
 elif vendor == "iluvatar":
-    from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import HAS_TLE
     from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
         topk_softplus_sqrt_baseline as _gems_baseline_op,
     )
-    from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
-        topk_softplus_sqrt_tle as _gems_tle_op,
-    )
-
-    # iluvatar also has a dedicated shared-memory kernel for hash mode.
-    HAS_TLE_HASH = HAS_TLE
 
 try:
     from vllm._custom_ops import topk_hash_softplus_sqrt as _vllm_topk_softplus_sqrt
@@ -102,6 +61,81 @@ try:
 except ImportError:
     HAS_VLLM = False
     _vllm_topk_softplus_sqrt = None
+
+
+# ---------------------------------------------------------------------------
+# Ascend baseline: vllm-ascend exposes the same sqrt-softplus gating math as a
+# CANN custom kernel (``moe_gating_top_k_hash`` with ``norm_type=2``, i.e.
+# softplus -> sqrt).  vLLM's CUDA ``_moe_C.topk_softplus_sqrt`` does not exist
+# on NPU, so on Ascend this is the native operator to compare against.
+# ---------------------------------------------------------------------------
+_ascend_gating = None
+if vendor == "ascend":
+    try:
+        from vllm_ascend.utils import enable_custom_op
+
+        enable_custom_op()
+        _ascend_gating = torch.ops._C_ascend.moe_gating_top_k_hash
+    except (ImportError, AttributeError, RuntimeError):
+        _ascend_gating = None
+
+HAS_ASCEND_GATING = _ascend_gating is not None
+
+_TEI_TEMPLATE_CACHE = {}
+
+
+def _tei_template(num_tokens, topk, device):
+    """Cached ``token_expert_indices`` range tensor.
+
+    vLLM's fused kernel writes this range inside the kernel; the CANN op does
+    not have that output, so build the template once and copy it per call.  It
+    must not be rebuilt with ``arange`` on every timed call or the baseline
+    would be charged for several extra launches.
+    """
+    key = (num_tokens, topk, str(device))
+    template = _TEI_TEMPLATE_CACHE.get(key)
+    if template is None:
+        template = (
+            torch.arange(num_tokens, device=device).unsqueeze(1) * topk
+            + torch.arange(topk, device=device).unsqueeze(0)
+        ).to(torch.int32)
+        _TEI_TEMPLATE_CACHE[key] = template
+    return template
+
+
+def _vllm_ascend_topk_softplus_sqrt_wrapper(
+    topk_weights,
+    topk_indices,
+    token_expert_indices,
+    gating_output,
+    renormalize,
+    routed_scaling_factor,
+    correction_bias=None,
+    input_ids=None,
+    tid2eid=None,
+):
+    """vllm-ascend CANN kernel baseline (sqrt-softplus gating)."""
+    num_tokens, topk = topk_weights.shape
+    bias = (
+        correction_bias.to(gating_output.dtype) if correction_bias is not None else None
+    )
+    y, eidx, _ = _ascend_gating(
+        gating_output,
+        k=topk,
+        bias=bias,
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+        k_group=1,
+        group_count=1,
+        routed_scaling_factor=routed_scaling_factor,
+        eps=1e-20,
+        group_select_mode=0,
+        renorm=0,
+        norm_type=2,
+    )
+    topk_weights.copy_(y)
+    topk_indices.copy_(eidx)
+    token_expert_indices.copy_(_tei_template(num_tokens, topk, gating_output.device))
 
 
 def _vllm_topk_softplus_sqrt_wrapper(
@@ -171,7 +205,9 @@ def _torch_topk_softplus_sqrt_ref(
 
 
 _baseline_op = (
-    _vllm_topk_softplus_sqrt_wrapper if HAS_VLLM else _torch_topk_softplus_sqrt_ref
+    _vllm_ascend_topk_softplus_sqrt_wrapper
+    if HAS_ASCEND_GATING
+    else _vllm_topk_softplus_sqrt_wrapper if HAS_VLLM else _torch_topk_softplus_sqrt_ref
 )
 
 
@@ -219,114 +255,12 @@ class TopkSoftplusSqrtBenchmark(base.Benchmark):
             )
 
 
-class TopkSoftplusSqrtHashBenchmark(base.Benchmark):
-    DEFAULT_SHAPE_DESC = "num_tokens, num_experts, topk"
-
-    def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            (1, 256, 6),
-            (10, 256, 6),
-            (16, 256, 6),
-            (128, 256, 6),
-            (512, 256, 6),
-            (1024, 256, 6),
-            (2048, 256, 6),
-            (4096, 256, 6),
-        ]
-
-    def get_input_iter(self, dtype):
-        for num_tokens, num_experts, topk in self.shapes:
-            torch.manual_seed(1)
-            gating_output = torch.randn(
-                (num_tokens, num_experts), dtype=dtype, device=self.device
-            )
-            topk_weights = torch.empty(
-                (num_tokens, topk), dtype=torch.float32, device=self.device
-            )
-            topk_indices = torch.empty(
-                (num_tokens, topk), dtype=torch.int32, device=self.device
-            )
-            token_expert_indices = torch.empty(
-                (num_tokens, topk), dtype=torch.int32, device=self.device
-            )
-            input_ids = torch.arange(num_tokens, device=self.device, dtype=torch.int32)
-            tid2eid = torch.randint(
-                0,
-                num_experts,
-                (num_tokens, topk),
-                device=self.device,
-                dtype=torch.int32,
-            )
-            yield (
-                topk_weights,
-                topk_indices,
-                token_expert_indices,
-                gating_output,
-                True,
-                1.0,
-                None,
-                input_ids,
-                tid2eid,
-            )
-
-
-_skip_no_tle = pytest.mark.skipif(
-    not HAS_TLE,
-    reason=f"TLE-optimized kernel is not available on {vendor}",
-)
-_skip_no_tle_hash = pytest.mark.skipif(
-    not HAS_TLE_HASH,
-    reason=f"TLE-optimized hash kernel is not available on {vendor}",
-)
-
-
-# ------------------------------- dense path --------------------------------
 @pytest.mark.topk_softplus_sqrt
 def test_topk_softplus_sqrt():
-    """Default entry point. Runs whether or not TLE is available."""
     bench = TopkSoftplusSqrtBenchmark(
         op_name="topk_softplus_sqrt",
         torch_op=_baseline_op,
         gems_op=_gems_baseline_op,
-        dtypes=[torch.bfloat16],
-    )
-    bench.run()
-
-
-@pytest.mark.topk_softplus_sqrt
-@_skip_no_tle
-def test_topk_softplus_sqrt_tle():
-    """TLE-optimized kernel (dense path)."""
-    bench = TopkSoftplusSqrtBenchmark(
-        op_name="topk_softplus_sqrt_tle",
-        torch_op=_baseline_op,
-        gems_op=_gems_tle_op,
-        dtypes=[torch.bfloat16],
-    )
-    bench.run()
-
-
-# ------------------------------- hash path ---------------------------------
-@pytest.mark.topk_softplus_sqrt
-def test_topk_softplus_sqrt_hash():
-    """Baseline kernel, hash mode."""
-    bench = TopkSoftplusSqrtHashBenchmark(
-        op_name="topk_softplus_sqrt_hash",
-        torch_op=_baseline_op,
-        gems_op=_gems_baseline_op,
-        dtypes=[torch.bfloat16],
-    )
-    bench.run()
-
-
-@pytest.mark.topk_softplus_sqrt
-@_skip_no_tle_hash
-def test_topk_softplus_sqrt_tle_hash():
-    """TLE-optimized kernel, hash mode (mthreads / thead / hygon / iluvatar only)."""
-    bench = TopkSoftplusSqrtHashBenchmark(
-        op_name="topk_softplus_sqrt_tle_hash",
-        torch_op=_baseline_op,
-        gems_op=_gems_tle_op,
         dtypes=[torch.bfloat16],
     )
     bench.run()

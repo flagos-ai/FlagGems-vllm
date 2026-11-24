@@ -22,6 +22,8 @@ import math
 import pytest
 import torch
 
+from . import conftest as cfg
+
 # CUDA reference
 try:
     from vllm.third_party.flashmla.flash_mla_interface import (
@@ -36,13 +38,14 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 # Triton implementation under test
+import flaggems_vllm
 from flaggems_vllm.ops.flash_mla_with_kvcache import FlashMLASchedMeta
-from flaggems_vllm.ops.flash_mla_with_kvcache import (
-    flash_mla_with_kvcache as triton_flash_mla,
-)
 from flaggems_vllm.ops.flash_mla_with_kvcache import (
     get_mla_metadata as triton_get_mla_metadata,
 )
+
+# The operator as registered, so a backend that replaces it is what is tested.
+triton_flash_mla = flaggems_vllm.flash_mla_with_kvcache
 
 DEVICE = "cuda"
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -50,9 +53,20 @@ FP8_MAX = 448.0
 
 
 def generate_v32_fp8_kv_cache(
-    num_pages, page_block_size, h_k=1, d_nope=512, d_rope=64, device=DEVICE
+    num_pages,
+    page_block_size,
+    h_k=1,
+    d_nope=512,
+    d_rope=64,
+    device=DEVICE,
+    scale_fmt=None,
 ):
-    """Generate V32 FP8 KV cache: 512 FP8 + 4 FP32 scales + 64 BF16."""
+    """Generate V32 FP8 KV cache: 512 FP8 + 4 FP32 scales + 64 BF16.
+
+    scale_fmt "ue8m0" rounds every scale up to a power of two, the way
+    indexer_k_quant_and_cache does, so that the format the caller promises
+    matches the cache.
+    """
     total_tokens = num_pages * page_block_size
 
     nope_data = (
@@ -63,6 +77,8 @@ def generate_v32_fp8_kv_cache(
     groups = nope_flat.reshape(-1, 4, 128)
     scales = groups.float().abs().amax(dim=-1) / FP8_MAX
     scales = scales.clamp(min=1e-12)
+    if scale_fmt == "ue8m0":
+        scales = torch.exp2(torch.ceil(torch.log2(scales)))
     quantized = (groups.float() / scales[:, :, None]).clamp(-FP8_MAX, FP8_MAX)
     fp8_data = quantized.reshape(-1, d_nope).to(torch.float8_e4m3fn)
 
@@ -177,23 +193,82 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize(
-    "batch,h_q,topk,num_pages",
-    [
-        (2, 64, 64, 50),
-        (2, 128, 128, 100),
-    ],
-)
-def test_sparse_decode_v32_fp8(batch, h_q, topk, num_pages):
-    """V32 sparse decode uses 656-byte FP8 cache and no dynamic topk."""
+# Twenty shapes per layout, taken from decode traces: GLM-5.2 runs V32 with 64
+# heads, topk 2048 and 64-token pages, DeepSeek-V4 runs MODEL1 with 64 heads,
+# topk 128 and an extra cache of 512 tokens in 64-token pages or 8192 in pages
+# of 2. The batch sweep covers both sides of the partition counts the backends
+# schedule with; the rest vary topk, page size and head count. num_pages only
+# has to hold the tokens the indices point at, so it stays small.
+V32_SHAPES = [
+    # (batch, h_q, topk, page_block_size, num_pages)
+    (1, 64, 2048, 64, 40),
+    (2, 64, 2048, 64, 40),
+    (4, 64, 2048, 64, 60),
+    (8, 64, 2048, 64, 60),
+    (16, 64, 2048, 64, 80),
+    (19, 64, 2048, 64, 80),
+    (20, 64, 2048, 64, 80),
+    (21, 64, 2048, 64, 80),
+    (32, 64, 2048, 64, 100),
+    (40, 64, 2048, 64, 100),
+    (64, 64, 2048, 64, 120),
+    (80, 64, 2048, 64, 120),
+    (128, 64, 2048, 64, 160),
+    (5, 128, 2048, 64, 80),
+    (2, 64, 64, 64, 50),
+    (2, 128, 128, 64, 100),
+    (4, 64, 512, 16, 200),
+    (8, 64, 1024, 16, 120),
+    (3, 64, 4096, 64, 200),
+    (12, 64, 2048, 2, 1536),
+]
+MODEL1_SHAPES = [
+    # (batch, h_q, topk, extra_topk, extra_page_block_size)
+    (1, 64, 128, 0, 0),
+    (2, 64, 128, 0, 0),
+    (4, 64, 128, 0, 0),
+    (8, 64, 128, 0, 0),
+    (16, 64, 128, 0, 0),
+    (20, 64, 128, 0, 0),
+    (21, 64, 128, 0, 0),
+    (32, 64, 128, 0, 0),
+    (64, 64, 128, 0, 0),
+    (128, 64, 128, 0, 0),
+    (4, 64, 512, 0, 0),
+    (2, 128, 128, 0, 0),
+    (1, 64, 128, 512, 64),
+    (8, 64, 128, 512, 64),
+    (20, 64, 128, 512, 64),
+    (40, 64, 128, 512, 64),
+    (128, 64, 128, 512, 64),
+    (1, 64, 128, 8192, 2),
+    (8, 64, 128, 8192, 2),
+    (64, 64, 128, 8192, 2),
+]
+if cfg.QUICK_MODE:
+    V32_SHAPES = V32_SHAPES[::5]
+    MODEL1_SHAPES = MODEL1_SHAPES[::5]
+
+
+@pytest.mark.flash_mla_with_kvcache
+@pytest.mark.parametrize("scale_fmt", [None, "ue8m0"])
+@pytest.mark.parametrize("batch,h_q,topk,page_block_size,num_pages", V32_SHAPES)
+def test_sparse_decode_v32_fp8(batch, h_q, topk, page_block_size, num_pages, scale_fmt):
+    """V32 sparse decode uses 656-byte FP8 cache and no dynamic topk.
+
+    Both scale formats are run: the cache is quantized the way scale_fmt says
+    and scale_fmt is passed along, so a backend that dequantizes a power of two
+    differently is checked against the same reference.
+    """
     print("\n=== test_sparse_decode_v32_fp8 ===")
     seq_q, d_qk = 1, 576
     head_dim_v = 512
-    page_block_size = 64
 
     torch.manual_seed(42)
     q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device=DEVICE)
-    kv_cache = generate_v32_fp8_kv_cache(num_pages, page_block_size)
+    kv_cache = generate_v32_fp8_kv_cache(
+        num_pages, page_block_size, scale_fmt=scale_fmt
+    )
     total_tokens = num_pages * page_block_size
     indices = torch.randint(
         0, total_tokens, (batch, seq_q, topk), dtype=torch.int32, device=DEVICE
@@ -225,6 +300,7 @@ def test_sparse_decode_v32_fp8(batch, h_q, topk, num_pages):
         indices=indices,
         attn_sink=attn_sink,
         out=triton_out_buf,
+        scale_fmt=scale_fmt,
     )
 
     assert cuda_out.data_ptr() == cuda_out_buf.data_ptr()
@@ -233,28 +309,52 @@ def test_sparse_decode_v32_fp8(batch, h_q, topk, num_pages):
     check_close(triton_lse, cuda_lse, "lse")
 
 
-def test_sparse_decode_model1_topk_length_attn_sink_out():
-    """MODEL1 log-like path: 584-byte cache, topk_length, attn_sink, out."""
-    print("\n=== test_sparse_decode_model1_topk_length_attn_sink_out ===")
-    batch, seq_q, h_q, d_qk, topk = 8, 1, 64, 512, 128
+@pytest.mark.flash_mla_with_kvcache
+@pytest.mark.parametrize(
+    "batch,h_q,topk,extra_topk,extra_page_block_size", MODEL1_SHAPES
+)
+def test_sparse_decode_model1(batch, h_q, topk, extra_topk, extra_page_block_size):
+    """MODEL1: 584-byte cache, dynamic topk_length, attn_sink, out, extra cache."""
+    print("\n=== test_sparse_decode_model1 ===")
+    seq_q, d_qk = 1, 512
     head_dim_v = 512
     page_block_size = 64
-    num_pages = 16
+    num_pages = math.ceil(topk / page_block_size) + 4
 
-    torch.manual_seed(43)
+    torch.manual_seed(43 + batch + extra_topk)
     q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device=DEVICE)
     kv_cache = generate_model1_fp8_kv_cache(num_pages, page_block_size)
-    total_tokens = num_pages * page_block_size
     indices = torch.randint(
-        0, total_tokens, (batch, seq_q, topk), dtype=torch.int32, device=DEVICE
+        0,
+        num_pages * page_block_size,
+        (batch, seq_q, topk),
+        dtype=torch.int32,
+        device=DEVICE,
     )
     topk_length = torch.randint(1, topk + 1, (batch,), dtype=torch.int32, device=DEVICE)
     attn_sink = torch.randn(h_q, dtype=torch.float32, device=DEVICE)
+    extra = {}
+    if extra_topk:
+        extra_num_pages = math.ceil(extra_topk / extra_page_block_size) + 4
+        extra_tokens = extra_num_pages * extra_page_block_size
+        extra["extra_k_cache"] = generate_model1_fp8_kv_cache(
+            extra_num_pages, extra_page_block_size
+        )
+        extra["extra_indices_in_kvcache"] = torch.randint(
+            0,
+            extra_tokens,
+            (batch, seq_q, extra_topk),
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        extra["extra_topk_length"] = torch.randint(
+            1, extra_topk + 1, (batch,), dtype=torch.int32, device=DEVICE
+        )
+
     cuda_out_buf = torch.empty(
         batch, seq_q, h_q, head_dim_v, dtype=torch.bfloat16, device=DEVICE
     )
     triton_out_buf = torch.empty_like(cuda_out_buf)
-
     cuda_out, cuda_lse = _run_cuda(
         q,
         kv_cache,
@@ -266,6 +366,7 @@ def test_sparse_decode_model1_topk_length_attn_sink_out():
         topk_length=topk_length,
         attn_sink=attn_sink,
         out=cuda_out_buf,
+        **extra,
     )
     triton_out, triton_lse = _run_triton(
         q,
@@ -278,83 +379,11 @@ def test_sparse_decode_model1_topk_length_attn_sink_out():
         topk_length=topk_length,
         attn_sink=attn_sink,
         out=triton_out_buf,
+        **extra,
     )
 
-    check_close(triton_out, cuda_out, "out", cos_threshold=0.98)
-    check_close(triton_lse, cuda_lse, "lse", cos_threshold=0.98)
-
-
-@pytest.mark.parametrize(
-    "extra_page_block_size,extra_topk,extra_num_pages",
-    [
-        (64, 512, 12),
-        (2, 512, 260),
-    ],
-)
-def test_sparse_decode_model1_extra_kv(
-    extra_page_block_size, extra_topk, extra_num_pages
-):
-    """MODEL1 attends original sparse cache plus extra sparse cache."""
-    print("\n=== test_sparse_decode_model1_extra_kv ===")
-    batch, seq_q, h_q, d_qk, topk = 4, 1, 64, 512, 128
-    head_dim_v = 512
-    page_block_size = 64
-    num_pages = 12
-
-    torch.manual_seed(44 + extra_page_block_size)
-    q = torch.randn(batch, seq_q, h_q, d_qk, dtype=torch.bfloat16, device=DEVICE)
-    kv_cache = generate_model1_fp8_kv_cache(num_pages, page_block_size)
-    extra_k_cache = generate_model1_fp8_kv_cache(extra_num_pages, extra_page_block_size)
-
-    indices = torch.randint(
-        0,
-        num_pages * page_block_size,
-        (batch, seq_q, topk),
-        dtype=torch.int32,
-        device=DEVICE,
-    )
-    extra_indices = torch.randint(
-        0,
-        extra_num_pages * extra_page_block_size,
-        (batch, seq_q, extra_topk),
-        dtype=torch.int32,
-        device=DEVICE,
-    )
-    topk_length = torch.randint(1, topk + 1, (batch,), dtype=torch.int32, device=DEVICE)
-    extra_topk_length = torch.randint(
-        1, extra_topk + 1, (batch,), dtype=torch.int32, device=DEVICE
-    )
-    attn_sink = torch.randn(h_q, dtype=torch.float32, device=DEVICE)
-
-    cuda_out, cuda_lse = _run_cuda(
-        q,
-        kv_cache,
-        None,
-        None,
-        head_dim_v,
-        is_fp8_kvcache=True,
-        indices=indices,
-        topk_length=topk_length,
-        attn_sink=attn_sink,
-        extra_k_cache=extra_k_cache,
-        extra_indices_in_kvcache=extra_indices,
-        extra_topk_length=extra_topk_length,
-    )
-    triton_out, triton_lse = _run_triton(
-        q,
-        kv_cache,
-        None,
-        None,
-        head_dim_v,
-        is_fp8_kvcache=True,
-        indices=indices,
-        topk_length=topk_length,
-        attn_sink=attn_sink,
-        extra_k_cache=extra_k_cache,
-        extra_indices_in_kvcache=extra_indices,
-        extra_topk_length=extra_topk_length,
-    )
-
+    assert cuda_out.data_ptr() == cuda_out_buf.data_ptr()
+    assert triton_out.data_ptr() == triton_out_buf.data_ptr()
     check_close(triton_out, cuda_out, "out", cos_threshold=0.98)
     check_close(triton_lse, cuda_lse, "lse", cos_threshold=0.98)
 
@@ -458,32 +487,57 @@ def test_error_dense_rejects_sparse_only_args():
         )
 
 
-def test_error_sched_meta_reuse_mismatch():
-    q = torch.empty(1, 1, 64, 512, dtype=torch.bfloat16, device=DEVICE)
-    kv_cache = torch.empty(4, 64, 1, 584, dtype=torch.uint8, device=DEVICE)
-    meta = FlashMLASchedMeta(
-        have_initialized=True,
-        config=FlashMLASchedMeta.Config(
-            b=2,
-            s_q=1,
-            h_q=64,
-            page_block_size=64,
-            h_k=1,
-            causal=False,
-            is_fp8_kvcache=True,
-            topk=64,
-            extra_page_block_size=None,
-            extra_topk=None,
-        ),
+def _sched_meta(**overrides):
+    config = dict(
+        b=1,
+        s_q=1,
+        h_q=64,
+        head_dim_k=512,
+        page_block_size=64,
+        h_k=1,
+        causal=False,
+        is_fp8_kvcache=True,
+        topk=64,
+        extra_page_block_size=None,
+        extra_topk=None,
+    )
+    config.update(overrides)
+    return FlashMLASchedMeta(
+        have_initialized=True, config=FlashMLASchedMeta.Config(**config)
     )
 
-    with pytest.raises(AssertionError, match="sched_meta.config.b"):
-        triton_flash_mla(q, kv_cache, None, None, 512, meta)
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"b": 2}, "sched_meta.config.b"),
+        # A schedule is only reusable for the layout it was built for: 512 and
+        # 576 are different kernels with different tiles.
+        ({"head_dim_k": 576}, "sched_meta.config.head_dim_k"),
+        ({"topk": 128}, "sched_meta.config.topk"),
+    ],
+)
+def test_error_sched_meta_reuse_mismatch(overrides, message):
+    q = torch.empty(1, 1, 64, 512, dtype=torch.bfloat16, device=DEVICE)
+    kv_cache = torch.empty(4, 64, 1, 584, dtype=torch.uint8, device=DEVICE)
+    indices = torch.zeros(1, 1, 64, dtype=torch.int32, device=DEVICE)
+
+    with pytest.raises(AssertionError, match=message):
+        triton_flash_mla(
+            q,
+            kv_cache,
+            None,
+            None,
+            512,
+            _sched_meta(**overrides),
+            is_fp8_kvcache=True,
+            indices=indices,
+        )
 
 
 if __name__ == "__main__":
-    test_sparse_decode_v32_fp8(2, 64, 64, 50)
-    test_sparse_decode_v32_fp8(2, 128, 128, 100)
-    test_sparse_decode_model1_topk_length_attn_sink_out()
-    test_sparse_decode_model1_extra_kv(64, 512, 12)
+    for shape in V32_SHAPES:
+        test_sparse_decode_v32_fp8(*shape)
+    for shape in MODEL1_SHAPES:
+        test_sparse_decode_model1(*shape)
     test_dense_decode_seq_q1()

@@ -23,7 +23,26 @@ import math
 
 import torch
 import triton
-import triton.experimental.tle.language as tle
+
+try:
+    import triton.experimental.tle.language as tle
+except ModuleNotFoundError:
+    # TLE (Triton experimental language extensions) ships with FlagTree but
+    # not with stock Triton. All `tle.*` references in this module occur
+    # inside @triton.jit-traced function bodies, so the name only needs to
+    # resolve lazily when those kernels are actually compiled/launched. This
+    # stub keeps module import working on a stock-Triton environment and
+    # raises a clear error only if a TLE-backed kernel in this module is
+    # actually invoked.
+    class _MissingTLE:
+        def __getattr__(self, name):
+            raise ModuleNotFoundError(
+                "triton.experimental.tle.language is required to run this "
+                "module's kernels, but is not installed (requires "
+                "FlagTree; see tools/setup.sh)."
+            )
+
+    tle = _MissingTLE()
 import triton.language as tl
 
 from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL
@@ -3698,7 +3717,13 @@ def _validate_inputs(
         raise ValueError(f"g must be on {device}, got {g.device}")
     if g.dtype not in (dtype, torch.float32):
         raise ValueError(f"g must have dtype {dtype} or float32, got {g.dtype}")
-    _validate_tensor(beta, name="beta", ndim=3, device=device, dtype=dtype)
+    # Upstream GDN emits FP32 sigmoid gates even for BF16/FP16 projections.
+    beta_dtype = (
+        torch.float32
+        if isinstance(beta, torch.Tensor) and beta.dtype == torch.float32
+        else dtype
+    )
+    _validate_tensor(beta, name="beta", ndim=3, device=device, dtype=beta_dtype)
 
     if k.shape != q.shape:
         raise ValueError("q and k must have identical [B, T, Hg, K] shapes")
@@ -3762,6 +3787,11 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
 ):
     """
+    Ascend accepts FP16/BF16 q, k and v in [B, T, heads, 128] layout.
+    The g and beta tensors have [B, T, value_heads] shape and may use the
+    projection dtype or FP32. FP32 beta is passed directly to the kernels;
+    it is not downcast to match q. Other beta dtypes are rejected.
+
     This backend is specialized for chunk size 64 and K=V=128. The source
     preprocessing kernel does not expose the KKT inverse ``A`` expected by the
     generic FLA seven-value protocol, so the third result is intentionally

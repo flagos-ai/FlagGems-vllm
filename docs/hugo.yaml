@@ -97,7 +97,7 @@ module:
       target: i18n
     - source: ../conf
       target: data
-    - source: ../benchmark
+    - source: data/benchmark
       target: data/benchmark
 
 params:

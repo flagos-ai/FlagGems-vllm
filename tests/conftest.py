@@ -26,6 +26,22 @@ import yaml
 
 import flaggems_vllm
 
+# ---------------------------------------------------------------------------
+# Device context health tracking
+#
+# A hardware-level kernel fault (e.g. cudaErrorIllegalInstruction on NVIDIA)
+# permanently poisons the device context of the current process.  Every
+# subsequent device call, even a simple torch.randint, then raises, making it
+# look as if hundreds of unrelated tests have failed.
+#
+# _DEVICE_CONTEXT_DEAD is set to True the first time a probe through
+# flaggems_vllm.runtime.torch_device_fn fails in pytest_runtest_teardown.
+# pytest_runtest_setup then skips every remaining test so they are reported
+# as "skipped" rather than "failed", keeping the failure list focused on the
+# actual culprit.
+# ---------------------------------------------------------------------------
+_DEVICE_CONTEXT_DEAD = False
+
 # On platforms without a native CUDA backend, torchada redirects
 # torch.cuda.* entry points (e.g. torch.cuda.synchronize) to the vendor
 # backend; tests call them directly.
@@ -52,6 +68,7 @@ RECORD_LOG = False
 RECORD_JSON = False
 TO_CPU = False
 QUICK_MODE = False
+FIRST_PARAMETER_ONLY = False
 
 device = flaggems_vllm.device
 
@@ -73,6 +90,12 @@ def pytest_addoption(parser):
         "--quick",
         action="store_true",
         help="run tests on quick mode",
+    )
+
+    parser.addoption(
+        "--first-parameter-only",
+        action="store_true",
+        help="Run only the first parameter combination for each test function",
     )
 
     try:
@@ -112,6 +135,7 @@ def pytest_configure(config):
     global RUNTEST_INFO
     global TO_CPU
     global QUICK_MODE
+    global FIRST_PARAMETER_ONLY
 
     REGISTERED_MARKS = {
         marker.split(":")[0].strip() for marker in config.getini("markers")
@@ -121,6 +145,7 @@ def pytest_configure(config):
     RECORD_JSON = config.getoption("--record") == "json"
     TO_CPU = config.getoption("--ref") == "cpu"
     QUICK_MODE = config.getoption("--quick") is True
+    FIRST_PARAMETER_ONLY = config.getoption("--first-parameter-only") is True
 
     if RECORD_JSON:
         report_file = config.getoption("--output")
@@ -140,8 +165,58 @@ def pytest_configure(config):
             format="[%(levelname)s] %(message)s",
         )
 
+    # Print info when first-parameter-only is enabled
+    if FIRST_PARAMETER_ONLY:
+        print(f"\n{'='*70}")
+        print("FIRST-PARAMETER-ONLY MODE ENABLED")
+        print(
+            "   Each test function will run with only its first parameter combination"
+        )
+        print(f"{'='*70}\n")
+
+
+def _probe_device_context() -> bool:
+    """Return True when the device context is healthy, False when it is dead.
+
+    A hardware-level kernel fault (cudaErrorIllegalInstruction and similar)
+    poisons the device context permanently: every subsequent device call
+    raises. We surface that with a synchronize, the cheapest reliable probe,
+    which needs no device allocation and works even when the allocator is in
+    a bad state. It goes through ``torch_device_fn`` (the vendor's
+    ``torch.cuda`` equivalent) so non-CUDA backends are probed the same way.
+    """
+    torch_device_fn = flaggems_vllm.runtime.torch_device_fn
+    try:
+        if not torch_device_fn.is_available():
+            return True
+        torch_device_fn.synchronize()
+        return True
+    except Exception:
+        return False
+
+
+def pytest_runtest_setup(item):
+    """Stop scheduling tests once the device context has been poisoned.
+
+    Once a kernel faults, the context cannot recover inside this process, so
+    every remaining test would fail with the same AcceleratorError regardless
+    of the operator under test.  Skip them so the failure list reflects only
+    the real culprit.
+    """
+    global _DEVICE_CONTEXT_DEAD
+    if _DEVICE_CONTEXT_DEAD:
+        pytest.skip("device context poisoned by an earlier test failure")
+
 
 def pytest_runtest_teardown(item, nextitem):
+    global _DEVICE_CONTEXT_DEAD
+    if not _DEVICE_CONTEXT_DEAD and not _probe_device_context():
+        _DEVICE_CONTEXT_DEAD = True
+        logging.warning(
+            "device context poisoned after %s, remaining tests will be skipped",
+            item.nodeid,
+        )
+
     if not RECORD_LOG:
         return
 
@@ -234,8 +309,83 @@ def pytest_terminal_summary(terminalreporter):
         os.fsync(json_file.fileno())
 
 
+def _item_has_bfloat16_dtype(item):
+    """Check if a parameterized test item includes bfloat16 in its dtype parameter."""
+    if not hasattr(item, "callspec") or item.callspec is None:
+        return False
+
+    for param_name, param_value in item.callspec.params.items():
+        if "dtype" not in param_name.lower():
+            continue
+        # Match torch.bfloat16, string "bfloat16", numpy dtype, etc.
+        if "bfloat16" in str(param_value).lower():
+            return True
+    return False
+
+
 def pytest_collection_modifyitems(session, config, items):
+    """
+    Modify the collected test items before they are executed.
+
+    This hook handles:
+    1. --collect-marks: Collect all test marks and write to a YAML file
+    2. --first-parameter-only: Keep only one parameter combination per test function,
+       preferring the first one that uses bfloat16 dtype.
+    """
+
+    first_parameter_only = config.getoption("--first-parameter-only")
     collect_marks_file = config.getoption("--collect-marks")
+
+    if first_parameter_only:
+        # Group items by test function. For parameterized tests, drop the
+        # parameter part of the nodeid:
+        # "tests/test_add.py::test_add[dtype0-0.001-shape0]" -> "tests/test_add.py::test_add"
+        function_groups = {}
+
+        for item in items:
+            base_key = item.nodeid
+            if "[" in base_key:
+                base_key = base_key.split("[")[0]
+
+            if base_key not in function_groups:
+                function_groups[base_key] = []
+            function_groups[base_key].append(item)
+
+        # Keep only one item per group, preferring bfloat16
+        kept_items = []
+        bfloat16_count = 0
+        fallback_count = 0
+
+        for base_key, group_items in function_groups.items():
+            # Sort by nodeid to ensure deterministic selection
+            group_items.sort(key=lambda x: x.nodeid)
+
+            # Priority 1: first item that uses bfloat16 dtype
+            selected = None
+            for item in group_items:
+                if _item_has_bfloat16_dtype(item):
+                    selected = item
+                    bfloat16_count += 1
+                    break
+
+            # Priority 2: fallback to the very first item in the group
+            if selected is None:
+                selected = group_items[0]
+                fallback_count += 1
+
+            kept_items.append(selected)
+
+        original_count = len(items)
+        items[:] = kept_items
+
+        print(f"\n{'='*70}")
+        print("FIRST-PARAMETER-ONLY MODE ENABLED (bfloat16 preferred)")
+        print(f"   Original tests: {original_count}")
+        print(f"   Running tests:  {len(kept_items)} (one per test function)")
+        print(f"      bfloat16 preferred: {bfloat16_count}")
+        print(f"      fallback (no bfloat16): {fallback_count}")
+        print(f"{'='*70}\n")
+
     if collect_marks_file:
         report = []
         for item in items:
@@ -264,3 +414,4 @@ def pytest_collection_modifyitems(session, config, items):
 
         # Skip all tests
         items.clear()
+        return
