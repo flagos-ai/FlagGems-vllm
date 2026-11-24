@@ -44,14 +44,10 @@ NULL_BLOCK_ID = 0
 if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as _tle
-
-        _HAS_RAW_TLE = True
     except ImportError:
         _tle = None  # type: ignore[assignment]
-        _HAS_RAW_TLE = False
 else:
     _tle = None  # type: ignore[assignment]
-    _HAS_RAW_TLE = False
 
 
 def _build_metax_tle():
