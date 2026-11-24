@@ -25,6 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils.shape_utils import broadcast
+
 logger = logging.getLogger(__name__)
 
 _ASCEND_AFFINE_BATCH_RANK = 4
@@ -381,8 +383,8 @@ def _validate(a, b, out):
         raise ValueError("Incompatible inner dimensions")
 
     try:
-        batch_shape = tuple(torch.broadcast_shapes(a.shape[:-2], b.shape[:-2]))
-    except RuntimeError as exc:
+        batch_shape = broadcast(tuple(a.shape[:-2]), tuple(b.shape[:-2]))
+    except ValueError as exc:
         raise ValueError("Incompatible batch dimensions") from exc
     shape = (*batch_shape, a.shape[-2], b.shape[-1])
     if out is not None:
