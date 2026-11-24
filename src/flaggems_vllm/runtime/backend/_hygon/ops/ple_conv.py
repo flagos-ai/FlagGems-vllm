@@ -13,6 +13,10 @@ the request search loads the whole ``query_start_loc`` vector at once instead
 of walking a serial binary search, and every window copy moves a contiguous
 [channel, window] tile in one shot. Long prefill convolves a [token, channel]
 tile per program so the fixed per-program metadata loads amortize.
+
+When FlagTree TLE is available, decode and fused-spec channel weights are
+staged once in shared memory via ``tle.gpu.alloc`` / ``local_ptr`` so the
+dilation taps reuse them instead of re-gathering from global memory.
 """
 
 from __future__ import annotations
@@ -22,6 +26,20 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm.utils import has_triton_tle
+
+if has_triton_tle(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
+
+        HAS_TLE = True
+    except ImportError:
+        tle = None  # type: ignore[assignment]
+        HAS_TLE = False
+else:
+    tle = None  # type: ignore[assignment]
+    HAS_TLE = False
 
 NULL_BLOCK_ID = 0
 
@@ -52,7 +70,7 @@ def _arch_support_pdl() -> bool:
 
 # Dilated short convolution
 @triton.jit(do_not_specialize=["num_reqs", "bs_iters", "has_token_map"])
-def _ple_conv_kernel(
+def _ple_conv_kernel_baseline(
     x_ptr,
     state_ptr,
     w_ptr,
@@ -76,6 +94,7 @@ def _ple_conv_kernel(
     STATE_LEN_P2: tl.constexpr,
     DILATION: tl.constexpr,
     KERNEL_SIZE: tl.constexpr,
+    KERNEL_SIZE_SMEM: tl.constexpr,
     SPEC_QUERY_LEN: tl.constexpr,
     MODE: tl.constexpr,
     HAS_INIT: tl.constexpr,
@@ -296,7 +315,7 @@ def _ple_conv_kernel(
 # amortizes the per-program metadata loads across BT tokens, and the channel
 # axis keeps every tap a coalesced row read.
 @triton.jit(do_not_specialize=["num_reqs", "bs_iters", "has_token_map"])
-def _ple_conv_prefill_kernel(
+def _ple_conv_prefill_kernel_baseline(
     x_ptr,
     state_ptr,
     w_ptr,
@@ -319,6 +338,7 @@ def _ple_conv_prefill_kernel(
     STATE_LEN: tl.constexpr,
     DILATION: tl.constexpr,
     KERNEL_SIZE: tl.constexpr,
+    KERNEL_SIZE_SMEM: tl.constexpr,
     HAS_INIT: tl.constexpr,
     NULL_STATE_ID: tl.constexpr,
     FUSE_RESIDUAL: tl.constexpr,
@@ -440,7 +460,7 @@ def _ple_conv_prefill_kernel(
 # walks every token then shifts the window. One launch avoids the
 # host gap between the output kernel and the writeback on BW1000.
 @triton.jit
-def _ple_conv_spec_fused_kernel(
+def _ple_conv_spec_fused_kernel_baseline(
     x_ptr,
     state_ptr,
     w_ptr,
@@ -458,6 +478,7 @@ def _ple_conv_spec_fused_kernel(
     STATE_LEN: tl.constexpr,
     DILATION: tl.constexpr,
     KERNEL_SIZE: tl.constexpr,
+    KERNEL_SIZE_SMEM: tl.constexpr,
     SPEC_QUERY_LEN: tl.constexpr,
     STATE_WIDTH: tl.constexpr,
     STATE_WIDTH_P2: tl.constexpr,
@@ -576,7 +597,7 @@ def _ple_conv_spec_fused_kernel(
 # same in-place rows, so every old-window load finishes (debug_barrier)
 # before the first store; the tile never splits a channel across programs.
 @triton.jit
-def _ple_conv_spec_tile_shift_kernel(
+def _ple_conv_spec_tile_shift_kernel_baseline(
     x_ptr,
     state_ptr,
     state_idx_ptr,
@@ -644,7 +665,7 @@ def _ple_conv_spec_tile_shift_kernel(
 
 # Contiguous [channel, window] writeback for the single-request prefill tail.
 @triton.jit
-def _ple_conv_writeback_linear_kernel(
+def _ple_conv_writeback_linear_kernel_baseline(
     x_ptr,
     state_ptr,
     out_ptr,
@@ -731,7 +752,7 @@ def _ple_conv_writeback_linear_kernel(
 # Strided views and multi-request batches fall back to the per-request,
 # per-channel-block copy that walks the window columns.
 @triton.jit(do_not_specialize=["has_token_map"])
-def _ple_conv_writeback_kernel(
+def _ple_conv_writeback_kernel_baseline(
     x_ptr,
     state_ptr,
     state_idx_ptr,
@@ -814,6 +835,455 @@ def _ple_conv_writeback_kernel(
         )
 
 
+if HAS_TLE:
+    # Dilated short convolution
+    @triton.jit(do_not_specialize=["num_reqs", "bs_iters", "has_token_map"])
+    def _ple_conv_kernel_tle(
+        x_ptr,
+        state_ptr,
+        w_ptr,
+        residual_ptr,
+        outer_residual_ptr,
+        state_idx_ptr,
+        qsl_ptr,
+        num_acc_ptr,
+        has_init_ptr,
+        token_idx_ptr,
+        has_token_map,
+        num_reqs,
+        bs_iters,
+        state_idx_stride,
+        state_bs,
+        state_ws,
+        state_cs,
+        C: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        STATE_LEN: tl.constexpr,
+        STATE_LEN_P2: tl.constexpr,
+        DILATION: tl.constexpr,
+        KERNEL_SIZE: tl.constexpr,
+        KERNEL_SIZE_SMEM: tl.constexpr,
+        SPEC_QUERY_LEN: tl.constexpr,
+        MODE: tl.constexpr,
+        HAS_INIT: tl.constexpr,
+        NULL_STATE_ID: tl.constexpr,
+        FUSE_RESIDUAL: tl.constexpr,
+        WRITE_TAIL: tl.constexpr,
+        VEC_REQS: tl.constexpr,
+        CONTIG_SHIFT: tl.constexpr,
+        launch_pdl: tl.constexpr,
+    ):
+        t = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < C
+
+        # Stage the channel x kernel weight tile in shared memory once so every
+        # dilation tap reuses the same smem row instead of re-gathering weights.
+        w_smem = tle.gpu.alloc(
+            [BLOCK_C, KERNEL_SIZE_SMEM],
+            dtype=tl.float32,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
+        )
+        c_local = tl.arange(0, BLOCK_C)
+        for k0 in tl.static_range(0, KERNEL_SIZE):
+            w0 = tl.load(
+                w_ptr + c_offs * KERNEL_SIZE + k0,
+                mask=c_mask,
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(
+                tle.gpu.local_ptr(w_smem, (c_local, tl.full([BLOCK_C], k0, tl.int32))),
+                w0,
+                mask=c_mask,
+            )
+
+        if launch_pdl:
+            gdc_wait()
+
+        # Mode-specific launches use logical row indices. Mixed batches map them
+        # back to the original token order without gathering inputs or residuals.
+        output_t = tl.load(token_idx_ptr + t, mask=has_token_map, other=t).to(tl.int64)
+
+        if MODE == "decode":
+            r = t
+            q_start = t
+            j = tl.full([], 0, tl.int32)
+            slot_off = tl.full([], 0, tl.int32)
+            in_range = True
+        else:
+            # Locate the request containing this token. The whole offset vector
+            # fits one load for small batches; larger ones keep the binary walk.
+            if VEC_REQS:
+                req_offs = tl.arange(0, VEC_REQS)
+                qsl_vec = tl.load(
+                    qsl_ptr + req_offs,
+                    mask=req_offs <= num_reqs,
+                    other=2147483647,
+                )
+                r = tl.sum((qsl_vec <= t).to(tl.int32), 0) - 1
+                r = tl.minimum(tl.maximum(r, 0), num_reqs - 1)
+            else:
+                lo = tl.full([], 1, tl.int32)
+                hi = tl.full([], num_reqs + 1, tl.int32)
+                for _ in range(bs_iters):
+                    mid = (lo + hi) // 2
+                    qmid = tl.load(qsl_ptr + mid, mask=mid <= num_reqs, other=0)
+                    pred = qmid <= t
+                    lo = tl.where(pred, mid + 1, lo)
+                    hi = tl.where(pred, hi, mid)
+                r = tl.minimum(lo - 1, num_reqs - 1)
+            q_start = tl.load(qsl_ptr + r)
+            j = (t - q_start).to(tl.int32)
+            total_real = tl.load(qsl_ptr + num_reqs)
+            in_range = t < total_real
+            if MODE == "spec":
+                num_acc = tl.load(num_acc_ptr + r)
+                # Roll back draft state to the last accepted token.
+                slot_off = tl.minimum(
+                    tl.maximum(num_acc - 1, 0), SPEC_QUERY_LEN - 1
+                ).to(tl.int32)
+            else:
+                slot_off = tl.full([], 0, tl.int32)
+
+        sid = tl.load(state_idx_ptr + r * state_idx_stride).to(tl.int64)
+        state_ok = sid != NULL_STATE_ID
+        sid_safe = tl.where(state_ok, sid, 0)
+        if HAS_INIT:
+            has_init = tl.load(has_init_ptr + r, mask=state_ok, other=0) != 0
+        else:
+            has_init = state_ok
+        if MODE == "spec":
+            # A new spec chunk can produce output from its own tokens without a
+            # prior state; null slots in other modes denote inactive rows.
+            read_state = state_ok
+            out_ok = in_range
+        else:
+            read_state = state_ok & has_init
+            out_ok = in_range & state_ok
+
+        # state[sid, w, c] may be a strided view into a shared pool.
+        base_state = state_ptr + sid_safe * state_bs
+        acc = tl.zeros([BLOCK_C], tl.float32)
+        for k in tl.static_range(0, KERNEL_SIZE):
+            h = j + DILATION * k
+            # from_state is a scalar. Loading both taps and selecting with
+            # tl.where still issues the masked-off gather, which wastes bandwidth.
+            from_state = h <= STATE_LEN - 1
+            if from_state:
+                tap = tl.load(
+                    base_state + (h + slot_off) * state_ws + c_offs * state_cs,
+                    mask=c_mask & read_state,
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                input_t = q_start + h - STATE_LEN
+                input_t = tl.load(
+                    token_idx_ptr + input_t,
+                    mask=has_token_map & out_ok,
+                    other=input_t,
+                ).to(tl.int64)
+                tap = tl.load(
+                    x_ptr + input_t * C + c_offs,
+                    mask=c_mask & out_ok,
+                    other=0.0,
+                ).to(tl.float32)
+            weight = tl.load(
+                tle.gpu.local_ptr(w_smem, (c_local, tl.full([BLOCK_C], k, tl.int32))),
+                mask=c_mask,
+                other=0.0,
+            )
+            acc += weight * tap
+
+        # F.conv1d materializes its output dtype before SiLU. Hygon eager SiLU
+        # keeps the full fp32 sigmoid product, so the kernel matches it bitwise
+        # in bf16 and stays within an ulp in fp16.
+        conv = acc.to(residual_ptr.dtype.element_ty).to(tl.float32)
+        y = conv * tl.sigmoid(conv)
+        conv_output = tl.where(out_ok, y, 0.0).to(residual_ptr.dtype.element_ty)
+        ple_output = conv_output
+        if FUSE_RESIDUAL:
+            residual = tl.load(
+                residual_ptr + output_t * C + c_offs,
+                mask=c_mask,
+                other=0.0,
+            )
+            # Preserve the original eager operation boundaries: short convolution is
+            # first accumulated into the BF16/FP16 PLE output, then the outer residual
+            # is added to that rounded value.
+            ple_output = (residual + conv_output).to(residual_ptr.dtype.element_ty)
+            outer_residual = tl.load(
+                outer_residual_ptr + output_t * C + c_offs,
+                mask=c_mask,
+                other=0.0,
+            )
+            ple_output = outer_residual.to(tl.float32) + ple_output.to(tl.float32)
+        if launch_pdl:
+            gdc_launch_dependents()
+        tl.store(
+            residual_ptr + output_t * C + c_offs,
+            ple_output,
+            mask=c_mask,
+        )
+
+        if WRITE_TAIL:
+            # One long request: the last STATE_LEN tokens are the new window, and
+            # each token program writes its own column. No second launch.
+            q_end = tl.load(qsl_ptr + r + 1)
+            qlen = (q_end - q_start).to(tl.int32)
+            col = j - (qlen - STATE_LEN)
+            in_tail = (col >= 0) & (col < STATE_LEN) & state_ok
+            col_safe = tl.maximum(col, 0)
+            tail = tl.load(
+                x_ptr + output_t * C + c_offs,
+                mask=c_mask & in_tail,
+                other=0.0,
+            )
+            tl.store(
+                base_state + col_safe * state_ws + c_offs * state_cs,
+                tail,
+                mask=c_mask & in_tail,
+            )
+
+        if MODE == "decode":
+            # Decode has one program per request and channel block, so no peer can
+            # still be reading this state slice when it is updated. The window
+            # shift is one contiguous [channel, window] load/store pair when the
+            # layout allows it; the column loop below stays for strided views.
+            decode_input = tl.load(
+                x_ptr + output_t * C + c_offs,
+                mask=c_mask & state_ok,
+                other=0.0,
+            )
+            if CONTIG_SHIFT:
+                w_offs = tl.arange(0, STATE_LEN_P2)
+                w_live = w_offs < STATE_LEN
+                src_col = tl.where(w_offs < STATE_LEN - 1, w_offs + 1, 0)
+                window = tl.load(
+                    base_state
+                    + c_offs[:, None] * state_cs
+                    + src_col[None, :] * state_ws,
+                    mask=(
+                        (w_offs[None, :] < STATE_LEN - 1)
+                        & has_init
+                        & state_ok
+                        & c_mask[:, None]
+                    ),
+                    other=0.0,
+                )
+                window = tl.where(
+                    w_offs[None, :] == STATE_LEN - 1,
+                    decode_input[:, None],
+                    window,
+                )
+                # History spans warps: finish every old-window load (and every
+                # convolution tap above) before the first in-place write.
+                tl.debug_barrier()
+                tl.store(
+                    base_state
+                    + c_offs[:, None] * state_cs
+                    + w_offs[None, :] * state_ws,
+                    window,
+                    mask=w_live[None, :] & state_ok & c_mask[:, None],
+                )
+            else:
+                for i in tl.static_range(0, STATE_LEN):
+                    if i < STATE_LEN - 1:
+                        next_state = tl.load(
+                            base_state + (i + 1) * state_ws + c_offs * state_cs,
+                            mask=c_mask & state_ok & has_init,
+                            other=0.0,
+                        )
+                    else:
+                        next_state = decode_input
+                    tl.store(
+                        base_state + i * state_ws + c_offs * state_cs,
+                        next_state,
+                        mask=c_mask & state_ok,
+                    )
+
+    # Small-batch speculative fuse: one program per request and channel tile
+    # walks every token then shifts the window. One launch avoids the
+    # host gap between the output kernel and the writeback on BW1000.
+    @triton.jit
+    def _ple_conv_spec_fused_kernel_tle(
+        x_ptr,
+        state_ptr,
+        w_ptr,
+        residual_ptr,
+        outer_residual_ptr,
+        state_idx_ptr,
+        qsl_ptr,
+        num_acc_ptr,
+        token_idx_ptr,
+        has_token_map: tl.constexpr,
+        state_idx_stride,
+        state_bs,
+        C: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        STATE_LEN: tl.constexpr,
+        DILATION: tl.constexpr,
+        KERNEL_SIZE: tl.constexpr,
+        KERNEL_SIZE_SMEM: tl.constexpr,
+        SPEC_QUERY_LEN: tl.constexpr,
+        STATE_WIDTH: tl.constexpr,
+        STATE_WIDTH_P2: tl.constexpr,
+        NULL_STATE_ID: tl.constexpr,
+        FUSE_RESIDUAL: tl.constexpr,
+    ):
+        r = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < C
+
+        # Stage the channel x kernel weight tile in shared memory once so every
+        # dilation tap reuses the same smem row instead of re-gathering weights.
+        w_smem = tle.gpu.alloc(
+            [BLOCK_C, KERNEL_SIZE_SMEM],
+            dtype=tl.float32,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
+        )
+        c_local = tl.arange(0, BLOCK_C)
+        for k0 in tl.static_range(0, KERNEL_SIZE):
+            w0 = tl.load(
+                w_ptr + c_offs * KERNEL_SIZE + k0,
+                mask=c_mask,
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(
+                tle.gpu.local_ptr(w_smem, (c_local, tl.full([BLOCK_C], k0, tl.int32))),
+                w0,
+                mask=c_mask,
+            )
+
+        sid = tl.load(state_idx_ptr + r * state_idx_stride).to(tl.int64)
+        state_ok = sid != NULL_STATE_ID
+        sid_safe = tl.where(state_ok, sid, 0)
+        base_state = state_ptr + sid_safe * state_bs
+        q_start = tl.load(qsl_ptr + r)
+        q_end = tl.load(qsl_ptr + r + 1)
+        qlen = (q_end - q_start).to(tl.int32)
+        num_acc = tl.load(num_acc_ptr + r)
+        slot_off = tl.minimum(tl.maximum(num_acc - 1, 0), SPEC_QUERY_LEN - 1).to(
+            tl.int32
+        )
+        # Spec may emit output from its own tokens without prior state.
+        read_state = state_ok
+
+        for j in tl.static_range(0, SPEC_QUERY_LEN):
+            in_range = j < qlen
+            t = q_start + j
+            output_t = tl.load(
+                token_idx_ptr + t, mask=has_token_map & in_range, other=t
+            ).to(tl.int64)
+            out_ok = in_range
+            acc = tl.zeros([BLOCK_C], tl.float32)
+            for k in tl.static_range(0, KERNEL_SIZE):
+                h = j + DILATION * k
+                from_state = h <= STATE_LEN - 1
+                if from_state:
+                    tap = tl.load(
+                        base_state + (h + slot_off) * STATE_WIDTH + c_offs,
+                        mask=c_mask & read_state,
+                        other=0.0,
+                    ).to(tl.float32)
+                else:
+                    input_t = q_start + h - STATE_LEN
+                    input_t = tl.load(
+                        token_idx_ptr + input_t,
+                        mask=has_token_map & out_ok,
+                        other=input_t,
+                    ).to(tl.int64)
+                    tap = tl.load(
+                        x_ptr + input_t * C + c_offs,
+                        mask=c_mask & out_ok,
+                        other=0.0,
+                    ).to(tl.float32)
+                weight = tl.load(
+                    tle.gpu.local_ptr(
+                        w_smem, (c_local, tl.full([BLOCK_C], k, tl.int32))
+                    ),
+                    mask=c_mask,
+                    other=0.0,
+                )
+                acc += weight * tap
+            conv = acc.to(residual_ptr.dtype.element_ty).to(tl.float32)
+            y = conv * tl.sigmoid(conv)
+            conv_output = tl.where(out_ok, y, 0.0).to(residual_ptr.dtype.element_ty)
+            ple_output = conv_output
+            if FUSE_RESIDUAL:
+                residual = tl.load(
+                    residual_ptr + output_t * C + c_offs,
+                    mask=c_mask,
+                    other=0.0,
+                )
+                ple_output = (residual + conv_output).to(residual_ptr.dtype.element_ty)
+                outer_residual = tl.load(
+                    outer_residual_ptr + output_t * C + c_offs,
+                    mask=c_mask,
+                    other=0.0,
+                )
+                ple_output = outer_residual.to(tl.float32) + ple_output.to(tl.float32)
+            tl.store(
+                residual_ptr + output_t * C + c_offs,
+                ple_output,
+                mask=c_mask & out_ok,
+            )
+
+        # Same contiguous window roll as the standalone writeback kernel.
+        w_offs = tl.arange(0, STATE_WIDTH_P2)
+        w_live = w_offs < STATE_WIDTH
+        do_write = w_offs < STATE_LEN + qlen - 1
+        m = 1 + w_offs
+        from_state = m <= STATE_LEN - 1
+        src_col = tl.minimum(slot_off + m, STATE_WIDTH - 1)
+        window = tl.load(
+            base_state + c_offs[:, None] * STATE_WIDTH + src_col[None, :],
+            mask=from_state[None, :] & state_ok & c_mask[:, None],
+            other=0.0,
+        )
+        input_t = q_start + m - STATE_LEN
+        input_t = tl.load(
+            token_idx_ptr + input_t,
+            mask=has_token_map & w_live & (~from_state) & do_write,
+            other=input_t,
+        ).to(tl.int64)
+        x_chunk = tl.load(
+            x_ptr + input_t[None, :] * C + c_offs[:, None],
+            mask=(~from_state & do_write)[None, :] & state_ok & c_mask[:, None],
+            other=0.0,
+        )
+        value = tl.where(from_state[None, :], window, x_chunk)
+        tl.debug_barrier()
+        tl.store(
+            base_state + c_offs[:, None] * STATE_WIDTH + w_offs[None, :],
+            value,
+            mask=w_live[None, :] & do_write[None, :] & state_ok & c_mask[:, None],
+        )
+
+
+if HAS_TLE:
+    # Weight tiles reused across dilation taps / spec tokens go through TLE
+    # smem. Prefill and standalone tile-shift stay on the baseline path: an
+    # extra smem round-trip there was pure overhead on BW1000.
+    _ple_conv_kernel = _ple_conv_kernel_tle
+    _ple_conv_prefill_kernel = _ple_conv_prefill_kernel_baseline
+    _ple_conv_spec_fused_kernel = _ple_conv_spec_fused_kernel_tle
+    _ple_conv_spec_tile_shift_kernel = _ple_conv_spec_tile_shift_kernel_baseline
+else:
+    _ple_conv_kernel = _ple_conv_kernel_baseline
+    _ple_conv_prefill_kernel = _ple_conv_prefill_kernel_baseline
+    _ple_conv_spec_fused_kernel = _ple_conv_spec_fused_kernel_baseline
+    _ple_conv_spec_tile_shift_kernel = _ple_conv_spec_tile_shift_kernel_baseline
+
+_ple_conv_writeback_linear_kernel = _ple_conv_writeback_linear_kernel_baseline
+_ple_conv_writeback_kernel = _ple_conv_writeback_kernel_baseline
+
+
 def ple_conv(
     inputs: torch.Tensor,
     residual: torch.Tensor,
@@ -836,6 +1306,9 @@ def ple_conv(
     kernel_spec_query_len = spec_query_len if mode == "spec" else 1
     T, C = inputs.shape
     K = conv_weights.shape[1]
+    # Hygon TLE alloc: non-pow2 dims must be multiples of 16; keep a
+    # padded weight row even when KERNEL_SIZE itself is already pow2.
+    kernel_size_smem = max(triton.next_power_of_2(K), 16)
     state_len = (K - 1) * dilation
     state_width = state_len + kernel_spec_query_len - 1
     if token_indices is not None:
@@ -944,6 +1417,7 @@ def ple_conv(
             STATE_LEN=state_len,
             DILATION=dilation,
             KERNEL_SIZE=K,
+            KERNEL_SIZE_SMEM=kernel_size_smem,
             SPEC_QUERY_LEN=kernel_spec_query_len,
             STATE_WIDTH=state_width,
             STATE_WIDTH_P2=state_width_p2,
@@ -977,6 +1451,7 @@ def ple_conv(
             STATE_LEN_P2=state_len_p2,
             DILATION=dilation,
             KERNEL_SIZE=K,
+            KERNEL_SIZE_SMEM=kernel_size_smem,
             SPEC_QUERY_LEN=kernel_spec_query_len,
             MODE=mode,
             HAS_INIT=has_initial_states_arg,
@@ -1013,6 +1488,7 @@ def ple_conv(
             STATE_LEN=state_len,
             DILATION=dilation,
             KERNEL_SIZE=K,
+            KERNEL_SIZE_SMEM=kernel_size_smem,
             HAS_INIT=has_initial_states_arg,
             FUSE_RESIDUAL=outer_residual is not None,
             NULL_STATE_ID=NULL_BLOCK_ID,
