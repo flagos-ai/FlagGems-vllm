@@ -43,9 +43,10 @@ from flaggems_vllm.ops.silu_and_mul import silu_and_mul_out
 from flaggems_vllm.utils import libentry
 
 try:
+    import triton.experimental.tle as tle_api
     from triton.experimental.tle import language as tle_async
 except ImportError:
-    tle_async = None
+    tle_api = tle_async = None
 
 _SCALE_CACHE = WeakTensorKeyDictionary()
 
@@ -74,7 +75,9 @@ W8_TILE_BYTES = tl.constexpr(128 * 128)
 W8_HALF_TILE_BYTES = tl.constexpr(64 * 128)
 EXPERT_ID_MASK = tl.constexpr(0x3FFFFFFF)
 SHORT_TILE_FLAG = tl.constexpr(0x40000000)
-DENSE_BLOCK_ROWS = 64
+OVERLAP_BLOCK_ROWS = 64
+ALLOCATOR_MIN_BLOCK = 512
+ALLOCATOR_SMALL_POOL_LIMIT = 1 << 20
 _PPU_DENSE_MIN_TOKENS = 4096
 _TL_QUANT_TYPE_UINT4B8 = tl.constexpr(QUANT_TYPE_UINT4B8)
 _TL_QUANT_TYPE_UINT8B128 = tl.constexpr(QUANT_TYPE_UINT8B128)
@@ -1328,9 +1331,40 @@ class MoEShape(NamedTuple):
     top_k: int
 
 
+def overlaps_live_input(start: int, end: int, tensor: torch.Tensor) -> bool:
+    first = tensor.data_ptr()
+    if end <= first or not tensor.numel():
+        return False
+    if tensor.is_contiguous():
+        return start < first + tensor.nbytes
+
+    # Only scales may be strided. Each [expert, column] group row is contiguous.
+    experts, columns, groups = tensor.shape
+    item = tensor.element_size()
+    expert_step, column_step, _ = (stride * item for stride in tensor.stride())
+    width = groups * item
+    if (
+        start
+        >= first + (experts - 1) * expert_step + (columns - 1) * column_step + width
+    ):
+        return False
+    for expert in range(experts):
+        row = first + expert * expert_step
+        # First column whose last byte can reach the output, including padded rows.
+        column = max(0, (start - row - width) // column_step + 1) if column_step else 0
+        row += column * column_step
+        if column < columns and row < end and start < row + width:
+            return True
+    return False
+
+
 def validate_inputs(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     output: Optional[torch.Tensor],
     inplace: bool,
@@ -1339,41 +1373,95 @@ def validate_inputs(
 ) -> MoEShape:
     if inplace and output is not None:
         raise ValueError("Cannot pass both inplace=True and output")
+    device = hidden_states.device
+    live_inputs = (w1, w2, w1_scale, w2_scale, topk_weights, topk_ids)
+    if device.type != "cuda" or any(t.device != device for t in live_inputs):
+        raise ValueError("All tensors must reside on the same PPU device")
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):
         raise NotImplementedError("PPU fused Marlin MoE requires FP16 or BF16")
+    if hidden_states.ndim != 2 or topk_ids.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
+        raise ValueError("Expected activations/routing rank 2 and weights rank 3")
+    if any(t.requires_grad for t in (hidden_states, *live_inputs)):
+        raise NotImplementedError("PPU fused Marlin MoE is inference-only")
     m, k = hidden_states.shape
-    e, n2, _ = w1.shape
+    e, n2, packed_k = w1.shape
     n = n2 // 2
-    if quant_type_id in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3):
-        allowed_group_sizes = (
-            (-1, 32, 64, 128) if quant_type_id == QUANT_TYPE_FP8_E4M3 else (128,)
-        )
-        if group_size not in allowed_group_sizes:
-            raise NotImplementedError(
-                f"quant_type_id={quant_type_id} does not support group_size={group_size}"
-            )
-        if (
-            k % 32
-            or n % 32
-            or (group_size != -1 and (k % group_size or n % group_size))
-        ):
-            raise ValueError("Input dimensions must be divisible by group_size")
-    else:
-        expected_group_size = 128 if quant_type_id == QUANT_TYPE_UINT4B8 else 32
-        if group_size != expected_group_size:
-            raise NotImplementedError(
-                f"quant_type_id={quant_type_id} requires group_size="
-                f"{expected_group_size}"
-            )
-        if k % 128 or n % 128:
-            raise ValueError(
-                "4-bit hidden_size and intermediate_size must be multiples of 128"
-            )
-    if output is not None and (
-        output.shape != hidden_states.shape or output.dtype != hidden_states.dtype
+    if min(k, n, e) <= 0 or n2 % 2:
+        raise ValueError("Positive K/N/E and paired gate/up weights required")
+    rows, top_k = topk_ids.shape
+    if rows != m or not 1 <= top_k <= e or topk_weights.shape != topk_ids.shape:
+        raise ValueError("Routing must have shape [M, topk], 1 <= topk <= E")
+    float_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+    if (
+        topk_ids.dtype not in (torch.int32, torch.int64)
+        or topk_weights.dtype not in float_dtypes
     ):
-        raise ValueError("Output shape/dtype must match hidden_states")
-    return MoEShape(m, k, n, e, topk_ids.shape[1])
+        raise NotImplementedError("Unsupported routing dtype")
+    if not all(t.is_contiguous() for t in (hidden_states, topk_weights, topk_ids)):
+        raise NotImplementedError("Activations and routing must be contiguous")
+    if output is not None and (
+        output.shape != hidden_states.shape
+        or output.dtype != hidden_states.dtype
+        or output.device != device
+        or not output.is_contiguous()
+        or output.requires_grad
+    ):
+        raise ValueError(
+            "Output must match hidden_states shape/dtype/device and be contiguous and inference-only"
+        )
+
+    is_fp8 = quant_type_id == QUANT_TYPE_FP8_E4M3
+    is_mxfp4 = quant_type_id == QUANT_TYPE_FP4_E2M1
+    is_w4 = is_mxfp4 or quant_type_id == QUANT_TYPE_UINT4B8
+    if is_fp8:
+        allowed_groups = (-1, 32, 64, 128)
+    else:
+        allowed_groups = (32,) if is_mxfp4 else (128,)
+    if group_size not in allowed_groups:
+        raise NotImplementedError(
+            f"quant_type_id={quant_type_id} does not support group_size={group_size}"
+        )
+    alignment = 128 if is_w4 else (32 if group_size == -1 else group_size)
+    if k % alignment or n % alignment:
+        raise ValueError(
+            f"hidden_size and intermediate_size must be multiples of {alignment}"
+        )
+
+    packing = 2 if is_w4 else 1
+    if packed_k != k // packing or w2.shape != (e, k, n // packing):
+        raise ValueError("Quantized weight shapes do not match activations")
+    weight_dtypes = (torch.uint8, torch.float8_e4m3fn) if is_fp8 else (torch.uint8,)
+    for weight in (w1, w2):
+        if weight.dtype not in weight_dtypes or not weight.is_contiguous():
+            raise NotImplementedError(
+                "Expected contiguous output-major weights of the selected quantized dtype"
+            )
+
+    if is_fp8:
+        scale_dtypes = float_dtypes
+    elif is_mxfp4:
+        scale_dtypes = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
+    else:
+        scale_dtypes = (hidden_states.dtype,)
+    for scale, columns, reduction in ((w1_scale, n2, k), (w2_scale, k, n)):
+        groups = 1 if group_size == -1 else reduction // group_size
+        if scale.shape != (e, columns, groups):
+            raise ValueError("Scale shape does not match the selected group size")
+        if (
+            scale.dtype not in scale_dtypes
+            or scale.layout != torch.strided
+            or (groups > 1 and scale.stride(-1) != 1)
+        ):
+            raise NotImplementedError(
+                "Expected strided scales of the selected dtype with unit group stride"
+            )
+    target = hidden_states if inplace else output
+    if target is not None and target.numel():
+        start = target.data_ptr()
+        end = start + target.nbytes
+        if any(overlaps_live_input(start, end, tensor) for tensor in live_inputs):
+            raise ValueError("Output must not overlap weights, scales or routing")
+    return MoEShape(m, k, n, e, top_k)
 
 
 def scale_layout(scale: torch.Tensor, is_mxfp4: bool) -> ScaleLayout:
@@ -1457,18 +1545,13 @@ def raw_tile_modes(call: MarlinCall, use_wide_tile: bool) -> Tuple[bool, bool]:
         or not (tokens * top_k <= 16 * experts or use_wide_tile)
     ):
         return False, False
-    bf16_group = (
+    if call.quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1):
+        return False, True
+    raw_w8 = (
         call.group_size == 128
         and call.w1_scale.dtype == call.w2_scale.dtype == torch.bfloat16
     )
-    raw_w8 = bf16_group and call.quant_type_id in (
-        QUANT_TYPE_UINT8B128,
-        QUANT_TYPE_FP8_E4M3,
-    )
-    raw_w4 = (bf16_group and call.quant_type_id == QUANT_TYPE_UINT4B8) or (
-        call.group_size == 32 and call.quant_type_id == QUANT_TYPE_FP4_E2M1
-    )
-    return raw_w8, raw_w4
+    return raw_w8, False
 
 
 def direct_schedule(
@@ -1599,8 +1682,8 @@ def eligible_for_dense(call: MarlinCall) -> bool:
             )
             or call.quant_type_id == QUANT_TYPE_FP4_E2M1
         )
-        and max(call.w1.numel(), call.w2.numel())
-        * (4 if call.quant_type_id in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1) else 2)
+        # The decoded BF16 gate/up bank [E, 2N, K] is the larger projection.
+        and 4 * call.shape.experts * call.shape.intermediate * call.shape.hidden
         <= _PPU_DENSE_MAX_DECODE_BYTES
     )
 
@@ -1981,8 +2064,8 @@ def align_dense_fp8_histogram(
 
     r = ids.numel()
     e = num_experts
-    em = r + (DENSE_BLOCK_ROWS - 1) * e
-    mb = triton.cdiv(em, 64)
+    em = r + (OVERLAP_BLOCK_ROWS - 1) * e
+    mb = triton.cdiv(em, OVERLAP_BLOCK_ROWS)
     rb = triton.next_power_of_2(triton.cdiv(r, e))
     sorted_ids = torch.empty((em,), device=ids.device, dtype=torch.int32)
     experts = torch.empty((mb,), device=ids.device, dtype=torch.int32)
@@ -2002,10 +2085,10 @@ def align_dense_fp8_histogram(
         num_warps=4,
     )
     moe_align_block_size_stage2_vec[(e,)](count, e)
-    moe_align_block_size_stage3[(1,)](post, count, prefix, e, e, 64)
+    moe_align_block_size_stage3[(1,)](post, count, prefix, e, e, OVERLAP_BLOCK_ROWS)
 
     moe_align_block_size_stage4[(e,)](
-        ids, sorted_ids, experts, count, prefix, e, 64, r, rb
+        ids, sorted_ids, experts, count, prefix, e, OVERLAP_BLOCK_ROWS, r, rb
     )
     return sorted_ids, experts, post, prefix
 
@@ -2094,7 +2177,7 @@ def run_fp8_ordered_overlap(
     for metadata in (sorted_ids, experts, padded, prefix):
         metadata.record_stream(main)
     em = sorted_ids.numel()
-    row_tiles = triton.cdiv(em, 64)
+    row_tiles = triton.cdiv(em, OVERLAP_BLOCK_ROWS)
 
     def project_gate(
         bank: torch.Tensor, projected: torch.Tensor, window: slice
@@ -2120,7 +2203,7 @@ def run_fp8_ordered_overlap(
             topk,
             input_mul,
             True,
-            64,
+            OVERLAP_BLOCK_ROWS,
             256,
             32,
             8,
@@ -2184,7 +2267,7 @@ def run_fp8_ordered_overlap(
             1,
             not input_mul,
             True,
-            64,
+            OVERLAP_BLOCK_ROWS,
             256,
             32,
             8,
@@ -2283,10 +2366,9 @@ def run_dense_wna16(
     down_tile: int,
     decode_elements: int,
     projection_width: int,
-    workspace_limit: int,
+    configs: Tuple[Dict[str, int], Dict[str, int]],
 ) -> torch.Tensor:
     from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
-        get_default_config,
         invoke_fused_moe_triton_kernel,
     )
 
@@ -2306,6 +2388,7 @@ def run_dense_wna16(
     down = cache[: routes * down_tile].view(m, topk, down_tile)
     if (
         is_fp8
+        and configs[0]["BLOCK_SIZE_M"] == OVERLAP_BLOCK_ROWS
         and m >= MIN_OVERLAP_TOKENS
         and e in (128, 256)
         and k == 4096
@@ -2316,29 +2399,21 @@ def run_dense_wna16(
         and k % down_tile == 0
         and down_tile % 256 == 0
     ):
-        workspace = (
-            2 * decode_elements
-            + 2 * routes * (projection_width + n)
-            + 4 * (e + 1) ** 2
-            + 16 * (routes + (DENSE_BLOCK_ROWS - 1) * e)
-            + 8
+        return run_fp8_ordered_overlap(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            output,
+            topk_ids,
+            apply_router_weight_on_input,
+            scratch,
+            gateup,
+            intermediate,
+            down,
         )
-        if workspace <= workspace_limit:
-            return run_fp8_ordered_overlap(
-                hidden_states,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                topk_weights,
-                output,
-                topk_ids,
-                apply_router_weight_on_input,
-                scratch,
-                gateup,
-                intermediate,
-                down,
-            )
     if quant_type_id == QUANT_TYPE_FP4_E2M1:
         w1_scale, w2_scale = w1_scale.view(torch.uint8), w2_scale.view(torch.uint8)
     for index, (weight, scales) in enumerate(((w1, w1_scale), (w2, w2_scale))):
@@ -2346,15 +2421,7 @@ def run_dense_wna16(
         output_size, reduction = weight.shape[1:]
         if is_w4:
             reduction *= 2
-        config = get_default_config(
-            max(m, _PPU_DENSE_MIN_TOKENS),
-            e,
-            output_size,
-            reduction,
-            topk,
-            "bf16",
-            gemm_stage="gemm1" if first else "gemm2",
-        )
+        config = configs[index]
         if first:
             sorted_ids, experts, padded = align_grouped_tokens(
                 topk_ids, config["BLOCK_SIZE_M"], e
@@ -2414,26 +2481,73 @@ def run_dense_wna16(
 def run_dense_batches(
     call: MarlinCall, gate_limit: int, down_limit: int, workspace_limit: int
 ) -> None:
+    from flaggems_vllm.runtime.backend._thead.ops.fused_moe import get_default_config
+
     gate_tile = min(2 * call.shape.intermediate, gate_limit)
     down_tile = min(call.shape.hidden, down_limit)
     decode_elements = call.shape.experts * max(
         gate_tile * call.shape.hidden, down_tile * call.shape.intermediate
     )
     projection_width = max(2 * call.shape.intermediate, down_tile)
-    fixed_bytes = (
-        2 * decode_elements
-        + 4 * (call.shape.experts + 1) ** 2
-        + 16 * (DENSE_BLOCK_ROWS - 1) * call.shape.experts
-        + 8
+    tokens, k, n, experts, top_k = call.shape
+    config_tokens = max(tokens, _PPU_DENSE_MIN_TOKENS)
+    configs = (
+        get_default_config(
+            config_tokens, experts, 2 * n, k, top_k, "bf16", gemm_stage="gemm1"
+        ),
+        get_default_config(
+            config_tokens, experts, k, n, top_k, "bf16", gemm_stage="gemm2"
+        ),
     )
-    bytes_per_token = call.shape.top_k * (
-        2 * (projection_width + call.shape.intermediate) + 12
-    )
-    batch_tokens = min(
-        call.shape.tokens, (workspace_limit - fixed_bytes) // bytes_per_token
-    )
+    block_m = configs[0]["BLOCK_SIZE_M"]
+    if block_m != configs[1]["BLOCK_SIZE_M"]:
+        raise ValueError(
+            "Dense GEMM stages must use the same BLOCK_SIZE_M for shared routing"
+        )
+
+    def workspace_bytes(batch: int) -> int:
+        routes = batch * top_k
+        padded = routes + min(routes, experts) * (block_m - 1)
+        # Both dense paths allocate BF16 decode/projection/activation storage and
+        # int32 sorted ids, expert blocks, post-pad length, counts and prefix sums.
+        sizes = (
+            2 * decode_elements,
+            2 * routes * projection_width,
+            2 * routes * n,
+            4 * padded,
+            4 * triton.cdiv(padded, block_m),
+            4,
+            4 * (experts + 1) * experts,
+            4 * (experts + 1),
+        )
+        # The SDK caching allocator can leave up to 1 MiB unsplit in each large
+        # block. Graph capture also allocates two minimum-size RNG state blocks.
+        allocated = 2 * ALLOCATOR_MIN_BLOCK
+        for size in sizes:
+            allocated += triton.cdiv(size, ALLOCATOR_MIN_BLOCK) * ALLOCATOR_MIN_BLOCK
+            if size > ALLOCATOR_SMALL_POOL_LIMIT:
+                allocated += ALLOCATOR_SMALL_POOL_LIMIT
+        return allocated
+
+    batch_tokens = tokens
+    if workspace_bytes(tokens) > workspace_limit:
+        low, high = 0, tokens - 1
+        while low < high:
+            mid = (low + high + 1) // 2
+            if workspace_bytes(mid) <= workspace_limit:
+                low = mid
+            else:
+                high = mid - 1
+        batch_tokens = low
     if batch_tokens < 1:
         raise NotImplementedError("PPU dense MoE workspace exceeds its budget")
+    if batch_tokens < call.shape.tokens and call.out is not call.hidden_states:
+        # An earlier output chunk can overwrite a later chunk's activations.
+        distance = abs(call.out.data_ptr() - call.hidden_states.data_ptr())
+        if 0 < distance < call.hidden_states.nbytes:
+            raise ValueError(
+                "output must not partially overlap hidden_states in chunked dense MoE"
+            )
     for start in range(0, call.shape.tokens, batch_tokens):
         end = min(start + batch_tokens, call.shape.tokens)
         run_dense_wna16(
@@ -2451,7 +2565,7 @@ def run_dense_batches(
             down_tile=down_tile,
             decode_elements=decode_elements,
             projection_width=projection_width,
-            workspace_limit=workspace_limit,
+            configs=configs,
         )
 
 
@@ -5066,10 +5180,7 @@ def stage_grouped_activations(
     )
     if (
         use_packed_gather
-        and (permute_k16 or permute_k32)
-        and activations.dtype == torch.bfloat16
         and activations.size(1) >= 1024
-        and activations.size(1) % (32 if permute_k32 else 16) == 0
         and activations.data_ptr() % 4 == 0
     ):
         k_pairs = activations.size(1) // 2
@@ -5761,6 +5872,23 @@ _PPU_QUANT_TYPES = (
 _VLLM_QUANT_TYPE_FP8_E4M3 = 2814749767172868
 
 
+@lru_cache(maxsize=16)
+def supports_marlin_tle(device: torch.device) -> bool:
+    if tle_api is None:
+        return False
+    features = ("load", "gpu.alloc", "gpu.local_ptr")
+    with torch.cuda.device(device):
+        if hasattr(tle_api, "is_tle_supported"):
+            return tle_api.is_tle_supported(features)
+        if hasattr(tle_api, "get_supported_primitives"):
+            from triton.compiler.compiler import make_backend
+
+            target = triton.runtime.driver.active.get_current_target()
+            backend = type(make_backend(target)).__module__.split(".")[-2]
+            return set(features) <= tle_api.get_supported_primitives(backend)
+    return False
+
+
 def dispatch_marlin_call(call: MarlinCall) -> None:
     with torch.cuda.device(call.hidden_states.device):
         if eligible_for_dense(call):
@@ -5810,15 +5938,19 @@ def run_marlin_moe(
     shape = validate_inputs(
         hidden_states,
         w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weights,
         topk_ids,
         output,
         inplace,
         group_size,
         quant_type_id,
     )
-    if tle_async is None:
+    if not supports_marlin_tle(hidden_states.device):
         raise NotImplementedError(
-            "PPU fused Marlin MoE requires a TLE-enabled FlagTree build"
+            "PPU fused Marlin MoE requires TLE load, gpu.alloc and gpu.local_ptr"
         )
     out = hidden_states if inplace else output
     if out is None:
@@ -5887,13 +6019,13 @@ def fused_marlin_moe(
         quant_type_id = QUANT_TYPE_FP8_E4M3
     if quant_type_id not in _PPU_QUANT_TYPES:
         return generic_fused_marlin_moe(**locals())
-    if isinstance(activation, Enum):
-        if (
-            activation.name.lower() != "silu"
-            and str(activation.value).lower() != "silu"
-        ):
-            raise NotImplementedError("PPU fused Marlin MoE supports only SiLU")
-    elif activation is not None and str(activation).lower() != "silu":
+    if isinstance(activation, Enum) and activation.name.lower() == "silu":
+        activation = activation.name
+    else:
+        activation = getattr(
+            activation, "value", getattr(activation, "name", activation)
+        )
+    if activation is not None and str(activation).lower() != "silu":
         raise NotImplementedError("PPU fused Marlin MoE supports only SiLU")
     if any(
         value is not None for value in (g_idx1, g_idx2, sort_indices1, sort_indices2)
@@ -5923,7 +6055,7 @@ def fused_marlin_moe(
             "Unsupported PPU fused Marlin MoE option "
             "(bias/map/scaling/workspace/activation)"
         )
-    if global_num_experts not in (-1, w1.shape[0]):
+    if global_num_experts != -1 and (w1.ndim != 3 or global_num_experts != w1.shape[0]):
         raise NotImplementedError("PPU fused Marlin MoE requires local weights")
     return run_marlin_moe(
         hidden_states,

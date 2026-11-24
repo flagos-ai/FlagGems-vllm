@@ -1623,6 +1623,71 @@ def test_fused_marlin_moe_w8a16_inference_updates(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
+@pytest.mark.parametrize("unsafe_case", ["mismatched_blocks", "shifted_output"])
+def test_fused_marlin_moe_w8a16_rejects_unsafe_dense_call_ppu(monkeypatch, unsafe_case):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    kernels = importlib.import_module(
+        "flaggems_vllm.runtime.backend._thead.ops.fused_moe"
+    )
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w8a16_int8(
+        4096, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    storage = hs.new_full((hs.size(0) + 1, hs.size(1)), 7)
+    if unsafe_case == "mismatched_blocks":
+        get_config = kernels.get_default_config
+
+        def tuned_config(*args, gemm_stage):
+            config = get_config(*args, gemm_stage=gemm_stage)
+            if gemm_stage == "gemm2":
+                config = dict(config, BLOCK_SIZE_M=32)
+            return config
+
+        monkeypatch.setattr(kernels, "get_default_config", tuned_config)
+        error = "BLOCK_SIZE_M"
+    else:
+        monkeypatch.setattr(backend, "_PPU_DENSE_MAX_WORKSPACE_BYTES", 4 << 20)
+        hs = storage[:-1]
+        error = "partially overlap"
+    with pytest.raises(ValueError, match=error):
+        flaggems_vllm.fused_marlin_moe(
+            hs,
+            w1,
+            w2,
+            None,
+            None,
+            s1,
+            s2,
+            tw,
+            ti,
+            QUANT_TYPE_UINT8B128,
+            output=storage[1:],
+        )
+    gems_assert_equal(storage, torch.full_like(storage, 7))
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head scale layouts")
+def test_fused_marlin_moe_w8a16_output_in_scale_padding_ppu():
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w8a16_int8(
+        1, 4, 256, 128, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    storage = s1.new_empty((*s1.shape[:2], s1.size(2) + hs.numel()))
+    scales = storage[..., : s1.size(2)]
+    scales.copy_(s1)
+    args = (hs, w1, w2, None, None, scales, s2, tw, ti, QUANT_TYPE_UINT8B128)
+    reference = flaggems_vllm.fused_marlin_moe(*args)
+    output = storage[0, 0, s1.size(2) :].view_as(hs)
+    flaggems_vllm.fused_marlin_moe(*args, output=output)
+    gems_assert_equal(output, reference)
+    # Shift by one element so the output now includes a live scale.
+    with pytest.raises(ValueError, match="overlap"):
+        flaggems_vllm.fused_marlin_moe(
+            *args, output=storage[0, 0, 1 : 1 + hs.numel()].view_as(hs)
+        )
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
