@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Compare public thinking-budget entry points on identical workloads.
+"""Time thinking-budget and compare with vLLM when available.
 
 Cold/incremental workloads use stepwise kernel event timing with 10 warmup
 and 100 measured steps. Other timing modes are not implemented for these cases.
@@ -17,12 +17,8 @@ try:
     from vllm.v1.worker.gpu.sample.thinking_budget import (
         apply_thinking_budget as vllm_reference,
     )
-except ImportError as exc:
-    raise ImportError(
-        "Failed to import apply_thinking_budget from vLLM. "
-        "Check that the installed vLLM version provides this API "
-        "and its dependencies are installed correctly."
-    ) from exc
+except (ImportError, OSError):
+    vllm_reference = None
 
 from benchmark import base, consts
 from benchmark.conftest import Config
@@ -53,7 +49,11 @@ class ThinkingBudgetBenchmark(base.Benchmark):
         for batch_size in batch_sizes
         for history_len in (128, 16384, 32768)
     ]
-    DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
+    DEFAULT_METRICS = (
+        ["latency_base", "latency", "speedup"]
+        if vllm_reference is not None
+        else ["latency"]
+    )
     WARMUP_STEPS = 10
     ITERATIONS = 100
 
@@ -118,7 +118,8 @@ class ThinkingBudgetBenchmark(base.Benchmark):
                 torch.tensor([91], dtype=torch.int32, device=self.device),
             )
             if not mode.startswith("cold-"):
-                vllm_reference(*args)
+                prepare_op = vllm_reference or apply_thinking_budget
+                prepare_op(*args)
             self._original = [args[index].clone() for index in (0, 5, 8, 9, 10)]
             yield args
 

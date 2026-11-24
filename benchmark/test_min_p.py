@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
-"""Compare public min-p entry points on identical inputs.
+"""Time min-p and compare with vLLM when its reference is available.
 
 The standard timer measures repeated calls on already-filtered logits
 after warmup. Each provider starts from the same original logits.
@@ -12,12 +12,8 @@ import torch
 
 try:
     from vllm.v1.worker.gpu.sample.min_p import apply_min_p as vllm_reference
-except ImportError as exc:
-    raise ImportError(
-        "Failed to import apply_min_p from vLLM. "
-        "Check that the installed vLLM version provides this API "
-        "and its dependencies are installed correctly."
-    ) from exc
+except (ImportError, OSError):
+    vllm_reference = None
 
 from benchmark import base
 from flaggems_vllm import apply_min_p, runtime
@@ -33,7 +29,11 @@ pytestmark = [
 
 class MinPBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "tokens, vocab"
-    DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
+    DEFAULT_METRICS = (
+        ["latency_base", "latency", "speedup"]
+        if vllm_reference is not None
+        else ["latency"]
+    )
     DEFAULT_SHAPES = [(50, 1024), (1, 32000), (32, 128256), (128, 152065)]
 
     def __init__(self):
