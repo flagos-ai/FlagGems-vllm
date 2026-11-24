@@ -312,3 +312,74 @@ def test_grouped_topk_score_1():
 
     bench.set_gems(flaggems_vllm.grouped_topk)
     bench.run()
+
+
+def _baseline_grouped_topk_cuda9(*args):
+    return torch.ops._moe_C.grouped_topk(*args)
+
+
+class GroupedTopKPaddingBenchmark(GroupedTopKBenchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (rows, experts, groups, keep, topk)
+            for rows in (1, 8, 32, 128, 257)
+            for experts, groups, keep, topk in ((512, 1, 1, 16), (256, 8, 4, 8))
+        ]
+
+    def grouped_topk_input_fn(self, config, dtype, device):
+        rows = config[0]
+        for args in super().grouped_topk_input_fn(config, dtype, device):
+            for padding_count in sorted(
+                {0, rows // 4, rows // 2, (3 * rows) // 4, rows}
+            ):
+                mask = torch.arange(rows, device=device) < padding_count
+                yield (*args, mask)
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(
+    vendor_name != "nvidia", reason="padding is a CUDA routing contract"
+)
+def test_grouped_topk_padding_benchmark():
+    if not hasattr(torch.ops._moe_C, "grouped_topk"):
+        pytest.skip("native CUDA grouped_topk required for the measured baseline")
+    op = torch.ops._moe_C.grouped_topk.default
+    if not any(a.name == "is_padding" for a in op._schema.arguments):
+        pytest.skip("native CUDA grouped_topk padding argument required")
+    bench = GroupedTopKPaddingBenchmark(
+        op_name="grouped_topk_padding",
+        torch_op=_baseline_grouped_topk_cuda9,
+        dtypes=[torch.float32, torch.bfloat16],
+        renormalize=True,
+        routed_scaling_factor=3.998,
+        scoring_func=1,
+    )
+    bench.set_gems(flaggems_vllm.grouped_topk)
+    bench.run()
+
+
+class GroupedTopKGenericBenchmark(GroupedTopKBenchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [
+            (rows, experts, groups, keep, topk)
+            for rows in (1, 64, 4096)
+            for experts, groups, keep, topk in (
+                (384, 3, 2, 4),
+                (512, 8, 4, 8),
+                (1024, 8, 4, 16),
+            )
+        ]
+
+
+@pytest.mark.grouped_topk
+@pytest.mark.skipif(vendor_name != "nvidia", reason="NVIDIA generic routing sweep")
+def test_grouped_topk_generic_sigmoid_benchmark():
+    bench = GroupedTopKGenericBenchmark(
+        op_name="grouped_topk_generic",
+        torch_op=ref_grouped_topk,
+        dtypes=[torch.bfloat16],
+        renormalize=True,
+        scoring_func=1,
+    )
+    bench.set_gems(flaggems_vllm.grouped_topk)
+    bench.run()

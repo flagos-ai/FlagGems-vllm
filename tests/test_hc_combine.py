@@ -3,11 +3,15 @@
 """Independent CPU oracle, public dispatch, boundaries, and legacy regression."""
 
 import builtins
+import importlib.util
 import itertools
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm as gems
 from baseline import hc_combine as baseline
@@ -301,3 +305,73 @@ def test_hc_combine_native_resolution(monkeypatch, mode):
     else:
         assert native is None and not calls
         assert baseline.NATIVE_UNAVAILABLE_REASON
+
+
+@pytest.fixture
+def ascend_hc_combine():
+    """A private copy of the Ascend module, so its LibEntry cache starts empty."""
+    path = Path(gems.__file__).parent / "runtime/backend/_ascend/ops/hc_combine.py"
+    name = "hc_combine_ascend_under_test"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        yield module
+
+
+@pytest.mark.hc_combine
+def test_hc_combine_fixed_launch_reuses_compiled_kernel(ascend_hc_combine, monkeypatch):
+    """The fixed-config launch has to find the kernel LibEntry compiled for it.
+
+    LibEntry stores a kernel under its argument key plus the compile options of
+    the launch that built it. The warm path skips LibEntry and looks the kernel up
+    itself, so a lookup without those options misses every time and the launch
+    silently falls back to the slow path. The result stays correct either way.
+    """
+    module = ascend_hc_combine
+    if not module._COMPILED_LAUNCH_HAS_CONSTEXPRS:
+        pytest.skip("compiled-kernel launch needs Triton 3.3-3.6")
+    config = triton.Config({"BLOCK_D": 128, "LOOP": False}, num_warps=4, num_stages=1)
+    options = {"num_warps": config.num_warps, "num_stages": config.num_stages}
+    kernel = module._hc_combine_runtime_shape
+    monkeypatch.setattr(module, "_FIXED_CONFIG", config)
+    monkeypatch.setattr(module, "_FIXED_LAUNCH_OPTIONS", options)
+    monkeypatch.setattr(
+        module, "_FIXED_LAUNCH_OPTIONS_KEY", kernel._launch_options_key(options)
+    )
+    through_libentry = []
+    run = kernel.run
+
+    def counting_run(*args, **kwargs):
+        through_libentry.append(kwargs["grid"])
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "run", counting_run)
+
+    n, hc, d = 7, 3, 513
+    data, _ = baseline.build_inputs(
+        dict(n=n, hc=hc, d=d, layout="dense", injection="none"),
+        torch.float16,
+        gems.device,
+    )
+    residual, block, injection, _ = data
+    expected = reference(*data)
+    for _ in range(3):
+        out = residual.new_empty(residual.shape)
+        module._launch_hc_combine(
+            residual,
+            block,
+            injection,
+            out,
+            n,
+            d,
+            hc,
+            residual.stride(0),
+            block.stride(0),
+            0,
+        )
+        assert_result(out, expected)
+
+    # Only the cold launch compiles through LibEntry; the warm ones reuse it.
+    assert len(through_libentry) == 1
