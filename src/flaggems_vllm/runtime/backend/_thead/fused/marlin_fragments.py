@@ -125,12 +125,16 @@ def decode_i4_register(q, s0, s1):
 
 
 @triton.jit
-def decode_mx_register(q, s0, s1):
+def decode_mx_register(q, s0, s1, WIDE: tl.constexpr = False):
     codes = q & 0x7777
     low_bytes = byte_permute(0xC0800000, 0xC0804000, codes)
     high_bytes = byte_permute(0x3F3F3F00, 0x40404040, codes)
     signs = byte_permute(0x80808080, 0x80808080, q)
-    high_bytes = logic3(high_bytes, signs << 1, 0x80808080, 0xF8)
+    # Wide tiles reuse each decoded word across several MMA operations.
+    if WIDE:
+        high_bytes = logic3(high_bytes, signs << 1, 0x80808080, 0xF8)
+    else:
+        high_bytes |= (signs << 1) & 0x80808080
     return (
         multiply_bf16_pairs(byte_permute(low_bytes, high_bytes, 0x5140), s0),
         multiply_bf16_pairs(byte_permute(low_bytes, high_bytes, 0x7362), s1),
