@@ -4644,8 +4644,8 @@ def accumulate_quantized_wide_tile(
                         sub = group * 4 + part * 2 + half
                         lo, hi = q0 >> (half * 16), q8 >> (half * 16)
                         if MX:
-                            a2, a3 = decode_mx_register(hi, s1, s1)
                             a0, a1 = decode_mx_register(lo, s0, s0)
+                            a2, a3 = decode_mx_register(hi, s1, s1)
                         else:
                             a2, a3 = decode_i4_register(hi, s1, s1)
                             a0, a1 = decode_i4_register(lo, s0, s0)
