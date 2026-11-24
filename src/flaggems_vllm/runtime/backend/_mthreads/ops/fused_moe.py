@@ -3437,7 +3437,23 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
     # GEMM1, and reusing it here triggers an IMA on MUSA/Triton. It writes to
     # the cached mm2 buffer instead.
     if use_tle:
-        _tle_gemm(act, w2, mm2, m_indices, E, total, H, n_inter, STAGES=2)
+        # GEMM2 gets the same treatment: a 128x256 tile keeps the accumulator at
+        # 128 registers per thread once the consumer has 8 warps, and the K-loop
+        # is short (K = intermediate size), so two stages suffice.
+        wide2 = H % 256 == 0
+        _tle_gemm(
+            act,
+            w2,
+            mm2,
+            m_indices,
+            E,
+            total,
+            H,
+            n_inter,
+            STAGES=2,
+            BN=256 if wide2 else 128,
+            NUM_WARPS=8 if wide2 else 4,
+        )
     else:
         w2t = _dense_transpose_weights(w2)
         g2 = (total // BM) * triton.cdiv(H, 128)
