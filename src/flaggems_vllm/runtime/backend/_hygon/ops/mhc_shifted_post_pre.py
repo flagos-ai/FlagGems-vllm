@@ -292,10 +292,13 @@ def _project_rows(
     footprint is bounded by the tile size, not by H.
     """
     n_idx = tl.arange(0, HC)
-    comb_rows = 2 * HC + n_idx[:, None] * HC + n_idx[None, :]
+    # The comb block is loaded as one flat (HC*HC, BLOCK_F) tile: a 3D
+    # (HC, HC, BLOCK_F) product made the reduction layout-convert on every
+    # tile and cost ~10 us per decode call on BW1000.
+    comb_rows = 2 * HC + tl.arange(0, HC * HC)
     pre_acc = tl.zeros((HC,), dtype=tl.float32)
     post_acc = tl.zeros((HC,), dtype=tl.float32)
-    comb_acc = tl.zeros((HC, HC), dtype=tl.float32)
+    comb_acc = tl.zeros((HC * HC,), dtype=tl.float32)
     base = token * (HC * H)
     for f0 in range(0, H, BLOCK_F):
         offs = f0 + tl.arange(0, BLOCK_F)
@@ -318,12 +321,12 @@ def _project_rows(
             ).to(tl.float32)
             post_acc += tl.sum(post_t * a[None, :], axis=1)
             comb_t = tl.load(
-                fn_ptr + comb_rows[:, :, None] * fn_stride + cols[None, None, :],
-                mask=f_mask[None, None, :],
+                fn_ptr + comb_rows[:, None] * fn_stride + cols[None, :],
+                mask=f_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
-            comb_acc += tl.sum(comb_t * a[None, None, :], axis=2)
-    return pre_acc, post_acc, comb_acc
+            comb_acc += tl.sum(comb_t * a[None, :], axis=1)
+    return pre_acc, post_acc, tl.reshape(comb_acc, (HC, HC))
 
 
 @triton.jit
