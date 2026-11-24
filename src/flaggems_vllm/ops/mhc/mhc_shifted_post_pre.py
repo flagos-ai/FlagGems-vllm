@@ -561,6 +561,71 @@ def mhc_shifted_post_pre(
             mix_size,
         )
 
+    # MThreads (MUSA) hc=4 boundary: fuse post, collapse, row sum of squares
+    # and (for narrow rows) the norm into one token kernel, then run a packed
+    # split-K project plus one fused reduce/coefficient launch.  hc != 4 keeps
+    # the fully generic stages below.
+    if hc == 4 and runtime.device.vendor_name == "mthreads":
+        from flaggems_vllm.runtime.backend._mthreads.ops.mhc_shifted_post_pre import (
+            mhc_shifted_post_pre_mthreads,
+        )
+
+        return mhc_shifted_post_pre_mthreads(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix,
+            norm_weight,
+            norm_eps,
+            capture_aux,
+            num_tokens,
+            hc,
+            hidden_size,
+            mix_size,
+        )
+
+    # Hygon (gfx93x DCU) hc=4 boundary: fuse post with the collapse and the row
+    # sum of squares, then run a split-K project plus a combined
+    # reduce/coefficient kernel.  Decode-sized batches fold the projection and
+    # the coefficients into the token kernel and need only one launch.
+    # hc != 4 keeps the fully generic stages below.
+    if hc == 4 and runtime.device.vendor_name == "hygon":
+        from flaggems_vllm.runtime.backend._hygon.ops.mhc_shifted_post_pre import (
+            mhc_shifted_post_pre_hygon,
+        )
+
+        return mhc_shifted_post_pre_hygon(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix,
+            norm_weight,
+            norm_eps,
+            capture_aux,
+            num_tokens,
+            hc,
+            hidden_size,
+            mix_size,
+        )
+
     # (1) post, with the coefficients the previous boundary produced.  The
     # comb layout is vLLM's, which is mhc_post's TRANSPOSED default.
     residual_cur = mhc_post(

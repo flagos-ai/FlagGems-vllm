@@ -37,8 +37,13 @@ except ImportError:
 
 def _vllm_gemma_rms_norm(x, w, eps):
     """Reference using vllm.model_executor.layers.layernorm.GemmaRMSNorm."""
+    # vLLM's CustomOp must be instantiated inside a vLLM config context;
+    # newer vLLM raises "Current vLLM config is not set" otherwise.
+    from vllm.config import VllmConfig, set_current_vllm_config
+
     N = x.shape[-1]
-    norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
+    with set_current_vllm_config(VllmConfig()):
+        norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
     norm.weight = torch.nn.Parameter(w.float())
     norm = norm.to(x.device)
     with torch.inference_mode():

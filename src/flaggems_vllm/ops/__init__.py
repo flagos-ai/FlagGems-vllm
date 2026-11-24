@@ -38,6 +38,7 @@ from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
 )
 from flaggems_vllm.ops.cross_entropy_loss import cross_entropy_loss
 from flaggems_vllm.ops.cutlass_scaled_mm import cutlass_scaled_mm
+from flaggems_vllm.ops.deep_gemm_fp8_o_proj import deep_gemm_fp8_o_proj
 from flaggems_vllm.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
@@ -278,6 +279,7 @@ from flaggems_vllm.ops.kpool import (
     kpool_decode_update_and_maybe_write_cache_batched,
     kpool_seed_tail_cache,
 )
+from flaggems_vllm.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.ops.mhc_with_norm import (
     mhc_fused_post_pre_with_norm,
     mhc_pre_with_norm,
@@ -331,6 +333,7 @@ __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "cross_entropy_loss",
     "cutlass_scaled_mm",
+    "deep_gemm_fp8_o_proj",
     "dequantize_and_gather_k_cache",
     "dgeglu",
     "dispatch_fused_moe_kernel",
@@ -401,6 +404,7 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "mamba_mixer",
     "marlin_gemm",
     "matmul_persistent",
     "mhc_bwd",
