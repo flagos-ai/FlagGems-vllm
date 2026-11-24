@@ -2117,3 +2117,34 @@ def test_fused_marlin_moe_w8a16_int8_codes(num_tokens, hidden_size, ids_dtype, d
         hidden_states, *references, router_weights, expert_ids
     )
     gems_assert_close(output, reference, dtype, atol=0.02)
+
+
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend backend regression"
+)
+@pytest.mark.parametrize(
+    "bits",
+    [
+        pytest.param(4, marks=pytest.mark.fused_marlin_moe_w4a16),
+        pytest.param(8, marks=pytest.mark.fused_marlin_moe_w8a16),
+    ],
+)
+@torch.inference_mode()
+def test_ascend_marlin_inference_weight_updates(bits):
+    make_inputs, quant_type = (
+        (_make_inputs_w4a16_int4, QUANT_TYPE_UINT4B8)
+        if bits == 4
+        else (_make_inputs_w8a16_int8, QUANT_TYPE_UINT8B128)
+    )
+    hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
+        4, 3, 384, 128, 1, torch.bfloat16, flaggems_vllm.device
+    )
+    tw = tw.float()
+    args = (hs, w1, w2, None, None, s1, s2, tw, ti, quant_type)
+    expected = _reference_w8a16_grouped(hs, ref1, ref2, tw, ti)
+    actual = flaggems_vllm.fused_marlin_moe(*args)
+    assert compute_max_diff(actual.float(), expected) < 0.04
+    s2.zero_()
+    torch.testing.assert_close(
+        flaggems_vllm.fused_marlin_moe(*args), torch.zeros_like(hs), rtol=0, atol=0
+    )

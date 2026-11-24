@@ -7,7 +7,6 @@ FP16 weight decoding uses native INT8 conversion and FP16 multiplication.
 GEMM accumulation and router-weighted reduction use FP32.
 """
 
-import weakref
 from functools import lru_cache
 from typing import Callable, Optional
 
@@ -21,112 +20,8 @@ GROUP_SIZE = 128
 MAX_EXPERTS = 512
 MAX_HIDDEN_SIZE = 7168
 MAX_INTERMEDIATE_SIZE = 14336
-INT32_INDEX_LIMIT = 2**31
 EXACT_ROUTE_INDEX_LIMIT = 2**24
-
-
-@triton.jit
-def prepare_packed_kernel(
-    W,
-    S,
-    Q,
-    T,
-    Safe,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    BN: tl.constexpr,
-    TASKS: tl.constexpr,
-    BITS: tl.constexpr,
-):
-    PACK: tl.constexpr = 8 // BITS
-    BYTES: tl.constexpr = 128 // PACK
-    for pid in range(tl.program_id(0), TASKS, tl.num_programs(0)):
-        pn = pid % tl.cdiv(N, BN)
-        g = (pid // tl.cdiv(N, BN)) % (K // 128)
-        # Packed expert weights can exceed 2 GiB; widen before address products.
-        e = (pid // (tl.cdiv(N, BN) * (K // 128))).to(tl.int64)
-        ns = pn * BN + tl.arange(0, BN)
-        kh = tl.arange(0, BYTES)
-        v = tl.load(
-            W + (e * N + ns[:, None]) * (K // PACK) + g * BYTES + kh[None, :],
-            ns[:, None] < N,
-            other=0,
-        )
-        tl.store(
-            Q + ((e * (K // 128) + g) * N + ns[:, None]) * BYTES + kh[None, :],
-            v ^ (0x88 if BITS == 4 else 0x80),
-            ns[:, None] < N,
-        )
-        s = tl.load(S + e * N * (K // 128) + ns * (K // 128) + g, ns < N, other=0)
-        tl.store(T + (e * (K // 128) + g) * N + ns, s, ns < N)
-        magnitude = tl.abs(s.to(tl.float32))
-        safe = (magnitude == 0) | (
-            (magnitude >= 0.00006103515625) & (magnitude <= 4096.0)
-        )
-        flag = tl.min(tl.where(ns < N, safe, True).to(tl.int32), 0)
-        tl.store(Safe + (e * (K // 128) + g) * tl.cdiv(N, BN) + pn, flag)
-
-
-weight_cache = {}
-
-
-def prepare_weights(weight, scale, bits=4):
-    key = (id(weight), id(scale), bits)
-    version = (weight._version, scale._version, weight.data_ptr(), scale.data_ptr())
-    item = weight_cache.get(key)
-    if (
-        item is not None
-        and item[0]() is weight
-        and item[1]() is scale
-        and item[2] == version
-    ):
-        return item[3:]
-    expert_count, output_features, packed_k = weight.shape
-    hidden_size = packed_k * (8 // bits)
-    group_count = hidden_size // GROUP_SIZE
-    packed_group = GROUP_SIZE // (8 // bits)
-    tile_n = 32
-    packed = torch.empty(
-        (expert_count, group_count, output_features, packed_group),
-        device=weight.device,
-        dtype=torch.uint8,
-    )
-    grouped_scale = torch.empty(
-        (expert_count, group_count, output_features),
-        device=scale.device,
-        dtype=scale.dtype,
-    )
-    scale_is_fast = torch.empty(
-        (expert_count, group_count, triton.cdiv(output_features, tile_n)),
-        device=weight.device,
-        dtype=torch.int32,
-    )
-    tasks = expert_count * group_count * triton.cdiv(output_features, tile_n)
-    prepare_packed_kernel[(min(tasks, 1024),)](
-        weight,
-        scale,
-        packed,
-        grouped_scale,
-        scale_is_fast,
-        output_features,
-        hidden_size,
-        tile_n,
-        tasks,
-        bits,
-    )
-
-    def _drop_cached_weight(_weight_ref):
-        weight_cache.pop(key, None)
-
-    weight_cache[key] = (
-        weakref.ref(weight, _drop_cached_weight),
-        weakref.ref(scale, _drop_cached_weight),
-        version,
-        packed,
-        grouped_scale,
-        scale_is_fast,
-    )
-    return packed, grouped_scale, scale_is_fast
+GROUPED_WORKSPACE_BYTES = 1 << 30
 
 
 @triton.jit
@@ -582,11 +477,10 @@ def dequantize_adaptive_task(
     ns = tl.arange(0, CB)
     kk = tl.arange(0, 128)
     for kb in range(K // 128):
-        base = (expert.to(tl.int64) * (K // 128) + kb) * N + col + SUB * VBN
         for chunk in range(VBN // CB):
-            q = tl.load(Q + (base + chunk * CB) * 128 + tl.arange(0, CB * 128))
-            scale = tl.load(S + base + chunk * CB + ns)
-            value = dequantize_tile(q, scale, CB, 8)
+            value = load_weight_tile(
+                Q, S, expert, col + SUB * VBN + chunk * CB, kb, N, K, CB, 8
+            )
             if iteration >= 2 and chunk == 0:
                 al.sync_block_wait(
                     "cube",
@@ -769,12 +663,31 @@ def cube_gemm(
 
 
 @triton.jit
-def dequantize_tile(q, scales, RB: tl.constexpr, BITS: tl.constexpr):
+def load_weight_tile(
+    Q,
+    S,
+    expert,
+    col,
+    kb,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    RB: tl.constexpr,
+    BITS: tl.constexpr,
+):
+    group_bytes: tl.constexpr = 128 // (8 // BITS)
+    groups: tl.constexpr = K // 128
+    rows = expert.to(tl.int64) * N + col + tl.arange(0, RB)
+    group = rows * groups + kb
+    codes = tl.load(
+        Q + group[:, None] * group_bytes + tl.arange(0, group_bytes)[None, :]
+    )
+    # The public layout uses offset-binary codes, packed low nibble first for INT4.
+    q = tl.reshape(codes ^ (0x88 if BITS == 4 else 0x80), (RB * group_bytes,))
+    scales = tl.load(S + group)
     if BITS == 4:
         h = tl.full((RB * 128,), 0, tl.float16)
         h = al.custom("cast_int4_to_fp16", q, 0, RB * 128, out=h)
     else:
-        # Preparation converts offset-binary UINT8 codes to signed INT8 bits.
         h = q.to(tl.int8, bitcast=True).to(tl.float16)
     values_h = tl.reshape(h, (RB, 128))
     if scales.dtype == tl.float16:
@@ -787,191 +700,9 @@ def dequantize_tile(q, scales, RB: tl.constexpr, BITS: tl.constexpr):
 
 
 @triton.jit
-def copy_quant_matrix(
-    Source, destination, offset, ROWS: tl.constexpr, COLS: tl.constexpr = 128
-):
-    source = tl.make_block_ptr(
-        base=Source + offset,
-        shape=(ROWS, COLS),
-        strides=(COLS, 1),
-        offsets=(0, 0),
-        block_shape=(ROWS, COLS),
-        order=(1, 0),
-    )
-    tle.dsa.copy(source, destination, [ROWS, COLS])
-
-
-@triton.jit
-def store_pipeline_chunk(
-    Work,
-    value,
-    PID,
-    SUB,
-    iteration,
-    chunk,
-    BN: tl.constexpr,
-    CB: tl.constexpr,
-    CHUNKS: tl.constexpr,
-):
-    STAGES: tl.constexpr = 4 if Work.dtype.element_ty == tl.float16 and BN == 512 else 2
-    tl.static_assert((STAGES & (STAGES - 1)) == 0)
-    ns = tl.arange(0, CB)
-    kk = tl.arange(0, 128)
-    if iteration >= STAGES and chunk == 0:
-        al.sync_block_wait(
-            "cube",
-            "vector",
-            3,
-            sender_pipe=al.PIPE.PIPE_MTE2,
-            receiver_pipe=al.PIPE.PIPE_MTE3,
-        )
-    offset = (
-        (PID * STAGES + (iteration & (STAGES - 1))) * BN * 128
-        + SUB * (BN // 2) * 128
-        + chunk * CB * 128
-    )
-    tl.store(Work + offset + ns[:, None] * 128 + kk[None, :], value)
-    if chunk == CHUNKS - 1:
-        al.sync_block_set(
-            "vector",
-            "cube",
-            2,
-            sender_pipe=al.PIPE.PIPE_MTE3,
-            receiver_pipe=al.PIPE.PIPE_MTE2,
-        )
-        iteration += 1
-    return iteration
-
-
-@triton.jit
-def dequantize_int8_pipeline(
-    Q,
-    S,
-    Experts,
-    Work,
-    PID,
-    SUB,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    BN: tl.constexpr,
-    TASKS: tl.constexpr,
-    GRID: tl.constexpr,
-    MERGE: tl.constexpr,
-):
-    STAGES: tl.constexpr = 4 if Work.dtype.element_ty == tl.float16 and BN == 512 else 2
-    tl.static_assert((STAGES & (STAGES - 1)) == 0)
-    VBN: tl.constexpr = BN // 2
-    CB: tl.constexpr = VBN if VBN < 128 else 128
-    CHUNKS: tl.constexpr = VBN // CB
-    TOTAL: tl.constexpr = K // 128 * CHUNKS
-    q0 = tle.dsa.alloc((CB, 128), tl.uint8, tle.dsa.ascend.UB)
-    q1 = tle.dsa.alloc((CB, 128), tl.uint8, tle.dsa.ascend.UB)
-    s0 = tle.dsa.alloc((CB, 1), Work.dtype.element_ty, tle.dsa.ascend.UB)
-    s1 = tle.dsa.alloc((CB, 1), Work.dtype.element_ty, tle.dsa.ascend.UB)
-    iteration = 0
-    for task in range(PID, TASKS, GRID):
-        tile = task // (N // BN)
-        pn = task % (N // BN) * 2 + SUB
-        expert = tl.load(Experts + tile)
-        active = expert >= 0
-        if MERGE:
-            previous = tile - 1
-            local_tile = 0
-            same = active
-            while (previous >= 0) & same:
-                before = tl.load(Experts + previous)
-                same = before == expert
-                local_tile += same.to(tl.int32)
-                previous -= 1
-            active = active & (local_tile % 2 == 0)
-        if active:
-            start = expert.to(tl.int64) * (K // 128) * N + pn * VBN
-            copy_quant_matrix(Q, q0, start * 128, CB)
-            copy_quant_matrix(S, s0, start, CB, 1)
-            for pair in range(tl.cdiv(TOTAL, 2)):
-                j = pair * 2
-                if j + 1 < TOTAL:
-                    next_row = (
-                        (expert.to(tl.int64) * (K // 128) + (j + 1) // CHUNKS) * N
-                        + pn * VBN
-                        + (j + 1) % CHUNKS * CB
-                    )
-                    copy_quant_matrix(Q, q1, next_row * 128, CB)
-                    copy_quant_matrix(S, s1, next_row, CB, 1)
-                h0 = dequantize_tile(
-                    tle.dsa.to_tensor(q0, writable=False),
-                    tle.dsa.to_tensor(s0, writable=False),
-                    CB,
-                    8,
-                )
-                if Work.dtype.element_ty == tl.float16 and CHUNKS == 2:
-                    split_ns = tl.arange(0, CB)
-                    split_ks = tl.arange(0, 128)
-                    if iteration >= STAGES:
-                        al.sync_block_wait(
-                            "cube",
-                            "vector",
-                            3,
-                            sender_pipe=al.PIPE.PIPE_MTE2,
-                            receiver_pipe=al.PIPE.PIPE_MTE3,
-                        )
-                    split_offset = (
-                        PID * STAGES + (iteration & (STAGES - 1))
-                    ) * BN * 128 + SUB * VBN * 128
-                    tl.store(
-                        Work
-                        + split_offset
-                        + split_ns[:, None] * 128
-                        + split_ks[None, :],
-                        h0,
-                        split_ns[:, None] < 112,
-                    )
-                else:
-                    iteration = store_pipeline_chunk(
-                        Work, h0, PID, SUB, iteration, j % CHUNKS, BN, CB, CHUNKS
-                    )
-                if j + 2 < TOTAL:
-                    next_row = (
-                        (expert.to(tl.int64) * (K // 128) + (j + 2) // CHUNKS) * N
-                        + pn * VBN
-                        + (j + 2) % CHUNKS * CB
-                    )
-                    copy_quant_matrix(Q, q0, next_row * 128, CB)
-                    copy_quant_matrix(S, s0, next_row, CB, 1)
-                if j + 1 < TOTAL:
-                    h1 = dequantize_tile(
-                        tle.dsa.to_tensor(q1, writable=False),
-                        tle.dsa.to_tensor(s1, writable=False),
-                        CB,
-                        8,
-                    )
-                    if Work.dtype.element_ty == tl.float16 and CHUNKS == 2:
-                        tl.store(
-                            Work
-                            + split_offset
-                            + split_ns[:, None] * 128
-                            + split_ks[None, :],
-                            h0,
-                            split_ns[:, None] >= 112,
-                        )
-                    iteration = store_pipeline_chunk(
-                        Work, h1, PID, SUB, iteration, (j + 1) % CHUNKS, BN, CB, CHUNKS
-                    )
-    for _ in range(tl.minimum(iteration, STAGES)):
-        al.sync_block_wait(
-            "cube",
-            "vector",
-            3,
-            sender_pipe=al.PIPE.PIPE_MTE2,
-            receiver_pipe=al.PIPE.PIPE_MTE3,
-        )
-
-
-@triton.jit
 def dequantize_weights(
     Q,
     S,
-    Safe,
     Experts,
     Work,
     PID,
@@ -986,14 +717,11 @@ def dequantize_weights(
 ):
     STAGES: tl.constexpr = 4 if Work.dtype.element_ty == tl.float16 and BN == 512 else 2
     tl.static_assert((STAGES & (STAGES - 1)) == 0)
-    BYTES: tl.constexpr = 128 // (8 // BITS)
     VBN: tl.constexpr = BN // 2
-    # Keep INT4's existing UB bound; INT8's native cast permits the full Vector tile.
-    CB: tl.constexpr = (
-        VBN
-        if BITS == 8 and Work.dtype.element_ty == tl.float16
-        else 64 if VBN > 64 else VBN
+    MAX_ROWS: tl.constexpr = (
+        128 if BITS == 8 and Work.dtype.element_ty == tl.float16 else 64
     )
+    CB: tl.constexpr = VBN if VBN <= MAX_ROWS else MAX_ROWS
     ns = tl.arange(0, CB)
     ks = tl.arange(0, 128)
     iteration = 0
@@ -1014,13 +742,10 @@ def dequantize_weights(
             active = active & (local_tile % 2 == 0)
         if active:
             for kb in range(K // 128):
-                base = (expert.to(tl.int64) * (K // 128) + kb) * N + pn * VBN
                 for chunk in range(VBN // CB):
-                    packed = tl.load(
-                        Q + (base + chunk * CB) * BYTES + tl.arange(0, CB * BYTES)
+                    result = load_weight_tile(
+                        Q, S, expert, pn * VBN + chunk * CB, kb, N, K, CB, BITS
                     )
-                    scale = tl.load(S + base + chunk * CB + ns)
-                    result = dequantize_tile(packed, scale, CB, BITS)
                     # Wait once before overwriting either half of the GM stage.
                     if iteration >= STAGES and chunk == 0:
                         tle.dsa.ascend.sync_block_wait(
@@ -1124,7 +849,6 @@ def gemm_kernel(
     A,
     Q,
     S,
-    Safe,
     Experts,
     Work,
     Output,
@@ -1226,28 +950,10 @@ def gemm_kernel(
                 TASKS,
                 GRID,
             )
-        elif (
-            BITS == 8 and BM <= 64 and Work.dtype.element_ty == tl.float16 and BN == 512
-        ):
-            dequantize_int8_pipeline(
-                Q,
-                S,
-                Experts,
-                Work,
-                tl.program_id(0),
-                tle.dsa.ascend.sub_vec_id(),
-                N,
-                K,
-                BN,
-                TASKS,
-                GRID,
-                MERGE,
-            )
         else:
             dequantize_weights(
                 Q,
                 S,
-                Safe,
                 Experts,
                 Work,
                 tl.program_id(0),
@@ -1404,12 +1110,9 @@ def expert_panel_kernel(
                     )
                 vector_stage = (pid * STAGES + vector_iteration % STAGES) * BN * K
                 for kb in range(K // 128):
-                    base = (
-                        vector_expert.to(tl.int64) * (K // 128) + kb
-                    ) * N + vector_col
-                    codes = tl.load(Q + base * 128 + tl.arange(0, VBN * 128))
-                    scales = tl.load(S + base + ns)
-                    decoded = dequantize_tile(codes, scales, VBN, 8)
+                    decoded = load_weight_tile(
+                        Q, S, vector_expert, vector_col, kb, N, K, VBN, 8
+                    )
                     if kb >= 2:
                         al.sync_block_wait(
                             "cube",
@@ -1481,7 +1184,6 @@ def grouped_quantized_gemm(
         and n == 512
         and w.shape[0] >= cores
     ):
-        q, scale, safe = prepare_weights(w, s, bits)
         panel_bn = 256
         panel_grid = min(w.shape[0] * (n // panel_bn), cores)
         panel_work = torch.empty(
@@ -1489,8 +1191,8 @@ def grouped_quantized_gemm(
         )
         expert_panel_kernel[(panel_grid,)](
             a,
-            q,
-            scale,
+            w,
+            s,
             counts,
             offsets,
             panel_work,
@@ -1528,7 +1230,6 @@ def grouped_quantized_gemm(
     grid = min(tasks, cores)
     if merge and k == 4096:
         grid = min(grid, 19)
-    q, scale, safe = prepare_weights(w, s, bits)
     stages = 4 if a.dtype == torch.float16 and bn == 512 else 2
     work = torch.empty(
         (grid * stages * (512 if tail_tiles else bn) * 128,),
@@ -1537,9 +1238,8 @@ def grouped_quantized_gemm(
     )
     gemm_kernel[(grid,)](
         a,
-        q,
-        scale,
-        safe,
+        w,
+        s,
         experts,
         work,
         out,
@@ -1569,10 +1269,8 @@ def small_fused_kernel(
     X,
     Q1,
     S1,
-    F1,
     Q2,
     S2,
-    F2,
     IDs,
     P,
     EP,
@@ -1655,7 +1353,6 @@ def small_fused_kernel(
         dequantize_weights(
             Q1,
             S1,
-            F1,
             ep,
             work,
             pid,
@@ -1684,7 +1381,6 @@ def small_fused_kernel(
         dequantize_weights(
             Q2,
             S2,
-            F2,
             ep,
             work,
             pid,
@@ -1731,7 +1427,7 @@ def small_route_workspace_sizes(
     return sizes
 
 
-def small_route_moe(x, w1, w2, s1, s2, p, ids, bits=4):
+def small_route_moe(x, w1, w2, s1, s2, p, ids, out, bits):
     m, k = x.shape
     n = w1.shape[1] // 2
     t = ids.shape[1]
@@ -1747,20 +1443,15 @@ def small_route_moe(x, w1, w2, s1, s2, p, ids, bits=4):
     )
     wide_second = bits == 8 and x.dtype == torch.float16 and k == 4096 and n == 256
     sizes = small_route_workspace_sizes(m, k, n, t, g, bits, wide_first, wide_second)
-    q1, s1, f1 = prepare_weights(w1, s1, bits)
-    q2, s2, f2 = prepare_weights(w2, s2, bits)
     meta = torch.empty(m * t, device=x.device, dtype=torch.int32)
     # Direct typed allocations avoid unsupported pointer casts and view-dispatch overhead.
     buffers = [torch.empty(size, device=x.device, dtype=x.dtype) for size in sizes]
-    out = torch.empty_like(x)
     small_fused_kernel[(g,)](
         x,
-        q1,
+        w1,
         s1,
-        f1,
-        q2,
+        w2,
         s2,
-        f2,
         ids,
         p,
         meta,
@@ -1779,7 +1470,6 @@ def small_route_moe(x, w1, w2, s1, s2, p, ids, bits=4):
         enable_fp_fusion=False,
         multibuffer=False,
     )
-    return out
 
 
 @triton.jit
@@ -2230,21 +1920,97 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
         raise ValueError("top_k must be positive")
     if x.requires_grad:
         raise NotImplementedError("Forward inference only")
+    out = torch.empty_like(x)
     if m == 0:
-        return torch.empty((m, k), device=x.device, dtype=x.dtype)
-    # Wide weights favor grouped reuse over one padded GEMM tile per route.
+        return out
+
     small_routes = 16 if n >= 2048 else 64
     if n > 4096:
         small_routes = min(small_routes, max(e - 1, 1))
-    if m * t <= small_routes:
-        return small_route_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits)
-    out = torch.empty((m, k), device=x.device, dtype=x.dtype)
+    cores = triton.runtime.driver.active.utils.get_device_properties(x.device.index)[
+        "num_aicore"
+    ]
+    start = 0
+    batch = m
+    while start < m:
+        batch = min(batch, m - start)
+        r = batch * t
+        if r > small_routes:
+            bm, use_small_m, padded = grouped_route_geometry(
+                batch, t, e, k, n, bits, x.dtype
+            )
+            # packed_x and the down projection share storage. Both GEMMs run on the
+            # same stream, so only the larger of their decode workspaces is live.
+            panel = (
+                bits == 8
+                and x.dtype == torch.float16
+                and k == 4096
+                and n == 256
+                and bm == 128
+                and r >= e * 256
+            )
+            decode_bytes = cores * (256 * k if panel else 4 * 512 * GROUP_SIZE) * 2
+            workspace = (
+                padded * (k + 3 * n) * 2
+                + decode_bytes
+                + 4
+                * (
+                    e * r
+                    + r
+                    + 2 * e
+                    + 1
+                    + padded // bm
+                    + (r if topk_ids.dtype == torch.int64 else 0)
+                )
+            )
+            if workspace > GROUPED_WORKSPACE_BYTES or r >= EXACT_ROUTE_INDEX_LIMIT:
+                if batch == 1:
+                    raise NotImplementedError(
+                        "One token exceeds the Ascend MoE workspace or indexing limit"
+                    )
+                batch = (batch + 1) // 2
+                continue
+        end = start + batch
+        ids = topk_ids[start:end]
+        if ids.dtype == torch.int64:
+            ids32 = torch.empty((batch, t), device=x.device, dtype=torch.int32)
+            cast_expert_ids[(triton.cdiv(r, 1024),)](ids, ids32, r, 1024)
+            ids = ids32
+            del ids32
+        if r <= small_routes:
+            small_route_moe(
+                x[start:end],
+                w1,
+                w2,
+                s1,
+                s2,
+                topk_weights[start:end],
+                ids,
+                out[start:end],
+                bits,
+            )
+        else:
+            grouped_route_moe(
+                x[start:end],
+                w1,
+                w2,
+                s1,
+                s2,
+                topk_weights[start:end],
+                ids,
+                out[start:end],
+                bits,
+                bm,
+                use_small_m,
+                padded,
+            )
+        del ids
+        start = end
+    return out
 
+
+def grouped_route_geometry(m, t, e, k, n, bits, dtype):
     r = m * t
-    routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
-    counts = torch.empty((e,), device=x.device, dtype=torch.int32)
-    route_experts(topk_ids, routes, counts)
-    # Dense expert batches amortize dequantization with a larger M tile.
     bm = (
         128
         if m >= 8192 or (n > 4096 and r >= e * 64)
@@ -2252,7 +2018,7 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     )
     use_small_m = (
         bits == 8
-        and x.dtype == torch.float16
+        and dtype == torch.float16
         and k == 4096
         and n == 256
         and bm in (16, 32)
@@ -2260,14 +2026,21 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     )
     if use_small_m:
         bm = 16
-    padded = triton.cdiv(r + e * (bm - 1), bm) * bm
-    if (
-        max(e * r, padded * k, padded * 2 * n) >= INT32_INDEX_LIMIT
-        or r >= EXACT_ROUTE_INDEX_LIMIT
-    ):
-        raise NotImplementedError(
-            "Geometry exceeds 32-bit addressing or exact routing-index limits"
-        )
+    padded = triton.cdiv(r + min(e, r) * (bm - 1), bm) * bm
+    return bm, use_small_m, padded
+
+
+def grouped_route_moe(
+    x, w1, w2, s1, s2, topk_weights, topk_ids, out, bits, bm, use_small_m, padded
+):
+    m, k = x.shape
+    e, n2, _ = w1.shape
+    n = n2 // 2
+    t = topk_ids.shape[1]
+    r = m * t
+    routes = torch.empty((e, r), device=x.device, dtype=torch.int32)
+    counts = torch.empty((e,), device=x.device, dtype=torch.int32)
+    route_experts(topk_ids, routes, counts)
     offsets = torch.empty((e + 1,), device=x.device, dtype=torch.int32)
     experts = torch.empty((padded // bm,), device=x.device, dtype=torch.int32)
     inv = torch.empty((r,), device=x.device, dtype=torch.int32)
@@ -2278,7 +2051,11 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     )
     h = torch.empty((padded, 2 * n), device=x.device, dtype=x.dtype)
     a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
-    z = torch.empty((padded, k), device=x.device, dtype=x.dtype)
+    z = (
+        packed_x
+        if packed_x is not None
+        else torch.empty((padded, k), device=x.device, dtype=x.dtype)
+    )
     write_expert_offsets[1,](counts, offsets, e, triton.next_power_of_2(e), bm)
     if bits == 8 and k == 4096:
         if (
@@ -2392,7 +2169,6 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     )
     grouped_quantized_gemm(a, w2, s2, experts, z, bm, bits)
     combine_expert_outputs(z, topk_weights, out, inv)
-    return out
 
 
 def fused_marlin_moe(
@@ -2490,12 +2266,6 @@ def fused_marlin_moe(
         raise NotImplementedError("Ascend BF16 or FP16 activations are required")
     if topk_ids.device != hidden_states.device or not topk_ids.is_contiguous():
         raise NotImplementedError("Routing IDs must be contiguous on the input NPU")
-    if topk_ids.dtype == torch.int64 and topk_ids.numel() > 0:
-        ids32 = torch.empty(topk_ids.shape, device=topk_ids.device, dtype=torch.int32)
-        cast_expert_ids[(triton.cdiv(topk_ids.numel(), 1024),)](
-            topk_ids, ids32, topk_ids.numel(), 1024
-        )
-        topk_ids = ids32
     bits = 4 if quant_type_id == QUANT_TYPE_UINT4B8 else 8
     return run_quantized_moe(
         hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, bits
