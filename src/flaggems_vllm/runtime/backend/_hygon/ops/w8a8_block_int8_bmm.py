@@ -37,6 +37,8 @@ _H1_TUNED_INTEGER_CONFIGS = {
     64: (16, 32, 4, 2, False),
     72: (16, 64, 4, 2, False),
     80: (16, 64, 4, 2, False),
+    88: (16, 64, 4, 2, False),
+    96: (16, 64, 4, 2, False),
     112: (64, 64, 4, 4, True),
     136: (32, 64, 4, 2, False),
     144: (32, 64, 4, 2, False),
@@ -44,6 +46,7 @@ _H1_TUNED_INTEGER_CONFIGS = {
     400: (64, 64, 2, 4, False),
     416: (64, 64, 2, 4, False),
     448: (64, 64, 2, 4, True),
+    464: (64, 64, 1, 4, False),
 }
 
 
@@ -738,33 +741,43 @@ def _integer_factor_body(
     # Keep activation rows on the dot's column axis to reduce register
     # pressure in the broadcast shift-add and improve the MMAC feed layout.
     acc = tl.zeros((BN, BM), tl.int32)
-    for outer in range(8):
-        if INLINE_EXPONENTS:
-            words = tl.where(outer < 4, WORD0, WORD1) >> ((outer % 4) * 8)
-        else:
-            xp = tl.load(P + rm * 8 + outer, rm < M, other=0).to(tl.uint32)
-            wp = tl.load(P + (M + PN) * 8 + outer).to(tl.uint32)
-            words = xp + wp
-        for sub in tl.range(4, loop_unroll_factor=INNER, num_stages=IST):
-            kk = (outer * 4 + sub) * 128 + rk
-            a = tl.load(W + rn[:, None] * 4096 + kk[None, :])
-            if ALIGNED:
-                w = tl.load(A + rm[None, :] * 4096 + kk[:, None])
+    LONG_LOOP: tl.constexpr = INLINE_EXPONENTS and (
+        M == 2048 or M == 4096 or M == 16384
+    )
+    for page in tl.static_range(2 if LONG_LOOP else 1):
+        if LONG_LOOP:
+            words = WORD0 if page == 0 else WORD1
+        for outer in range(1 if LONG_LOOP else 8):
+            if INLINE_EXPONENTS:
+                if not LONG_LOOP:
+                    words = tl.where(outer < 4, WORD0, WORD1) >> ((outer % 4) * 8)
             else:
-                w = tl.load(
-                    A + rm[None, :] * 4096 + kk[:, None], rm[None, :] < M, other=0
+                xp = tl.load(P + rm * 8 + outer, rm < M, other=0).to(tl.uint32)
+                wp = tl.load(P + (M + PN) * 8 + outer).to(tl.uint32)
+                words = xp + wp
+            for sub in tl.range(
+                16 if LONG_LOOP else 4, loop_unroll_factor=INNER, num_stages=IST
+            ):
+                group = page * 16 + sub if LONG_LOOP else outer * 4 + sub
+                kk = group * 128 + rk
+                a = tl.load(W + rn[:, None] * 4096 + kk[None, :])
+                if ALIGNED:
+                    w = tl.load(A + rm[None, :] * 4096 + kk[:, None])
+                else:
+                    w = tl.load(
+                        A + rm[None, :] * 4096 + kk[:, None], rm[None, :] < M, other=0
+                    )
+                part = tl.dot(a, w, out_dtype=tl.int32)
+                shifts = words & 3 if INLINE_EXPONENTS else words
+                acc = tl.inline_asm_elementwise(
+                    "v_lshl_add_u32 $0, $1, $2, $3",
+                    "=v,v,v,v",
+                    [part, shifts[None, :], acc],
+                    dtype=tl.int32,
+                    is_pure=True,
+                    pack=1,
                 )
-            part = tl.dot(a, w, out_dtype=tl.int32)
-            shifts = words & 3 if INLINE_EXPONENTS else words
-            acc = tl.inline_asm_elementwise(
-                "v_lshl_add_u32 $0, $1, $2, $3",
-                "=v,v,v,v",
-                [part, shifts[None, :], acc],
-                dtype=tl.int32,
-                is_pure=True,
-                pack=1,
-            )
-            words = words >> (2 if INLINE_EXPONENTS else 8)
+                words = words >> (2 if INLINE_EXPONENTS else 8)
     if INLINE_EXPONENTS:
         scale = (emin << 23).to(tl.float32, bitcast=True)
         value = acc.to(tl.float32) * scale[None, :]
@@ -1389,7 +1402,7 @@ def _int8_block_bmm(
             )
             return out
         if (
-            8 <= m <= 48
+            (m == 4 or 8 <= m <= 48)
             and (batch, n, k, sm, sn) == (1, 1024, 4096, 1, 128)
             and A.stride()[1:] == (4096, 1)
             and B.stride()[1:] == (1, 4096)
@@ -1421,6 +1434,11 @@ def _int8_block_bmm(
                 num_warps=2,
                 num_stages=2,
                 kpack=2,
+                PACK_SCALE_PAIRS=(
+                    m == 40
+                    and A_scale.data_ptr() % 8 == 0
+                    and B_scale.data_ptr() % 8 == 0
+                ),
             )
             return out
         if (
@@ -1479,6 +1497,13 @@ def _int8_block_bmm(
             return out
         a_scale_stride = A_scale.stride()
         integer_cfg = _H1_TUNED_INTEGER_CONFIGS.get(m)
+        if integer_cfg is None and 104 < m <= 192:
+            split = 5 if m <= 128 else 3
+            bm = 32 if 128 < m <= 160 else 64
+            integer_cfg = (bm, 64, split, 2 if bm == 32 else 4, False)
+            integer_path = 0
+        else:
+            integer_path = 3 if integer_cfg is not None and integer_cfg[-1] else 2
         if (
             integer_cfg is not None
             and (batch, n, k, sm, sn, sk) == (1, 1024, 4096, 1, 128, 128)
@@ -1491,14 +1516,17 @@ def _int8_block_bmm(
             and out_dtype in (torch.bfloat16, torch.float32)
             and not torch.cuda.is_current_stream_capturing()
         ):
-            bm, bn, split, warps, combined = integer_cfg
+            bm, bn, split, warps, _ = integer_cfg
+            tile_count = triton.cdiv(m, bm) * (1024 // bn)
             if split > 1:
                 partial, counter = _single_head_uneven_split_workspace(
                     A.device, torch.cuda.current_stream(A.device).cuda_stream
                 )
+                assert tile_count <= counter.numel()
+                assert tile_count * split * bm * bn <= partial.numel()
             else:
                 partial, counter = None, None
-            int8_single_head_integer_kernel[(triton.cdiv(m, bm) * (1024 // bn), split)](
+            int8_single_head_integer_kernel[(tile_count, split)](
                 A,
                 B,
                 A_scale,
@@ -1516,49 +1544,8 @@ def _int8_block_bmm(
                 Partial=partial,
                 Counter=counter,
                 SPLIT_K=split,
-                PATH=3 if combined else 2,
+                PATH=integer_path,
                 num_warps=warps,
-                num_stages=1,
-                kpack=2,
-            )
-            return out
-        if (
-            104 < m <= 192
-            and (batch, n, k, sm, sn, sk) == (1, 1024, 4096, 1, 128, 128)
-            and A.dtype == B.dtype == torch.int8
-            and A.stride()[1:] == (4096, 1)
-            and B.stride()[1:] == (1, 4096)
-            and a_scale_stride[1:] == (32, 1)
-            and B_scale.stride()[1:] == (1, 32)
-            and out.stride()[1:] == (1024, 1)
-            and A_scale.dtype == B_scale.dtype == torch.float32
-            and out_dtype in (torch.bfloat16, torch.float32)
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            partial, counter = _single_head_uneven_split_workspace(
-                A.device, torch.cuda.current_stream(A.device).cuda_stream
-            )
-            split = 5 if m <= 128 else 3
-            bm = 32 if 128 < m <= 160 else 64
-            int8_single_head_integer_kernel[(triton.cdiv(m, bm) * 16, split)](
-                A,
-                B,
-                A_scale,
-                B_scale,
-                out,
-                m,
-                32,
-                1,
-                32,
-                1,
-                BM=bm,
-                BN=64,
-                GM=4,
-                STAGES=2,
-                Partial=partial,
-                Counter=counter,
-                SPLIT_K=split,
-                num_warps=2 if bm == 32 else 4,
                 num_stages=1,
                 kpack=2,
             )
@@ -1610,6 +1597,7 @@ def _int8_block_bmm(
             and out.stride()[1:] == (1024, 1)
             and A_scale.dtype == B_scale.dtype == torch.float32
         ):
+            prefetch = m in (432,) and out_dtype in (torch.bfloat16, torch.float32)
             int8_single_head_integer_kernel[(triton.cdiv(m, 64) * 16,)](
                 A,
                 B,
@@ -1625,8 +1613,9 @@ def _int8_block_bmm(
                 BN=64,
                 GM=4,
                 STAGES=2,
+                PATH=2 if prefetch else 0,
                 num_warps=4,
-                num_stages=2,
+                num_stages=1 if prefetch else 2,
                 kpack=1,
             )
             return out
@@ -1663,7 +1652,7 @@ def _int8_block_bmm(
             (
                 m == 1028
                 or (
-                    m in (2048, 3076, 3805, 4100)
+                    m in (2048, 3076, 3805, 4096, 4100, 16384)
                     and out_dtype in (torch.bfloat16, torch.float32)
                 )
             )
@@ -1690,9 +1679,13 @@ def _int8_block_bmm(
                 BN=128,
                 GM=4,
                 STAGES=2,
-                PATH=(4 if m in (3076, 3805, 4100) else 5 if m == 1028 else True),
+                PATH=(
+                    4
+                    if m in (3076, 3805, 4096, 4100, 16384)
+                    else 5 if m == 1028 else True
+                ),
                 num_warps=8,
-                num_stages=1 if m in (2048, 3076, 3805, 4100) else 2,
+                num_stages=1 if m in (2048, 3076, 3805, 4096, 4100, 16384) else 2,
                 kpack=1,
             )
             return out
@@ -1941,6 +1934,7 @@ def int8_single_head_split_float_kernel(
     XSK: tl.constexpr,
     BN: tl.constexpr,
     SPLIT: tl.constexpr,
+    PACK_SCALE_PAIRS: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     split = tl.program_id(1)
@@ -1949,36 +1943,123 @@ def int8_single_head_split_float_kernel(
     row = pm * 16 + tl.arange(0, 16)
     col = pn * BN + tl.arange(0, BN)
     rk = tl.arange(0, 128)
-    ap = A + row[:, None] * 4096 + rk[None, :]
+    CLAMP_ROWS: tl.constexpr = M == 24 or M == 40
+    UNMASK_ROWS: tl.constexpr = M % 16 == 0 or CLAMP_ROWS
+    safe_row = tl.minimum(row, M - 1) if CLAMP_ROWS else row
+    ap = A + safe_row[:, None] * 4096 + rk[None, :]
     wp = W + col[None, :] * 4096 + rk[:, None]
-    asp = XS + row * XSM
+    asp = XS + safe_row * XSM
     wsp = WS + (pn * BN // 128) * 32
-    acc = tl.zeros((16, BN), tl.float32)
-    # OR only predicates; combining float exponent bits can create false alarms.
-    scale_limit: tl.constexpr = 18446744073709551616.0
-    unsafe_flags = tl.zeros((16,), tl.int32)
-    for pair in tl.range(16 // SPLIT, num_stages=2):
-        group = split * (32 // SPLIT) + pair * 2
-        groups = group + tl.arange(0, 2)
-        if M % 16 == 0:
-            xs = tl.load(asp[:, None] + groups[None, :] * XSK)
+    minimum = tl.zeros((16,), tl.int32)
+    exponents = (minimum, minimum, minimum, minimum, minimum, minimum, minimum, minimum)
+    LOCAL_INTEGER: tl.constexpr = M == 32 or M == 48 or (M == 40 and PACK_SCALE_PAIRS)
+    if LOCAL_INTEGER:
+        minimum = tl.full((16,), 255, tl.int32)
+        maximum = tl.zeros((16,), tl.int32)
+        bad = tl.zeros((16,), tl.uint32)
+        exponents = ()
+        if PACK_SCALE_PAIRS:
+            xp = XS.to(tl.pointer_type(tl.uint64))
+            wp64 = WS.to(tl.pointer_type(tl.uint64))
+            for pair_index in tl.static_range(4):
+                pair_group = split * 4 + pair_index
+                if UNMASK_ROWS:
+                    xpair = tl.load(xp + safe_row * (XSM // 2) + pair_group)
+                else:
+                    xpair = tl.load(
+                        xp + row * (XSM // 2) + pair_group, row < M, 0x3F8000003F800000
+                    )
+                wpair = tl.load(wp64 + (pn * BN // 128) * 16 + pair_group)
+                for subscale in tl.static_range(2):
+                    local_xs = (
+                        (xpair >> (subscale * 32))
+                        .to(tl.uint32)
+                        .to(tl.float32, bitcast=True)
+                    )
+                    local_ws = (
+                        (wpair >> (subscale * 32))
+                        .to(tl.uint32)
+                        .to(tl.float32, bitcast=True)
+                    )
+                    local_bits = (local_xs * local_ws).to(tl.uint32, bitcast=True)
+                    local_exponent = ((local_bits >> 23) & 255).to(tl.int32)
+                    minimum = tl.minimum(minimum, local_exponent)
+                    maximum = tl.maximum(maximum, local_exponent)
+                    bad |= local_bits & 0x807FFFFF
+                    exponents += (local_exponent,)
         else:
-            xs = tl.load(asp[:, None] + groups[None, :] * XSK, row[:, None] < M, 0)
-        scales = xs * tl.load(wsp + groups)[None, :]
-        scale0, scale1 = tl.split(scales)
-        unsafe_flags |= (~(tl.abs(scale0) < scale_limit)).to(tl.int32) | (
-            ~(tl.abs(scale1) < scale_limit)
-        ).to(tl.int32)
-        for sub in tl.static_range(2):
-            offset = (group + sub) * 128
-            if M % 16 == 0:
+            for local_group in tl.static_range(8):
+                group = split * 8 + local_group
+                if UNMASK_ROWS:
+                    local_xs = tl.load(asp + group * XSK)
+                else:
+                    local_xs = tl.load(asp + group * XSK, row < M, 1.0)
+                local_scale = local_xs * tl.load(wsp + group)
+                local_bits = local_scale.to(tl.uint32, bitcast=True)
+                local_exponent = ((local_bits >> 23) & 255).to(tl.int32)
+                minimum = tl.minimum(minimum, local_exponent)
+                maximum = tl.maximum(maximum, local_exponent)
+                bad |= local_bits & 0x807FFFFF
+                exponents += (local_exponent,)
+        valid = (
+            (bad == 0) & (minimum >= 63) & (maximum <= 159) & (maximum - minimum <= 6)
+        )
+        use_integer = tl.min(valid | (row >= M), 0) == 1
+    else:
+        use_integer = False
+    if use_integer:
+        word = tl.zeros((16,), tl.uint32)
+        for i in tl.static_range(8):
+            word |= (exponents[i] - minimum).to(tl.uint32) << (i * 3)
+        iacc = tl.zeros((16, BN), tl.int32)
+        for group_index in tl.range(8, num_stages=2):
+            offset = (split * 8 + group_index) * 128
+            if UNMASK_ROWS:
                 a = tl.load(ap + offset)
             else:
                 a = tl.load(ap + offset, row[:, None] < M, 0)
             w = tl.load(wp + offset)
-            scale = scale0 if sub == 0 else scale1
             part = tl.dot(a, w, out_dtype=tl.int32)
-            acc = tl.fma(part.to(tl.float32), scale[:, None], acc)
+            iacc = tl.inline_asm_elementwise(
+                "v_lshl_add_u32 $0, $1, $2, $3",
+                "=v,v,v,v",
+                [part, (word & 7)[:, None], iacc],
+                dtype=tl.int32,
+                is_pure=True,
+                pack=1,
+            )
+            word = word >> 3
+        acc = (
+            iacc.to(tl.float32) * (minimum << 23).to(tl.float32, bitcast=True)[:, None]
+        )
+        unsafe_flags = tl.zeros((16,), tl.int32)
+    else:
+        acc = tl.zeros((16, BN), tl.float32)
+        # OR only predicates; combining float exponent bits can create false alarms.
+        scale_limit: tl.constexpr = 18446744073709551616.0
+        unsafe_flags = tl.zeros((16,), tl.int32)
+        for pair in tl.range(16 // SPLIT, num_stages=2):
+            group = split * (32 // SPLIT) + pair * 2
+            groups = group + tl.arange(0, 2)
+            if UNMASK_ROWS:
+                xs = tl.load(asp[:, None] + groups[None, :] * XSK)
+            else:
+                xs = tl.load(asp[:, None] + groups[None, :] * XSK, row[:, None] < M, 0)
+            scales = xs * tl.load(wsp + groups)[None, :]
+            scale0, scale1 = tl.split(scales)
+            unsafe_flags |= (~(tl.abs(scale0) < scale_limit)).to(tl.int32) | (
+                ~(tl.abs(scale1) < scale_limit)
+            ).to(tl.int32)
+            for sub in tl.static_range(2):
+                offset = (group + sub) * 128
+                if UNMASK_ROWS:
+                    a = tl.load(ap + offset)
+                else:
+                    a = tl.load(ap + offset, row[:, None] < M, 0)
+                w = tl.load(wp + offset)
+                scale = scale0 if sub == 0 else scale1
+                part = tl.dot(a, w, out_dtype=tl.int32)
+                acc = tl.fma(part.to(tl.float32), scale[:, None], acc)
     offset = tl.arange(0, 16)[:, None] * BN + tl.arange(0, BN)[None, :]
     tl.store(P + (pid * SPLIT + split) * (16 * BN) + offset, acc)
     tl.debug_barrier()
