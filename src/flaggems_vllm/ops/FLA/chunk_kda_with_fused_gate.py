@@ -102,7 +102,7 @@ def _prune_ascend_inter(configs, named_args, **kwargs):
     use_cuda_graph=False,
     do_bench=_stage_bench,
 )
-@triton.jit(do_not_specialize=["T"], **_INTER_JIT_OPTIONS)
+@triton.jit(do_not_specialize=["T", "K"] if _ASCEND else ["T"], **_INTER_JIT_OPTIONS)
 def _ckfg_inter(
     q,
     k,

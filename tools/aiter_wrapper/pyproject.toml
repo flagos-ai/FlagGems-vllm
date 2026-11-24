@@ -1,0 +1,26 @@
+[build-system]
+requires = [
+    "ninja==1.11.1",
+    "packaging",
+    "pandas<3",
+    "pip",
+    "psutil",
+    "setuptools==79.0.1",
+    "setuptools_scm[toml]==10.2.1",
+    "wheel",
+]
+build-backend = "aiter_wrapper"
+backend-path = ["."]
+
+[project]
+name = "aiter-dtk"
+version = "0.1.8"
+description = "Hygon aiter built from the vendor sources for the running interpreter"
+requires-python = ">=3.10"
+dependencies = [
+    "einops",
+    "ninja==1.11.1",
+    "pandas<3",
+    "psutil",
+    "pybind11>=3.0.1",
+]
