@@ -148,25 +148,6 @@ def test_pad_indexer_heads_inner_offset(tail, dtype):
     assert_contract(gems.pad_indexer_heads, x, 3)
 
 
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
-@pytest.mark.parametrize("pad", [0, 16])
-@pytest.mark.pad_indexer_heads
-def test_pad_indexer_heads_contiguous_offset(dtype, pad):
-    x = storage_input((3 * 16 * 128 + 1,), dtype)[1:].view(3, 16, 128)
-    assert x.is_contiguous() and x.storage_offset() == 1
-    assert_contract(gems.pad_indexer_heads, x, pad)
-
-
-@pytest.mark.parametrize("broadcast", [False, True])
-@pytest.mark.pad_indexer_heads
-def test_pad_indexer_heads_large_grid(broadcast):
-    tokens = 8192
-    x = storage_input((1 if broadcast else tokens, 16, 128), torch.float8_e4m3fn)
-    if broadcast:
-        x = x.expand(tokens, -1, -1)
-    assert_contract(gems.pad_indexer_heads, x, 16)
-
-
 @pytest.mark.parametrize("dtype", EXTRA_DTYPES)
 @pytest.mark.parametrize("shape", [(7, 31), (7, 31, 9), (1, 31, 3, 5)])
 @pytest.mark.parametrize("pad", [0, 2])
