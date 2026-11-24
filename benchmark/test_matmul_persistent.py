@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NVIDIA benchmark with an optional vLLM native reference and baseline fallback."""
+"""Non-Graph matmul benchmark for NVIDIA and Ascend."""
 
 import inspect
 import math
@@ -25,6 +25,10 @@ import torch
 import flaggems_vllm as gems
 from baseline import matmul_persistent as workload
 from tests.test_matmul_persistent import assert_case
+from tests.test_matmul_persistent_ascend import (
+    assert_ascend_output,
+    build_ascend_inputs,
+)
 
 from . import base, consts
 from .conftest import Config
@@ -74,10 +78,20 @@ class MatmulPersistentBenchmark(base.Benchmark):
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             self.binding = workload.binding_from_shape(shape)
-            args, kwargs = workload.build_inputs(self.binding, dtype, gems.device)
-            yield (*args, kwargs)
+            if gems.vendor_name == "ascend":
+                yield (*build_ascend_inputs(self.binding, dtype, gems.device), {})
+            else:
+                args, kwargs = workload.build_inputs(self.binding, dtype, gems.device)
+                yield (*args, kwargs)
+
+    def _local_reference_kind(self):
+        if gems.vendor_name == "ascend":
+            return "torch_npu_matmul"
+        return workload.NATIVE_KIND
 
     def _python_baseline(self):
+        if gems.vendor_name == "ascend":
+            return torch.matmul
         if not hasattr(self, "_baseline_op"):
             try:
                 reference = workload.native()
@@ -146,14 +160,23 @@ class MatmulPersistentBenchmark(base.Benchmark):
         else:
             reference = self._python_baseline()
             self._use_reference(
-                workload.NATIVE_KIND if reference is not None else "unavailable",
+                (
+                    self._local_reference_kind()
+                    if reference is not None
+                    else "unavailable"
+                ),
                 reference,
             )
         return detail
 
     def get_latency(self, op, *args, **kwargs):
         # Candidate correctness errors must never trigger reference fallback.
-        expected = assert_case(*args, **kwargs)
+        is_ascend = gems.vendor_name == "ascend"
+        if is_ascend:
+            a, b = args
+            expected = a.cpu().double() @ b.cpu().double()
+        else:
+            expected = assert_case(*args, **kwargs)
         is_reference = op is self.torch_op
         before = [
             (value, value.clone())
@@ -162,9 +185,13 @@ class MatmulPersistentBenchmark(base.Benchmark):
         ]
         try:
             # Correctness checks and input snapshots stay outside timing.
-            torch.testing.assert_close(
-                op(*args, **kwargs), expected, rtol=0, atol=0, equal_nan=True
-            )
+            result = op(*args, **kwargs)
+            if is_ascend:
+                assert_ascend_output(result, expected, args[0])
+            else:
+                torch.testing.assert_close(
+                    result, expected, rtol=0, atol=0, equal_nan=True
+                )
             assert all(
                 torch.equal(value, saved) for value, saved in before
             ), "Callable modified inputs"
@@ -188,18 +215,27 @@ class MatmulPersistentBenchmark(base.Benchmark):
             if not self._has_json_reference and op is self._native_op:
                 reference = self._python_baseline()
                 if reference is not None and reference is not op:
-                    self._use_reference(workload.NATIVE_KIND, reference)
+                    self._use_reference(self._local_reference_kind(), reference)
                     return self.get_latency(reference, *args, **kwargs)
             self._use_reference(
                 "json_baseline" if self._has_json_reference else "unavailable", None
             )
+            if is_ascend and not self._has_json_reference:
+                raise RuntimeError(
+                    "No usable Ascend timing reference for "
+                    f"{self._shape_detail['key_shape']} ({args[0].dtype}): {reason}"
+                ) from exc
             return None
 
 
 @pytest.mark.matmul_persistent
 def test_matmul_persistent_benchmark():
-    assert gems.vendor_name == "nvidia", "NVIDIA CUDA required"
-    assert torch.cuda.is_available(), "NVIDIA CUDA is unavailable"
+    if gems.vendor_name == "ascend":
+        assert torch.npu.is_available(), "Ascend NPU is unavailable"
+    elif gems.vendor_name == "nvidia":
+        assert torch.cuda.is_available(), "NVIDIA CUDA is unavailable"
+    else:
+        pytest.skip("NVIDIA CUDA or Ascend NPU required")
     bench = MatmulPersistentBenchmark(
         op_name=workload.OP_NAME,
         torch_op=_native_reference(),

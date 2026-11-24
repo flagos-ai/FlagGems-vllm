@@ -37,7 +37,7 @@ def test_workload_contract():
 
 @pytest.mark.matmul_persistent
 def test_cpu_is_explicitly_unsupported():
-    with pytest.raises(NotImplementedError, match="NVIDIA"):
+    with pytest.raises(NotImplementedError, match="NVIDIA CUDA|Ascend NPU"):
         gems.matmul_persistent(torch.empty(2, 3), torch.empty(3, 4))
 
 
