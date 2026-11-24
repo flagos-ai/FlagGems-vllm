@@ -16,7 +16,7 @@ from flaggems_vllm.runtime import torch_device_fn
 
 from . import base, conftest, consts
 
-_SHAPE_FIELDS = ("T", "H", "D", "BS", "layout", "padding", "distribution", "cache")
+_SHAPE_FIELDS = workloads.SHAPE_FIELDS
 _TIMING_PROTOCOL = {
     "graph": False,
     "reset": "full allocations before every invocation, outside event interval",
@@ -47,12 +47,16 @@ class CacheFlashBenchmark(base.Benchmark):
 
     def set_shapes(self, shape_file_path=None):
         # The baseline owns the matrix. Preserve explicit external shape files.
-        super().set_shapes(shape_file_path)
-        if Path(shape_file_path).resolve() == Path(self.DEFAULT_SHAPE_FILES).resolve():
-            self.shapes = [
-                tuple(binding[name] for name in _SHAPE_FIELDS)
-                for binding in workloads.grid()
-            ]
+        if Path(shape_file_path).resolve() != Path(self.DEFAULT_SHAPE_FILES).resolve():
+            super().set_shapes(shape_file_path)
+            return
+        self.shape_desc = self.DEFAULT_SHAPE_DESC
+        self.shapes = list(workloads.CORE_SHAPES)
+        if (
+            conftest.Config.bench_level == consts.BenchLevel.COMPREHENSIVE
+            and not conftest.Config.query
+        ):
+            self.shapes.extend(workloads.COMPREHENSIVE_EXTRA_SHAPES)
 
     def init_user_config(self):
         super().init_user_config()

@@ -23,6 +23,9 @@ import flaggems_vllm
 from tests.accuracy_utils import gems_assert_close, gems_assert_equal
 
 DESCALE_BLOCK = 128
+# Preserve #779's tolerances after migration to the shared comparison helper.
+OUTPUT_RTOL = 0.025 if flaggems_vllm.vendor_name == "thead" else None
+LSE_RTOL = 2e-5 if flaggems_vllm.vendor_name == "thead" else None
 # LSE comparisons need a full FP32 reference matmul.
 torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -216,9 +219,11 @@ def _run_case(
     result, lse = actual if return_lse else (actual, None)
     ref, ref_lse = _reference(qr, kr, vr, qlens, klens, causal, window, cap, alibi)
     assert result is out
-    gems_assert_close(result.float(), ref, dtype=torch.float32, atol=0.025)
+    gems_assert_close(
+        result.float(), ref, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
+    )
     if return_lse:
-        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5)
+        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5, rtol=LSE_RTOL)
     else:
         pass
     output = flaggems_vllm.flash_attn_varlen_func(
@@ -239,7 +244,9 @@ def _run_case(
         alibi_slopes=alibi,
         **(metax_kwargs or {}),
     )
-    gems_assert_close(output.float(), ref, dtype=torch.float32, atol=0.025)
+    gems_assert_close(
+        output.float(), ref, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
+    )
     return qr, kr, vr, cuq, cuk, result
 
 
@@ -300,7 +307,13 @@ def test_bf16_baseline():
     baseline = flaggems_vllm.flash_attn_varlen_func(
         q.bfloat16(), k.bfloat16(), v.bfloat16(), 129, cuq, 257, cuk, causal=True
     )
-    gems_assert_close(result, baseline, dtype=(result).dtype, atol=0.03)
+    gems_assert_close(
+        result,
+        baseline,
+        dtype=result.dtype,
+        atol=0.03,
+        rtol=0.03 if flaggems_vllm.vendor_name == "thead" else None,
+    )
 
 
 def test_export_signature_and_empty():
@@ -395,8 +408,14 @@ def test_public_float_route(dtype, entry):
     expected, expected_lse = _reference(
         q.float(), k.float(), v.float(), [17, 129], [33, 257], True
     )
-    gems_assert_close(actual.float(), expected, dtype=(actual.float()).dtype, atol=0.01)
-    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05)
+    gems_assert_close(
+        actual.float(),
+        expected,
+        dtype=torch.float32,
+        atol=0.01,
+        rtol=0.01 if flaggems_vllm.vendor_name == "thead" else None,
+    )
+    gems_assert_close(lse, expected_lse, dtype=lse.dtype, atol=2e-5, rtol=LSE_RTOL)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -467,7 +486,9 @@ def test_probability_quantization_accuracy(
         expected = torch.full_like(
             actual, -127 * value_scale * math.tanh(score_gap / 2), dtype=torch.float32
         )
-        gems_assert_close(actual.float(), expected, dtype=torch.float32, atol=0.025)
+        gems_assert_close(
+            actual.float(), expected, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
+        )
         return
     torch.manual_seed(seed)
     tensors, descales, references = [], [], []
@@ -494,8 +515,10 @@ def test_probability_quantization_accuracy(
         v_descale=descales[2],
     )
     expected, expected_lse = _reference(*references, [512], [512], True)
-    gems_assert_close(out.float(), expected, dtype=(out.float()).dtype, atol=0.025)
-    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05)
+    gems_assert_close(
+        out.float(), expected, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
+    )
+    gems_assert_close(lse, expected_lse, dtype=lse.dtype, atol=2e-5, rtol=LSE_RTOL)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -633,9 +656,9 @@ def test_paged_shared_cache_workspace_fallback():
         qr, kr.repeat(3, 1, 1), vr.repeat(3, 1, 1), qlens, klens, True
     )
     gems_assert_close(
-        actual.float(), expected, dtype=(actual.float()).dtype, atol=0.025
+        actual.float(), expected, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
     )
-    gems_assert_close(lse, expected_lse, dtype=(lse).dtype, atol=2e-05)
+    gems_assert_close(lse, expected_lse, dtype=lse.dtype, atol=2e-5, rtol=LSE_RTOL)
 
 
 @pytest.mark.flash_attn_varlen_func_w8a8
@@ -733,7 +756,7 @@ def test_paged_long_query_constant_v(value, q_scale_factor):
         result.shape, value, dtype=torch.float32, device=flaggems_vllm.device
     )
     gems_assert_close(
-        result.float(), expected, dtype=(result.float()).dtype, atol=0.025
+        result.float(), expected, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
     )
 
 
@@ -927,7 +950,9 @@ def test_folded_causal_prefill_partial_query_tiles(query_length, dtype):
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
 @pytest.mark.parametrize("num_splits", [0, 1, 3, 32])
 @pytest.mark.parametrize("causal", [False, True])
@@ -947,7 +972,9 @@ def test_metax_gqa256_scheduling(heads, kvheads, num_splits, causal):
     assert torch.all(metadata == 17)
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged", [False, True])
 def test_metax_gqa256_prefill(dtype, paged):
@@ -965,7 +992,9 @@ def test_metax_gqa256_prefill(dtype, paged):
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 schedule"
+)
 @pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
@@ -986,7 +1015,9 @@ def test_metax_gqa256_long_query_tiles(heads, kvheads, broadcast_scales, causal)
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX schedule")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 schedule"
+)
 @pytest.mark.parametrize("kv_length", [2047, 2048])
 @pytest.mark.parametrize("query_bound", [1023, 1024])
 def test_metax_gqa256_schedule_boundary(kv_length, query_bound):
@@ -1035,7 +1066,9 @@ def test_real_shape_reader_preserves_sequence_metadata(missing):
         assert pages == [19, 13]
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize(
     "num_splits,error",
     [(-1, ValueError), (33, ValueError), (True, TypeError), (1.5, TypeError)],
@@ -1049,7 +1082,9 @@ def test_metax_invalid_splits(num_splits, error):
         )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize("dim,kvheads,qlen", [(256, 1, 1), (128, 2, 129)])
 def test_metax_int8_large_physical_page_offset(dim, kvheads, qlen):
     # Real TP4 pool extent: 605550 pages. Each page has 4096 INT8 elements,
@@ -1094,11 +1129,15 @@ def test_metax_int8_large_physical_page_offset(dim, kvheads, qlen):
             causal=True,
             return_softmax_lse=True,
         )
-        gems_assert_close(out.float(), ref, dtype=torch.float32, atol=0.025)
-        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5)
+        gems_assert_close(
+            out.float(), ref, dtype=torch.float32, atol=0.025, rtol=OUTPUT_RTOL
+        )
+        gems_assert_close(lse, ref_lse, dtype=torch.float32, atol=2e-5, rtol=LSE_RTOL)
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize(
     "window,cap,with_alibi",
     [((64, 0), 0.0, False), ((-1, -1), 20.0, False), ((-1, -1), 0.0, True)],
@@ -1124,7 +1163,9 @@ def test_metax_gqa256_split_score_modifiers(window, cap, with_alibi):
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX interface")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 interface"
+)
 @pytest.mark.parametrize("kind", ["dtype", "rank", "stride"])
 def test_metax_invalid_scheduler_metadata(kind):
     q = torch.empty((1, 4, 256), device=flaggems_vllm.device, dtype=torch.int8)
@@ -1141,7 +1182,9 @@ def test_metax_invalid_scheduler_metadata(kind):
         )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 dispatch"
+)
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("heads,kvheads", [(4, 1), (16, 2)])
@@ -1171,7 +1214,9 @@ def test_metax_d256_single_key_mixed_lengths(
     )
 
 
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX dispatch")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("metax", "thead"), reason="D256 dispatch"
+)
 @pytest.mark.parametrize("batch", [17, 64])
 def test_metax_d256_large_batch_packing(batch):
     _run_case(

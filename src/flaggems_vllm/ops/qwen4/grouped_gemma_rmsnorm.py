@@ -16,6 +16,7 @@
 
 import logging
 from numbers import Integral, Real
+from typing import Tuple
 
 import torch
 import triton
@@ -44,29 +45,30 @@ _CONFIGS = (
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-# SPEC contains (N, DIM, NUM_GROUPS, W_SHARED, ROW_GAPPED, EPS, BLOCK_SIZE,
-# stride_x). The compact signature reduces LibEntry's per-call parameter work.
+# SPEC contains (DIM, NUM_GROUPS, W_SHARED, ROW_GAPPED, EPS, BLOCK_SIZE,
+# stride_x). N still selects the tuning configuration, but only the launch grid
+# uses it: different row counts can reuse the same compiled kernel.
 # repr preserves all tuple fields in the SQL-backed tuner's scalar key column;
 # LibTuner still appends each pointer dtype independently to the tuning key.
 @libentry()
 @libtuner(
     configs=_CONFIGS,
-    key=["SPEC"],
-    strategy=[repr],
+    key=["N", "SPEC"],
+    strategy=[int, repr],
     # Explicit warmup/rep uses the non-Graph timer on Triton 3.2+; older
     # versions receive use_cuda_graph=False directly.
     warmup=5,
     rep=20,
     use_cuda_graph=False,
 )
-@triton.jit
-def _grouped_gemma_rmsnorm_kernel(X, W, Y, SPEC: tl.constexpr):
-    stride_x: tl.constexpr = SPEC[7]
-    DIM: tl.constexpr = SPEC[1]
-    NUM_GROUPS: tl.constexpr = SPEC[2]
-    W_SHARED: tl.constexpr = SPEC[3]
-    EPS: tl.constexpr = SPEC[5]
-    BLOCK_SIZE: tl.constexpr = SPEC[6]
+@triton.jit(do_not_specialize=["N"])
+def _grouped_gemma_rmsnorm_kernel(X, W, Y, N, SPEC: tl.constexpr):
+    stride_x: tl.constexpr = SPEC[6]
+    DIM: tl.constexpr = SPEC[0]
+    NUM_GROUPS: tl.constexpr = SPEC[1]
+    W_SHARED: tl.constexpr = SPEC[2]
+    EPS: tl.constexpr = SPEC[4]
+    BLOCK_SIZE: tl.constexpr = SPEC[5]
     GROUP_DIM: tl.constexpr = DIM // NUM_GROUPS
     pid = tl.program_id(0).to(tl.int64)
     row = pid // NUM_GROUPS
@@ -113,25 +115,9 @@ def _grouped_gemma_rmsnorm_kernel(X, W, Y, SPEC: tl.constexpr):
             tl.store(Y + row * DIM + group_offset + columns, result, mask)
 
 
-def grouped_gemma_rmsnorm(
+def _validate_grouped_gemma_rmsnorm_inputs(
     x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
-) -> torch.Tensor:
-    """Normalize each group and apply Gemma's ``z + z * weight`` affine.
-
-    ``x`` is a two-dimensional accelerator tensor with unit inner stride;
-    nonnegative row strides, including row gaps, are supported. A contiguous
-    ``weight`` has either ``DIM // num_groups`` elements shared across groups,
-    or ``DIM`` elements. The tensors independently use FP16, BF16, or FP32.
-    Accumulation and affine arithmetic use FP32, then round to ``x.dtype``.
-
-    ``eps`` accepts real scalars, including zero, negative values, NaN, and Inf.
-    These values follow the native FP32 sum/rsqrt expression without clamping;
-    invalid square roots and nonfinite arithmetic can produce NaN or Inf.
-    The result is fresh and contiguous. This is an inference-only forward API;
-    CPU/meta tensors and autograd are not supported.
-    """
-    logger.debug("GEMS GROUPED_GEMMA_RMSNORM")
-
+) -> Tuple[float, int]:
     if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
         raise TypeError("x and weight must be tensors")
     if x.layout != torch.strided or weight.layout != torch.strided:
@@ -144,7 +130,7 @@ def grouped_gemma_rmsnorm(
         num_groups = int(num_groups)
     if num_groups <= 0:
         raise ValueError("num_groups must be positive")
-    n, dim = x.shape
+    dim = x.shape[1]
     if dim <= 0 or dim % num_groups:
         raise ValueError("x.shape[1] must be positive and divisible by num_groups")
     row_stride = x.stride(0)
@@ -171,6 +157,30 @@ def grouped_gemma_rmsnorm(
         if isinstance(eps, bool) or not isinstance(eps, Real):
             raise TypeError("eps must be a real scalar")
         eps = float(eps)
+    return eps, num_groups
+
+
+def grouped_gemma_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
+) -> torch.Tensor:
+    """Normalize each group and apply Gemma's ``z + z * weight`` affine.
+
+    ``x`` is a two-dimensional accelerator tensor with unit inner stride;
+    nonnegative row strides, including row gaps, are supported. A contiguous
+    ``weight`` has either ``DIM // num_groups`` elements shared across groups,
+    or ``DIM`` elements. The tensors independently use FP16, BF16, or FP32.
+    Accumulation and affine arithmetic use FP32, then round to ``x.dtype``.
+
+    ``eps`` accepts real scalars, including zero, negative values, NaN, and Inf.
+    These values follow the native FP32 sum/rsqrt expression without clamping;
+    invalid square roots and nonfinite arithmetic can produce NaN or Inf.
+    The result is fresh and contiguous. This is an inference-only forward API;
+    CPU/meta tensors and autograd are not supported.
+    """
+    logger.debug("GEMS GROUPED_GEMMA_RMSNORM")
+
+    eps, num_groups = _validate_grouped_gemma_rmsnorm_inputs(x, weight, eps, num_groups)
+    n, dim = x.shape
     output = x.new_empty((n, dim))
     if n == 0:
         return output
@@ -181,11 +191,15 @@ def grouped_gemma_rmsnorm(
 
         _launch_grouped_gemma_rmsnorm(x, weight, output, eps, num_groups)
         return output
+    x_device = x.device
+    group_dim = dim // num_groups
+    row_stride = x.stride(0)
+    weight_numel = weight.numel()
     # C550 trials favor larger tiles for FP32 prefill; BF16 did not benefit.
     max_block_size = _MAX_BLOCK_SIZE
     if (
         _IS_METAX
-        and x_dtype == torch.float32
+        and x.dtype == torch.float32
         and (n >= _METAX_FP32_PREFILL_MIN_ROWS)
         and (group_dim >= _METAX_FP32_PREFILL_MIN_GROUP_DIM)
     ):
@@ -196,8 +210,8 @@ def grouped_gemma_rmsnorm(
             X=x,
             W=weight,
             Y=output,
+            N=n,
             SPEC=(
-                n,
                 dim,
                 num_groups,
                 weight_numel == group_dim,
@@ -215,8 +229,8 @@ def grouped_gemma_rmsnorm(
                 X=x,
                 W=weight,
                 Y=output,
+                N=n,
                 SPEC=(
-                    n,
                     dim,
                     num_groups,
                     weight_numel == group_dim,
