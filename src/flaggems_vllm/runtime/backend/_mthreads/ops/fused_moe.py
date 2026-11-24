@@ -3086,6 +3086,29 @@ def _compact_padded_kernel(
 
 
 @triton.jit
+def _compact_scatter_kernel(
+    src_ptr,
+    dst_ptr,
+    inv_perm_ptr,
+    hidden,
+    TOPK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    # Row-centric compaction: the source row is read once and stored into the
+    # TOPK padded rows its routing slots own. Reading each row once halves the
+    # traffic of the gather form (which re-reads every row TOPK times from the
+    # padded side); the padded rows that no token owns keep their zeros.
+    token = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    cols = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    col_mask = cols < hidden
+    x = tl.load(src_ptr + token * hidden + cols, mask=col_mask, other=0.0)
+    for j in tl.static_range(TOPK):
+        pos = tl.load(inv_perm_ptr + token * TOPK + j)
+        tl.store(dst_ptr + pos * hidden + cols, x, mask=col_mask)
+
+
+@triton.jit
 def _grouped_gemm_kernel(
     a_ptr,
     b_ptr,
@@ -3296,7 +3319,10 @@ def _dense_get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens):
     row_token = torch.empty(max_tokens, dtype=torch.int32, device=device)
     inv_perm = torch.empty(M * topk, dtype=torch.int32, device=device)
     m_indices = torch.empty(max_tokens, dtype=torch.int32, device=device)
-    hidden_perm = torch.empty(max_tokens, H, dtype=dtype, device=device)
+    # The compaction kernel only writes rows that a token owns; the per-expert
+    # padding rows must already be zero, so this buffer is zero-initialised
+    # once per shape instead of being patched on every call.
+    hidden_perm = torch.zeros(max_tokens, H, dtype=dtype, device=device)
     gate_up = torch.empty(max_tokens, 2 * n_inter, dtype=dtype, device=device)
     act = torch.empty(max_tokens, n_inter, dtype=dtype, device=device)
     # GEMM2 output: cached like the rest so a repeated call does not allocate
@@ -3372,13 +3398,12 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
         topk=topk,
         BLOCK=1024,
     )
-    _compact_padded_kernel[(triton.cdiv(total, 8), triton.cdiv(H, 256))](
+    _compact_scatter_kernel[(M, triton.cdiv(H, 256))](
         hidden_states,
         hidden_perm,
-        row_token,
-        total,
+        inv_perm,
         H,
-        BLOCK_M=8,
+        TOPK=topk,
         BLOCK_H=256,
         num_warps=4,
     )
