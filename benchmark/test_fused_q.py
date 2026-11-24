@@ -229,8 +229,6 @@ def test_fused_q_benchmark():
     if gems.vendor_name == "ascend":
         if not torch.npu.is_available():
             pytest.fail("Ascend backend selected, but no NPU is available")
-        if not torch.npu.get_device_name().startswith("Ascend910B4"):
-            pytest.skip("requires Ascend 910B4")
         AscendFusedQBenchmark(
             op_name="fused_q",
             torch_op=None,

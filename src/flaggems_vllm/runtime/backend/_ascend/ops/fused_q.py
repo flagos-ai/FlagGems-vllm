@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ascend 910B4 specialization for the full BF16 fused_q workload.
+"""Ascend specialization for the full BF16 fused_q workload.
 
-Use the validated fixed four-row tiles and 256-column NoPE tiles. Keep the
-single-launch schedule for the nine small workloads and the split schedule
-for other supported token counts. These fixed Ascend schedules do not autotune.
+The fixed four-row and 256-column NoPE tiles were validated on Ascend 910B4-1.
+Use one launch for the nine small workloads and split launches for other
+supported token counts. These fixed Ascend schedules do not autotune.
 """
 
 from functools import lru_cache
@@ -723,9 +723,6 @@ def _signature(inputs):
 
 @lru_cache(maxsize=16)
 def _program_limit(device):
-    if not torch_device_fn.get_device_name(device).startswith("Ascend910B4"):
-        raise NotImplementedError("fused_q Ascend specialization requires Ascend 910B4")
-
     properties = triton.runtime.driver.active.utils.get_device_properties(device.index)
     vector_cores = properties.get("num_vectorcore")
     if isinstance(vector_cores, int) and vector_cores > 0:
@@ -816,7 +813,7 @@ def fused_q(
     index_rope_interleave=False,
     quantize_mqa=True,
 ):
-    """Return indexer FP8, FP32 weights and packed MQA FP8 on Ascend 910B4.
+    """Return indexer FP8, FP32 weights and packed MQA FP8 on Ascend.
 
     The Ascend specialization supports the default quantized, NeoX indexer
     configuration. Positions must be within both RoPE caches and q_scale
