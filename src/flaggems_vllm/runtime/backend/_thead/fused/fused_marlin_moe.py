@@ -3628,9 +3628,14 @@ def tiny_fp8_down_reduce(
 
 
 @triton.jit
+def w8_slot_address(buffer, stage):
+    return tle_async.gpu.local_ptr(buffer, (stage, 0)).to(tl.int64).to(tl.int32)
+
+
+@triton.jit
 def square_accumulate(
-    weight_smem,
-    activation_smem,
+    qmem,
+    amem,
     weight_bytes,
     activations,
     scales,
@@ -3651,8 +3656,8 @@ def square_accumulate(
     if initial_dep is None:
         copy_token = tl.full((256,), 0, tl.int32)
         copy_token = prefetch_w8_tile(
-            weight_smem,
-            activation_smem,
+            w8_slot_address(qmem, 0),
+            w8_slot_address(amem, 0),
             weight_bytes,
             activations,
             QN,
@@ -3683,8 +3688,8 @@ def square_accumulate(
             scale1 = tl.load(scales + expert * SE + k_tile * SG + (n0 + 8) * SN)
         if k_tile + 1 < reduction_size // 128:
             copy_token = prefetch_w8_tile(
-                weight_smem + (k_tile + 1) % 2 * W8_TILE_BYTES,
-                activation_smem + (k_tile + 1) % 2 * 4096,
+                w8_slot_address(qmem, (k_tile + 1) % 2),
+                w8_slot_address(amem, (k_tile + 1) % 2),
                 weight_bytes,
                 activations,
                 QN,
@@ -3700,8 +3705,8 @@ def square_accumulate(
             copy_token = wait_w8_tile(copy_token, False)
         s0 = w8_scale_fragment(scale0, k_tile, SCALE_PAIR, FP8 and FAST)
         s1 = w8_scale_fragment(scale1, k_tile, SCALE_PAIR, FP8 and FAST)
-        qhere = weight_smem + k_tile % 2 * W8_TILE_BYTES
-        ahere = activation_smem + k_tile % 2 * 4096
+        qhere = w8_slot_address(qmem, k_tile % 2)
+        ahere = w8_slot_address(amem, k_tile % 2)
         for group in tl.static_range(4):
             (r0, r1, r2, r3) = load_matrix_x4(
                 qhere + (warp // 4) * W8_HALF_TILE_BYTES,
@@ -3782,21 +3787,21 @@ def marlin_moe_gemm_grouped_square_kernel(
     lane_in_group = lane % 4
     n0 = col_tile * 128 + warp * 16 + lane_group
     qmem = tle_async.gpu.alloc(
-        [32768],
+        [2, W8_TILE_BYTES],
         tl.uint8,
         layout=None,
         scope=tle_async.gpu.smem,
         nv_mma_shared_layout=False,
     )
     amem = tle_async.gpu.alloc(
-        [2 * 16 * 128 * 2],
+        [2, 16 * 128 * 2],
         tl.uint8,
         layout=None,
         scope=tle_async.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    weight_smem = tle_async.gpu.local_ptr(qmem, (0,)).to(tl.int64).to(tl.int32)
-    activation_smem = tle_async.gpu.local_ptr(amem, (0,)).to(tl.int64).to(tl.int32)
+    weight_smem = w8_slot_address(qmem, 0)
+    activation_smem = w8_slot_address(amem, 0)
     weight_base = weight_bytes + expert * QE + col_tile * 128 * QN
     inner_n = warp * 16 + lane_group
     if not PACK_WIDTH:
@@ -3963,8 +3968,8 @@ def marlin_moe_gemm_grouped_square_kernel(
             tl.load(scale_flags + expert) != 0 if scale_flags is not None else False
         )
         tile_inputs = (
-            weight_smem,
-            activation_smem,
+            qmem,
+            amem,
             weight_base,
             activations,
             scales,
@@ -3993,8 +3998,8 @@ def marlin_moe_gemm_grouped_square_kernel(
             )
     else:
         c = square_accumulate(
-            weight_smem,
-            activation_smem,
+            qmem,
+            amem,
             weight_base,
             activations,
             scales,
