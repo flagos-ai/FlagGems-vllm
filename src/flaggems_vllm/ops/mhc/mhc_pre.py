@@ -22,7 +22,6 @@ Key optimizations:
 """
 
 import enum
-import os
 import warnings
 import weakref
 
@@ -35,11 +34,6 @@ from flaggems_vllm.runtime import device as _device
 _MHC_PRE_MIX_PAD = tl.constexpr(32)
 
 _VENDOR = _device.vendor_name
-
-
-if _VENDOR == "mthreads":
-    # Has to be set before this module's kernels are first compiled.
-    os.environ.setdefault("TRITON_MUSA_ENABLE_LLC_OPT", "1")
 
 
 _MHC_FN_CACHE: dict[int, tuple[weakref.ref, int, int, dict]] = {}
@@ -2235,7 +2229,7 @@ def mhc_pre(
     return post_mix, comb_mix, layer_input
 
 
-# Imported last: the hygon companion imports this module's kernels (circular otherwise).
+# Imported last: the vendor companions import this module's kernels (circular otherwise).
 if _VENDOR == "ascend":
     from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import (
         _HAS_TLE,
@@ -2248,3 +2242,7 @@ elif _VENDOR == "hygon":
     from flaggems_vllm.runtime.backend._hygon.ops import mhc_pre as _HYGON
 
     _HYGON.install_fastlaunch(globals(), _HYGON.KERNELS)
+elif _VENDOR == "mthreads":
+    from flaggems_vllm.runtime.backend._mthreads.ops import mhc_pre as _MTHREADS
+
+    _MTHREADS.install_llc_opt(globals())
