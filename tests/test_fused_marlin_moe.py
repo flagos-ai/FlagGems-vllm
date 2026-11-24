@@ -2123,28 +2123,128 @@ def test_fused_marlin_moe_w8a16_int8_codes(num_tokens, hidden_size, ids_dtype, d
     flaggems_vllm.vendor_name != "ascend", reason="Ascend backend regression"
 )
 @pytest.mark.parametrize(
-    "bits",
+    "bits,dtype,tokens",
     [
-        pytest.param(4, marks=pytest.mark.fused_marlin_moe_w4a16),
-        pytest.param(8, marks=pytest.mark.fused_marlin_moe_w8a16),
+        pytest.param(4, torch.bfloat16, 4, marks=pytest.mark.fused_marlin_moe_w4a16),
+        pytest.param(4, torch.bfloat16, 65, marks=pytest.mark.fused_marlin_moe_w4a16),
+        pytest.param(8, torch.bfloat16, 4, marks=pytest.mark.fused_marlin_moe_w8a16),
+        pytest.param(8, torch.float16, 65, marks=pytest.mark.fused_marlin_moe_w8a16),
     ],
 )
-@torch.inference_mode()
-def test_ascend_marlin_inference_weight_updates(bits):
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_ascend_marlin_weight_updates(bits, dtype, tokens, inference, capture):
     make_inputs, quant_type = (
         (_make_inputs_w4a16_int4, QUANT_TYPE_UINT4B8)
         if bits == 4
         else (_make_inputs_w8a16_int8, QUANT_TYPE_UINT8B128)
     )
-    hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
-        4, 3, 384, 128, 1, torch.bfloat16, flaggems_vllm.device
+    with torch.inference_mode(inference):
+        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
+            tokens, 3, 384, 128, 1, dtype, flaggems_vllm.device
+        )
+        tw = tw.float()
+        args = (hs, w1, w2, None, None, s1, s2, tw, ti, quant_type)
+        actual = flaggems_vllm.fused_marlin_moe(*args)
+        if capture:
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                actual = flaggems_vllm.fused_marlin_moe(*args)
+
+        for weight, scale, reference in ((w1, s1, ref1), (w2, s2, ref2)):
+            for update_weight in (True, False):
+                if update_weight:
+                    # Encode +1 in each byte or nibble, preserving the current scales.
+                    weight.fill_(0x99 if bits == 4 else 129)
+                    reference.copy_(scale.repeat_interleave(GROUP_SIZE, dim=-1))
+                else:
+                    scale.mul_(0.5)
+                    reference.mul_(0.5)
+                if capture:
+                    graph.replay()
+                else:
+                    actual = flaggems_vllm.fused_marlin_moe(*args)
+                expected = _reference_w8a16_grouped(hs, ref1, ref2, tw, ti)
+                assert compute_max_diff(actual.float(), expected) < 0.04
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend grouped routing"
+)
+@pytest.mark.parametrize(
+    "tokens,experts,topk,dtype",
+    [
+        pytest.param(8192, 256, 6, torch.bfloat16, id="adaptive-tails"),
+        pytest.param(8192, 32, 1, torch.float16, id="panel-tails"),
+        pytest.param(16385, 256, 6, torch.float16, id="unequal-batches"),
+    ],
+)
+@torch.inference_mode()
+def test_ascend_marlin_grouped_replay(tokens, experts, topk, dtype):
+    device = flaggems_vllm.device
+    k, n = 4096, 256
+    # Counts span the 16/32/64/128-row tails, full tiles and unused experts.
+    ids = torch.empty((tokens, topk), dtype=torch.int64)
+    counts = [1, 85, 145, 161, 193, 257]
+    ids[:, 0] = len(counts)
+    start = 0
+    for expert, count in enumerate(counts):
+        ids[start : start + count, 0] = expert
+        start += count
+    if topk > 1:
+        ids[:, 1:] = torch.arange(experts - topk + 1, experts)
+    ids = ids.to(device)
+    x = (torch.arange(tokens, device=device) % 7 + 1).to(dtype) / 32
+    hs = x[:, None].expand(tokens, k).contiguous()
+    w1 = torch.full((experts, 2 * n, k), 129, dtype=torch.uint8, device=device)
+    w2 = torch.full((experts, k, n), 129, dtype=torch.uint8, device=device)
+    s1 = torch.full((experts, 2 * n, k // 128), 1 / 128, dtype=dtype, device=device)
+    expert_scale = (torch.arange(experts, device=device) % 4 + 1).to(dtype) / 128
+    column_scale = torch.where(torch.arange(k, device=device) % 3 == 0, 0.5, 1.0).to(
+        dtype
     )
-    tw = tw.float()
-    args = (hs, w1, w2, None, None, s1, s2, tw, ti, quant_type)
-    expected = _reference_w8a16_grouped(hs, ref1, ref2, tw, ti)
-    actual = flaggems_vllm.fused_marlin_moe(*args)
-    assert compute_max_diff(actual.float(), expected) < 0.04
-    s2.zero_()
-    torch.testing.assert_close(
-        flaggems_vllm.fused_marlin_moe(*args), torch.zeros_like(hs), rtol=0, atol=0
+    s2 = (
+        (expert_scale[:, None] * column_scale[None, :])[:, :, None]
+        .expand(experts, k, n // 128)
+        .contiguous()
     )
+    probs = torch.full((tokens, topk), 1 / topk, device=device, dtype=torch.float32)
+    args = (hs, w1, w2, None, None, s1, s2, probs, ids, QUANT_TYPE_UINT8B128)
+    flaggems_vllm.fused_marlin_moe(*args)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = flaggems_vllm.fused_marlin_moe(*args)
+
+    # Power-of-two column scales preserve rounding through the router-weighted sum.
+    first, second = 1.0, 1.0
+    for changed in (w1, w2, s1, s2):
+        if changed is w1:
+            w1.fill_(130)
+            first = 2.0
+        elif changed is w2:
+            w2.fill_(131)
+            second = 3.0
+        elif changed is s1:
+            s1.mul_(0.25)
+            first *= 0.25
+        else:
+            s2.mul_(0.5)
+            second *= 0.5
+        graph.replay()
+        gate = (x.float() * (k * first / 128)).to(dtype).float()
+        activation = (torch.nn.functional.silu(gate) * gate).to(dtype).float()
+        projected = (activation[:, None] * (n * second) * expert_scale[ids].float()).to(
+            dtype
+        )
+        expected = (projected.float() * probs).sum(1).to(dtype)
+        for row in range(0, tokens, 512):
+            tile = actual[row : row + 512]
+            torch.testing.assert_close(
+                tile,
+                expected[row : row + 512, None] * column_scale,
+                rtol=0.015,
+                atol=1e-5,
+            )

@@ -21,6 +21,7 @@ MAX_EXPERTS = 512
 MAX_HIDDEN_SIZE = 7168
 MAX_INTERMEDIATE_SIZE = 14336
 EXACT_ROUTE_INDEX_LIMIT = 2**24
+# Per grouped batch, excluding caller inputs, the returned output and allocator reservations.
 GROUPED_WORKSPACE_BYTES = 1 << 30
 
 
@@ -682,7 +683,8 @@ def load_weight_tile(
         Q + group[:, None] * group_bytes + tl.arange(0, group_bytes)[None, :]
     )
     # The public layout uses offset-binary codes, packed low nibble first for INT4.
-    q = tl.reshape(codes ^ (0x88 if BITS == 4 else 0x80), (RB * group_bytes,))
+    signed_codes = (codes ^ (0x88 if BITS == 4 else 0x80)).to(tl.uint8)
+    q = tl.reshape(signed_codes, (RB * group_bytes,))
     scales = tl.load(S + group)
     if BITS == 4:
         h = tl.full((RB * 128,), 0, tl.float16)
@@ -2050,12 +2052,6 @@ def grouped_route_moe(
         else torch.empty((padded, k), device=x.device, dtype=x.dtype)
     )
     h = torch.empty((padded, 2 * n), device=x.device, dtype=x.dtype)
-    a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
-    z = (
-        packed_x
-        if packed_x is not None
-        else torch.empty((padded, k), device=x.device, dtype=x.dtype)
-    )
     write_expert_offsets[1,](counts, offsets, e, triton.next_power_of_2(e), bm)
     if bits == 8 and k == 4096:
         if (
@@ -2151,6 +2147,8 @@ def grouped_route_moe(
         )
     else:
         grouped_quantized_gemm(packed_x, w1, s1, experts, h, bm, bits)
+    del routes
+    a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
     mask_tail = (
         bits == 8
         and x.dtype == torch.float16
@@ -2167,7 +2165,14 @@ def grouped_route_moe(
         counts=counts if mask_tail else None,
         bm=bm,
     )
+    del h
+    z = (
+        packed_x
+        if packed_x is not None
+        else torch.empty((padded, k), device=x.device, dtype=x.dtype)
+    )
     grouped_quantized_gemm(a, w2, s2, experts, z, bm, bits)
+    del a
     combine_expert_outputs(z, topk_weights, out, inv)
 
 
