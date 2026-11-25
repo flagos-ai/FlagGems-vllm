@@ -49,7 +49,6 @@ from flaggems_vllm.runtime.backend._thead.fused.marlin_fragments import (
     decode_int8_fragments,
     decode_mx_register,
     fold_fp8_scale_fragment,
-    multiply_bf16_pairs,
     scale_int8_pair,
 )
 from flaggems_vllm.runtime.backend._thead.tle_utils import supports_tle_primitives
@@ -516,32 +515,6 @@ def write_fp8_expert_scale_safety(
 
 
 @triton.jit
-def decode_int8_fragment_bf16(q, s0, s1):
-    low, high = tl.inline_asm_elementwise(
-        (
-            "{ .reg .b32 l<3>, h<3>, v<2>;\n"
-            "ppu.prmt.b32 l0,$2,0x43,0x4140;\n"
-            "ppu.prmt.b32 h0,$2,0x43,0x4342;\n"
-            "ppu.and.b32 l1,l0,0xff7fff7f;\n"
-            "ppu.and.b32 h1,h0,0xff7fff7f;\n"
-            "ppu.lop3.b32 l2,l0,0xff80ff80,0x00800080,0x6a;\n"
-            "ppu.lop3.b32 h2,h0,0xff80ff80,0x00800080,0x6a;\n"
-            "ppu.sub.bf16x2 v0,l1,l2;\n"
-            "ppu.sub.bf16x2 v1,h1,h2;\n"
-            "ppu.mov.b32 $0,v0;\n"
-            "ppu.mov.b32 $1,v1;\n"
-            "}\n"
-        ),
-        "=r,=r,r",
-        [q],
-        dtype=(tl.uint32, tl.uint32),
-        is_pure=True,
-        pack=1,
-    )
-    return multiply_bf16_pairs(low, s0), multiply_bf16_pairs(high, s1)
-
-
-@triton.jit
 def load_w8_packed_scales(ptr, stride_n, FOLD: tl.constexpr):
     words = ptr.to(tl.pointer_type(tl.uint32))
     first = tl.load(words)
@@ -806,16 +779,16 @@ def store_k16(k):
 
 
 @triton.jit
-def load_activation_fragment_x2(shared, channel: tl.constexpr, copy_token):
-    # Load the packed fragment directly from the AIU shared-memory swizzle.
-    return tl.inline_asm_elementwise(
-        "ppu.ldmatrix.sync.aligned.m8n8.x2.swzl.shared.b16 {$0,$1},[$2],{$3,$4,$5,$6,$7,$8};",
-        "=r,=r,r,r,r,r,r,r,r,r,~{memory}",
-        [shared, 0, 0, 1, 8, 1, channel, copy_token],
-        dtype=(tl.uint32, tl.uint32),
-        is_pure=False,
-        pack=1,
-    )
+def load_activation_fragment_x2(shared, channel: tl.constexpr, lane):
+    # The AIU swizzle rotates four-row groups and swaps the two 16-byte halves.
+    sector = channel // 32
+    skew = ((sector & 1) << 1) | (sector >> 1)
+    row = lane // 4
+    rotated_row = (row & ~3) | ((row + skew) & 3)
+    word = (lane % 4) ^ ((row // 4) * 4)
+    offset = sector * 64 + rotated_row * 8 + word
+    ptr = shared.to(tl.uint64).to(tl.pointer_type(tl.uint32, 3))
+    return tl.load(ptr + offset), tl.load(ptr + (offset ^ 4))
 
 
 LARGE_SCALE_WARP_THRESHOLD = 8 * 1024
@@ -3706,8 +3679,7 @@ def square_accumulate(
                     (b0, b1, b2, b3) = load_matrix_x4(
                         ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, copy_token
                     )
-                    a0, a1 = decode_int8_fragment_bf16(q0, s0, s0)
-                    a2, a3 = decode_int8_fragment_bf16(q8, s1, s1)
+                    a0, a1, a2, a3 = decode_int8_fragments(q0, q8, s0, s1)
                 (c0, c1, c2, c3, c4, c5, c6, c7) = mma_bf16_square(
                     a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7
                 )
@@ -4152,7 +4124,7 @@ def raw_w4_square_kernel(
                     sub = group * 4 + chunk * 2 + part
                     if ROWS == 8:
                         b0, b1 = load_activation_fragment_x2(
-                            ahere + (sub // 4) * 1024, (sub % 4) * 32, copy_token
+                            ahere + (sub // 4) * 1024, (sub % 4) * 32, lane
                         )
                         c0, c1, c2, c3 = mma_bf16_m16n8(
                             a0, a2, a1, a3, b0, b1, c0, c1, c2, c3
@@ -4265,6 +4237,7 @@ def w8_narrow_accumulate(
     SCALE_PAIR: tl.constexpr = False,
 ):
     # Two K=128 buffers overlap AIU transfer and eight 16-K MMAs.
+    lane = tl.arange(0, 256) % 32
     if initial_dep is None:
         copy_token = tl.full((256,), 0, tl.int32)
         copy_token = prefetch_w8_tile(
@@ -4338,18 +4311,11 @@ def w8_narrow_accumulate(
                         (a0, a2, a1, a3) = decode_fp8_pair(q0, q8, s0, s1, True)
                     else:
                         (a0, a2, a1, a3) = decode_fp8_pair(q0, q8, s0, s1, False)
-                    (b0, b1) = load_activation_fragment_x2(
-                        ahere + sub // 4 * 1024, sub % 4 * 32, copy_token
-                    )
                 else:
-                    (b0, b1) = load_activation_fragment_x2(
-                        ahere + sub // 4 * 1024, sub % 4 * 32, copy_token
-                    )
-                    if IS_SPLIT_Q:
-                        a0, a2 = decode_int8_fragment_bf16(q0, s0, s0)
-                        a1, a3 = decode_int8_fragment_bf16(q8, s1, s1)
-                    else:
-                        a0, a2, a1, a3 = decode_int8_fragments(q0, q8, s0, s1)
+                    a0, a2, a1, a3 = decode_int8_fragments(q0, q8, s0, s1)
+                (b0, b1) = load_activation_fragment_x2(
+                    ahere + sub // 4 * 1024, sub % 4 * 32, lane
+                )
                 (c0, c1, c2, c3) = mma_bf16_m16n8(
                     a0, a1, a2, a3, b0, b1, c0, c1, c2, c3
                 )
@@ -4652,8 +4618,7 @@ def accumulate_quantized_wide_tile(
                     else:
                         sub = group * 2 + part
                         if QTYPE == _TL_QUANT_TYPE_UINT8B128:
-                            a0, a1 = decode_int8_fragment_bf16(q0, s0, s0)
-                            a2, a3 = decode_int8_fragment_bf16(q8, s1, s1)
+                            a0, a1, a2, a3 = decode_int8_fragments(q0, q8, s0, s1)
                         else:
                             a0, a1, a2, a3 = decode_fp8_pair(q0, q8, s0, s1, FAST)
                     # Reuse the decoded fragment for each live group of 16 routes.
