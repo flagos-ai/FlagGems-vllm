@@ -58,7 +58,7 @@ def _cpu_reference(sampled, mapping, traces, lengths, total, prompt):
     total_lengths = total.cpu().tolist()
     prompt_lengths = prompt.cpu().tolist()
     for batch_idx, req_idx in enumerate(request_indices):
-        if req_idx < 0:
+        if req_idx < 0 or req_idx >= len(trace_lengths):
             continue
         step = total_lengths[req_idx] - prompt_lengths[req_idx]
         if 0 <= step < trace_lengths[req_idx]:
@@ -66,11 +66,15 @@ def _cpu_reference(sampled, mapping, traces, lengths, total, prompt):
     return result
 
 
-def _assert_replay(sampled, mapping, traces, lengths, total, prompt, expected=None):
+def _assert_replay(
+    sampled, mapping, traces, lengths, total, prompt, expected=None, *, check_vllm=True
+):
     cpu_expected = _cpu_reference(sampled, mapping, traces, lengths, total, prompt)
     if expected is not None:
         assert cpu_expected == expected
-    reference_sampled = sampled.clone() if vllm_reference is not None else None
+    reference_sampled = (
+        sampled.clone() if check_vllm and vllm_reference is not None else None
+    )
     pointer = sampled.data_ptr()
     assert (
         flaggems_apply_trace_tokens(sampled, mapping, traces, lengths, total, prompt)
@@ -109,6 +113,15 @@ def test_replay_overwrites_sampled_at_each_step():
 
 
 @pytest.mark.apply_trace_tokens
+def test_single_request_replays_current_step():
+    traces = torch.zeros(1, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
+    traces[0, 1] = 101
+    _assert_replay(
+        _i64([-7]), _i32([0]), traces, _i32([3]), _i32([6]), _i32([5]), [101]
+    )
+
+
+@pytest.mark.apply_trace_tokens
 def test_past_end_of_trace_leaves_sampled_untouched():
     traces = torch.zeros(1, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
     traces[0, :2] = _i32([100, 101])
@@ -139,7 +152,9 @@ def test_idx_mapping_indirection_and_negative_skip():
 
 
 @pytest.mark.apply_trace_tokens
-@pytest.mark.parametrize("num_reqs", [5, 33, 127, 128, 129, 256, 257])
+@pytest.mark.parametrize(
+    "num_reqs", [1, 2, 3, 5, 32, 33, 127, 128, 129, 256, 257, 4096]
+)
 def test_mixed_requests_with_padded_trace_rows(num_reqs):
     row_width = MAX_MODEL_LEN + 3
     traces = torch.arange(
@@ -151,6 +166,66 @@ def test_mixed_requests_with_padded_trace_rows(num_reqs):
     prompt = _i32([5] * num_reqs)
     total = _i32([4 + idx % 6 for idx in range(num_reqs)])
     _assert_replay(_i64([-7] * num_reqs), mapping, traces, lengths, total, prompt)
+
+
+@pytest.mark.apply_trace_tokens
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend",
+    reason="non-contiguous sampled views are covered by the Ascend specialization",
+)
+@pytest.mark.parametrize("num_reqs", [5, 33])
+def test_noncontiguous_sampled_and_trace_views(num_reqs):
+    sampled_storage = _i64([-7, 99] * num_reqs)
+    sampled = sampled_storage[::2]
+    traces = torch.arange(
+        num_reqs * (MAX_MODEL_LEN + 2), dtype=torch.int32, device=DEVICE
+    ).reshape(num_reqs, MAX_MODEL_LEN + 2)[:, 1:-1]
+    mapping = _i32(([2, -1, 2, 0, 4] * num_reqs)[:num_reqs])
+    lengths = _i32([1, 0, 3, 1, 2])
+    total = _i32([5, 5, 7, 3, 7])
+    prompt = _i32([5, 5, 5, 5, 5])
+
+    _assert_replay(sampled, mapping, traces, lengths, total, prompt, check_vllm=False)
+    assert sampled_storage[1::2].cpu().tolist() == [99] * num_reqs
+
+
+@pytest.mark.apply_trace_tokens
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend",
+    reason="positive out-of-range mappings are guarded by the Ascend specialization",
+)
+@pytest.mark.parametrize("num_reqs", [6, 33])
+def test_invalid_steps_and_mappings_leave_sampled_untouched(num_reqs):
+    traces = torch.zeros(5, MAX_MODEL_LEN, dtype=torch.int32, device=DEVICE)
+    traces[4, 1] = -123456789
+    _assert_replay(
+        _i64(([10, 20, 30, 40, 50, 60] * num_reqs)[:num_reqs]),
+        _i32(([0, 1, 2, 3, 4, 9] * num_reqs)[:num_reqs]),
+        traces,
+        _i32([3, 0, 3, 3, 2]),
+        _i32([4, 5, 8, 100000, 6]),
+        _i32([5, 5, 5, 5, 5]),
+        ([10, 20, 30, 40, -123456789, 60] * num_reqs)[:num_reqs],
+        check_vllm=False,
+    )
+
+
+@pytest.mark.apply_trace_tokens
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend",
+    reason="empty batches are an Ascend-specific no-launch case",
+)
+def test_empty_request_batch_is_a_noop():
+    _assert_replay(
+        torch.empty(0, dtype=torch.int64, device=DEVICE),
+        torch.empty(0, dtype=torch.int32, device=DEVICE),
+        torch.empty((0, MAX_MODEL_LEN), dtype=torch.int32, device=DEVICE),
+        torch.empty(0, dtype=torch.int32, device=DEVICE),
+        torch.empty(0, dtype=torch.int32, device=DEVICE),
+        torch.empty(0, dtype=torch.int32, device=DEVICE),
+        [],
+        check_vllm=False,
+    )
 
 
 @pytest.mark.apply_trace_tokens

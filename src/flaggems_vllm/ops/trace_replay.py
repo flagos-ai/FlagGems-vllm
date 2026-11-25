@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
+
 
 @triton.jit
 def _trace_replay_kernel(
@@ -64,6 +66,15 @@ def apply_trace_tokens(
     prompt_len: torch.Tensor,
 ) -> None:
     """Overwrite ``sampled`` in place with trace tokens for the current step."""
+    if runtime.device.vendor_name == "ascend":
+        from flaggems_vllm.runtime.backend._ascend.ops.trace_replay import (
+            apply_trace_tokens_ascend,
+        )
+
+        return apply_trace_tokens_ascend(
+            sampled, idx_mapping, trace_token_ids, trace_len, total_len, prompt_len
+        )
+
     num_reqs = idx_mapping.shape[0]
     block = min(triton.next_power_of_2(max(num_reqs, 1)), 128)
     _trace_replay_kernel[(triton.cdiv(num_reqs, block),)](
