@@ -21,15 +21,19 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from .qwen_h4096_primitives import load_score_float4 as v370__load_score_float4
-from .qwen_h4096_primitives import pair2_broadcast_f32 as v369__pair2_broadcast_f32
-from .qwen_h4096_primitives import pair2_max_u32 as v388__pair2_max_u32
-from .qwen_h4096_primitives import pair2_sum_f32 as v369__pair2_sum_f32
-from .qwen_h4096_primitives import sort4_pack as v166__sort4_pack
-from .qwen_h4096_primitives import sorted_head as v166__sorted_head
 from .routing_primitives import ordered_score_key as routing__ordered_score_key
 from .routing_primitives import warp_broadcast_f32 as routing__warp_broadcast_f32
 from .routing_primitives import warp_max_u32 as routing__warp_max_u32
+from .sm90_softmax_e512_routing_helpers import (
+    load_score_float4 as v370__load_score_float4,
+)
+from .sm90_softmax_e512_routing_helpers import (
+    pair2_broadcast_f32 as v369__pair2_broadcast_f32,
+)
+from .sm90_softmax_e512_routing_helpers import pair2_max_u32 as v388__pair2_max_u32
+from .sm90_softmax_e512_routing_helpers import pair2_sum_f32 as v369__pair2_sum_f32
+from .sm90_softmax_e512_routing_helpers import sort4_pack as v166__sort4_pack
+from .sm90_softmax_e512_routing_helpers import sorted_head as v166__sorted_head
 
 v369__HIDDEN = 4096
 v369__EXPERTS = 512

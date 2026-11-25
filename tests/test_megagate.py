@@ -18,19 +18,23 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import MegaGateContext
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import (
-    MegaGateContext,
+    api as megagate_api,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import (
     create_megagate_context,
+    megagate,
 )
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import (
-    dsv4 as dsv4_module,
+    sqrt_softplus_h4096_e256_k6 as dsv4_module,
 )
-from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate import megagate
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.api import (
     EXPERTS,
     HIDDEN,
@@ -42,9 +46,16 @@ from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.api import (
     MegaGateContextError,
     UnpreparedShapeError,
 )
-from flaggems_vllm.utils.tle_capabilities import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.capabilities import (
+    _has_module_wide_named_barrier_support,
+    is_megagate_available,
     supports_megagate_tle,
     supports_module_wide_named_barriers,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.registry import (
+    ShapeKey,
+    get_kernel_plan,
+    get_profile,
 )
 
 pytestmark = pytest.mark.megagate
@@ -89,16 +100,94 @@ SCHEDULE_FAMILY_CASES = (
 def _has_hopper_megagate() -> bool:
     if flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available():
         return False
-    try:
-        if tuple(torch.cuda.get_device_capability()) != (9, 0):
-            return False
-        import triton.experimental.tle.language as tle
-    except (ImportError, RuntimeError):
+    if tuple(torch.cuda.get_device_capability()) != (9, 0):
         return False
-    return supports_megagate_tle(tle) and supports_module_wide_named_barriers()
+    return is_megagate_available()
 
 
 HOPPER_MEGAGATE_AVAILABLE = _has_hopper_megagate()
+
+
+def test_megagate_tle_capability_is_operator_local() -> None:
+    def api(*args, **kwargs):
+        raise AssertionError("capability probe executed a TLE primitive")
+
+    language = SimpleNamespace(
+        pipe=api,
+        device_mesh=api,
+        MeshConfig=api,
+        distributed_barrier=api,
+        shard_id=api,
+        gpu=SimpleNamespace(
+            alloc=api,
+            local_ptr=api,
+            copy=api,
+            warp_specialize=api,
+            alloc_barrier=api,
+            barrier_wait=api,
+            wgmma=api,
+            wgmma_wait=api,
+            smem=object(),
+        ),
+    )
+
+    assert supports_megagate_tle(language)
+    assert not supports_megagate_tle(None)
+    for namespace in (language, language.gpu):
+        for name, value in vars(namespace).copy().items():
+            if callable(value):
+                setattr(namespace, name, object())
+                assert not supports_megagate_tle(language), name
+            delattr(namespace, name)
+            before = vars(namespace).copy()
+            assert not supports_megagate_tle(language), name
+            assert vars(namespace) == before
+            setattr(namespace, name, value)
+
+
+def test_megagate_named_barrier_capability_requires_fixed_contract() -> None:
+    def api(*args, **kwargs):
+        raise AssertionError("capability probe executed a compiler API")
+
+    def reserve(_semantic, count, _generator=None):
+        raise AssertionError("capability probe executed the frontend allocator")
+
+    core = SimpleNamespace(
+        _FIRST_VIRTUAL_NAMED_BARRIER_ID=16,
+        _reserve_named_barrier_ids=reserve,
+    )
+    libtriton = SimpleNamespace(
+        tle=SimpleNamespace(
+            passes=SimpleNamespace(add_allocate_named_barriers=api),
+        )
+    )
+
+    assert _has_module_wide_named_barrier_support(core, libtriton)
+
+    core._FIRST_VIRTUAL_NAMED_BARRIER_ID = 15
+    assert not _has_module_wide_named_barrier_support(core, libtriton)
+    core._FIRST_VIRTUAL_NAMED_BARRIER_ID = 16
+
+    def legacy_reserve(_semantic, count):
+        raise AssertionError("capability probe executed the legacy allocator")
+
+    core._reserve_named_barrier_ids = legacy_reserve
+    assert not _has_module_wide_named_barrier_support(core, libtriton)
+    core._reserve_named_barrier_ids = object()
+    assert not _has_module_wide_named_barrier_support(core, libtriton)
+    core._reserve_named_barrier_ids = reserve
+
+    libtriton.tle.passes.add_allocate_named_barriers = object()
+    assert not _has_module_wide_named_barrier_support(core, libtriton)
+
+
+def test_megagate_named_barrier_capability_is_cached() -> None:
+    first = supports_module_wide_named_barriers()
+    before = supports_module_wide_named_barriers.cache_info()
+    assert supports_module_wide_named_barriers() is first
+    after = supports_module_wide_named_barriers.cache_info()
+    assert after.misses == before.misses
+    assert after.hits == before.hits + 1
 
 
 @pytest.mark.megagate
@@ -122,20 +211,27 @@ def test_megagate_dsv4_public_contract() -> None:
 
 
 @pytest.mark.parametrize("profile_name", tuple(PROFILES))
-def test_megagate_profile_module_matches_registry(profile_name: str) -> None:
+def test_megagate_profile_shape_plans_match_modules(profile_name: str) -> None:
     profile = PROFILES[profile_name]
-    module = importlib.import_module(profile.module)
-    assert module.PROFILE == profile.name
-    assert (module.HIDDEN, module.EXPERTS, module.TOPK) == (
-        profile.hidden,
-        profile.experts,
-        profile.topk,
-    )
-    assert module.ROUTED_SCALING_FACTOR == profile.routed_scaling_factor
-    assert tuple(module.SUPPORTED_TOKENS) == profile.supported_tokens
-    assert module.TOKEN_TO_LEAF == dict(profile.source_leaf_by_tokens)
-    assert module.MegaGateContextError is MegaGateContextError
-    assert module.UnpreparedShapeError is UnpreparedShapeError
+    actual_leaves = {}
+    implementation_modules = set()
+    for tokens in profile.supported_tokens:
+        plan = get_kernel_plan(profile.shape_key(tokens))
+        module = importlib.import_module(plan.implementation_module)
+        implementation_modules.add(module)
+        assert (module.HIDDEN, module.EXPERTS, module.TOPK) == (
+            profile.hidden,
+            profile.experts,
+            profile.topk,
+        )
+        assert module.ROUTED_SCALING_FACTOR == profile.routed_scaling_factor
+        assert tokens in module.SUPPORTED_TOKENS
+        assert module.TOKEN_TO_LEAF[tokens] == plan.source_leaf
+        assert module.MegaGateContextError is MegaGateContextError
+        assert module.UnpreparedShapeError is UnpreparedShapeError
+        actual_leaves[tokens] = plan.source_leaf
+    assert len(implementation_modules) == 1
+    assert actual_leaves == dict(profile.source_leaf_by_tokens)
 
     context = create_megagate_context(profile=profile_name)
     assert context.profile == profile_name
@@ -143,6 +239,26 @@ def test_megagate_profile_module_matches_registry(profile_name: str) -> None:
     assert context.supported_tokens == profile.supported_tokens
     assert context.source_leaf_by_tokens == dict(profile.source_leaf_by_tokens)
     context.close()
+
+
+def test_megagate_profile_aliases_are_not_dispatch_key_fields() -> None:
+    assert {"model", "module", "name", "profile"}.isdisjoint(
+        ShapeKey.__dataclass_fields__
+    )
+    assert "module" not in type(PROFILES["dsv4_flash"]).__dataclass_fields__
+    for alias, canonical, tokens in (
+        ("dsv4", "dsv4_flash", 1028),
+        ("deepseek_v4", "dsv4_flash", 1028),
+        ("deepseek_v3_2", "dsv32", 1028),
+        ("qwen_h2048", "qwen_h2048_e256_k8", 1034),
+        ("qwen_h4096", "qwen_h4096_e512_k10", 1035),
+    ):
+        alias_profile = get_profile(alias)
+        canonical_profile = get_profile(canonical)
+        alias_shape = alias_profile.shape_key(tokens)
+        canonical_shape = canonical_profile.shape_key(tokens)
+        assert alias_shape == canonical_shape
+        assert get_kernel_plan(alias_shape) is get_kernel_plan(canonical_shape)
 
 
 def test_megagate_api_signatures_keep_prepare_outside_hot_path() -> None:
@@ -187,6 +303,75 @@ def test_megagate_context_close_releases_host_state() -> None:
     assert context.prepared_tokens == ()
 
 
+def test_megagate_prepares_exact_plans_and_caches_device_capability(
+    monkeypatch,
+) -> None:
+    class Tensor:
+        def __init__(self, shape):
+            self.shape = shape
+            self.ndim = len(shape)
+            self.dtype = torch.bfloat16
+            self.device = torch.device("cuda", 0)
+
+    capability_queries = []
+    plans = []
+    closed = []
+
+    def get_capability(device):
+        capability_queries.append(device)
+        return (9, 0)
+
+    class HostContext:
+        def prepare(self, x, weight, bias, *, routed_scaling_factor, plan):
+            if not plans:
+                plans.append(None)
+                raise RuntimeError("injected prepare failure")
+            plans.append(plan)
+
+        def run(self, x, weight, bias, *, routed_scaling_factor):
+            return x, weight
+
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(
+        megagate_api,
+        "torch",
+        SimpleNamespace(
+            Tensor=Tensor,
+            cuda=SimpleNamespace(get_device_capability=get_capability),
+        ),
+    )
+    monkeypatch.setattr(
+        megagate_api,
+        "_load_plan_module",
+        lambda plan: SimpleNamespace(MegaGateContext=HostContext),
+    )
+    context = MegaGateContext()
+    first, second = (Tensor((tokens, HIDDEN)) for tokens in SUPPORTED_TOKENS[:2])
+    weight = Tensor((EXPERTS, HIDDEN))
+
+    with pytest.raises(RuntimeError, match="injected prepare failure"):
+        context.prepare(first, weight)
+    assert context.prepared_tokens == ()
+    with pytest.raises(UnpreparedShapeError):
+        megagate(first, weight, context=context)
+
+    for x in (first, second):
+        context.prepare(x, weight)
+        assert plans[-1] is get_kernel_plan(context.profile_spec.shape_key(x.shape[0]))
+        assert megagate(x, weight, context=context) == (x, weight)
+    assert context.prepared_tokens == SUPPORTED_TOKENS[:2]
+    assert capability_queries == [first.device, first.device]
+
+    context.close()
+    assert context.prepared_tokens == ()
+    assert len(closed) == 1
+    with pytest.raises(UnpreparedShapeError):
+        megagate(first, weight, context=context)
+    assert capability_queries == [first.device, first.device]
+
+
 @pytest.mark.parametrize("tokens", [1, 1024, 4101, 16385])
 def test_megagate_exact_token_dispatch_fails_closed_on_cpu(tokens: int) -> None:
     # Meta tensors keep this source/API test cheap and prove that an unsupported
@@ -208,7 +393,7 @@ def test_megagate_supported_token_rejects_non_cuda_abi() -> None:
     x = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device="meta")
     gate_weight = torch.empty((EXPERTS, HIDDEN), dtype=torch.bfloat16, device="meta")
     correction_bias = torch.empty((EXPERTS,), dtype=torch.float32, device="meta")
-    with pytest.raises(ValueError, match="violates the DSV4 ABI"):
+    with pytest.raises(ValueError, match="requires CUDA inputs"):
         megagate(
             x,
             gate_weight,

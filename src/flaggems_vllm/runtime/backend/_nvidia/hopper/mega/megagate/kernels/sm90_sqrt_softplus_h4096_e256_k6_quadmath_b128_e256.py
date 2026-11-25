@@ -31,8 +31,8 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from . import dsv4_common as _common
 from . import ordered_routing as _ordered
+from . import sm90_sqrt_softplus_h4096_e256_k6_common as _common
 
 SUPPORTED_TOKENS: Final = (7884, 8221, 13021, 16384)
 HIDDEN: Final = _common.HIDDEN

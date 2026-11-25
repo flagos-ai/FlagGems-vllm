@@ -22,7 +22,7 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from . import dsv32_common as _common
+from . import sm90_grouped_sigmoid_h7168_e256_k8_common as _common
 
 SOURCE_LEAF: Final = "v372"
 

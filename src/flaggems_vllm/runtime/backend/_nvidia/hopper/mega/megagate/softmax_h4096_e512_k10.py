@@ -30,51 +30,52 @@ No CUDA Graph path or runtime research-tree dependency is introduced here.
 from __future__ import annotations
 
 import importlib
-import math
-import threading
-from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final
 
 import torch
 
+from .capabilities import require_megagate_tle
+from .context import (
+    HostContext,
+    InputContract,
+    validate_prepare_inputs,
+    validate_runtime_inputs,
+)
 from .errors import MegaGateContextError, UnpreparedShapeError
 from .kernels.runtime import ExactGridUnboundCompiledRunner
+from .registry import get_module_dispatch
+from .types import KernelPlan
 
 PROFILE: Final = "qwen_h4096_e512_k10"
-SUPPORTED_TOKENS: Final = (
-    1035,
-    1036,
-    2048,
-    4107,
-    4108,
-    4434,
-    4435,
-    5240,
-    8214,
-    13421,
-    13422,
-    16384,
-)
+TOKEN_TO_LEAF: Final = get_module_dispatch(__name__)
+SUPPORTED_TOKENS: Final = tuple(TOKEN_TO_LEAF)
 HIDDEN: Final = 4096
 EXPERTS: Final = 512
 TOPK: Final = 10
 ROUTED_SCALING_FACTOR: Final = 1.0
+_INPUT_CONTRACT: Final = InputContract(
+    name="functional Qwen-H4096",
+    supported_tokens=SUPPORTED_TOKENS,
+    hidden=HIDDEN,
+    experts=EXPERTS,
+    routed_scaling_factor=ROUTED_SCALING_FACTOR,
+    requires_correction_bias=False,
+)
 
 
 @dataclass(frozen=True)
 class _LeafDefinition:
     name: str
     module_name: str
-    tokens: tuple[int, ...]
     weight_block: int
     x_blocks: tuple[tuple[int, int | None], ...]
     candidate_producers: int
     candidate_words: int
     candidate_dtype: torch.dtype
-    state_tiles: Mapping[int, int]
-    grid: Mapping[int, int]
+    state_tiles: int
+    grid: int
     expected_abi_names: tuple[str, ...]
     uses_mesh: bool = False
 
@@ -86,15 +87,14 @@ class _LeafDefinition:
 _LEAF_DEFINITIONS: Final = (
     _LeafDefinition(
         name="v371",
-        module_name="qwen_h4096_e64_cluster8",
-        tokens=(1035, 1036),
+        module_name="sm90_softmax_h4096_e512_k10_small_cluster8",
         weight_block=64,
         x_blocks=((128, None),),
         candidate_producers=0,
         candidate_words=0,
         candidate_dtype=torch.float32,
-        state_tiles=MappingProxyType({1035: 0, 1036: 0}),
-        grid=MappingProxyType({1035: 9, 1036: 9}),
+        state_tiles=0,
+        grid=9,
         expected_abi_names=(
             "weight_desc",
             "x_desc",
@@ -108,15 +108,14 @@ _LEAF_DEFINITIONS: Final = (
     ),
     _LeafDefinition(
         name="v400",
-        module_name="qwen_h4096_t2048",
-        tokens=(2048,),
+        module_name="sm90_softmax_h4096_e512_k10_t2048",
         weight_block=128,
         x_blocks=((64, None),),
         candidate_producers=4,
         candidate_words=10,
         candidate_dtype=torch.int32,
-        state_tiles=MappingProxyType({2048: 32}),
-        grid=MappingProxyType({2048: 128}),
+        state_tiles=32,
+        grid=128,
         expected_abi_names=(
             "weight_desc",
             "x_desc",
@@ -130,15 +129,14 @@ _LEAF_DEFINITIONS: Final = (
     ),
     _LeafDefinition(
         name="v412",
-        module_name="qwen_h4096_t410x",
-        tokens=(4107, 4108),
+        module_name="sm90_softmax_h4096_e512_k10_t4107_t4108",
         weight_block=128,
         x_blocks=((128, None),),
         candidate_producers=4,
         candidate_words=10,
         candidate_dtype=torch.int32,
-        state_tiles=MappingProxyType({4107: 33, 4108: 33}),
-        grid=MappingProxyType({4107: 132, 4108: 132}),
+        state_tiles=33,
+        grid=132,
         expected_abi_names=(
             "weight_desc",
             "x_desc",
@@ -152,15 +150,14 @@ _LEAF_DEFINITIONS: Final = (
     ),
     _LeafDefinition(
         name="v414",
-        module_name="qwen_h4096_t443x",
-        tokens=(4434, 4435),
+        module_name="sm90_softmax_h4096_e512_k10_t4434_t4435",
         weight_block=64,
         x_blocks=((64, None), (8, None)),
         candidate_producers=4,
         candidate_words=10,
         candidate_dtype=torch.int32,
-        state_tiles=MappingProxyType({4434: 33, 4435: 33}),
-        grid=MappingProxyType({4434: 132, 4435: 132}),
+        state_tiles=33,
+        grid=132,
         expected_abi_names=(
             "weight_desc",
             "x64_desc",
@@ -175,15 +172,14 @@ _LEAF_DEFINITIONS: Final = (
     ),
     _LeafDefinition(
         name="v431",
-        module_name="qwen_h4096_t5240",
-        tokens=(5240,),
+        module_name="sm90_softmax_h4096_e512_k10_t5240",
         weight_block=128,
         x_blocks=((128, None), (32, None)),
         candidate_producers=4,
         candidate_words=10,
         candidate_dtype=torch.int32,
-        state_tiles=MappingProxyType({5240: 33}),
-        grid=MappingProxyType({5240: 132}),
+        state_tiles=33,
+        grid=132,
         expected_abi_names=(
             "weight_desc",
             "x128_desc",
@@ -198,15 +194,14 @@ _LEAF_DEFINITIONS: Final = (
     ),
     _LeafDefinition(
         name="v394",
-        module_name="qwen_h4096_t8214",
-        tokens=(8214,),
+        module_name="sm90_softmax_h4096_e512_k10_t8214",
         weight_block=256,
         x_blocks=((128, None),),
         candidate_producers=2,
         candidate_words=10,
         candidate_dtype=torch.int32,
-        state_tiles=MappingProxyType({8214: 65}),
-        grid=MappingProxyType({8214: 130}),
+        state_tiles=65,
+        grid=130,
         expected_abi_names=(
             "weight_desc",
             "x_desc",
@@ -220,15 +215,14 @@ _LEAF_DEFINITIONS: Final = (
     ),
     _LeafDefinition(
         name="v430",
-        module_name="qwen_h4096_t1342x",
-        tokens=(13421, 13422),
+        module_name="sm90_softmax_h4096_e512_k10_t13421_t13422",
         weight_block=256,
         x_blocks=((128, None), (128, 80)),
         candidate_producers=2,
         candidate_words=10,
         candidate_dtype=torch.int32,
-        state_tiles=MappingProxyType({13421: 65, 13422: 65}),
-        grid=MappingProxyType({13421: 130, 13422: 130}),
+        state_tiles=65,
+        grid=130,
         expected_abi_names=(
             "weight_desc",
             "x128_desc",
@@ -243,15 +237,14 @@ _LEAF_DEFINITIONS: Final = (
     ),
     _LeafDefinition(
         name="v415",
-        module_name="qwen_h4096_t16384",
-        tokens=(16384,),
+        module_name="sm90_softmax_h4096_e512_k10_t16384",
         weight_block=256,
         x_blocks=((128, None),),
         candidate_producers=2,
         candidate_words=40,
         candidate_dtype=torch.float32,
-        state_tiles=MappingProxyType({16384: 64}),
-        grid=MappingProxyType({16384: 128}),
+        state_tiles=64,
+        grid=128,
         expected_abi_names=(
             "weight_desc",
             "x128_desc",
@@ -265,14 +258,9 @@ _LEAF_DEFINITIONS: Final = (
     ),
 )
 
-_TOKEN_TO_DEFINITION: Final = {
-    token: definition for definition in _LEAF_DEFINITIONS for token in definition.tokens
+_DEFINITION_BY_LEAF: Final = {
+    definition.name: definition for definition in _LEAF_DEFINITIONS
 }
-assert tuple(_TOKEN_TO_DEFINITION) == SUPPORTED_TOKENS
-
-TOKEN_TO_LEAF: Final = MappingProxyType(
-    {token: definition.name for token, definition in _TOKEN_TO_DEFINITION.items()}
-)
 
 # Public, immutable dispatch metadata.  Runtime module objects and callables are
 # intentionally absent so importing this API remains CPU/static-test friendly.
@@ -280,12 +268,12 @@ DISPATCH: Final = MappingProxyType(
     {
         token: MappingProxyType(
             {
-                "tle_leaf": definition.name,
-                "module": definition.module_name,
+                "tle_leaf": leaf,
+                "module": _DEFINITION_BY_LEAF[leaf].module_name,
                 "kernel_count": 1,
             }
         )
-        for token, definition in _TOKEN_TO_DEFINITION.items()
+        for token, leaf in TOKEN_TO_LEAF.items()
     }
 )
 
@@ -385,13 +373,6 @@ class _CompiledLeaf:
     abi_arg_names: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class _WorkspaceKey:
-    device_index: int
-    stream_handle: int
-    tokens: int
-
-
 @dataclass
 class _Workspace:
     logits: torch.Tensor
@@ -416,133 +397,6 @@ def _allocator(size: int, alignment: int, stream: int) -> torch.Tensor:
     return torch.empty(size, device="cuda", dtype=torch.uint8)
 
 
-def _require_tle_capabilities() -> None:
-    """Fail clearly when the installed TLE runtime lacks required SM90 APIs."""
-
-    try:
-        import triton.experimental.tle.language as tle
-    except ImportError as error:
-        raise RuntimeError("MegaGate requires Triton TLE support") from error
-
-    from flaggems_vllm.utils.tle_capabilities import (
-        supports_megagate_tle,
-        supports_module_wide_named_barriers,
-    )
-
-    if not supports_megagate_tle(tle):
-        raise RuntimeError(
-            "MegaGate requires TLE pipe, warp-specialization, barrier, "
-            "TMA, and WGMMA APIs"
-        )
-    if not supports_module_wide_named_barriers():
-        raise RuntimeError(
-            "MegaGate requires module-wide named-barrier allocation support"
-        )
-
-
-def _require_tensor(
-    tensor: torch.Tensor,
-    *,
-    name: str,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-) -> None:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if tuple(tensor.shape) != shape:
-        raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
-    if tensor.dtype != dtype:
-        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
-    if tensor.device != device:
-        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
-
-
-def _validate_inputs(
-    x: torch.Tensor,
-    gate_weight: torch.Tensor,
-    correction_bias: torch.Tensor | None,
-    routed_scaling_factor: float,
-    *,
-    prepare: bool,
-) -> tuple[int, torch.device]:
-    if correction_bias is not None:
-        raise ValueError("Qwen softmax routing does not accept correction_bias")
-    if not isinstance(x, torch.Tensor) or not isinstance(gate_weight, torch.Tensor):
-        raise TypeError("x and gate_weight must be torch.Tensor objects")
-    if x.ndim != 2:
-        raise ValueError(f"x must be rank two, got rank {x.ndim}")
-    tokens = int(x.shape[0])
-    if tokens not in _TOKEN_TO_DEFINITION:
-        raise ValueError(
-            f"functional Qwen-H4096 rejects T={tokens}; "
-            f"supported={SUPPORTED_TOKENS}"
-        )
-    device = x.device
-    if device.type != "cuda":
-        raise ValueError(f"x must be CUDA, got {device}")
-    _require_tensor(
-        x,
-        name="x",
-        shape=(tokens, HIDDEN),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    _require_tensor(
-        gate_weight,
-        name="gate_weight",
-        shape=(EXPERTS, HIDDEN),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    scale = float(routed_scaling_factor)
-    if not math.isfinite(scale) or scale != ROUTED_SCALING_FACTOR:
-        raise ValueError("routed_scaling_factor must be exactly 1.0")
-    if prepare and tuple(torch.cuda.get_device_capability(device)) != (9, 0):
-        raise RuntimeError("functional Qwen-H4096 MegaGate requires SM90")
-    return tokens, device
-
-
-def _validate_runtime_inputs(
-    x: torch.Tensor,
-    gate_weight: torch.Tensor,
-    correction_bias: torch.Tensor | None,
-    routed_scaling_factor: float,
-) -> tuple[int, torch.device]:
-    """Straight-line hot ABI checks without prepare-time architecture I/O."""
-
-    if correction_bias is not None:
-        raise ValueError("Qwen softmax routing does not accept correction_bias")
-    if not isinstance(x, torch.Tensor) or not isinstance(gate_weight, torch.Tensor):
-        raise TypeError("x and gate_weight must be torch.Tensor objects")
-    if x.ndim != 2:
-        raise ValueError(f"x must be rank two, got rank {x.ndim}")
-    tokens = int(x.shape[0])
-    if tokens not in _TOKEN_TO_DEFINITION:
-        raise ValueError(
-            f"functional Qwen-H4096 rejects T={tokens}; "
-            f"supported={SUPPORTED_TOKENS}"
-        )
-    device = x.device
-    if (
-        tuple(x.shape) != (tokens, HIDDEN)
-        or tuple(gate_weight.shape) != (EXPERTS, HIDDEN)
-        or x.dtype != torch.bfloat16
-        or gate_weight.dtype != torch.bfloat16
-        or device.type != "cuda"
-        or gate_weight.device != device
-        or not x.is_contiguous()
-        or not gate_weight.is_contiguous()
-    ):
-        raise ValueError("x or gate_weight violates the Qwen-H4096 ABI")
-    scale = float(routed_scaling_factor)
-    if not math.isfinite(scale) or scale != ROUTED_SCALING_FACTOR:
-        raise ValueError("routed_scaling_factor must be exactly 1.0")
-    return tokens, device
-
-
 def _compiled_abi_arg_names(compiled: Any) -> tuple[str, ...]:
     try:
         names = tuple(str(name) for name in compiled.src.fn.arg_names)
@@ -555,7 +409,7 @@ def _compiled_abi_arg_names(compiled: Any) -> tuple[str, ...]:
     return names
 
 
-class MegaGateContext:
+class MegaGateContext(HostContext[_CompiledLeaf, _Workspace]):
     """Compiled exact leaves plus per-stream internal workspaces."""
 
     api_kind = "functional_unbound_eager_qwen_h4096_final50"
@@ -563,22 +417,13 @@ class MegaGateContext:
     final_scope = "qwen_h4096_e512_k10_eager12"
 
     def __init__(self) -> None:
-        self._compiled: dict[int, _CompiledLeaf] = {}
-        self._workspaces: dict[_WorkspaceKey, _Workspace] = {}
-        self._last_workspace_entry: tuple[_WorkspaceKey, _Workspace] | None = None
+        super().__init__()
         # One current weight storage may need E64/E128/E256 descriptors.  A
         # copy-on-write descriptor map retains all required variants without
         # retaining an unbounded history of old model weights.
         self._weight_descriptor_cache_entry: (
             tuple[tuple[int, int], dict[tuple[Any, ...], Any]] | None
         ) = None
-        self._device_index: int | None = None
-        self._lock = threading.RLock()
-
-    @property
-    def prepared_tokens(self) -> tuple[int, ...]:
-        with self._lock:
-            return tuple(sorted(self._compiled))
 
     @property
     def prepared_dispatch(self) -> dict[int, str]:
@@ -597,25 +442,6 @@ class MegaGateContext:
             }
 
     @staticmethod
-    def _resolve_device_index(device: torch.device) -> int:
-        if device.index is not None:
-            return int(device.index)
-        return int(torch.cuda.current_device())
-
-    def _workspace_key(
-        self,
-        device: torch.device,
-        tokens: int,
-        *,
-        stream: torch.cuda.Stream | None = None,
-    ) -> _WorkspaceKey:
-        device_index = (
-            torch.cuda.current_device() if device.index is None else int(device.index)
-        )
-        current_stream = stream or torch.cuda.current_stream(device)
-        return _WorkspaceKey(device_index, int(current_stream.cuda_stream), tokens)
-
-    @staticmethod
     def _workspace_from_blueprint(
         blueprint: _WorkspaceBlueprint,
         device: torch.device,
@@ -626,28 +452,6 @@ class MegaGateContext:
             state=blueprint.state.zeros(device),
         )
 
-    def _workspace_for_key(
-        self,
-        key: _WorkspaceKey,
-        leaf: _CompiledLeaf,
-        *,
-        device: torch.device,
-    ) -> _Workspace:
-        last_entry = self._last_workspace_entry
-        if last_entry is not None and last_entry[0] == key:
-            return last_entry[1]
-        workspace = self._workspaces.get(key)
-        if workspace is None:
-            with self._lock:
-                workspace = self._workspaces.get(key)
-                if workspace is None:
-                    workspace = self._workspace_from_blueprint(
-                        leaf.workspace_blueprint, device
-                    )
-                    self._workspaces[key] = workspace
-        self._last_workspace_entry = (key, workspace)
-        return workspace
-
     def _workspace(self, device: torch.device, tokens: int) -> _Workspace:
         leaf = self._compiled.get(tokens)
         if leaf is None:
@@ -656,7 +460,10 @@ class MegaGateContext:
             )
         stream = torch.cuda.current_stream(device)
         key = self._workspace_key(device, tokens, stream=stream)
-        return self._workspace_for_key(key, leaf, device=device)
+        return self._get_or_create_workspace(
+            key,
+            lambda: self._workspace_from_blueprint(leaf.workspace_blueprint, device),
+        )
 
     @staticmethod
     def _weight_storage_key(gate_weight: torch.Tensor) -> tuple[int, int]:
@@ -723,7 +530,7 @@ class MegaGateContext:
             workspace.x_descriptor_entry = (key, descriptors)
         return descriptors
 
-    def clear_cached_input_descriptors(self) -> None:
+    def clear_cached_descriptors(self) -> None:
         """Release strong references retained by last-address descriptors."""
 
         with self._lock:
@@ -731,55 +538,41 @@ class MegaGateContext:
                 workspace.x_descriptor_entry = None
             self._weight_descriptor_cache_entry = None
 
-    def close(self) -> None:
-        """Release all compiled leaves, workspaces, and tensor descriptors."""
-
-        with self._lock:
-            for workspace in self._workspaces.values():
-                workspace.x_descriptor_entry = None
-            self._compiled.clear()
-            self._workspaces.clear()
-            self._last_workspace_entry = None
-            self._weight_descriptor_cache_entry = None
-            self._device_index = None
-
     def prepare(
         self,
         x: torch.Tensor,
         gate_weight: torch.Tensor,
         correction_bias: torch.Tensor | None = None,
         *,
+        plan: KernelPlan,
         routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
     ) -> Any:
         """Warm up and load one exact leaf without launching it."""
 
-        _require_tle_capabilities()
-        tokens, device = _validate_inputs(
+        require_megagate_tle()
+        tokens, device = validate_prepare_inputs(
+            _INPUT_CONTRACT,
             x,
             gate_weight,
             correction_bias,
             routed_scaling_factor,
-            prepare=True,
         )
-        definition = _TOKEN_TO_DEFINITION[tokens]
+        definition = _DEFINITION_BY_LEAF[plan.source_leaf]
         module = _load_leaf_module(definition)
         with self._lock, torch.cuda.device(device):
-            device_index = (
-                torch.cuda.current_device()
-                if device.index is None
-                else int(device.index)
-            )
-            if self._device_index is not None and self._device_index != device_index:
-                raise ValueError(
-                    "MegaGateContext is single-device; construct one context "
-                    "per CUDA device"
-                )
+            device_index = self._resolve_device_index(device)
+            self._require_prepare_device(device_index)
             self._device_index = device_index
             existing = self._compiled.get(tokens)
             if existing is not None:
                 stream = torch.cuda.current_stream(device)
                 key = self._workspace_key(device, tokens, stream=stream)
-                workspace = self._workspace_for_key(key, existing, device=device)
+                workspace = self._get_or_create_workspace(
+                    key,
+                    lambda: self._workspace_from_blueprint(
+                        existing.workspace_blueprint, device
+                    ),
+                )
                 self._weight_desc(existing, gate_weight)
                 self._x_descs(existing, workspace, x)
                 return existing.runner.compiled
@@ -788,7 +581,7 @@ class MegaGateContext:
             from triton.tools.tensor_descriptor import TensorDescriptor
 
             triton.set_allocator(_allocator)
-            grid = (int(definition.grid[tokens]),)
+            grid = (definition.grid,)
             weight_descriptor = TensorDescriptor(
                 gate_weight,
                 shape=[EXPERTS, HIDDEN],
@@ -822,7 +615,7 @@ class MegaGateContext:
                 candidate_scratch = torch.empty(
                     (0,), device=device, dtype=definition.candidate_dtype
                 )
-            state_tiles = int(definition.state_tiles[tokens])
+            state_tiles = definition.state_tiles
             state = torch.zeros(
                 (state_tiles, 16) if state_tiles else (0,),
                 device=device,
@@ -961,38 +754,14 @@ class MegaGateContext:
         *,
         routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens, device = _validate_runtime_inputs(
+        tokens, device = validate_runtime_inputs(
+            _INPUT_CONTRACT,
             x,
             gate_weight,
             correction_bias,
             routed_scaling_factor,
         )
-        leaf = self._compiled.get(tokens)
-        if leaf is None:
-            raise UnpreparedShapeError(
-                f"T={tokens} was not prepared; call context.prepare first"
-            )
-        device_index = self._resolve_device_index(device)
-        if leaf.device_index != device_index or self._device_index != device_index:
-            raise ValueError("runtime tensor device differs from prepared context")
-        if int(torch.cuda.current_device()) != device_index:
-            raise ValueError(
-                "current CUDA device differs from the prepared tensor device"
-            )
-
-        stream = torch.cuda.current_stream(device)
-        stream_handle = int(stream.cuda_stream)
-        workspace_key = _WorkspaceKey(device_index, stream_handle, tokens)
-        last_entry = self._last_workspace_entry
-        workspace = (
-            last_entry[1]
-            if last_entry is not None and last_entry[0] == workspace_key
-            else self._workspaces.get(workspace_key)
-        )
-        if workspace is None:
-            raise UnpreparedShapeError(
-                f"T={tokens} was not prepared on the current CUDA stream"
-            )
+        leaf, workspace, _, stream_handle = self._prepared_launch(tokens, device)
         weight_descriptor = self._weight_desc(leaf, gate_weight)
         x_descriptors = self._x_descs(leaf, workspace, x)
         topk_weights = torch.empty((tokens, TOPK), device=device, dtype=torch.float32)

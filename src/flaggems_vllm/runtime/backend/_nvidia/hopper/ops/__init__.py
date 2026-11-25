@@ -24,24 +24,16 @@ if triton.__version__ >= "3.4":
 __all__ = ["w8a8_block_matmul"]
 
 if _triton_version_utils.has_triton_tle(3, 6, 0):
+    from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.capabilities import (
+        is_megagate_available as _is_megagate_available,
+    )
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megamoe import (  # noqa: F401
         megamoe_fp8,
-    )
-    from flaggems_vllm.utils.tle_capabilities import (
-        supports_megagate_tle as _supports_megagate_tle,
-    )
-    from flaggems_vllm.utils.tle_capabilities import (
-        supports_module_wide_named_barriers as _supports_module_wide_named_barriers,
     )
 
     __all__.append("megamoe_fp8")
 
-    try:
-        import triton.experimental.tle.language as _tle_language
-    except (ImportError, RuntimeError):
-        _tle_language = None
-
-    if _supports_megagate_tle(_tle_language) and _supports_module_wide_named_barriers():
+    if _is_megagate_available():
         from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megagate import (  # noqa: F401
             create_megagate_context,
             megagate,

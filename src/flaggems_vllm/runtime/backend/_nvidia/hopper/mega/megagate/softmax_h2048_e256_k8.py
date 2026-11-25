@@ -30,58 +30,58 @@ is no CUDA Graph, padding, fallback, helper kernel, or ``Plan.launch`` path.
 
 from __future__ import annotations
 
-import math
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Final
 
 import torch
 
+from .capabilities import require_megagate_tle
+from .context import (
+    HostContext,
+    InputContract,
+    validate_prepare_inputs,
+    validate_runtime_inputs,
+)
 from .errors import MegaGateContextError, UnpreparedShapeError
-from .kernels.qwen_h2048_runtime import (
+from .kernels.preallocated_scratch_runtime import (
     ExactGridUnboundPreallocatedScratchCompiledRunner,
 )
 from .kernels.runtime import ExactGridUnboundCompiledRunner
+from .registry import get_module_dispatch
+from .types import KernelPlan
 
 PROFILE: Final = "qwen_h2048_e256_k8"
-SUPPORTED_TOKENS: Final = (
-    1034,
-    1035,
-    1036,
-    1352,
-    2048,
-    3104,
-    4107,
-    4108,
-    4138,
-    4434,
-    4435,
-    4436,
-    9309,
-    9330,
-    11469,
-    13421,
-    13422,
-    16384,
+TOKEN_TO_LEAF: Final = get_module_dispatch(__name__)
+SUPPORTED_TOKENS: Final = tuple(TOKEN_TO_LEAF)
+V366_TOKENS: Final = tuple(
+    tokens for tokens, leaf in TOKEN_TO_LEAF.items() if leaf == "v366"
 )
-V366_TOKENS: Final = SUPPORTED_TOKENS[:6]
-V365_TOKENS: Final = SUPPORTED_TOKENS[6:9]
-V364_TOKENS: Final = SUPPORTED_TOKENS[9:12]
-V363_TOKENS: Final = SUPPORTED_TOKENS[12:17]
-V367_TOKENS: Final = SUPPORTED_TOKENS[17:]
-TOKEN_TO_LEAF: Final = {
-    **{tokens: "v366" for tokens in V366_TOKENS},
-    **{tokens: "v365" for tokens in V365_TOKENS},
-    **{tokens: "v364" for tokens in V364_TOKENS},
-    **{tokens: "v363" for tokens in V363_TOKENS},
-    **{tokens: "v367" for tokens in V367_TOKENS},
-}
+V365_TOKENS: Final = tuple(
+    tokens for tokens, leaf in TOKEN_TO_LEAF.items() if leaf == "v365"
+)
+V364_TOKENS: Final = tuple(
+    tokens for tokens, leaf in TOKEN_TO_LEAF.items() if leaf == "v364"
+)
+V363_TOKENS: Final = tuple(
+    tokens for tokens, leaf in TOKEN_TO_LEAF.items() if leaf == "v363"
+)
+V367_TOKENS: Final = tuple(
+    tokens for tokens, leaf in TOKEN_TO_LEAF.items() if leaf == "v367"
+)
 
 HIDDEN: Final = 2048
 EXPERTS: Final = 256
 TOPK: Final = 8
 ROUTED_SCALING_FACTOR: Final = 1.0
 BLOCK_K: Final = 128
+_INPUT_CONTRACT: Final = InputContract(
+    name="functional Qwen-H2048 eager18",
+    supported_tokens=SUPPORTED_TOKENS,
+    hidden=HIDDEN,
+    experts=EXPERTS,
+    routed_scaling_factor=ROUTED_SCALING_FACTOR,
+    requires_correction_bias=False,
+)
 
 assert len(SUPPORTED_TOKENS) == 18
 assert tuple(sorted(SUPPORTED_TOKENS)) == SUPPORTED_TOKENS
@@ -101,13 +101,6 @@ class _CompiledLeaf:
     runner: Any
 
 
-@dataclass(frozen=True)
-class _WorkspaceKey:
-    device_index: int
-    stream_handle: int
-    tokens: int
-
-
 @dataclass
 class _Workspace:
     logits: torch.Tensor
@@ -124,11 +117,11 @@ def _load_dispatch_modules() -> dict[str, Any]:
     import triton
     from triton.tools.tensor_descriptor import TensorDescriptor
 
-    from .kernels import qwen_h2048_v363 as v363
-    from .kernels import qwen_h2048_v364 as v364
-    from .kernels import qwen_h2048_v365 as v365
-    from .kernels import qwen_h2048_v366 as v366
-    from .kernels import qwen_h2048_v367 as v367
+    from .kernels import sm90_softmax_h2048_e256_k8_b80_e128_clusterless as v364
+    from .kernels import sm90_softmax_h2048_e256_k8_fragmented_direct as v363
+    from .kernels import sm90_softmax_h2048_e256_k8_single_list as v365
+    from .kernels import sm90_softmax_h2048_e256_k8_small as v366
+    from .kernels import sm90_softmax_h2048_e256_k8_t16384_b128 as v367
 
     return {
         "descriptor_type": TensorDescriptor,
@@ -146,129 +139,6 @@ def _allocator(size: int, alignment: int, stream: int) -> torch.Tensor:
     return torch.empty(size, device="cuda", dtype=torch.uint8)
 
 
-def _require_tle_capabilities() -> None:
-    try:
-        import triton.experimental.tle.language as tle
-    except ImportError as error:
-        raise RuntimeError("MegaGate requires Triton TLE support") from error
-
-    from flaggems_vllm.utils.tle_capabilities import (
-        supports_megagate_tle,
-        supports_module_wide_named_barriers,
-    )
-
-    if not supports_megagate_tle(tle):
-        raise RuntimeError(
-            "MegaGate requires TLE pipe, warp-specialization, barrier, "
-            "TMA, and WGMMA APIs"
-        )
-    if not supports_module_wide_named_barriers():
-        raise RuntimeError(
-            "MegaGate requires module-wide named-barrier allocation support"
-        )
-
-
-def _require_tensor(
-    tensor: torch.Tensor,
-    *,
-    name: str,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-) -> None:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if tuple(tensor.shape) != shape:
-        raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
-    if tensor.dtype != dtype:
-        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
-    if tensor.device != device:
-        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
-
-
-def _validate_inputs(
-    x: torch.Tensor,
-    gate_weight: torch.Tensor,
-    correction_bias: torch.Tensor | None,
-    routed_scaling_factor: float,
-) -> tuple[int, torch.device]:
-    if correction_bias is not None:
-        raise ValueError("Qwen softmax routing does not accept correction_bias")
-    if not isinstance(x, torch.Tensor):
-        raise TypeError("x must be a torch.Tensor")
-    if x.ndim != 2:
-        raise ValueError(f"x must be rank two, got rank {x.ndim}")
-    tokens = int(x.shape[0])
-    if tokens not in TOKEN_TO_LEAF:
-        raise ValueError(
-            f"functional Qwen-H2048 eager18 rejects T={tokens}; "
-            f"supported={SUPPORTED_TOKENS}"
-        )
-    device = x.device
-    if device.type != "cuda":
-        raise ValueError(f"x must be CUDA, got {device}")
-    _require_tensor(
-        x,
-        name="x",
-        shape=(tokens, HIDDEN),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    _require_tensor(
-        gate_weight,
-        name="gate_weight",
-        shape=(EXPERTS, HIDDEN),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    scale = float(routed_scaling_factor)
-    if not math.isfinite(scale) or scale != ROUTED_SCALING_FACTOR:
-        raise ValueError("routed_scaling_factor must be exactly 1.0")
-    if tuple(torch.cuda.get_device_capability(device)) != (9, 0):
-        raise RuntimeError("functional Qwen-H2048 eager18 requires SM90")
-    return tokens, device
-
-
-def _validate_runtime_inputs(
-    x: torch.Tensor,
-    gate_weight: torch.Tensor,
-    correction_bias: torch.Tensor | None,
-    routed_scaling_factor: float,
-) -> tuple[int, torch.device]:
-    """Straight-line hot ABI validation without prepare-only probes."""
-
-    if correction_bias is not None:
-        raise ValueError("Qwen softmax routing does not accept correction_bias")
-    if not isinstance(x, torch.Tensor) or not isinstance(gate_weight, torch.Tensor):
-        raise TypeError("x and gate_weight must be torch.Tensor objects")
-    if x.ndim != 2:
-        raise ValueError(f"x must be rank two, got rank {x.ndim}")
-    tokens = int(x.shape[0])
-    if tokens not in TOKEN_TO_LEAF:
-        raise ValueError(
-            f"functional Qwen-H2048 eager18 rejects T={tokens}; "
-            f"supported={SUPPORTED_TOKENS}"
-        )
-    device = x.device
-    if (
-        tuple(x.shape) != (tokens, HIDDEN)
-        or tuple(gate_weight.shape) != (EXPERTS, HIDDEN)
-        or x.dtype != torch.bfloat16
-        or gate_weight.dtype != torch.bfloat16
-        or device.type != "cuda"
-        or gate_weight.device != device
-        or not x.is_contiguous()
-        or not gate_weight.is_contiguous()
-    ):
-        raise ValueError("inputs violate the functional Qwen-H2048 eager18 ABI")
-    scale = float(routed_scaling_factor)
-    if not math.isfinite(scale) or scale != ROUTED_SCALING_FACTOR:
-        raise ValueError("routed_scaling_factor must be exactly 1.0")
-    return tokens, device
-
-
 def _compiled_abi_arg_names(compiled: Any) -> tuple[str, ...]:
     try:
         names = tuple(str(name) for name in compiled.src.fn.arg_names)
@@ -281,7 +151,7 @@ def _compiled_abi_arg_names(compiled: Any) -> tuple[str, ...]:
     return names
 
 
-class MegaGateContext:
+class MegaGateContext(HostContext[_CompiledLeaf, _Workspace]):
     """Exact compiled leaves plus per-device/per-stream internal storage."""
 
     api_kind = "functional_unbound_eager_qwen_h2048_dispatch"
@@ -289,102 +159,46 @@ class MegaGateContext:
     final_scope = "qwen_h2048_e256_k8_eager18"
 
     def __init__(self) -> None:
-        self._compiled: dict[int, _CompiledLeaf] = {}
-        self._workspaces: dict[_WorkspaceKey, _Workspace] = {}
-        self._last_workspace_entry: tuple[_WorkspaceKey, _Workspace] | None = None
+        super().__init__()
         self._weight_descriptor_entries: dict[
             int, tuple[tuple[int, int, int, int], Any]
         ] = {}
         self._descriptor_type: Any | None = None
-        self._modules: dict[str, Any] | None = None
-        self._device_index: int | None = None
-        self._lock = threading.RLock()
-
-    @property
-    def prepared_tokens(self) -> tuple[int, ...]:
-        with self._lock:
-            return tuple(sorted(self._compiled))
 
     @staticmethod
-    def _resolve_device_index(device: torch.device) -> int:
-        if device.index is not None:
-            return int(device.index)
-        return int(torch.cuda.current_device())
-
-    def _workspace_key(
-        self,
-        device: torch.device,
-        tokens: int,
-        *,
-        stream: torch.cuda.Stream | None = None,
-    ) -> _WorkspaceKey:
-        current_stream = stream or torch.cuda.current_stream(device)
-        return _WorkspaceKey(
-            self._resolve_device_index(device),
-            int(current_stream.cuda_stream),
-            tokens,
-        )
-
-    def _workspace_for_key(
-        self,
-        key: _WorkspaceKey,
-        *,
-        device: torch.device,
+    def _allocate_workspace(
+        tokens: int, device: torch.device, family: str
     ) -> _Workspace:
-        last_entry = self._last_workspace_entry
-        if last_entry is not None and last_entry[0] == key:
-            return last_entry[1]
-        workspace = self._workspaces.get(key)
-        if workspace is None:
-            with self._lock:
-                workspace = self._workspaces.get(key)
-                if workspace is None:
-                    family = TOKEN_TO_LEAF[key.tokens]
-                    if family == "v364":
-                        block_tokens = 80
-                        state_dtype = torch.int32
-                        candidate_shape = (key.tokens, 2, 32)
-                    elif family == "v365":
-                        block_tokens = 128
-                        state_dtype = torch.int64
-                        candidate_shape = (key.tokens, 4, 16)
-                    elif family == "v366":
-                        block_tokens = 128
-                        state_dtype = torch.int64
-                        candidate_shape = None
-                    else:
-                        block_tokens = 128
-                        state_dtype = None
-                        candidate_shape = None
-                    token_tiles = (key.tokens + block_tokens - 1) // block_tokens
-                    workspace = _Workspace(
-                        logits=torch.empty(
-                            (key.tokens, EXPERTS),
-                            device=device,
-                            dtype=torch.float32,
-                        ),
-                        state=(
-                            torch.zeros(
-                                (token_tiles, 16),
-                                device=device,
-                                dtype=state_dtype,
-                            )
-                            if state_dtype is not None
-                            else None
-                        ),
-                        candidate_scratch=(
-                            torch.empty(
-                                candidate_shape,
-                                device=device,
-                                dtype=torch.float32,
-                            )
-                            if candidate_shape is not None
-                            else None
-                        ),
-                    )
-                    self._workspaces[key] = workspace
-        self._last_workspace_entry = (key, workspace)
-        return workspace
+        if family == "v364":
+            block_tokens = 80
+            state_dtype = torch.int32
+            candidate_shape = (tokens, 2, 32)
+        elif family == "v365":
+            block_tokens = 128
+            state_dtype = torch.int64
+            candidate_shape = (tokens, 4, 16)
+        elif family == "v366":
+            block_tokens = 128
+            state_dtype = torch.int64
+            candidate_shape = None
+        else:
+            block_tokens = 128
+            state_dtype = None
+            candidate_shape = None
+        token_tiles = (tokens + block_tokens - 1) // block_tokens
+        return _Workspace(
+            logits=torch.empty((tokens, EXPERTS), device=device, dtype=torch.float32),
+            state=(
+                torch.zeros((token_tiles, 16), device=device, dtype=state_dtype)
+                if state_dtype is not None
+                else None
+            ),
+            candidate_scratch=(
+                torch.empty(candidate_shape, device=device, dtype=torch.float32)
+                if candidate_shape is not None
+                else None
+            ),
+        )
 
     def _weight_desc(
         self,
@@ -462,7 +276,7 @@ class MegaGateContext:
                 workspace.global_scratch = scratch
         return scratch
 
-    def clear_cached_input_descriptors(self) -> None:
+    def clear_cached_descriptors(self) -> None:
         """Release strong references retained by last-address descriptors."""
 
         with self._lock:
@@ -470,20 +284,8 @@ class MegaGateContext:
                 workspace.x_descriptor_entries.clear()
             self._weight_descriptor_entries.clear()
 
-    def close(self) -> None:
-        """Release all compiled leaves, workspaces, and tensor descriptors."""
-
-        with self._lock:
-            for workspace in self._workspaces.values():
-                workspace.x_descriptor_entries.clear()
-                workspace.global_scratch = None
-            self._compiled.clear()
-            self._workspaces.clear()
-            self._last_workspace_entry = None
-            self._weight_descriptor_entries.clear()
-            self._descriptor_type = None
-            self._modules = None
-            self._device_index = None
+    def _clear_schedule_state(self) -> None:
+        self._descriptor_type = None
 
     def prepare(
         self,
@@ -491,32 +293,34 @@ class MegaGateContext:
         gate_weight: torch.Tensor,
         correction_bias: torch.Tensor | None = None,
         *,
+        plan: KernelPlan,
         routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
     ) -> Any:
         """Compile one exact final-dispatch leaf without launching it."""
 
-        tokens, device = _validate_inputs(
-            x, gate_weight, correction_bias, routed_scaling_factor
+        tokens, device = validate_prepare_inputs(
+            _INPUT_CONTRACT,
+            x,
+            gate_weight,
+            correction_bias,
+            routed_scaling_factor,
         )
-        _require_tle_capabilities()
+        require_megagate_tle()
         modules = _load_dispatch_modules()
-        family = TOKEN_TO_LEAF[tokens]
+        family = plan.source_leaf
         module = modules[family]
         with self._lock, torch.cuda.device(device):
             device_index = self._resolve_device_index(device)
-            if self._device_index is not None and self._device_index != device_index:
-                raise ValueError(
-                    "MegaGateContext is single-device; construct one context "
-                    "per CUDA device"
-                )
+            self._require_prepare_device(device_index)
             self._device_index = device_index
-            self._modules = modules
             self._descriptor_type = modules["descriptor_type"]
             modules["triton"].set_allocator(_allocator)
 
             stream = torch.cuda.current_stream(device)
             workspace_key = self._workspace_key(device, tokens, stream=stream)
-            workspace = self._workspace_for_key(workspace_key, device=device)
+            workspace = self._get_or_create_workspace(
+                workspace_key, lambda: self._allocate_workspace(tokens, device, family)
+            )
             existing = self._compiled.get(tokens)
             if existing is not None:
                 if isinstance(
@@ -577,6 +381,7 @@ class MegaGateContext:
                     num_warps=4,
                     maxnreg=module.KERNEL_MAXNREG,
                 )
+                constexpr_args = (module.CLUSTER4_MESH,)
                 expected_argument_count = 8
             elif family == "v365":
                 weight_block = module.EXPERTS_PER_CTA
@@ -767,9 +572,9 @@ class MegaGateContext:
                 abi_arg_names=abi_arg_names,
                 runner=runner,
             )
-            self._compiled[tokens] = leaf
             if isinstance(runner, ExactGridUnboundPreallocatedScratchCompiledRunner):
                 self._ensure_global_scratch(workspace, leaf, device=device)
+            self._compiled[tokens] = leaf
             return compiled
 
     def run(
@@ -780,38 +585,16 @@ class MegaGateContext:
         *,
         routed_scaling_factor: float = ROUTED_SCALING_FACTOR,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens, device = _validate_runtime_inputs(
-            x, gate_weight, correction_bias, routed_scaling_factor
+        tokens, device = validate_runtime_inputs(
+            _INPUT_CONTRACT,
+            x,
+            gate_weight,
+            correction_bias,
+            routed_scaling_factor,
         )
-        leaf = self._compiled.get(tokens)
-        if leaf is None:
-            raise UnpreparedShapeError(
-                f"T={tokens} was not prepared; call context.prepare first"
-            )
-        device_index = self._resolve_device_index(device)
-        if leaf.device_index != device_index or self._device_index != device_index:
-            raise ValueError("runtime tensor device differs from prepared context")
-        if int(torch.cuda.current_device()) != device_index:
-            raise ValueError(
-                "current CUDA device differs from the prepared tensor device"
-            )
-        modules = self._modules
-        if modules is None:
-            raise UnpreparedShapeError("context module state was not prepared")
-
-        stream = torch.cuda.current_stream(device)
-        stream_handle = int(stream.cuda_stream)
-        workspace_key = _WorkspaceKey(device_index, stream_handle, tokens)
-        last_entry = self._last_workspace_entry
-        workspace = (
-            last_entry[1]
-            if last_entry is not None and last_entry[0] == workspace_key
-            else self._workspaces.get(workspace_key)
+        leaf, workspace, device_index, stream_handle = self._prepared_launch(
+            tokens, device
         )
-        if workspace is None:
-            raise UnpreparedShapeError(
-                f"T={tokens} was not prepared on the current CUDA stream"
-            )
         weight_desc = self._weight_desc(
             gate_weight,
             block_experts=leaf.weight_block,
@@ -838,7 +621,6 @@ class MegaGateContext:
                 topk_indices,
                 topk_weights,
                 tokens,
-                modules["v366"].CLUSTER4_MESH,
             )
         elif leaf.family == "v365":
             if workspace.state is None or workspace.candidate_scratch is None:

@@ -36,8 +36,8 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from . import qwen_h2048_helpers as _packed
-from . import qwen_h2048_helpers as _v370_helpers
+from . import sm90_softmax_e256_routing_helpers as _packed
+from . import sm90_softmax_e256_routing_helpers as _v370_helpers
 from .routing_primitives import ordered_score_key as _ordered_score_key
 from .routing_primitives import subwarp8_sum_f32 as _subwarp8_sum_f32
 from .routing_primitives import warp_broadcast_f32 as _warp_broadcast_f32

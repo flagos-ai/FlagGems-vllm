@@ -33,15 +33,14 @@ import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.capabilities import (
+    is_megagate_available,
+)
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.registry import (
     PROFILES as _REGISTERED_PROFILES,
 )
 from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megagate.registry import (
     MegaGateProfile,
-)
-from flaggems_vllm.utils.tle_capabilities import (
-    supports_megagate_tle,
-    supports_module_wide_named_barriers,
 )
 
 from . import base, consts
@@ -118,12 +117,10 @@ def _has_hopper_megagate() -> bool:
     if flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available():
         return False
     try:
-        if tuple(torch.cuda.get_device_capability()) != (9, 0):
-            return False
-        import triton.experimental.tle.language as tle
-    except (ImportError, RuntimeError):
+        capability = torch.cuda.get_device_capability()
+    except RuntimeError:
         return False
-    return supports_megagate_tle(tle) and supports_module_wide_named_barriers()
+    return tuple(capability) == (9, 0) and is_megagate_available()
 
 
 def _load_vllm_gate() -> tuple[dict[str, Any] | None, str | None]:
