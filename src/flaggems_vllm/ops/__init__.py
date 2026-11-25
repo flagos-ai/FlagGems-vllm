@@ -178,6 +178,7 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_store_qsa_rows,
     qsa_prepare,
 )
+from flaggems_vllm.ops.lora_shrink import lora_shrink
 from flaggems_vllm.ops.minimax_m3_sparse_attn import (
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
@@ -404,6 +405,7 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "lora_shrink",
     "mamba_mixer",
     "marlin_gemm",
     "matmul_persistent",
