@@ -33,7 +33,7 @@ FlagGems 的通用算子。请从 FlagOS 索引安装匹配的 `flag-gems`（当
 
 ```bash
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
 当厂商镜像已经提供 PyTorch/NumPy 时请使用 `--no-deps`。在干净环境中，请按下文
@@ -145,7 +145,7 @@ source tools/setup.sh nvidia
 | `VENV_DIR` | 虚拟环境目录（默认 `.venv`）。 |
 | `PIP_INDEX_URL` | 主包索引（默认 PyPI；网络较慢时可改为国内镜像）。 |
 | `FLAG_GEMS_VERSION` | 覆盖 registry 中的 `flag-gems` 版本（默认 5.4.0）。 |
-| `FLAG_GEMS_INDEX` | 发布 `flag-gems` 的索引（默认 FlagOS hosted 索引）。 |
+| `FLAG_GEMS_INDEX` | 发布 `flag-gems` 的索引（默认 FlagOS daily 索引）。 |
 | `VLLM_VERSION` | 覆盖配置中 `vllm==...` 形式的版本（NVIDIA）。 |
 | `VLLM_PACKAGE` | 完整的 vLLM 依赖或 wheel URL，优先级高于 `VLLM_VERSION`。 |
 | `COMPILER` | `flagtree`、`triton` 或 `keep`。 |
@@ -209,7 +209,7 @@ python -m pip install "setuptools>=64,<82" wheel packaging pybind11 PyYAML sqlal
 
 # FlagGems 运行时
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
 ### 3. 安装编译器（FlagTree 或 Triton）
@@ -357,7 +357,7 @@ python -m pytest tests -q --quick
 ```bash
 # 1. 安装 FlagGems（通用算子后端）
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 
 # 2. 安装 FlagGems-vllm（vLLM 专用算子）
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
