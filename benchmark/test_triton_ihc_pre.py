@@ -12,8 +12,11 @@ import torch
 
 import flaggems_vllm
 from baseline import triton_ihc_pre as workloads
+from tools.collect_baseline_nvidia import _measure_latency
 
 from . import base, conftest, consts
+
+_OFFLINE_PROTOCOL = "triton-do-bench-no-graph-25ms-warmup-100ms-median"
 
 
 def _native_slot(*args, **kwargs):
@@ -72,22 +75,11 @@ class TritonIhcPreBenchmark(base.Benchmark):
         config = conftest.Config
         # optest leaves --mode at its kernel default. Use the existing eager
         # public-call timer for that entry point as well as --mode operator.
+        self._base_data = config.base_data
         with pytest.MonkeyPatch.context() as scoped:
             if not mode_is_explicit and config.mode == consts.BenchMode.KERNEL:
-                print("iHC pre uses --mode operator (synchronized mean, no Graph)")
                 scoped.setattr(config, "mode", consts.BenchMode.OPERATOR)
-            self._offline_shapes = None
-            self._offline_entry = {"shapes": {}}
-            if config.user_desired_metrics == ["latency"]:
-                scoped.setattr(config, "base_data", None)
-            elif config.base_data is not None:
-                entry = config.base_data.get(self.op_name, {})
-                self._offline_shapes = (entry or {}).get("shapes") or {}
-                scoped.setattr(
-                    config,
-                    "base_data",
-                    {**config.base_data, self.op_name: self._offline_entry},
-                )
+            scoped.setattr(config, "base_data", None)
             super().run()
 
     def init_user_config(self):
@@ -102,14 +94,14 @@ class TritonIhcPreBenchmark(base.Benchmark):
         )
 
     def _select_offline_row(self, shape_key, config):
-        if self._offline_shapes is None:
-            return None
+        if self._base_data is None:
+            return {"status": "N/A", "reason": "no offline NVIDIA baseline supplied"}
 
         # The shared matcher can fall back to tensor sizes alone. Expose only
         # this row's exact key/config, then let it do the normal ratio calculation.
-        self._offline_entry["shapes"] = {}
+        shapes = (self._base_data.get(self.op_name) or {}).get("shapes") or {}
         dtype = str(self._dtype)
-        record = (self._offline_shapes.get(shape_key) or {}).get(dtype)
+        record = (shapes.get(shape_key) or {}).get(dtype)
         reason = "no offline NVIDIA record for this shape key and dtype"
         if isinstance(record, dict):
             reference = record.get("config") or {}
@@ -138,14 +130,17 @@ class TritonIhcPreBenchmark(base.Benchmark):
                 or latency <= 0
             ):
                 reason = "offline NVIDIA record is invalid or lacks a positive latency"
-            elif protocol != self._timing_protocol:
+            elif protocol != _OFFLINE_PROTOCOL:
                 reason = (
                     f"offline NVIDIA timing protocol {protocol!r} does not match "
-                    f"{self._timing_protocol!r}"
+                    f"{_OFFLINE_PROTOCOL!r}"
                 )
             else:
                 key = str(config["inputs"]["x"]["shape"])
-                self._offline_entry["shapes"] = {key: {dtype: record}}
+                conftest.Config.base_data = {
+                    **self._base_data,
+                    self.op_name: {"shapes": {key: {dtype: record}}},
+                }
                 return {
                     "status": "MATCH",
                     "shape_key": shape_key,
@@ -156,11 +151,11 @@ class TritonIhcPreBenchmark(base.Benchmark):
 
     def record_shapes(self, *args, **kwargs):
         # Preserve normal tensor shapes while retaining layout and per-row N/A.
-        return {
+        self._detail = {
             "arguments": super().record_shapes(*args, **kwargs),
             "shape_key": workloads.key_shape(self._binding),
             "config": self._config,
-            "offline_nvidia": self._offline_status,
+            "offline_nvidia": None,
             "native": self._native_status,
             "timing": {
                 "scope": "complete public callable, allocation and contiguous copies",
@@ -174,6 +169,7 @@ class TritonIhcPreBenchmark(base.Benchmark):
             },
             "active_rows": len(self.shapes) * len(self.to_bench_dtypes),
         }
+        return self._detail
 
     def get_input_iter(self, dtype):
         native = None
@@ -228,7 +224,7 @@ class TritonIhcPreBenchmark(base.Benchmark):
                 del output
                 self._config = workloads.config(binding, dtype)
                 shape_key = workloads.key_shape(binding)
-                self._offline_status = self._select_offline_row(shape_key, self._config)
+                conftest.Config.base_data = None
             # Restore CPU threads before the framework enters device timing.
             yield (*args, kwargs)
             if self._native_status["reason"]:
@@ -255,9 +251,26 @@ class TritonIhcPreBenchmark(base.Benchmark):
         if not candidate and self._native_status["status"] != "ACCURACY_PASS":
             return None
         try:
-            latency = super().get_latency(
-                op if candidate else self._native, *args, **kwargs
-            )
+            if (
+                candidate
+                and self._native_status["status"] == "N/A"
+                and "latency_base" in self.to_bench_metrics
+            ):
+                self._detail["offline_nvidia"] = self._select_offline_row(
+                    self._detail["shape_key"], self._config
+                )
+                self._detail["timing"].update(
+                    framework="triton.testing.do_bench",
+                    statistic="device-event median",
+                    protocol=_OFFLINE_PROTOCOL,
+                    warmup_budget_ms=25,
+                    repetition_budget_ms=100,
+                )
+                latency = _measure_latency(workloads, op, args, kwargs)
+            else:
+                latency = super().get_latency(
+                    op if candidate else self._native, *args, **kwargs
+                )
             if not math.isfinite(latency) or latency <= 0:
                 raise ValueError(f"invalid latency: {latency}")
             changed = _changed_inputs(args, self._snapshots, restore=not candidate)
