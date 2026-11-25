@@ -13,91 +13,21 @@ import torch
 
 import flaggems_vllm as gems
 from baseline import lora_shrink as workload
-from benchmark import consts
 from benchmark.base import Benchmark
 from benchmark.conftest import Config, update_result
 from benchmark.consts import BenchMode as Mode
-from benchmark.gumbel_baseline import canonical_chip
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_lora_shrink import assert_output, reference_output
 
 # Benchmark.run asks get_latency for this slot even when native is unavailable.
 _NATIVE = object()
 _TIMERS = {
-    Mode.KERNEL: ("device-events-reset-outside", "device-event"),
-    Mode.OPERATOR: ("synchronized-host-wall-reset-outside", "operator-wall"),
-    Mode.WRAPPER: ("host-dispatch-reset-outside", "wrapper-wall"),
+    Mode.KERNEL: "device-events-reset-outside",
+    Mode.OPERATOR: "synchronized-host-wall-reset-outside",
+    Mode.WRAPPER: "host-dispatch-reset-outside",
 }
 _GRID = {tuple(b[d] for d in workload.DIMS): b for b in workload.grid()}
 _EXTRA = {"prefill_uneven", "tail_zero_scale"}
-
-
-def _positive(value):
-    return type(value) in (float, int) and math.isfinite(value) and value > 0
-
-
-def _qualified_archive(data, cfg, dtype, protocol, info):
-    """Keep raw cross-chip ratios out of the base class's normalized column."""
-    entry = data.get(workload.OP_NAME, {})
-    factors = data.get("_scaling_factors") or {}
-    gpu = data.get("_environment", {}).get("hardware", {}).get("gpu", {})
-    reference = canonical_chip(factors.get("reference_chip"))
-    info.update(
-        source=entry.get("native_api"), reference_chip=factors.get("reference_chip")
-    )
-    if factors.get("_error"):
-        return {}, factors["_error"]
-    if not reference or canonical_chip(gpu.get("name")) != reference:
-        return {}, "scaling factors do not identify the measured NVIDIA reference"
-    if entry.get("native_api") not in (
-        "ops.lora_shrink",
-        "vllm.lora.ops.triton_ops.lora_shrink_op.lora_shrink",
-    ):
-        return {}, "missing or different native source"
-    # Signature fallback cannot distinguish a different grouping of the same tokens.
-    row = entry.get("shapes", {}).get(str(cfg["key"]), {}).get(str(dtype))
-    if not row:
-        return {}, "no native record for the exact workload key and dtype"
-    if row.get("native_accuracy") != "PASS":
-        return {}, "archived native lacks independent accuracy qualification"
-    recorded = dict(row.get("config") or {})
-    native_bi = recorded.pop("native_fixed_bi_enabled", None)
-    if recorded != {k: v for k, v in cfg.items() if k != "native_fixed_bi_enabled"}:
-        return {}, "archived workload or grouped metadata differs"
-    if cfg["batch_invariant_requested"] and not native_bi:
-        return {}, "archived native did not use fixed BI reduction"
-    if cfg["case"] == "no_lora":
-        return {}, "host-only call has no device scaling factor"
-    if row.get("timing_protocol") != protocol or not _positive(row.get("latency_ms")):
-        return {}, "incompatible timing protocol or invalid native latency"
-
-    try:
-        target = torch_device_fn.get_device_name(torch_device_fn.current_device())
-    except (AttributeError, RuntimeError, TypeError):
-        target = consts._SELF_CHIP if gems.device == "cuda" else ""
-    matches = [
-        c
-        for c in factors.get("chips", [])
-        if c.get("vendor") == gems.vendor_name
-        and canonical_chip(c.get("chip")) == canonical_chip(target)
-    ]
-    if not canonical_chip(target) or len(matches) != 1:
-        return {}, "no unique scaling factor entry for the actual target chip"
-    chip = matches[0]
-    resource = row.get("bottle_neck_unit")
-    if (
-        resource == "mem"
-        and f"{gems.vendor_name} {chip['chip']}" in consts._ACHIEVABLE_BW_RATIO
-        and reference != "h800"
-    ):
-        return {}, "bandwidth override requires an H800 reference"
-    # Restrict the public factor lookup to the verified chip on multi-chip vendors.
-    archive = {**data, "_scaling_factors": {**factors, "chips": matches}}
-    factor = consts.lookup_scaling_factor(archive, gems.vendor_name, resource, dtype)
-    if not _positive(factor):
-        return {}, "missing bottleneck or positive scaling factor"
-    info.update(target_chip=chip["chip"], bottleneck=resource, scaling_factor=factor)
-    return archive, None
 
 
 class LoraShrinkBenchmark(Benchmark):
@@ -112,10 +42,10 @@ class LoraShrinkBenchmark(Benchmark):
     def run(self):
         if not Config.query and Config.mode not in _TIMERS:
             raise ValueError("lora_shrink requires no-Graph timing")
-        self.archive = Config.base_data
-        # Scope per-row archive selection, including when a candidate raises.
-        with patch.object(Config, "base_data", None):
-            return super().run()
+        if Config.user_desired_metrics == ["latency"]:
+            with patch.object(Config, "base_data", None):
+                return super().run()
+        return super().run()
 
     def get_input_iter(self, dtype):
         self.native = (
@@ -150,8 +80,6 @@ class LoraShrinkBenchmark(Benchmark):
             if self.mode == Mode.KERNEL and cfg["case"] == "no_lora"
             else self.mode
         )
-        _, prefix = _TIMERS[self.mode]
-        statistic = "median" if self.mode == Mode.KERNEL else "mean"
         reason = workload.unsupported_reason(self.binding, args[0].dtype)
         if self.native is None:
             reason = (
@@ -169,24 +97,12 @@ class LoraShrinkBenchmark(Benchmark):
             native_accuracy="NOT_RUN",
             native_reason=reason,
             native_performance="N/A",
-            timer=_TIMERS[self.clock][0],
+            timer=_TIMERS[self.clock],
             warmup_calls=self.warmup_calls,
             measured_calls=self.measured_calls,
-            statistic=statistic,
+            statistic="median" if self.mode == Mode.KERNEL else "mean",
             unit="ms",
         )
-        if cfg["case"] == "no_lora":
-            self.detail["offline_timer_required"] = _TIMERS[self.clock][0]
-        if self.archive is not None and Config.user_desired_metrics != ["latency"]:
-            info = dict(target_chip=None, bottleneck=None, scaling_factor=None)
-            protocol = (
-                f"no-graph-{prefix}-reset-outside-{self.warmup_calls}warmup-"
-                f"{self.measured_calls}sample-{statistic}"
-            )
-            Config.base_data, info["reason"] = _qualified_archive(
-                self.archive, cfg, args[0].dtype, protocol, info
-            )
-            self.detail["offline_baseline"] = info
         return self.detail
 
     def _qualify(self, op, args):
@@ -228,7 +144,7 @@ class LoraShrinkBenchmark(Benchmark):
                 samples.append((perf_counter_ns() - begin) / 1e6)
                 if self.clock == Mode.WRAPPER:
                     torch_device_fn.synchronize()
-        if not all(map(_positive, samples)):
+        if not all(math.isfinite(ms) and ms > 0 for ms in samples):
             raise ValueError(f"invalid latency samples (ms): {samples}")
         return samples
 
