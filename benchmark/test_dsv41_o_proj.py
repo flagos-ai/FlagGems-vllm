@@ -31,6 +31,7 @@ hides.
 import importlib
 import inspect
 import math
+import os
 import types
 
 import pytest
@@ -56,11 +57,21 @@ def is_hopper():
 
 HOPPER = is_hopper()
 
+
+def _deep_gemm_jit_available():
+    # vLLM's bundled DeepGEMM JIT-compiles its kernels with nvcc on first use
+    # (deep_jit::CUDA::find_cuda_toolkit), so a working CUDA toolkit is required
+    # in addition to a supported GPU. Images that ship only the driver and CUDA
+    # runtime have no nvcc, and every deep_gemm call then fails at launch time.
+    nvcc = os.path.join(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "nvcc")
+    return os.path.isfile(nvcc) and os.access(nvcc, os.X_OK)
+
+
 try:
     from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    HAS_VLLM = is_deep_gemm_supported()
+    HAS_VLLM = is_deep_gemm_supported() and _deep_gemm_jit_available()
 except ImportError:
     HAS_VLLM = False
 

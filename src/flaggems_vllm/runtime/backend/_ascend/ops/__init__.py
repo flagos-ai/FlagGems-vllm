@@ -60,6 +60,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.gather_conv_state import (
+    gather_conv_state,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.gather_kda_state import gather_kda_state
 from flaggems_vllm.runtime.backend._ascend.ops.gdn_w8a16_int8 import (
     chunk_gated_delta_rule_w8a16_int8,
@@ -72,6 +75,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import hc_combine
+from flaggems_vllm.runtime.backend._ascend.ops.hc_down_silu import hc_down_silu
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -83,7 +87,6 @@ from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.kda_conv_gather import gather_conv_state
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
 )
@@ -95,6 +98,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.matmul_persistent import (
+    matmul_persistent,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre_clamp_sinkhorn
@@ -108,6 +114,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.persistent_topk import persistent
 from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer import (
+    quant_lightning_indexer,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -170,6 +179,7 @@ __all__ = [
     "group_list_cumsum",
     "grouped_topk",
     "hc_combine",
+    "hc_down_silu",
     "ihc_pre",
     "indexer_epilogue",
     "indexer_gemm_score",
@@ -179,6 +189,7 @@ __all__ = [
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",
+    "matmul_persistent",
     "mhc_post",
     "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
@@ -188,6 +199,7 @@ __all__ = [
     "persistent_topk",
     "ple_state_scatter_",
     "prepare_compressor_workspace",
+    "quant_lightning_indexer",
     "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",

@@ -30,6 +30,8 @@ steady-state.
 """
 
 import importlib
+import os
+import shutil
 import warnings
 
 import pytest
@@ -71,10 +73,31 @@ _NATIVE_MHC_SHIFTED = {
 }
 
 
+def _nvcc_executable():
+    """Mirror deep_jit::CUDA::find_cuda_toolkit: the TileLang/DeepGEMM baseline
+    JIT-compiles with nvcc on first call, so a CUDA toolkit must be present."""
+    found = shutil.which("nvcc")
+    if found is None:
+        cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+        candidate = os.path.join(cuda_home, "bin", "nvcc")
+        if os.path.isfile(candidate):
+            found = candidate
+    return found is not None and os.access(found, os.X_OK)
+
+
 def _get_baseline_op():
     """vLLM's production kernel for this vendor, or None when it ships none."""
     entry = _NATIVE_MHC_SHIFTED.get(VENDOR)
     if entry is None:
+        return None
+    if VENDOR == "nvidia" and not _nvcc_executable():
+        warnings.warn(
+            "mhc_shifted_post_pre benchmark: no executable nvcc for the "
+            "nvidia TileLang/DeepGEMM baseline; running latency only "
+            "(speedup needs --base-data NV records).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return None
     module_name, attr = entry
     try:
