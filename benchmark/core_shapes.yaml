@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+lora_shrink:
+  shape_desc: "tokens, hidden, rank, slices, adapter slots"
+
 cooperative_topk: &cooperative_topk_shapes
   shapes:
     - [1, 127, 512]

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""No-Graph timing of the public LoRA shrink call, with output reset per sample."""
+"""Benchmark the public LoRA shrink call, including its output initialization."""
 
 import math
 import statistics
@@ -9,283 +9,184 @@ from time import perf_counter_ns
 from unittest.mock import patch
 
 import pytest
+import torch
 
 import flaggems_vllm as gems
 from baseline import lora_shrink as workload
 from benchmark import consts
 from benchmark.base import Benchmark
 from benchmark.conftest import Config, update_result
+from benchmark.consts import BenchMode as Mode
 from benchmark.gumbel_baseline import canonical_chip
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_lora_shrink import assert_output, reference_output
 
-_NATIVE_SLOT = object()
-_CORE_OMIT = {"tail_zero_scale", "prefill_uneven"}
-_HOST_TIMER = "synchronized-host-wall-reset-outside"
-_WRAPPER_TIMER = "host-dispatch-reset-outside"
-_EVENT_TIMER = "device-events-reset-outside"
-# Timer name in the result, collector protocol prefix, statistic.
-_MODES = {
-    consts.BenchMode.KERNEL: (
-        _EVENT_TIMER,
-        "no-graph-device-event-reset-outside",
-        "median",
-    ),
-    consts.BenchMode.OPERATOR: (
-        _HOST_TIMER,
-        "no-graph-operator-wall-reset-outside",
-        "mean",
-    ),
-    consts.BenchMode.WRAPPER: (
-        _WRAPPER_TIMER,
-        "no-graph-wrapper-wall-reset-outside",
-        "mean",
-    ),
+# Benchmark.run asks get_latency for this slot even when native is unavailable.
+_NATIVE = object()
+_TIMERS = {
+    Mode.KERNEL: ("device-events-reset-outside", "device-event"),
+    Mode.OPERATOR: ("synchronized-host-wall-reset-outside", "operator-wall"),
+    Mode.WRAPPER: ("host-dispatch-reset-outside", "wrapper-wall"),
 }
+_GRID = {tuple(b[d] for d in workload.DIMS): b for b in workload.grid()}
+_EXTRA = {"prefill_uneven", "tail_zero_scale"}
 
 
 def _positive(value):
     return type(value) in (float, int) and math.isfinite(value) and value > 0
 
 
-def _archive_scaling(data):
-    scaling = data.get("_scaling_factors") or {}
-    if scaling.get("_error"):
-        raise ValueError(scaling["_error"])
-    ref = canonical_chip(scaling.get("reference_chip"))
-    env = data.get("_environment", {})
-    measured = env.get("hardware", {}).get("gpu", {}).get("name")
-    if not ref or ref != canonical_chip(measured):
-        raise ValueError("factor reference chip differs from measured NVIDIA GPU")
+def _qualified_archive(data, cfg, dtype, protocol, info):
+    """Keep raw cross-chip ratios out of the base class's normalized column."""
+    entry = data.get(workload.OP_NAME, {})
+    factors = data.get("_scaling_factors") or {}
+    gpu = data.get("_environment", {}).get("hardware", {}).get("gpu", {})
+    reference = canonical_chip(factors.get("reference_chip"))
+    info.update(
+        source=entry.get("native_api"), reference_chip=factors.get("reference_chip")
+    )
+    if factors.get("_error"):
+        return {}, factors["_error"]
+    if not reference or canonical_chip(gpu.get("name")) != reference:
+        return {}, "scaling factors do not identify the measured NVIDIA reference"
+    if entry.get("native_api") not in (
+        "ops.lora_shrink",
+        "vllm.lora.ops.triton_ops.lora_shrink_op.lora_shrink",
+    ):
+        return {}, "missing or different native source"
+    # Signature fallback cannot distinguish a different grouping of the same tokens.
+    row = entry.get("shapes", {}).get(str(cfg["key"]), {}).get(str(dtype))
+    if not row:
+        return {}, "no native record for the exact workload key and dtype"
+    if row.get("native_accuracy") != "PASS":
+        return {}, "archived native lacks independent accuracy qualification"
+    recorded = dict(row.get("config") or {})
+    native_bi = recorded.pop("native_fixed_bi_enabled", None)
+    if recorded != {k: v for k, v in cfg.items() if k != "native_fixed_bi_enabled"}:
+        return {}, "archived workload or grouped metadata differs"
+    if cfg["batch_invariant_requested"] and not native_bi:
+        return {}, "archived native did not use fixed BI reduction"
+    if cfg["case"] == "no_lora":
+        return {}, "host-only call has no device scaling factor"
+    if row.get("timing_protocol") != protocol or not _positive(row.get("latency_ms")):
+        return {}, "incompatible timing protocol or invalid native latency"
+
     try:
-        chip = torch_device_fn.get_device_name(torch_device_fn.current_device())
+        target = torch_device_fn.get_device_name(torch_device_fn.current_device())
     except (AttributeError, RuntimeError, TypeError):
-        chip = consts._SELF_CHIP if gems.device == "cuda" else ""
-    if not canonical_chip(chip):
-        raise ValueError("cannot identify the measured target chip")
-    targets = [
-        item
-        for item in scaling.get("chips", [])
-        if item.get("vendor") == gems.vendor_name
-        and canonical_chip(item.get("chip")) == canonical_chip(chip)
+        target = consts._SELF_CHIP if gems.device == "cuda" else ""
+    matches = [
+        c
+        for c in factors.get("chips", [])
+        if c.get("vendor") == gems.vendor_name
+        and canonical_chip(c.get("chip")) == canonical_chip(target)
     ]
-    if len(targets) != 1:
-        raise ValueError(f"no unique scaling entry for {gems.vendor_name} {chip}")
-    # The shared lookup accepts a sole same-vendor entry when no name matches.
-    # Only give it the entry verified against the actual target device.
-    return {**scaling, "chips": targets}
+    if not canonical_chip(target) or len(matches) != 1:
+        return {}, "no unique scaling factor entry for the actual target chip"
+    chip = matches[0]
+    resource = row.get("bottle_neck_unit")
+    if (
+        resource == "mem"
+        and f"{gems.vendor_name} {chip['chip']}" in consts._ACHIEVABLE_BW_RATIO
+        and reference != "h800"
+    ):
+        return {}, "bandwidth override requires an H800 reference"
+    # Restrict the public factor lookup to the verified chip on multi-chip vendors.
+    archive = {**data, "_scaling_factors": {**factors, "chips": matches}}
+    factor = consts.lookup_scaling_factor(archive, gems.vendor_name, resource, dtype)
+    if not _positive(factor):
+        return {}, "missing bottleneck or positive scaling factor"
+    info.update(target_chip=chip["chip"], bottleneck=resource, scaling_factor=factor)
+    return archive, None
 
 
 class LoraShrinkBenchmark(Benchmark):
     DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
-    DEFAULT_SHAPE_DESC = "tokens, hidden, rank, slices, adapter slots"
+    DEFAULT_SHAPES = [shape for shape, b in _GRID.items() if b["case"] not in _EXTRA]
 
-    def set_shapes(self, shape_file):
-        grid = workload.grid()
-        if Path(shape_file).resolve() != Path(self.DEFAULT_SHAPE_FILES).resolve():
-            super().set_shapes(shape_file)
-            return
-        if Config.query or Config.bench_level == consts.BenchLevel.CORE:
-            grid = [b for b in grid if b["case"] not in _CORE_OMIT]
-        self.shapes = [tuple(b[d] for d in workload.DIMS) for b in grid]
-
-    def _archive_row(self, rec, cfg, source):
-        if not isinstance(rec, dict):
-            raise ValueError("no record for the exact workload key and dtype")
-        if source not in (
-            "ops.lora_shrink",
-            "vllm.lora.ops.triton_ops.lora_shrink_op.lora_shrink",
-        ):
-            raise ValueError("missing or different vLLM native source")
-        # The collector records timing only. Qualifying its exported rows uses
-        # native_accuracy from this benchmark's matching independent CPU check.
-        if rec.get("native_accuracy") != "PASS":
-            raise ValueError(
-                "missing or failed independent native accuracy qualification"
-            )
-        observed = rec.get("config") or {}
-        if any(
-            field not in observed or observed[field] != value
-            for field, value in cfg.items()
-            if field != "native_fixed_bi_enabled"
-        ):
-            raise ValueError(
-                "NVIDIA workload config, layout or grouped metadata differs"
-            )
-        if cfg["batch_invariant_requested"] and not observed.get(
-            "native_fixed_bi_enabled"
-        ):
-            raise ValueError("archived native did not use the requested BI reduction")
-        if cfg["case"] == "no_lora":
-            raise ValueError(
-                "host-only no-LoRA call has no GPU resource scaling factor"
-            )
-        protocol = (
-            f"{self.protocol_prefix}-{self.warmup_calls}warmup-"
-            f"{self.measured_calls}sample-{self.statistic}"
-        )
-        if rec.get("timing_protocol") != protocol:
-            raise ValueError("incompatible no-Graph sampling protocol")
-        if not _positive(rec.get("latency_ms")):
-            raise ValueError("missing or invalid NVIDIA latency_ms")
-        if rec.get("bottle_neck_unit") not in ("mem", "tensor", "cuda"):
-            raise ValueError("missing NVIDIA bottleneck classification")
-
-    def _project_archive(self, data):
-        entry = data.get(self.op_name) or {}
-        try:
-            scaling = _archive_scaling(data)
-            scaling_error = None
-        except (ValueError, AttributeError, TypeError) as exc:
-            scaling = {}
-            scaling_error = str(exc)
-        variants = {}
-        for binding in workload.grid():
-            key = str(workload.key_shape(binding))
-            rows = (entry.get("shapes") or {}).get(key) or {}
-            matched = {}
-            for dtype in self.dtypes:
-                dt = str(dtype)
-                rec = rows.get(dt)
-                factor = None
-                reasons = [scaling_error] if scaling_error else []
-                try:
-                    self._archive_row(
-                        rec,
-                        workload.config(binding, dtype),
-                        entry.get("native_api"),
-                    )
-                    if not scaling_error:
-                        target = scaling["chips"][0]
-                        resource = rec["bottle_neck_unit"]
-                        # The public C550 bandwidth override was measured against
-                        # the H800-class reference, not an arbitrary NVIDIA GPU.
-                        target_key = f"{target['vendor']} {target['chip']}"
-                        if (
-                            resource == "mem"
-                            and target_key in consts._ACHIEVABLE_BW_RATIO
-                            and canonical_chip(scaling["reference_chip"]) != "h800"
-                        ):
-                            raise ValueError(
-                                "achievable bandwidth override has a different reference GPU"
-                            )
-                        factor = consts.lookup_scaling_factor(
-                            {"_scaling_factors": scaling},
-                            gems.vendor_name,
-                            resource,
-                            dtype,
-                        )
-                        if not _positive(factor):
-                            raise ValueError(
-                                "missing or invalid factor for target chip, bottleneck and dtype"
-                            )
-                except (ValueError, AttributeError, TypeError) as exc:
-                    reasons.append(str(exc))
-                self.archive_info[key, dt] = {
-                    "reason": "; ".join(reasons) or None,
-                    "source": entry.get("native_api"),
-                    "reference_chip": (data.get("_scaling_factors") or {}).get(
-                        "reference_chip"
-                    ),
-                    "target_chip": scaling["chips"][0]["chip"] if scaling else None,
-                    "bottleneck": (
-                        rec.get("bottle_neck_unit") if isinstance(rec, dict) else None
-                    ),
-                    "scaling_factor": factor if not reasons else None,
-                }
-                if not reasons:
-                    matched[dt] = rec
-            if matched:
-                variants[key] = {"shapes": {key: matched}}
-        return {
-            **data,
-            "_scaling_factors": scaling,
-            self.op_name: {"variants": variants},
-        }
+    def set_more_shapes(self):
+        if Path(Config.shape_file).resolve() == Path(self.DEFAULT_SHAPE_FILES):
+            return [shape for shape, b in _GRID.items() if b["case"] in _EXTRA]
+        return []
 
     def run(self):
-        if Config.query:
+        if not Config.query and Config.mode not in _TIMERS:
+            raise ValueError("lora_shrink requires no-Graph timing")
+        self.archive = Config.base_data
+        # Scope per-row archive selection, including when a candidate raises.
+        with patch.object(Config, "base_data", None):
             return super().run()
-        if Config.mode not in _MODES:
-            raise ValueError(
-                "lora_shrink requires no-Graph timing; cudagraph is unsupported"
-            )
-        self.timer, self.protocol_prefix, self.statistic = _MODES[Config.mode]
-        self.archive_info = {}
-        data = Config.base_data
-        if Config.user_desired_metrics == ["latency"]:
-            data = None
-        elif data is not None:
-            # Expose only exact, qualified rows to Benchmark.run(). The base
-            # otherwise writes an unnormalized ratio when a factor is missing.
-            data = self._project_archive(data)
-        with patch.object(Config, "base_data", data):
-            super().run()
 
     def get_input_iter(self, dtype):
-        grid = {tuple(b[d] for d in workload.DIMS): b for b in workload.grid()}
-        native = None
-        reason = "native timing disabled by --metrics"
-        if "latency_base" in self.to_bench_metrics:
-            native = workload.native()
-            reason = workload.NATIVE_UNAVAILABLE_REASON
-            if native is self.gems_op or native is getattr(gems.ops, self.op_name):
-                reason = "native resolves to the Gems candidate"
+        self.native = (
+            workload.native() if "latency_base" in self.to_bench_metrics else None
+        )
         misses = []
         for shape in self.shapes:
-            if tuple(shape) not in grid:
-                raise ValueError(f"unknown lora_shrink workload {shape}: use --query")
-            binding = grid[tuple(shape)]
-            cfg = workload.config(binding, dtype)
-            key = cfg["key"]
-            self.base_variant = str(key)
+            binding = _GRID[tuple(shape)]
+            self.binding = binding
             args, kwargs = workload.build_inputs(binding, dtype, self.device)
             self.expected = reference_output(*args, **kwargs)
-            self.native = native
-            self.host_only = binding["case"] == "no_lora"
-            self.row_timer = (
-                _HOST_TIMER
-                if self.host_only and self.mode == consts.BenchMode.KERNEL
-                else self.timer
-            )
-            self.detail = {
-                "args": super().record_shapes(*args, **kwargs),
-                "config": cfg,
-                "native_accuracy": "NOT_RUN",
-                "native_reason": reason or workload.unsupported_reason(binding, dtype),
-                "native_performance": "N/A",
-                "timer": self.row_timer,
-                "warmup_calls": self.warmup_calls,
-                "measured_calls": self.measured_calls,
-                "statistic": self.statistic,
-                "unit": "ms",
-            }
-            archive = self.archive_info.get((self.base_variant, str(dtype)))
-            if archive is not None:
-                self.detail["offline_baseline"] = archive
-            # The collector's no-op event pair is incompatible with a host-call timer.
-            if self.host_only:
-                self.detail["offline_timer_required"] = self.row_timer
-            # Candidate failures must propagate even when only native latency is
-            # requested. Each implementation gets a fresh writable output buffer.
-            self.candidate_args = self._qualify(self.gems_op, args)
-            self.detail["candidate_accuracy"] = "PASS"
+            self.candidate = self._qualify(self.gems_op, args)
             yield (*args, kwargs)
-            if self.detail["native_reason"]:
-                misses.append({"shape": key, "reason": self.detail["native_reason"]})
+            if reason := self.detail["native_reason"]:
+                misses.append({"shape": self.detail["config"]["key"], "reason": reason})
         if misses:
             update_result(
                 self.op_name,
-                {
-                    "dtype": str(dtype),
-                    "native_baseline_misses": misses,
-                    "native_baseline_skip_reason": "; ".join(
+                dict(
+                    dtype=str(dtype),
+                    native_baseline_misses=misses,
+                    native_baseline_skip_reason="; ".join(
                         dict.fromkeys(m["reason"] for m in misses)
                     ),
-                },
+                ),
             )
 
     def record_shapes(self, *args, **kwargs):
+        cfg = workload.config(self.binding, args[0].dtype)
+        self.clock = (
+            Mode.OPERATOR
+            if self.mode == Mode.KERNEL and cfg["case"] == "no_lora"
+            else self.mode
+        )
+        _, prefix = _TIMERS[self.mode]
+        statistic = "median" if self.mode == Mode.KERNEL else "mean"
+        reason = workload.unsupported_reason(self.binding, args[0].dtype)
+        if self.native is None:
+            reason = (
+                workload.NATIVE_UNAVAILABLE_REASON
+                if "latency_base" in self.to_bench_metrics
+                else "native timing disabled by --metrics"
+            )
+        elif self.native is self.gems_op:
+            reason = "native resolves to the candidate"
+        self.detail = dict(
+            key_shape=torch.Size(cfg["key"]),
+            args=super().record_shapes(*args, **kwargs),
+            config=cfg,
+            candidate_accuracy="PASS",
+            native_accuracy="NOT_RUN",
+            native_reason=reason,
+            native_performance="N/A",
+            timer=_TIMERS[self.clock][0],
+            warmup_calls=self.warmup_calls,
+            measured_calls=self.measured_calls,
+            statistic=statistic,
+            unit="ms",
+        )
+        if cfg["case"] == "no_lora":
+            self.detail["offline_timer_required"] = _TIMERS[self.clock][0]
+        if self.archive is not None and Config.user_desired_metrics != ["latency"]:
+            info = dict(target_chip=None, bottleneck=None, scaling_factor=None)
+            protocol = (
+                f"no-graph-{prefix}-reset-outside-{self.warmup_calls}warmup-"
+                f"{self.measured_calls}sample-{statistic}"
+            )
+            Config.base_data, info["reason"] = _qualified_archive(
+                self.archive, cfg, args[0].dtype, protocol, info
+            )
+            self.detail["offline_baseline"] = info
         return self.detail
 
     def _qualify(self, op, args):
@@ -301,75 +202,65 @@ class LoraShrinkBenchmark(Benchmark):
         assert_output(out, self.expected, call_args, exact=args[-1] == 0)
         return call_args
 
-    def _samples(self, op, call_args, initial):
-        # Base.get_latency() repeats fn() inside one timed loop with no reset
-        # hook. Restore the entire output outside every warmup and event pair.
-        out = call_args[2]
-        for _ in range(self.warmup_calls):
-            out.copy_(initial)
-            torch_device_fn.synchronize()
-            op(*call_args)
-        samples = []
-        if self.row_timer == _EVENT_TIMER:
+    def _samples(self, op, args, initial):
+        # Benchmark.get_latency has no per-call reset hook. Keep each copy and
+        # its synchronization outside the public call's timing interval.
+        if self.clock == Mode.KERNEL:
             start = torch_device_fn.Event(enable_timing=True)
             end = torch_device_fn.Event(enable_timing=True)
-        for _ in range(self.measured_calls):
-            out.copy_(initial)
+        samples = []
+        for i in range(self.warmup_calls + self.measured_calls):
+            args[2].copy_(initial)
             torch_device_fn.synchronize()
-            if self.row_timer == _EVENT_TIMER:
+            if i < self.warmup_calls:
+                op(*args)
+            elif self.clock == Mode.KERNEL:
                 start.record()
-                op(*call_args)
+                op(*args)
                 end.record()
                 torch_device_fn.synchronize()
-                elapsed = start.elapsed_time(end)
+                samples.append(start.elapsed_time(end))
             else:
                 begin = perf_counter_ns()
-                op(*call_args)
-                if self.row_timer == _HOST_TIMER:
+                op(*args)
+                if self.clock == Mode.OPERATOR:
                     torch_device_fn.synchronize()
-                elapsed = (perf_counter_ns() - begin) / 1e6
-                if self.row_timer == _WRAPPER_TIMER:
+                samples.append((perf_counter_ns() - begin) / 1e6)
+                if self.clock == Mode.WRAPPER:
                     torch_device_fn.synchronize()
-            samples.append(elapsed)
-        if not all(math.isfinite(ms) and ms > 0 for ms in samples):
+        if not all(map(_positive, samples)):
             raise ValueError(f"invalid latency samples (ms): {samples}")
         return samples
 
     def get_latency(self, op, *args, **kwargs):
-        if op is _NATIVE_SLOT:
-            if self.detail["native_reason"]:
-                return None
-            stage = "qualification"
-            try:
-                call_args = self._qualify(self.native, args)
+        native = op is _NATIVE
+        if native and self.detail["native_reason"]:
+            return None
+        stage = "qualification"
+        try:
+            call_args = self._qualify(self.native, args) if native else self.candidate
+            if native:
                 self.detail["native_accuracy"] = "PASS"
-                stage = "timing"
-                samples = self._samples(self.native, call_args, args[2])
-                stage = "post-timing qualification"
-                assert_output(
-                    call_args[2], self.expected, call_args, exact=args[-1] == 0
-                )
-            except Exception as exc:
-                if stage != "timing":
-                    self.detail["native_accuracy"] = "FAIL"
-                self.detail["native_reason"] = (
-                    f"native {stage}: {type(exc).__name__}: {exc}"
-                )
-                return None
-            self.detail["native_performance"] = "PASS"
-            self.detail["native_samples_ms"] = samples
-        else:
-            samples = self._samples(op, self.candidate_args, args[2])
-            assert_output(
-                self.candidate_args[2],
-                self.expected,
-                self.candidate_args,
-                exact=args[-1] == 0,
+            stage = "timing"
+            samples = self._samples(self.native if native else op, call_args, args[2])
+            stage = "post-timing qualification"
+            assert_output(call_args[2], self.expected, call_args, exact=args[-1] == 0)
+        except Exception as exc:
+            if not native:
+                raise
+            if stage != "timing":
+                self.detail["native_accuracy"] = "FAIL"
+            self.detail["native_reason"] = (
+                f"native {stage}: {type(exc).__name__}: {exc}"
             )
-            self.detail["candidate_samples_ms"] = samples
+            return None
+        provider = "native" if native else "candidate"
+        self.detail[f"{provider}_samples_ms"] = samples
+        if native:
+            self.detail["native_performance"] = "PASS"
         return (
             statistics.median(samples)
-            if self.statistic == "median"
+            if self.mode == Mode.KERNEL
             else statistics.mean(samples)
         )
 
@@ -378,17 +269,15 @@ class LoraShrinkBenchmark(Benchmark):
 def test_lora_shrink(request):
     bench = LoraShrinkBenchmark(
         op_name=workload.OP_NAME,
-        torch_op=_NATIVE_SLOT,
+        torch_op=_NATIVE,
         gems_op=gems.lora_shrink,
-        is_inplace=workload.IS_INPLACE,
         dtypes=workload.DTYPES,
+        is_inplace=workload.IS_INPLACE,
     )
-    # pytest leaves the framework defaults as ints and supplies explicit CLI
-    # values as strings. Match the collector's 5/25-call protocol by default.
-    warmup = request.config.getoption("warmup")
-    repetition = request.config.getoption("iter")
+    # Explicit CLI values are strings. Defaults here match the in-place collector.
+    warmup, rep = (request.config.getoption(k) for k in ("warmup", "iter"))
     bench.warmup_calls = int(warmup) if isinstance(warmup, str) else 5
-    bench.measured_calls = int(repetition) if isinstance(repetition, str) else 25
+    bench.measured_calls = int(rep) if isinstance(rep, str) else 25
     if bench.warmup_calls < 0 or bench.measured_calls < 1:
         raise ValueError("lora_shrink requires warmup >= 0 and iter >= 1 calls")
     bench.run()
