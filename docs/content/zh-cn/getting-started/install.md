@@ -33,7 +33,7 @@ FlagGems 的通用算子。请从 FlagOS 索引安装匹配的 `flag-gems`（当
 
 ```bash
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
 当厂商镜像已经提供 PyTorch/NumPy 时请使用 `--no-deps`。在干净环境中，请按下文
@@ -54,6 +54,11 @@ python -m pip install torch torchvision torchaudio \
 其他后端请遵循厂商的 PyTorch/Triton 安装说明。经过验证的组合统一记录在
 `src/flaggems_vllm/backends.yaml` 的 `deps`、`triton`、`flagtree`、`vllm` 字段中，
 `tools/setup.sh` 以该文件为唯一数据源。
+
+当后端提供了 `flagtree:` 版本时，请优先使用它而非通用 Triton。部分算子的快速
+路径依赖 FlagTree 提供的 TLE（warp specialization）扩展；缺少它时会回退到通用
+实现，结果正确但明显更慢。详见
+[手动安装的第 3 步](#3-安装编译器flagtree-或-triton)。
 
 ## 从源码安装
 
@@ -140,12 +145,13 @@ source tools/setup.sh nvidia
 | `VENV_DIR` | 虚拟环境目录（默认 `.venv`）。 |
 | `PIP_INDEX_URL` | 主包索引（默认 PyPI；网络较慢时可改为国内镜像）。 |
 | `FLAG_GEMS_VERSION` | 覆盖 registry 中的 `flag-gems` 版本（默认 5.4.0）。 |
-| `FLAG_GEMS_INDEX` | 发布 `flag-gems` 的索引（默认 FlagOS hosted 索引）。 |
+| `FLAG_GEMS_INDEX` | 发布 `flag-gems` 的索引（默认 FlagOS daily 索引）。 |
 | `VLLM_VERSION` | 覆盖配置中 `vllm==...` 形式的版本（NVIDIA）。 |
 | `VLLM_PACKAGE` | 完整的 vLLM 依赖或 wheel URL，优先级高于 `VLLM_VERSION`。 |
 | `COMPILER` | `flagtree`、`triton` 或 `keep`。 |
 | `USE_FLAGTREE` | `1` 强制 FlagTree，`0` 强制 Triton。 |
 | `FLAGTREE_VERSION` / `TRITON_PACKAGE` | 覆盖编译器版本。 |
+| `USE_FLAGCX` | `OFF` 表示跳过 FlagTree 的 flagcx 封装（CUDA 13 主机需要；只有分布式 TLE 算子会用到它）。 |
 | `SKIP_BACKEND_DEPS` | `1` 表示不改动厂商 torch 栈。 |
 | `SKIP_FLAGGEMS` / `SKIP_PROJECT` | 跳过 FlagGems / FlagGems-vllm 安装。 |
 | `STRICT_TRITON_IMPORT` | `1` 表示 `import triton` 失败即报错。 |
@@ -203,10 +209,51 @@ python -m pip install "setuptools>=64,<82" wheel packaging pybind11 PyYAML sqlal
 
 # FlagGems 运行时
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
-### 3. 安装 FlagGems-vllm，且不替换厂商栈
+### 3. 安装编译器（FlagTree 或 Triton）
+
+厂商镜像通常已自带匹配的编译器，此时可跳过本步。但请确认装的是哪一个，因为
+它决定了 warp specialization（TLE）算子能否启用：
+
+```bash
+python - <<'PY'
+import importlib
+print("triton:", importlib.import_module("triton").__version__)
+try:
+    importlib.import_module("triton.experimental.tle.language")
+    print("TLE kernels: available")
+except Exception as error:
+    print(f"TLE kernels: unavailable ({type(error).__name__})")
+PY
+```
+
+部分算子同时提供 TLE 快速路径和通用回退实现。两者结果都正确，但回退实现明显更
+慢：以稀疏 FlashMLA prefill 为例，纯 Triton 下约为 FlagTree 的一半性能。各后端
+对应的版本固定在 `src/flaggems_vllm/backends.yaml` 的 `flagtree:` 字段：
+
+```bash
+# FlagTree 会替换 triton，先卸载以避免 site-packages 中两个实现相互覆盖。
+python -m pip uninstall -y triton
+python -m pip install "flagtree==0.7.0" \
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-nvidia/simple/
+```
+
+在 CUDA 13 主机上还需设置 `USE_FLAGCX=OFF`。FlagTree 的可选 `flagcx` 封装会在
+导入时加载 CUDA 12 的 `libcudart`，而只有分布式 TLE 算子才需要它：
+
+```bash
+export USE_FLAGCX=OFF
+```
+
+也可以直接交给脚本完成以上所有步骤：
+
+```bash
+COMPILER=flagtree bash tools/setup.sh --no-venv nvidia
+```
+
+### 4. 安装 FlagGems-vllm，且不替换厂商栈
 
 ```bash
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -226,7 +273,7 @@ numpy。请按上面的方式显式安装运行时依赖。如果是在干净的
 python -m pip install --no-build-isolation -e .
 ```
 
-### 4. 安装测试依赖
+### 5. 安装测试依赖
 
 与后端无关的基础测试集：
 
@@ -275,7 +322,7 @@ python -m pip install "vllm-ascend==0.24.0rc1"
 
 未安装 vLLM 时，这些测试会自动 skip，其余测试仍可运行。
 
-### 5. 指定后端
+### 6. 指定后端
 
 `flaggems_vllm` 会自动探测加速卡，但在多厂商镜像中显式指定更可靠：
 
@@ -284,7 +331,7 @@ export FLAGGEMS_VENDOR=ascend   # nvidia、ascend、hygon、metax ...
 export DNN_VENDOR=ascend        # 兼容旧文档
 ```
 
-### 6. 验证
+### 7. 验证
 
 ```bash
 # 设备、厂商与 float32 冒烟检查
@@ -310,7 +357,7 @@ python -m pytest tests -q --quick
 ```bash
 # 1. 安装 FlagGems（通用算子后端）
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 
 # 2. 安装 FlagGems-vllm（vLLM 专用算子）
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -348,6 +395,26 @@ python -c "import triton"
 
 如果 PyTorch 或 Triton 未正确安装，请参考上文"PyTorch、Triton 与 vLLM"小节或
 使用 `bash tools/setup.sh nvidia` 重建环境。
+
+### FlagTree 导入报错 `libcudart.so.12`
+
+在 CUDA 13 主机上，`import flaggems_vllm`（或任何 TLE 算子）可能失败：
+
+```text
+OSError: libcudart.so.12: cannot open shared object file
+```
+
+导入 TLE 语言时，FlagTree 的可选 `flagcx` 封装会加载 CUDA 12 的 `libcudart`。
+只有分布式 TLE 算子需要它，因此可以直接跳过：
+
+```bash
+export USE_FLAGCX=OFF
+```
+
+`src/flaggems_vllm/backends.yaml` 中的 NVIDIA 配置已经设置了该变量，所以由
+`tools/setup.sh` 创建的环境会从 venv 激活脚本继承它；手动安装则需要自行导出。
+另外，当 `tools/setup.sh` 没有替换编译器时（`COMPILER=keep`，即 `--no-venv`
+的默认行为），它会报告当前的编译器与 TLE 状态。
 
 ### Triton 版本不匹配
 

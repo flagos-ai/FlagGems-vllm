@@ -12,12 +12,8 @@ import torch
 
 try:
     from vllm.v1.worker.gpu.sample.min_p import apply_min_p as vllm_reference
-except ImportError as exc:
-    raise ImportError(
-        "Failed to import apply_min_p from vLLM. "
-        "Check that the installed vLLM version provides this API "
-        "and its dependencies are installed correctly."
-    ) from exc
+except ImportError:
+    vllm_reference = None
 
 from benchmark import base
 from flaggems_vllm import apply_min_p, runtime
@@ -34,6 +30,8 @@ pytestmark = [
 class MinPBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "tokens, vocab"
     DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
+    if vllm_reference is None:
+        DEFAULT_METRICS = ["latency"]
     DEFAULT_SHAPES = [(50, 1024), (1, 32000), (32, 128256), (128, 152065)]
 
     def __init__(self):

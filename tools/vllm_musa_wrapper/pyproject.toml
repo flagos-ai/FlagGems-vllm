@@ -1,0 +1,18 @@
+[build-system]
+requires = ["pip", "setuptools>=80.10.2", "wheel"]
+build-backend = "vllm_musa_wrapper"
+backend-path = ["."]
+
+[project]
+name = "vllm-musa"
+version = "0.1.24"
+description = "Static-metadata wrapper that builds the Moore Threads vLLM platform plugin"
+requires-python = ">=3.10"
+dependencies = [
+    "click==8.2.0",
+    "einops",
+    "mthreads-ml-py>=2.4.1",
+    "openai>=2.24.0",
+    "ray<=2.48.0,>=2.47.1",
+    "torchada>=0.1.76",
+]

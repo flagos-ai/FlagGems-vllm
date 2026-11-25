@@ -16,8 +16,8 @@ pytestmark = pytest.mark.cooperative_topk
 device = flaggems_vllm.device
 torch_device_fn = flaggems_vllm.runtime.torch_device_fn
 gpu = pytest.mark.skipif(
-    device not in ("cuda", "npu") or not torch_device_fn.is_available(),
-    reason="CUDA or NPU device required",
+    device not in ("cuda", "musa", "npu") or not torch_device_fn.is_available(),
+    reason="CUDA, MUSA or NPU device required",
 )
 KS = [512, 1024, 2048]
 SHAPES = [
@@ -193,7 +193,16 @@ def test_exact_selection_edge_values(width, distribution, k):
     logits = x.to(device).unsqueeze(0)
     lengths, output, workspace = _buffers(logits, [width], k)
     flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
-    _check(logits, lengths, output, k, reference_on_cpu=device == "npu")
+    # Some device topk implementations rank negative NaNs below finite values.
+    # Our contract canonicalizes both NaN signs above +inf; keep the exact CPU
+    # oracle for this case, including its NaN multiplicity check.
+    _check(
+        logits,
+        lengths,
+        output,
+        k,
+        reference_on_cpu=device == "npu" or distribution == "negative_nan",
+    )
 
 
 @gpu
@@ -236,18 +245,46 @@ def test_arbitrary_fp32_bit_patterns(width, k):
 
 
 @gpu
+@pytest.mark.parametrize("rows,width", [(2, 65539), (5, 65539), (2, 262144)])
+def test_partial_wide_rows_with_near_zero_cutoff(rows, width):
+    # A short active prefix places the kth value below zero even in a wide row.
+    k, active = 2048, 4097
+    bits = torch.arange(active, dtype=torch.int32).remainder(7).bitwise_or(-2147483648)
+    prefix = bits.view(torch.float32)
+    prefix[::5] = -0.0
+    prefix[::11] = 0.0
+    logits = torch.full((rows, width), float("nan"), dtype=torch.float32)
+    logits[:, :active] = prefix
+    logits = logits.to(device)
+    lengths, output, workspace = _buffers(
+        logits, [active if i % 2 == 0 else active - 17 for i in range(rows)], k
+    )
+    flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
 @pytest.mark.parametrize(
     "width,candidate_count,k",
     [
         (4097, 63, 512),
         (4097, 64, 512),
         (4097, 65, 512),
+        (4097, 127, 512),
+        (4097, 128, 512),
+        (4097, 129, 512),
+        (16384, 127, 1024),
+        (16384, 128, 1024),
+        (16384, 129, 1024),
         (16384, 255, 1024),
         (16384, 256, 1024),
         (16384, 257, 1024),
         (65539, 255, 512),
         (65539, 256, 512),
         (65539, 257, 512),
+        (65539, 255, 2048),
+        (65539, 256, 2048),
+        (65539, 257, 2048),
         (262147, 255, 512),
         (262147, 256, 512),
         (262147, 257, 512),
@@ -274,6 +311,26 @@ def test_threshold_bucket_capacity_boundaries(width, candidate_count, k):
     lengths, output, workspace = _buffers(logits, [width] * rows, k)
     flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
     _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
+@pytest.mark.parametrize("tail_score", [2.0, 1.0625])
+def test_compacted_selection_preserves_scalar_tail(tail_score):
+    # Reordered compaction must leave a distinct slot for the scalar tail,
+    # both above the boundary bucket and among its candidates.
+    width, k = 4097, 512
+    logits = torch.full((1, width), -2.0)
+    positions = torch.randperm(width - 1, generator=torch.Generator().manual_seed(61))
+    logits[0, positions[:480]] = 2.0
+    logits[0, positions[480:607]] = (
+        1.03125 + torch.arange(127) * torch.finfo(torch.float32).eps
+    )
+    logits[0, -1] = tail_score
+    logits = logits.to(device)
+    lengths, output, workspace = _buffers(logits, [width], k)
+    flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    _check(logits, lengths, output, k, reference_on_cpu=True)
+    assert torch.any(output == width - 1)
 
 
 @gpu
@@ -314,22 +371,26 @@ def test_single_row_partitioned_threshold_candidates(width, candidate_count):
 
 @gpu
 @pytest.mark.parametrize("workspace_shape", [(4, 16384), (2, 2, 16384), (65537,)])
-def test_multidimensional_workspace_reuse(workspace_shape):
-    rows, width, k = 4, 16384, 1024
+@pytest.mark.parametrize("guard_size", [4, 32])
+@pytest.mark.parametrize("width,k", [(16384, 1024), (65539, 2048)])
+def test_multidimensional_workspace_reuse(workspace_shape, guard_size, width, k):
+    rows = 4
     logits = torch.randn(rows, width, device=device)
     lengths, output, _ = _buffers(logits, [0, k, k + 1, width], k)
     workspace_numel = 1
     for size in workspace_shape:
         workspace_numel *= size
-    storage = torch.full((workspace_numel + 64,), 251, dtype=torch.uint8, device=device)
-    workspace = storage[32:-32].view(workspace_shape)
+    storage = torch.full(
+        (workspace_numel + 2 * guard_size,), 251, dtype=torch.uint8, device=device
+    )
+    workspace = storage[guard_size:-guard_size].view(workspace_shape)
     for poison in (17, 29):
         workspace.fill_(poison)
         output.fill_(-17)
         flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
         _check(logits, lengths, output, k, reference_on_cpu=True)
-        assert torch.all(storage[:32] == 251)
-        assert torch.all(storage[-32:] == 251)
+        assert torch.all(storage[:guard_size] == 251)
+        assert torch.all(storage[-guard_size:] == 251)
 
 
 @gpu
@@ -536,12 +597,19 @@ def test_ascend_unsupported_width_preserves_output():
 
 
 @gpu
-@pytest.mark.parametrize("width", [4097, 16384, 65539, 262147])
-@pytest.mark.parametrize("k", [512] if cfg.QUICK_MODE else [512, 2048])
+@pytest.mark.parametrize(
+    "width,k",
+    [
+        (width, k)
+        for width in [4097, 16384, 65539, 262147]
+        for k in ([512] if cfg.QUICK_MODE else [512, 2048])
+    ]
+    + [(16384, 1024)],
+)
 def test_device_graph_replay_with_changed_values_and_lengths(width, k):
     graph_type = getattr(
         torch_device_fn,
-        {"cuda": "CUDAGraph", "npu": "NPUGraph"}[device],
+        {"cuda": "CUDAGraph", "musa": "MUSAGraph", "npu": "NPUGraph"}[device],
         None,
     )
     if graph_type is None or not hasattr(torch_device_fn, "graph"):
@@ -610,21 +678,35 @@ def test_export_and_vendor_dispatch():
     assert "cooperative_topk" in flaggems_vllm.ops.__all__
     assert callable(flaggems_vllm.ops.cooperative_topk)
     assert callable(flaggems_vllm.cooperative_topk)
-    if flaggems_vllm.vendor_name == "thead":
+    if flaggems_vllm.vendor_name == "hygon":
+        from flaggems_vllm.runtime.backend._hygon.ops.cooperative_topk import (
+            cooperative_topk as hygon_cooperative_topk,
+        )
+
+        assert flaggems_vllm.cooperative_topk is hygon_cooperative_topk
+    elif flaggems_vllm.vendor_name == "thead":
         from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import (
             cooperative_topk as thead_cooperative_topk,
         )
 
         assert flaggems_vllm.cooperative_topk is thead_cooperative_topk
-    if flaggems_vllm.vendor_name == "ascend":
+    elif flaggems_vllm.vendor_name == "ascend":
         from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import (
             cooperative_topk as ascend_cooperative_topk,
         )
 
         assert flaggems_vllm.cooperative_topk is ascend_cooperative_topk
-    if flaggems_vllm.vendor_name == "iluvatar":
+    elif flaggems_vllm.vendor_name == "iluvatar":
         from flaggems_vllm.runtime.backend._iluvatar.ops.cooperative_topk import (
             cooperative_topk as iluvatar_cooperative_topk,
         )
 
         assert flaggems_vllm.cooperative_topk is iluvatar_cooperative_topk
+    elif flaggems_vllm.vendor_name == "mthreads":
+        from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
+            cooperative_topk as mthreads_cooperative_topk,
+        )
+
+        assert flaggems_vllm.cooperative_topk is mthreads_cooperative_topk
+    else:
+        assert flaggems_vllm.ops.cooperative_topk is flaggems_vllm.cooperative_topk
