@@ -81,14 +81,20 @@ def _min_p_kernel(
 
     threshold = max_val + tl.log(min_p)
     if SINGLE_TILE:
-        filtered = tl.where(logits < threshold, -float("inf"), logits)
-        tl.store(row_ptr + offsets, filtered, offsets < vocab_size)
+        tl.store(
+            row_ptr + offsets,
+            -float("inf"),
+            (offsets < vocab_size) & (logits < threshold),
+        )
     else:
         for i in range(0, vocab_size, BLOCK_SIZE):
             block = i + offsets
             logits = tl.load(row_ptr + block, block < vocab_size, other=-float("inf"))
-            filtered = tl.where(logits < threshold, -float("inf"), logits)
-            tl.store(row_ptr + block, filtered, block < vocab_size)
+            tl.store(
+                row_ptr + block,
+                -float("inf"),
+                (block < vocab_size) & (logits < threshold),
+            )
 
 
 def _prune_min_p_configs(configs, named_args, **kwargs):

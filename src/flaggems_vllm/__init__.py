@@ -22,6 +22,7 @@ from importlib.metadata import version as _metadata_version
 from flaggems_vllm import testing  # noqa: F401
 from flaggems_vllm import runtime
 from flaggems_vllm.ops import *  # noqa: F401,F403
+from flaggems_vllm.runtime import flagtune  # noqa: F401
 from flaggems_vllm.runtime.symm_mem import (
     disable_symm_mem,
     enable_symm_mem,

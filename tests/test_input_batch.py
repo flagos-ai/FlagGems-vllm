@@ -15,11 +15,18 @@
 
 import pytest
 import torch
-from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected as vllm_op
+
+try:
+    from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected as vllm_op
+except ImportError:
+    vllm_op = None
 
 import flaggems_vllm
 
-pytestmark = pytest.mark.get_num_sampled_and_rejected
+pytestmark = [
+    pytest.mark.get_num_sampled_and_rejected,
+    pytest.mark.skipif(vllm_op is None, reason="vLLM reference is unavailable"),
+]
 SIZES = (1, 7, 32, 128, 512)
 
 
