@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nightly full-range validation on the H20 runner: every functional test plus
+# Daily full-range validation on the H20 runner: every functional test plus
 # every benchmark at core level, plus unit-test coverage. Pull requests only run the selected subset
 # (see unittest.yaml), so this catches regressions that path-based selection
 # misses.
+#
+# Triggered via workflow_dispatch from an internal control-plane server crontab
+# (10:43 CST via .github/scripts/trigger_workflow.sh) instead of GitHub's
+# built-in schedule, which can be delayed by several hours under load.
 
 name: daily
 
@@ -24,9 +28,6 @@ permissions:
 
 on:
   workflow_dispatch:
-  schedule:
-    # UTC; starts at 00:03 UTC+8.
-    - cron: '3 16 * * *'
 
 concurrency:
   group: daily
