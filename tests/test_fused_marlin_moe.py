@@ -25,7 +25,6 @@ fp16/bf16 w_ref returned by quantize_weights so quantization round-off is
 shared by both sides.
 """
 
-import hashlib
 import importlib
 from types import SimpleNamespace
 
@@ -1107,39 +1106,17 @@ def test_fused_marlin_moe_w8a16_fp8_down_prune():
 
 
 def test_fused_marlin_moe_w8a16_fp8_down_cache_version():
-    """The pruning rule is not in the table name unless the kernel is versioned.
+    """The down kernel's pruning rule only runs on a cache miss.
 
-    Pruning only runs on a cache miss, so a table shared with the code before
-    the rule existed would keep serving its three-stage results.
+    A table written before the rule existed keeps serving its three-stage
+    results unless the kernel names a new table. The mechanism itself is
+    covered in test_libentry.py; this pins the kernel that depends on it.
     """
-    from flaggems_vllm.utils import libentry, libtuner
-
     module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
     down = module._fused_moe_kernel_w8a16_down_fp8.fn
+
+    assert down.early_config_prune is module._prune_w8a16_fp8_down_configs
     assert down.cache_version is not None
-
-    def build(version):
-        return libentry()(
-            libtuner(
-                configs=list(down.configs),
-                key=list(down.keys),
-                cache_version=version,
-            )(module.fused_moe_kernel_w8a16_down)
-        ).fn
-
-    unversioned = build(None)
-    # No version: the hash is the one computed before the parameter existed.
-    assert (
-        unversioned.kernel_hash
-        == hashlib.md5(
-            f"{unversioned.cache_key}{unversioned.configs_hash}".encode("utf-8")
-        ).hexdigest()[:32]
-    )
-    # A version starts a new table, and the same version names the same table.
-    assert build("v1").config_table_name != unversioned.config_table_name
-    assert build("v1").config_table_name == build("v1").config_table_name
-    assert build("v1").config_table_name != build("v2").config_table_name
-    assert down.config_table_name != unversioned.config_table_name
 
 
 @pytest.mark.parametrize("blocks", [(64, 128), (128, 64)])
