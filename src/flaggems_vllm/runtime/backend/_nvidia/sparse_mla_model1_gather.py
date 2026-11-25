@@ -16,7 +16,7 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from flaggems_vllm.runtime.backend._nvidia.sparse_mla_tiles import sparse_smem_subslice
+from flaggems_vllm.ops.flash_mla_with_kvcache_model1 import tle_subslice
 
 
 @triton.jit
@@ -59,7 +59,6 @@ def normalize_cache(
     PackedRope,
     N,
     STRIDE: tl.constexpr,
-    PACK_ROPE: tl.constexpr,
 ):
     # Each block processes consecutive physical slots, including a partial final page.
     ids = tl.program_id(0) * 32 + tl.arange(0, 32)
@@ -73,7 +72,7 @@ def normalize_cache(
     hi = tl.max(tl.where(g[None, :] < 7, exps, 0), 1)
     lo = tl.min(tl.where(g[None, :] < 7, exps, 255), 1)
     d = tl.arange(0, 512)
-    data = tl.load(
+    content = tl.load(
         K + (page + slot * 576)[:, None] + d[None, :],
         (ids[:, None] < N) & (d[None, :] < 448),
         0.0,
@@ -81,21 +80,20 @@ def normalize_cache(
     ratio = (tl.maximum(127 + tl.minimum(exps - hi[:, None], 0), 0) << 23).to(
         tl.float32, bitcast=True
     )
-    norm = scaled_bytes(data, ratio, 32)
+    norm = scaled_bytes(content, ratio, 32)
     tl.store(
         Normalized + ids.to(tl.int64)[:, None] * 448 + d[None, :],
         norm,
         (ids[:, None] < N) & (d[None, :] < 448),
     )
-    if PACK_ROPE:
-        r = tl.arange(0, 64)
-        src = (page + slot * 576 + 448) // 2
-        rope = tl.load(
-            E.to(tl.pointer_type(tl.bfloat16)) + src[:, None] + r[None, :],
-            ids[:, None] < N,
-            0.0,
-        )
-        tl.store(PackedRope + ids[:, None] * 64 + r[None, :], rope, ids[:, None] < N)
+    r = tl.arange(0, 64)
+    src = (page + slot * 576 + 448) // 2
+    rope = tl.load(
+        E.to(tl.pointer_type(tl.bfloat16)) + src[:, None] + r[None, :],
+        ids[:, None] < N,
+        0.0,
+    )
+    tl.store(PackedRope + ids[:, None] * 64 + r[None, :], rope, ids[:, None] < N)
     scale = tl.where(hi == 0, 0x00400000, hi << 23).to(tl.float32, bitcast=True)
     tl.store(Scale + ids, tl.where(hi - lo > 2, -scale, scale), ids < N)
 
@@ -541,7 +539,7 @@ def producer(
             byte_cols = cols * 2
             for tile in tl.static_range(4):
                 dst_k = tle.gpu.local_ptr(
-                    sparse_smem_subslice(sk.slot(buf), [0, tile * 128], [BK, 128]),
+                    tle_subslice(sk.slot(buf), [0, tile * 128], [BK, 128]),
                     (rows, byte_cols),
                 )
                 src_k = (

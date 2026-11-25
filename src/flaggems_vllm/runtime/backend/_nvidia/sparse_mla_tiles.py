@@ -16,38 +16,11 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 import triton.language.core as tlc
-from triton.experimental.tle.language.gpu import types as tle_types
 
 ACCUMULATOR_SCALE_FLOOR = tl.constexpr(2.0**-32)
 
 
 QK_RECOMPUTE_THRESHOLD = tl.constexpr(2.0**-14)
-
-
-@tlc.builtin
-def sparse_smem_subslice(buf, offsets, shape, _semantic=None):
-    offsets = [int(tlc._unwrap_if_constexpr(value)) for value in offsets]
-    shape = [int(tlc._unwrap_if_constexpr(value)) for value in shape]
-    view_type = tle_types.buffered_tensor_type(
-        buf.dtype,
-        shape,
-        buf.type.storage,
-        buf.type.layout,
-        _semantic,
-        alloc_shape=buf.type.alloc_shape,
-    )
-    handle = _semantic.builder.create_memdesc_subslice(
-        view_type.to_ir(_semantic.builder), buf.handle, offsets
-    )
-    return tle_types.buffered_tensor(
-        handle,
-        buf.dtype,
-        shape,
-        buf.type.storage,
-        buf.type.layout,
-        _semantic,
-        alloc_shape=buf.type.alloc_shape,
-    )
 
 
 @tlc.builtin

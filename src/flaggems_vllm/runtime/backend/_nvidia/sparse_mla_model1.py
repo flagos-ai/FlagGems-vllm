@@ -31,6 +31,8 @@ from triton.experimental.gluon.language import (
 from triton.experimental.gluon.language.nvidia import hopper
 from triton.experimental.gluon.language.nvidia.hopper import async_copy
 
+from flaggems_vllm.ops.flash_mla_with_kvcache_model1 import _cache_views as cache_views
+from flaggems_vllm.ops.flash_mla_with_kvcache_model1 import tle_subslice
 from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
     publish_p_fp8_sw64_coupled_stmatrix,
 )
@@ -44,7 +46,6 @@ from flaggems_vllm.runtime.backend._nvidia.sparse_mla_tiles import (
     publish_sparse_p128_fp8,
     sparse_fp8_transpose_values,
     sparse_named_barriers,
-    sparse_smem_subslice,
 )
 
 
@@ -279,20 +280,20 @@ def leader(
         else:
             tle.gpu.barrier_wait(kfull[buf], phaseIdx=cycle)
         logits = tle.gpu.wgmma(
-            sparse_smem_subslice(sq, [0, 0], [64, 256]),
-            sparse_smem_subslice(sk.slot(buf), [0, 0], [BK, 256]),
+            tle_subslice(sq, [0, 0], [64, 256]),
+            tle_subslice(sk.slot(buf), [0, 0], [BK, 256]),
             out_dtype=tl.float32,
             trans_b=True,
         )
         logits = tle.gpu.wgmma(
-            sparse_smem_subslice(sq, [0, 256], [64, 128]),
-            sparse_smem_subslice(sk.slot(buf), [0, 256], [BK, 128]),
+            tle_subslice(sq, [0, 256], [64, 128]),
+            tle_subslice(sk.slot(buf), [0, 256], [BK, 128]),
             logits,
             trans_b=True,
         )
         logits = tle.gpu.wgmma(
-            sparse_smem_subslice(sq, [0, 384], [64, 64]),
-            sparse_smem_subslice(sk.slot(buf), [0, 384], [BK, 64]),
+            tle_subslice(sq, [0, 384], [64, 64]),
+            tle_subslice(sk.slot(buf), [0, 384], [BK, 64]),
             logits,
             trans_b=True,
         )
@@ -578,7 +579,7 @@ def follower(
             ratio = tl.where(cols128[None, :] < 64, qleft[:, None], qright[:, None])
             qnorm = (qpart.to(tl.float32) * ratio).to(tl.float8e4nv)
             tl.store(
-                tle.gpu.local_ptr(sparse_smem_subslice(sq, [0, pair * 128], [64, 128])),
+                tle.gpu.local_ptr(tle_subslice(sq, [0, pair * 128], [64, 128])),
                 qnorm,
             )
     tl.store(tle.gpu.local_ptr(qs), mx)
@@ -605,9 +606,7 @@ def follower(
             tle.gpu.barrier_wait(kfull[buf], phaseIdx=cycle)
         for half in tl.static_range(BK // 64):
             for group in tl.static_range(4):
-                src = sparse_smem_subslice(
-                    sk.slot(buf), [half * 64, group * 128], [64, 128]
-                )
+                src = tle_subslice(sk.slot(buf), [half * 64, group * 128], [64, 128])
                 for warp_half in tl.static_range(1 if group == 3 else 2):
                     sparse_fp8_transpose_values(
                         src,
@@ -639,13 +638,13 @@ def follower(
             vbuf = buf * (BK // 64) + half
             a = tle.gpu.wgmma(
                 sp.slot(vbuf),
-                sparse_smem_subslice(sv.slot(vbuf), [0, 0], [128, 64]),
+                tle_subslice(sv.slot(vbuf), [0, 0], [128, 64]),
                 a,
                 trans_b=True,
             )
             a1 = tle.gpu.wgmma(
                 sp.slot(vbuf),
-                sparse_smem_subslice(sv.slot(vbuf), [128, 0], [128, 64]),
+                tle_subslice(sv.slot(vbuf), [128, 0], [128, 64]),
                 a1,
                 trans_b=True,
             )
@@ -1039,10 +1038,6 @@ class Model1Handle:
                 num_warps=8,
                 num_stages=1,
             )
-            if self.splits == 2:
-                merge_two[(b, h // 2)](
-                    self.partial, self.stats, self.out, self.lse, h, num_warps=2
-                )
             return self.out, self.lse
         if self.splits > 1 and t > 640:
             normalize_query[(b, h // 4)](
@@ -1057,7 +1052,6 @@ class Model1Handle:
                 self.packed_rope,
                 self.tokens,
                 self.stride,
-                True,
                 num_warps=8,
             )
         model1_fp8[(b, h // 64, self.splits)](
@@ -1159,7 +1153,12 @@ def prepare_model1(
         raise ValueError("Query scales must be contiguous FP32 [batch, heads, 7]")
     if packed_cache.shape != (pages, 64, 1, 584) or packed_cache.dtype != torch.uint8:
         raise ValueError("Expected native V4 cache pages [pages, 64, 1, 584]")
-    if packed_cache.stride()[1:] != (584, 584, 1) or packed_cache.stride(0) % 16 != 0:
+    if (
+        packed_cache.stride()[1:] != (584, 584, 1)
+        or packed_cache.stride(0) % 16 != 0
+        or packed_cache.data_ptr() % 16 != 0
+        or packed_cache.stride(0) < 64 * 584
+    ):
         raise ValueError(
             "V4 cache page data must be 16B-aligned and contiguous within a page"
         )
@@ -1177,23 +1176,25 @@ def prepare_model1(
     ):
         raise ValueError("Model1 tensors must share a CUDA device")
 
-    nbytes = packed_cache.untyped_storage().nbytes() - packed_cache.storage_offset()
-    flat = packed_cache.as_strided((nbytes & ~7,), (1,))
+    fp8_keys, exponent_words, bf16_keys, page_stride, _, _ = cache_views(packed_cache)
     sm = torch.cuda.get_device_properties(q.device).multi_processor_count
-    sm_limit = sm // (batch * (heads // 64))
+    work = batch * (heads // 64)
+    sm_limit = sm // work
     block = 128 if 128 < topk <= 640 and 1 < triton.cdiv(topk, 128) <= sm_limit else 64
     num_blocks = triton.cdiv(topk, block)
-    target = max(1, sm // (batch * (heads // 64)))
-    splits = (
-        1 if topk <= 128 else triton.cdiv(num_blocks, triton.cdiv(num_blocks, target))
-    )
-    work = batch * (heads // 64)
+    target = max(1, sm_limit)
     exact = topk <= 128 and work <= 64
     if exact:
         block = 64 if topk <= 64 else 128
-        splits = triton.cdiv(topk, block)
+        splits = 1
     elif num_blocks >= 32 and sm < work < 4 * sm and 0 < work % sm <= sm // 4:
         splits = 2
+    else:
+        splits = (
+            1
+            if topk <= 128
+            else triton.cdiv(num_blocks, triton.cdiv(num_blocks, target))
+        )
     out = torch.empty((batch, heads, 512), dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((batch, heads), dtype=torch.float32, device=q.device)
     part = out if splits == 1 else out.new_empty((batch, splits, heads, 512))
@@ -1206,9 +1207,9 @@ def prepare_model1(
         q,
         q_rope,
         q_scale,
-        flat.view(torch.float8_e4m3fn),
-        flat,
-        flat.view(torch.bfloat16),
+        fp8_keys,
+        exponent_words.view(torch.uint8),
+        bf16_keys,
         indices,
     )
     # Ten visits excludes every 1,114,624-token manifest shape.
@@ -1224,7 +1225,7 @@ def prepare_model1(
         state,
         flags,
         tokens,
-        packed_cache.stride(0),
+        page_stride,
         scale,
         splits,
         block,

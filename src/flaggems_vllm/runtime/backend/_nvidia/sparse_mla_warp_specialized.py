@@ -17,6 +17,7 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.ops.flash_mla_with_kvcache_model1 import tle_subslice
 from flaggems_vllm.runtime.backend._nvidia.sparse_mla_tiles import (
     ACCUMULATOR_SCALE_FLOOR,
     QK_RECOMPUTE_THRESHOLD,
@@ -26,7 +27,6 @@ from flaggems_vllm.runtime.backend._nvidia.sparse_mla_tiles import (
     sparse_fp8_split_blocks,
     sparse_fp8_transpose_values,
     sparse_named_barriers,
-    sparse_smem_subslice,
 )
 from flaggems_vllm.utils import libentry, libtuner
 
@@ -146,9 +146,7 @@ def sparse_fp8_producer(
                     tle.gpu.barrier_wait(kfree[key_half])
                 for group in tl.static_range(4):
                     dst = tle.gpu.local_ptr(
-                        sparse_smem_subslice(
-                            sk.slot(buf), [0, group * 128], [128, 128]
-                        ),
+                        tle_subslice(sk.slot(buf), [0, group * 128], [128, 128]),
                         (copy_rows, copy_columns),
                     )
                     src = (
@@ -214,7 +212,7 @@ def sparse_fp8_producer(
                 )
                 tl.store(
                     tle.gpu.local_ptr(
-                        sparse_smem_subslice(sk.slot(buf), [0, group * 128], [128, 128])
+                        tle_subslice(sk.slot(buf), [0, group * 128], [128, 128])
                     ),
                     content,
                 )
@@ -362,7 +360,7 @@ def sparse_fp8_consumer0(
         for half in tl.static_range(2):
             acc0 = tle.gpu.wgmma(
                 sp.slot(half),
-                sparse_smem_subslice(sv0.slot(half), [0, 0], [128, 64]),
+                tle_subslice(sv0.slot(half), [0, 0], [128, 64]),
                 acc0,
                 trans_b=True,
             )
@@ -470,7 +468,7 @@ def sparse_fp8_consumer1(
             for inner in tl.static_range(2):
                 if (inner if HALF_K_FREE else outer) == 0:
                     for group in tl.static_range(D_FRONT // 128):
-                        source = sparse_smem_subslice(
+                        source = tle_subslice(
                             sk.slot(buf),
                             [(outer if HALF_K_FREE else inner) * 64, group * 128],
                             [64, 128],
@@ -484,7 +482,7 @@ def sparse_fp8_consumer1(
                             )
                 else:
                     for group in tl.static_range(D_FRONT // 128, 4):
-                        source = sparse_smem_subslice(
+                        source = tle_subslice(
                             sk.slot(buf),
                             [(outer if HALF_K_FREE else inner) * 64, group * 128],
                             [64, 128],
@@ -527,13 +525,13 @@ def sparse_fp8_consumer1(
                     acc2 *= correction[:, None]
             acc0 = tle.gpu.wgmma(
                 sp.slot(half),
-                sparse_smem_subslice(sv1.slot(half), [0, 0], [128, 64]),
+                tle_subslice(sv1.slot(half), [0, 0], [128, 64]),
                 acc0,
                 trans_b=True,
             )
             acc1 = tle.gpu.wgmma(
                 sp.slot(half),
-                sparse_smem_subslice(sv1.slot(half), [128, 0], [128, 64]),
+                tle_subslice(sv1.slot(half), [128, 0], [128, 64]),
                 acc1,
                 trans_b=True,
             )

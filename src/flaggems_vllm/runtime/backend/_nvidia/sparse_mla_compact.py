@@ -17,6 +17,7 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.ops.flash_mla_with_kvcache_model1 import tle_subslice
 from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
     publish_p_fp8_sw64_coupled_stmatrix,
     vtranspose_fp8_64x128_kperm,
@@ -25,7 +26,6 @@ from flaggems_vllm.runtime.backend._nvidia.sparse_mla_tiles import (
     ACCUMULATOR_SCALE_FLOOR,
     QK_RECOMPUTE_THRESHOLD,
     sparse_named_barriers,
-    sparse_smem_subslice,
 )
 from flaggems_vllm.utils import libentry, libtuner
 
@@ -363,9 +363,7 @@ def sparse_fp8_compact_leader(
                 else:
                     publish_p_fp8_sw64_coupled_stmatrix(sp, probability_values)
                     for tile in tl.static_range(4):
-                        source = sparse_smem_subslice(
-                            sk.slot(slot), [0, tile * 128], [64, 128]
-                        )
+                        source = tle_subslice(sk.slot(slot), [0, tile * 128], [64, 128])
                         if tile < 2:
                             vtranspose_fp8_64x128_kperm(source, sv0, tile * 128)
                         else:
@@ -385,7 +383,7 @@ def sparse_fp8_compact_leader(
                 value *= correction[:, None]
                 value = tle.gpu.wgmma(
                     sp,
-                    sparse_smem_subslice(sv0, [0, 0], [LEADER_D, BLOCK_K]),
+                    tle_subslice(sv0, [0, 0], [LEADER_D, BLOCK_K]),
                     value,
                     trans_b=True,
                 )
@@ -470,7 +468,7 @@ def sparse_fp8_compact_follower(
             extra *= correction[:, None]
             extra = tle.gpu.wgmma(
                 sp,
-                sparse_smem_subslice(sv0, [128, 0], [128, BLOCK_K]),
+                tle_subslice(sv0, [128, 0], [128, BLOCK_K]),
                 extra,
                 trans_b=True,
             )
@@ -802,7 +800,7 @@ def sparse_fp8_tile(
         for candidate_group in tl.static_range(512 // BLOCK_D):
             if value_group == candidate_group:
                 for tile in tl.static_range(BLOCK_D // 128):
-                    source = sparse_smem_subslice(
+                    source = tle_subslice(
                         sk, [0, candidate_group * BLOCK_D + tile * 128], [64, 128]
                     )
                     vtranspose_fp8_64x128_kperm(source, sv, tile * 128)
