@@ -133,21 +133,20 @@ backends:
     triton: triton==3.6.0
     flagtree: flagtree==0.7.0
     vllm:
-      - vllm==0.20.2
+      - vllm==0.32.0
     test_deps:
       - "cupy-cuda12x>=12.0.0,<14.0.0"
     env:
       PATH: /usr/local/cuda/bin:$PATH
       LD_LIBRARY_PATH: /usr/local/cuda/lib64:$LD_LIBRARY_PATH
       USE_FLAGCX: "OFF"
-    # numpy is intentionally not pinned: vllm==0.20.2 needs
-    # opencv-python-headless>=4.13, which needs numpy>=2, so a numpy==1.26.4 pin
-    # makes the vLLM install unsatisfiable. The vLLM step resolves it.
+    # numpy is intentionally not pinned: vllm==0.32.0 requires numpy, and
+    # pinning numpy==1.26.4 makes the vLLM install unsatisfiable.
     deps:
       - flagcx==0.14.1+cuda13.3
-      - torch==2.11.0+cu130
+      - torch==2.13.0+cu130
       - torchaudio==2.11.0+cu130
-      - torchvision==0.26.0+cu130
+      - torchvision==0.28.0+cu130
 
   # ---------------------------------------------------------------------------
   # Huawei Ascend

@@ -277,7 +277,7 @@ jobs:
   python-op:
     name: python-op (nvidia tests and benchmarks)
     needs: preprocess
-    # Default: never execute fork-controlled code on the persistent H20 runner.
+    # Default: never execute fork-controlled code on the self-hosted A100 runner.
     # Maintainers may opt in a fork PR with the write-gated `ci/nvidia` label
     # (same trust model as `ci/all-vendors`).
     if: >-
@@ -289,12 +289,11 @@ jobs:
     uses: ./.github/workflows/backend-test.yaml
     with:
       backend: nvidia-cuda133
-      runner_label: h20
+      runner_label: nvidia-a100-1
       gpu_check_script: tools/gpu_check_nvidia.sh
       changed_files: ${{ needs.preprocess.outputs.targets }}
       pr_id: ${{ needs.preprocess.outputs.pr_id }}
       timeout_minutes: 60
-      # h20 is a persistent, non-ephemeral runner (see backend-test.yaml).
       uv_refresh: "1"
 
   backend-tests:
