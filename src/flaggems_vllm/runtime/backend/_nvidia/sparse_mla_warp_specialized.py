@@ -23,6 +23,7 @@ from flaggems_vllm.runtime.backend._nvidia.sparse_mla_tiles import (
     QK_RECOMPUTE_THRESHOLD,
     publish_sparse_p128_fp8,
     quantize_p_fp8_before_ready,
+    sink_normalization,
     sparse_fp8_publish_output,
     sparse_fp8_split_blocks,
     sparse_fp8_transpose_values,
@@ -72,7 +73,6 @@ def sparse_fp8_producer(
     CAN_ASYNC_NOPE: tl.constexpr = False,
     CAN_ASYNC_ROPE: tl.constexpr = False,
 ):
-    HALF_K_FREE: tl.constexpr = True
     batch = tl.program_id(0) // (H // 64)
     heads = (tl.program_id(0) % (H // 64)) * 64 + tl.arange(0, 64)
     dims = tl.arange(0, 512)
@@ -97,18 +97,21 @@ def sparse_fp8_producer(
             -1,
         )
         tl.store(tle.gpu.local_ptr(cached_indices), index_data)
+    else:
+        pass
     query = tl.load(
         Q + batch * qb + heads[:, None] * qh + dims[None, :],
         eviction_policy="evict_first",
     )
+    tl.store(tle.gpu.local_ptr(sq), query)
     if HAS_ROPE:
         query_rope = tl.load(
             QR + batch * qrb + heads[:, None] * qrh + ropes[None, :],
             eviction_policy="evict_first",
         )
-    tl.store(tle.gpu.local_ptr(sq), query)
-    if HAS_ROPE:
         tl.store(tle.gpu.local_ptr(sr), query_rope)
+    else:
+        pass
     tle.gpu.barrier_arrive(qfull[0])
     length = (
         cache_length
@@ -138,12 +141,14 @@ def sparse_fp8_producer(
         valid = (positions < split_end) & (ids >= 0) & (ids < N)
         ids = tl.where(valid, ids, 0).to(tl.uint64)
         pages, slots = (ids // 64, ids % 64)
-        if HALF_K_FREE and CAN_ASYNC_NOPE:
+        if CAN_ASYNC_NOPE:
             copy_rows = tl.broadcast_to(tl.arange(0, 128)[:, None], (128, 8))
             copy_columns = tl.broadcast_to((tl.arange(0, 8) * 16)[None, :], (128, 8))
             for key_half in tl.static_range(2):
                 if step >= 1:
                     tle.gpu.barrier_wait(kfree[key_half])
+                else:
+                    pass
                 for group in tl.static_range(4):
                     dst = tle.gpu.local_ptr(
                         tle_subslice(sk.slot(buf), [0, group * 128], [128, 128]),
@@ -194,11 +199,14 @@ def sparse_fp8_producer(
                         is_pure=False,
                         pack=1,
                     )
+                else:
+                    pass
         else:
             if step >= 1:
                 tle.gpu.barrier_wait(kfree[0])
-                if HALF_K_FREE:
-                    tle.gpu.barrier_wait(kfree[1])
+                tle.gpu.barrier_wait(kfree[1])
+            else:
+                pass
             columns = tl.arange(0, 128)
             for group in tl.static_range(4):
                 content = tl.load(
@@ -223,6 +231,8 @@ def sparse_fp8_producer(
                 0.0,
             )
             tl.store(tle.gpu.local_ptr(skr.slot(buf)), rope)
+        else:
+            pass
         kv_scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
         tl.store(tle.gpu.local_ptr(scales.slot(meta_buf)), kv_scale)
         if HAS_ROPE or TOPK > 512:
@@ -230,7 +240,9 @@ def sparse_fp8_producer(
                 tle.gpu.local_ptr(mask.slot(meta_buf)),
                 tl.where(valid, 0.0, -float("inf")),
             )
-        if HALF_K_FREE and CAN_ASYNC_NOPE:
+        else:
+            pass
+        if CAN_ASYNC_NOPE:
             tl.inline_asm_elementwise(
                 "{ cp.async.commit_group; cp.async.wait_group 0; mov.u32 $0, $1; }",
                 constraints="=r,r",
@@ -239,6 +251,8 @@ def sparse_fp8_producer(
                 is_pure=False,
                 pack=1,
             )
+        else:
+            pass
         # Matrix transpose avoids byte stores and their shared-memory bank conflicts.
         tl.debug_barrier()
         tl.inline_asm_elementwise(
@@ -287,7 +301,6 @@ def sparse_fp8_consumer0(
     HAS_SINK: tl.constexpr,
     RepairFlags,
     HAS_ROPE: tl.constexpr = True,
-    D_FRONT: tl.constexpr = 256,
     PREQUANTIZE_P: tl.constexpr = False,
 ):
     batch = tl.program_id(0) // (H // 64)
@@ -306,8 +319,6 @@ def sparse_fp8_consumer0(
     maximum = tl.full((64,), -float("inf"), tl.float32)
     denominator = tl.zeros((64,), tl.float32)
     acc0 = tl.zeros((64, 128), tl.float32)
-    if D_FRONT == 256:
-        acc1 = tl.zeros((64, 128), tl.float32)
     previous_scale = tl.full((64,), 1.0, tl.float32)
     tle.gpu.barrier_wait(qfull[0])
     first_block, key_blocks = sparse_fp8_split_blocks(length, SPLITS)
@@ -315,9 +326,13 @@ def sparse_fp8_consumer0(
     for step in range(split_blocks):
         meta_buf = step % 2
         tle.gpu.barrier_wait(kfull[0])
-        logits = tle.gpu.wgmma(sq, sk.slot(0), out_dtype=tl.float32, trans_b=True)
+        content_logits = tle.gpu.wgmma(
+            sq, sk.slot(0), out_dtype=tl.float32, trans_b=True
+        )
         if HAS_ROPE:
-            logits = tle.gpu.wgmma(sr, skr.slot(0), logits, trans_b=True)
+            logits = tle.gpu.wgmma(sr, skr.slot(0), content_logits, trans_b=True)
+        else:
+            logits = content_logits
         logits = tle.gpu.wgmma_wait(0, logits)
         tle.gpu.barrier_arrive(kfree[0])
         tle.gpu.barrier_arrive(kfree[1])
@@ -375,12 +390,12 @@ def sparse_fp8_consumer0(
             (maximum + tl.log2(denominator)) * 0.6931471805599453,
             float("inf"),
         )
-        inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
+        denominator_inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
         if HAS_SINK:
             sink = tl.load(Sink + heads)
-            inverse *= tl.where(
-                sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
-            )
+            inverse = sink_normalization(denominator_inverse, sink, logsum)
+        else:
+            inverse = denominator_inverse
         inverse *= previous_scale
     else:
         # Keep partial values in physical units; merge applies the sink only once.
@@ -398,17 +413,6 @@ def sparse_fp8_consumer0(
         0,
         STREAMING=SPLITS == 1,
     )
-    if D_FRONT == 256:
-        sparse_fp8_publish_output(
-            acc1,
-            inverse,
-            Output,
-            output_batch,
-            (tl.program_id(0) % (H // 64)),
-            H,
-            128,
-            STREAMING=SPLITS == 1,
-        )
     if SPLITS == 1:
         tl.store(LSE + batch * H + heads, logsum, eviction_policy="evict_first")
     else:
@@ -447,17 +451,14 @@ def sparse_fp8_consumer1(
     TOPK: tl.constexpr,
     HAS_LENGTH: tl.constexpr,
     SPLITS: tl.constexpr,
-    D_FRONT: tl.constexpr = 256,
 ):
-    HALF_K_FREE: tl.constexpr = D_FRONT == 128
     batch = tl.program_id(0) // (H // 64)
     length = (
         tl.minimum(tl.maximum(tl.load(Length + batch), 0), TOPK) if HAS_LENGTH else TOPK
     )
     acc0 = tl.zeros((64, 128), tl.float32)
     acc1 = tl.zeros((64, 128), tl.float32)
-    if D_FRONT == 128:
-        acc2 = tl.zeros((64, 128), tl.float32)
+    acc2 = tl.zeros((64, 128), tl.float32)
     first_block, key_blocks = sparse_fp8_split_blocks(length, SPLITS)
     split_blocks = tl.cdiv(key_blocks, 2)
     for step in range(split_blocks):
@@ -466,63 +467,62 @@ def sparse_fp8_consumer1(
         # Complete K64 transposes permit the next half-copy to start early.
         for outer in tl.static_range(2):
             for inner in tl.static_range(2):
-                if (inner if HALF_K_FREE else outer) == 0:
-                    for group in tl.static_range(D_FRONT // 128):
-                        source = tle_subslice(
-                            sk.slot(buf),
-                            [(outer if HALF_K_FREE else inner) * 64, group * 128],
-                            [64, 128],
+                if inner == 0:
+                    source = tle_subslice(
+                        sk.slot(buf),
+                        [outer * 64, 0],
+                        [64, 128],
+                    )
+                    for warp_half in tl.static_range(2):
+                        sparse_fp8_transpose_values(
+                            source,
+                            sv0.slot(outer),
+                            0,
+                            warp_half * 4,
                         )
-                        for warp_half in tl.static_range(2):
-                            sparse_fp8_transpose_values(
-                                source,
-                                sv0.slot((outer if HALF_K_FREE else inner)),
-                                group * 128,
-                                warp_half * 4,
-                            )
                 else:
-                    for group in tl.static_range(D_FRONT // 128, 4):
+                    for group in tl.static_range(1, 4):
                         source = tle_subslice(
                             sk.slot(buf),
-                            [(outer if HALF_K_FREE else inner) * 64, group * 128],
+                            [outer * 64, group * 128],
                             [64, 128],
                         )
                         for warp_half in tl.static_range(2):
-                            if D_FRONT == 128 and group == 3:
+                            if group == 3:
                                 sparse_fp8_transpose_values(
                                     source,
-                                    sv_tail.slot((outer if HALF_K_FREE else inner)),
+                                    sv_tail.slot(outer),
                                     0,
                                     warp_half * 4,
                                 )
                             else:
                                 sparse_fp8_transpose_values(
                                     source,
-                                    sv1.slot((outer if HALF_K_FREE else inner)),
-                                    (group - D_FRONT // 128) * 128,
+                                    sv1.slot(outer),
+                                    (group - 1) * 128,
                                     warp_half * 4,
                                 )
-                if HALF_K_FREE or (outer if HALF_K_FREE else inner) == 1:
-                    tl.inline_asm_elementwise(
-                        "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
-                        constraints="=r,r",
-                        args=[tl.arange(0, 128)],
-                        dtype=tl.int32,
-                        is_pure=False,
-                        pack=1,
-                    )
-                    if (inner if HALF_K_FREE else outer) == 0:
-                        tle.gpu.barrier_arrive(vfull[(outer if HALF_K_FREE else 0)])
-                    else:
-                        tle.gpu.barrier_arrive(kfree[(outer if HALF_K_FREE else 0)])
+                tl.inline_asm_elementwise(
+                    "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
+                    constraints="=r,r",
+                    args=[tl.arange(0, 128)],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+                if inner == 0:
+                    tle.gpu.barrier_arrive(vfull[outer])
+                else:
+                    tle.gpu.barrier_arrive(kfree[outer])
         for half in tl.static_range(2):
             tle.gpu.barrier_wait(pfull[half])
-            if D_FRONT != 128 or half == 0:
+            if half == 0:
                 correction = tl.load(tle.gpu.local_ptr(alpha.slot(half)))
                 acc0 *= correction[:, None]
                 acc1 *= correction[:, None]
-                if D_FRONT == 128:
-                    acc2 *= correction[:, None]
+                acc2 *= correction[:, None]
+            else:
+                pass
             acc0 = tle.gpu.wgmma(
                 sp.slot(half),
                 tle_subslice(sv1.slot(half), [0, 0], [128, 64]),
@@ -535,18 +535,18 @@ def sparse_fp8_consumer1(
                 acc1,
                 trans_b=True,
             )
-            if D_FRONT == 128:
-                acc2 = tle.gpu.wgmma(
-                    sp.slot(half),
-                    sv_tail.slot(half),
-                    acc2,
-                    trans_b=True,
-                )
-            if D_FRONT != 128 or half == 1:
+            acc2 = tle.gpu.wgmma(
+                sp.slot(half),
+                sv_tail.slot(half),
+                acc2,
+                trans_b=True,
+            )
+            if half == 1:
                 acc0 = tle.gpu.wgmma_wait(0, acc0)
                 acc1 = tle.gpu.wgmma_wait(0, acc1)
-                if D_FRONT == 128:
-                    acc2 = tle.gpu.wgmma_wait(0, acc2)
+                acc2 = tle.gpu.wgmma_wait(0, acc2)
+            else:
+                pass
         tle.gpu.barrier_wait(vfree[0])
     tle.gpu.barrier_wait(ofull[0], phaseIdx=0)
     inverse = tl.load(tle.gpu.local_ptr(factor))
@@ -558,7 +558,7 @@ def sparse_fp8_consumer1(
         output_batch,
         (tl.program_id(0) % (H // 64)),
         H,
-        D_FRONT,
+        128,
         STREAMING=SPLITS == 1,
     )
     sparse_fp8_publish_output(
@@ -568,21 +568,20 @@ def sparse_fp8_consumer1(
         output_batch,
         (tl.program_id(0) % (H // 64)),
         H,
-        D_FRONT + 128,
+        256,
         STREAMING=SPLITS == 1,
     )
 
-    if D_FRONT == 128:
-        sparse_fp8_publish_output(
-            acc2,
-            inverse,
-            Output,
-            output_batch,
-            (tl.program_id(0) % (H // 64)),
-            H,
-            D_FRONT + 256,
-            STREAMING=SPLITS == 1,
-        )
+    sparse_fp8_publish_output(
+        acc2,
+        inverse,
+        Output,
+        output_batch,
+        (tl.program_id(0) % (H // 64)),
+        H,
+        384,
+        STREAMING=SPLITS == 1,
+    )
 
 
 @libentry()
@@ -643,10 +642,8 @@ def sparse_fp8_warp_specialized(
     CAN_ASYNC_NOPE: tl.constexpr = False,
     CAN_ASYNC_ROPE: tl.constexpr = False,
 ):
-    HALF_K_FREE: tl.constexpr = True
     PRODUCER_WARPS: tl.constexpr = SMALL_WARPS if B_BUCKET == 0 else LARGE_WARPS
     PRODUCER_REGS: tl.constexpr = SMALL_REGS if B_BUCKET == 0 else LARGE_REGS
-    D_FRONT: tl.constexpr = 128
     # H800 has 50 MiB L2; large RoPE KV sets benefit from prepacking P.
     PREQUANTIZE_P: tl.constexpr = HAS_ROPE and N * (512 + 64 * 2 + 4) > 50 * 1024 * 1024
     COPY_REGS: tl.constexpr = (
@@ -659,12 +656,9 @@ def sparse_fp8_warp_specialized(
     # Paired copies overlap NoPE buffer reuse with consumer compute.
     sk = tle.gpu.alloc([1, 128, 512], tl.float8e4nv, scope=tle.gpu.smem)
     skr = tle.gpu.alloc([1, 128, 64], tl.bfloat16, scope=tle.gpu.smem)
-    sv0 = tle.gpu.alloc([2, D_FRONT, 64], tl.float8e4nv, scope=tle.gpu.smem)
+    sv0 = tle.gpu.alloc([2, 128, 64], tl.float8e4nv, scope=tle.gpu.smem)
     sv1 = tle.gpu.alloc([2, 256, 64], tl.float8e4nv, scope=tle.gpu.smem)
-    if D_FRONT == 128:
-        sv_tail = tle.gpu.alloc([2, 128, 64], tl.float8e4nv, scope=tle.gpu.smem)
-    else:
-        sv_tail = sv1
+    sv_tail = tle.gpu.alloc([2, 128, 64], tl.float8e4nv, scope=tle.gpu.smem)
     sp = tle.gpu.alloc([2, 64, 64], tl.float8e4nv, scope=tle.gpu.smem)
     alpha = tle.gpu.alloc(
         [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
@@ -697,12 +691,8 @@ def sparse_fp8_warp_specialized(
     # TLE maps these virtual IDs to physical IDs outside the WS reserved set.
     qfull = sparse_named_barriers(1, PRODUCER_WARPS * 32 + 128, 16)
     kfull = sparse_named_barriers(2, PRODUCER_WARPS * 32 + 128, 17)
-    kfree = sparse_named_barriers(
-        2 if HALF_K_FREE else 1, PRODUCER_WARPS * 32 + 256, 19
-    )
-    vfull = sparse_named_barriers(
-        2 if HALF_K_FREE else 1, 256, 24 if HALF_K_FREE else 20
-    )
+    kfree = sparse_named_barriers(2, PRODUCER_WARPS * 32 + 256, 19)
+    vfull = sparse_named_barriers(2, 256, 24)
     vfree = sparse_named_barriers(1, 256, 23)
     pfull = sparse_named_barriers(2, 256, 21)
     ofull = tle.gpu.alloc_barriers(1, arrive_count=1)
@@ -743,7 +733,6 @@ def sparse_fp8_warp_specialized(
                     HAS_SINK,
                     RepairFlags,
                     HAS_ROPE,
-                    D_FRONT,
                     PREQUANTIZE_P,
                 ),
             ),
@@ -812,17 +801,12 @@ def sparse_fp8_warp_specialized(
                     TOPK,
                     HAS_LENGTH,
                     SPLITS,
-                    D_FRONT,
                 ),
             ),
         ],
         [PRODUCER_WARPS, 4],
         [
             COPY_REGS,
-            (
-                240
-                if D_FRONT == 128
-                else (200 if PRODUCER_WARPS == 8 or PRODUCER_REGS == 56 else 208)
-            ),
+            (240),
         ],
     )

@@ -290,6 +290,17 @@ def test_native_v4_sparse_attention(topk):
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+def test_native_v4_long_value_reduction():
+    # A nonzero value mean exposes bias when many FP8 MMA tiles share an accumulator.
+    inputs = make_sparse_inputs((240, 64, 512, 8448, 1, 8320, 512, False, False, 212))
+    baseline, packed = native_v4_inputs(inputs)
+    reference, _, reference_lse = flashmla_reference().flash_mla_sparse_fwd(*baseline)
+    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed)
+    assert_sparse_fixture_close(output[:, 0], lse[:, :, 0], reference, reference_lse)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
 @pytest.mark.parametrize(
     "shape",
     [

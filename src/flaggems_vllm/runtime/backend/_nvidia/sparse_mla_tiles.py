@@ -34,6 +34,13 @@ def sparse_named_barriers(count, threads, base, _semantic=None):
 
 
 @triton.jit
+def sink_normalization(inverse, sink, logsum):
+    return inverse * tl.where(
+        sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
+    )
+
+
+@triton.jit
 def sparse_fp8_accumulate(logits, contribution):
     # Keep FP32 additions separate from tensor-core accumulation.
     return tl.inline_asm_elementwise(

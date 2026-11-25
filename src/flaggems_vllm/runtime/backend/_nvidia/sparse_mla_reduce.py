@@ -18,6 +18,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime.backend._nvidia.sparse_mla_tiles import (
     QK_RECOMPUTE_THRESHOLD,
+    sink_normalization,
     sparse_fp8_accumulate,
 )
 from flaggems_vllm.utils import libentry, libtuner
@@ -151,6 +152,8 @@ def sparse_fp8_repair(
                     heads[:, None] < H,
                     0,
                 )
+            else:
+                pass
             query_scale = tl.load(
                 QScale + batch * stride_qsb + heads * stride_qsh, heads < H, 0
             )
@@ -227,10 +230,10 @@ def sparse_fp8_repair(
                         valid[None, :],
                         0,
                     )
-                if HAS_ROPE:
                     rope_logits = tl.dot(query_rope, key_rope, out_dtype=tl.float32)
-                if HAS_ROPE:
                     logits += rope_logits
+                else:
+                    pass
                 logits = logits * query_scale[:, None] * kv_scale[None, :] * SM_SCALE
                 logits = tl.where(valid[None, :], logits, -float("inf"))
                 next_maximum = tl.maximum(maximum, tl.max(logits, 1))
@@ -268,14 +271,12 @@ def sparse_fp8_repair(
                 logsum = tl.where(
                     denominator > 0, maximum + tl.log(denominator), float("inf")
                 )
-                inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
+                denominator_inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
                 if HAS_SINK:
                     sink = tl.load(Sink + heads, heads < H, 0)
-                    inverse *= tl.where(
-                        sink == float("inf"),
-                        0.0,
-                        1.0 / (1.0 + tl.exp(sink - logsum)),
-                    )
+                    inverse = sink_normalization(denominator_inverse, sink, logsum)
+                else:
+                    inverse = denominator_inverse
                 output_ptr = Output + (batch * H + heads[:, None]) * 512 + dims[None, :]
                 tl.store(output_ptr, value0 * inverse[:, None], heads[:, None] < H)
                 tl.store(
@@ -293,6 +294,8 @@ def sparse_fp8_repair(
                 stats_ptr = Stats + ((batch * SPLITS + split) * H + heads) * 2
                 tl.store(stats_ptr, maximum, heads < H)
                 tl.store(stats_ptr + 1, denominator, heads < H)
+        else:
+            pass
 
 
 @triton.jit
@@ -339,7 +342,6 @@ def sparse_fp8_fast_merge(
     batch = tl.program_id(0)
     head_base = tl.program_id(1) * HEAD_TILE
     dims = tl.arange(0, 512)
-    need_repair = False
     if CHECK_REPAIR:
         head_group = head_base // 64
         flag_base = Flags + (batch * (H // 64) + head_group) * SPLITS
@@ -347,6 +349,8 @@ def sparse_fp8_fast_merge(
         for s in tl.static_range(SPLITS):
             flag_acc = flag_acc | tl.load(flag_base + s)
         need_repair = flag_acc != 0
+    else:
+        need_repair = False
     if need_repair:
         ropes = tl.arange(0, 64)
         length = (
@@ -362,6 +366,8 @@ def sparse_fp8_fast_merge(
                 query_rope = tl.load(QR + batch * qrb + head * qrh + ropes).to(
                     tl.float32
                 )
+            else:
+                pass
             query_scale = tl.load(QS + batch * qsb + head * qsh)
             maximum = -float("inf")
             denominator = 0.0
@@ -376,10 +382,13 @@ def sparse_fp8_fast_merge(
                         key_rope = tl.load(KR + page * krp + slot * krt + ropes).to(
                             tl.float32
                         )
+                    else:
+                        pass
                     key_scale = tl.load(KS + page * ksp + slot * kst)
-                    rope_score = 0.0
                     if HAS_ROPE:
                         rope_score = tl.sum(query_rope * key_rope, 0)
+                    else:
+                        rope_score = 0.0
                     score = (
                         (tl.sum(query * key, 0) + rope_score)
                         * query_scale
@@ -468,14 +477,12 @@ def sparse_fp8_fast_merge(
                 w1_a = tl.exp(m1_a - sm_a)
                 tot_a = d0_a * w0_a + d1_a * w1_a
                 lse_a = tl.where(tot_a > 0.0, gm_a + tl.log(tot_a), float("inf"))
-                inv_a = tl.where(tot_a > 0.0, 1.0 / tot_a, 0.0)
+                denominator_inverse = tl.where(tot_a > 0.0, 1.0 / tot_a, 0.0)
                 if HAS_SINK:
                     sk_a = tl.load(Sink + h0)
-                    inv_a *= tl.where(
-                        sk_a == float("inf"),
-                        0.0,
-                        1.0 / (1.0 + tl.exp(sk_a - lse_a)),
-                    )
+                    inv_a = sink_normalization(denominator_inverse, sk_a, lse_a)
+                else:
+                    inv_a = denominator_inverse
                 s0_a = w0_a * inv_a
                 s1_a = w1_a * inv_a
 
@@ -485,14 +492,12 @@ def sparse_fp8_fast_merge(
                 w1_b = tl.exp(m1_b - sm_b)
                 tot_b = d0_b * w0_b + d1_b * w1_b
                 lse_b = tl.where(tot_b > 0.0, gm_b + tl.log(tot_b), float("inf"))
-                inv_b = tl.where(tot_b > 0.0, 1.0 / tot_b, 0.0)
+                denominator_inverse = tl.where(tot_b > 0.0, 1.0 / tot_b, 0.0)
                 if HAS_SINK:
                     sk_b = tl.load(Sink + h1)
-                    inv_b *= tl.where(
-                        sk_b == float("inf"),
-                        0.0,
-                        1.0 / (1.0 + tl.exp(sk_b - lse_b)),
-                    )
+                    inv_b = sink_normalization(denominator_inverse, sk_b, lse_b)
+                else:
+                    inv_b = denominator_inverse
                 s0_b = w0_b * inv_b
                 s1_b = w1_b * inv_b
 
@@ -528,14 +533,12 @@ def sparse_fp8_fast_merge(
                     d_s = tl.load(st_ptr + 1)
                     total += d_s * tl.exp(m_s - safe_max)
                 logsum = tl.where(total > 0.0, gmax + tl.log(total), float("inf"))
-                inv = tl.where(total > 0.0, 1.0 / total, 0.0)
+                denominator_inverse = tl.where(total > 0.0, 1.0 / total, 0.0)
                 if HAS_SINK:
                     sink = tl.load(Sink + head)
-                    inv *= tl.where(
-                        sink == float("inf"),
-                        0.0,
-                        1.0 / (1.0 + tl.exp(sink - logsum)),
-                    )
+                    inv = sink_normalization(denominator_inverse, sink, logsum)
+                else:
+                    inv = denominator_inverse
                 acc = tl.zeros((512,), tl.float32)
                 for s in tl.static_range(SPLITS):
                     m_s = tl.load(Stats + ((batch * SPLITS + s) * H + head) * 2)
@@ -632,12 +635,12 @@ def sparse_fp8_short(
     )
     value = tl.dot(probability_fp8, values, out_dtype=tl.float32)
     logsum = tl.where(denominator > 0, maximum + tl.log(denominator), float("inf"))
-    inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
+    denominator_inverse = tl.where(denominator > 0, 1.0 / denominator, 0.0)
     if HAS_SINK:
         sink = tl.load(Sink + heads)
-        inverse *= tl.where(
-            sink == float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink - logsum))
-        )
+        inverse = sink_normalization(denominator_inverse, sink, logsum)
+    else:
+        inverse = denominator_inverse
     value *= (probability_scale * inverse)[:, None]
     tl.store(Output + (batch * H + heads[:, None]) * 512 + columns[None, :], value)
     tl.store(LSE + batch * H + heads, logsum, tl.program_id(2) == 0)

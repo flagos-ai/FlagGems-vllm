@@ -14,7 +14,6 @@
 
 """Hopper sparse MLA over native V4 cache pages with seven E8M0 scale groups."""
 
-from dataclasses import dataclass
 
 import torch
 import triton
@@ -44,6 +43,7 @@ from flaggems_vllm.runtime.backend._nvidia.sparse_mla_model1_gather import (
 )
 from flaggems_vllm.runtime.backend._nvidia.sparse_mla_tiles import (
     publish_sparse_p128_fp8,
+    sparse_fp8_publish_output,
     sparse_fp8_transpose_values,
     sparse_named_barriers,
 )
@@ -242,8 +242,6 @@ def leader(
     sk,
     skr,
     ks,
-    sv,
-    sv128,
     sv64,
     sp,
     alpha,
@@ -305,6 +303,8 @@ def leader(
         sc = tl.load(tle.gpu.local_ptr(ks.slot(buf)))
         if RING > BUFS:
             tle.gpu.barrier_arrive(kfree[buf], phaseIdx=cycle)
+        else:
+            pass
         scores = tl.where(
             sc[None, :] >= 0.0,
             (logits * qscale[:, None] * sc[None, :] + rope)
@@ -338,21 +338,28 @@ def leader(
                 tle.gpu.barrier_arrive(kfree[0])
             else:
                 tle.gpu.barrier_arrive(kfree[buf], phaseIdx=cycle)
+        else:
+            pass
         tle.gpu.barrier_wait(vfull[0])
-        acc *= beta[:, None]
+        # Promote each FP8 MMA tile before adding it to the long FP32 reduction.
+        tile_acc = tl.full((64, 64), 0.0, tl.float32)
         for half in tl.static_range(BK // 64):
             vbuf = buf * (BK // 64) + half
-            acc = tle.gpu.wgmma(
+            tile_acc = tle.gpu.wgmma(
                 sp.slot(vbuf),
                 sv64.slot(vbuf),
-                acc,
+                tile_acc,
                 trans_b=True,
             )
-        acc = tle.gpu.wgmma_wait(0, acc)
+        acc = tl.fma(acc, beta[:, None], tle.gpu.wgmma_wait(0, tile_acc))
         if RING > BUFS:
             tail = tle.gpu.wgmma_wait(0, tail)
+        else:
+            pass
         if BUFS == 1 and tl.cdiv(T, BK) > S:
             tle.gpu.barrier_wait(vfree[0])
+        else:
+            pass
     inv = tl.where(denom > 0.0, 1.0 / denom, 0.0)
     f = inv * prev
     tl.store(tle.gpu.local_ptr(factor), f)
@@ -376,135 +383,6 @@ def leader(
             maximum * 0.6931471805599453 + tl.log(denom),
             float("inf") if S == 1 else -float("inf"),
         ),
-    )
-
-
-@triton.jit
-def publish_front(
-    acc,
-    inverse,
-    Output,
-    batch,
-    head_block,
-    H: tl.constexpr,
-    OFFSET: tl.constexpr,
-    STREAMING: tl.constexpr = False,
-):
-    if Output.dtype.element_ty == tl.float32:
-        rows = head_block * 64 + tl.arange(0, 64)
-        columns = tl.arange(0, 128)
-        columns = (columns // 16) * 16 + (columns % 8) * 2 + (columns % 16) // 8
-        tl.store(
-            Output + (batch * H + rows[:, None]) * 512 + OFFSET + columns[None, :],
-            acc * inverse[:, None],
-        )
-        return
-        # Pair permuted accumulator columns into adjacent BF16 output elements.
-    base_u64 = (Output + (batch * H + head_block * 64) * 512 + OFFSET).to(tl.uint64)
-    st_op: tl.constexpr = "st.global.cs.v2.b32" if STREAMING else "st.global.v2.b32"
-    tl.inline_asm_elementwise(
-        asm=(
-            "{\n"
-            ".reg .b32 tid, row, col, offset, a, b, c, d;\n"
-            ".reg .b64 addr;\n"
-            "mov.u32 tid, %tid.x;\n"
-            "and.b32 tid, tid, 127;\n"
-            "shr.u32 row, tid, 5;\n"
-            "shl.b32 row, row, 4;\n"
-            "and.b32 col, tid, 31;\n"
-            "shr.u32 col, col, 2;\n"
-            "add.u32 row, row, col;\n"
-            "and.b32 col, tid, 3;\n"
-            "shl.b32 col, col, 3;\n"
-            "shl.b32 row, row, 10;\n"
-            "add.u32 offset, row, col;\n"
-            "cvt.u64.u32 addr, offset;\n"
-            "add.u64 addr, addr, $128;\n"
-            "cvt.rn.bf16x2.f32 a, $68, $64;\n"
-            "cvt.rn.bf16x2.f32 b, $69, $65;\n"
-            "cvt.rn.bf16x2.f32 c, $70, $66;\n"
-            "cvt.rn.bf16x2.f32 d, $71, $67;\n"
-            + st_op
-            + " [addr+0], {a, b};\n"
-            + st_op
-            + " [addr+8192], {c, d};\n"
-            "cvt.rn.bf16x2.f32 a, $76, $72;\n"
-            "cvt.rn.bf16x2.f32 b, $77, $73;\n"
-            "cvt.rn.bf16x2.f32 c, $78, $74;\n"
-            "cvt.rn.bf16x2.f32 d, $79, $75;\n"
-            + st_op
-            + " [addr+32], {a, b};\n"
-            + st_op
-            + " [addr+8224], {c, d};\n"
-            "cvt.rn.bf16x2.f32 a, $84, $80;\n"
-            "cvt.rn.bf16x2.f32 b, $85, $81;\n"
-            "cvt.rn.bf16x2.f32 c, $86, $82;\n"
-            "cvt.rn.bf16x2.f32 d, $87, $83;\n"
-            + st_op
-            + " [addr+64], {a, b};\n"
-            + st_op
-            + " [addr+8256], {c, d};\n"
-            "cvt.rn.bf16x2.f32 a, $92, $88;\n"
-            "cvt.rn.bf16x2.f32 b, $93, $89;\n"
-            "cvt.rn.bf16x2.f32 c, $94, $90;\n"
-            "cvt.rn.bf16x2.f32 d, $95, $91;\n"
-            + st_op
-            + " [addr+96], {a, b};\n"
-            + st_op
-            + " [addr+8288], {c, d};\n"
-            "cvt.rn.bf16x2.f32 a, $100, $96;\n"
-            "cvt.rn.bf16x2.f32 b, $101, $97;\n"
-            "cvt.rn.bf16x2.f32 c, $102, $98;\n"
-            "cvt.rn.bf16x2.f32 d, $103, $99;\n"
-            + st_op
-            + " [addr+128], {a, b};\n"
-            + st_op
-            + " [addr+8320], {c, d};\n"
-            "cvt.rn.bf16x2.f32 a, $108, $104;\n"
-            "cvt.rn.bf16x2.f32 b, $109, $105;\n"
-            "cvt.rn.bf16x2.f32 c, $110, $106;\n"
-            "cvt.rn.bf16x2.f32 d, $111, $107;\n"
-            + st_op
-            + " [addr+160], {a, b};\n"
-            + st_op
-            + " [addr+8352], {c, d};\n"
-            "cvt.rn.bf16x2.f32 a, $116, $112;\n"
-            "cvt.rn.bf16x2.f32 b, $117, $113;\n"
-            "cvt.rn.bf16x2.f32 c, $118, $114;\n"
-            "cvt.rn.bf16x2.f32 d, $119, $115;\n"
-            + st_op
-            + " [addr+192], {a, b};\n"
-            + st_op
-            + " [addr+8384], {c, d};\n"
-            "cvt.rn.bf16x2.f32 a, $124, $120;\n"
-            "cvt.rn.bf16x2.f32 b, $125, $121;\n"
-            "cvt.rn.bf16x2.f32 c, $126, $122;\n"
-            "cvt.rn.bf16x2.f32 d, $127, $123;\n"
-            + st_op
-            + " [addr+224], {a, b};\n"
-            + st_op
-            + " [addr+8416], {c, d};\n"
-            "mov.u32 $0, 0;\n"
-            "}\n"
-        ),
-        constraints=(
-            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-            "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
-            "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
-            "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
-            "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l"
-        ),
-        args=[acc * inverse[:, None], base_u64],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=64,
     )
 
 
@@ -591,9 +469,8 @@ def follower(
         ),
     )
     tle.gpu.barrier_arrive(qfull[0])
-    if qrepair:
-        tl.atomic_or(Flags + b, 1, sem="relaxed")
-        tl.atomic_or(RepairState, 1, sem="relaxed")
+    tl.atomic_or(Flags + b, 1, mask=qrepair != 0, sem="relaxed")
+    tl.atomic_or(RepairState, 1, mask=qrepair != 0, sem="relaxed")
     _, count = split_block_range(split, tl.cdiv(T, BK), S)
     a1 = tl.full((64, 128), 0.0, tl.float32)
     a = tl.full((64, 128), 0.0, tl.float32)
@@ -631,39 +508,41 @@ def follower(
             tle.gpu.barrier_arrive(kfree[buf], phaseIdx=cycle)
         tle.gpu.barrier_wait(pfull[0])
         beta = tl.load(tle.gpu.local_ptr(alpha.slot(buf)))
-        a *= beta[:, None]
-        a1 *= beta[:, None]
-        c *= beta[:, None]
+        tile_a = tl.full((64, 128), 0.0, tl.float32)
+        tile_a1 = tl.full((64, 128), 0.0, tl.float32)
+        tile_c = tl.full((64, 128), 0.0, tl.float32)
         for half in tl.static_range(BK // 64):
             vbuf = buf * (BK // 64) + half
-            a = tle.gpu.wgmma(
+            tile_a = tle.gpu.wgmma(
                 sp.slot(vbuf),
                 tle_subslice(sv.slot(vbuf), [0, 0], [128, 64]),
-                a,
+                tile_a,
                 trans_b=True,
             )
-            a1 = tle.gpu.wgmma(
+            tile_a1 = tle.gpu.wgmma(
                 sp.slot(vbuf),
                 tle_subslice(sv.slot(vbuf), [128, 0], [128, 64]),
-                a1,
+                tile_a1,
                 trans_b=True,
             )
-            c = tle.gpu.wgmma(
+            tile_c = tle.gpu.wgmma(
                 sp.slot(vbuf),
                 sv128.slot(vbuf),
-                c,
+                tile_c,
                 trans_b=True,
             )
-        a1 = tle.gpu.wgmma_wait(0, a1)
-        a = tle.gpu.wgmma_wait(0, a)
-        c = tle.gpu.wgmma_wait(0, c)
+        a1 = tl.fma(a1, beta[:, None], tle.gpu.wgmma_wait(0, tile_a1))
+        a = tl.fma(a, beta[:, None], tle.gpu.wgmma_wait(0, tile_a))
+        c = tl.fma(c, beta[:, None], tle.gpu.wgmma_wait(0, tile_c))
         if BUFS == 1 and tl.cdiv(T, BK) > S:
             tle.gpu.barrier_wait(vfree[0])
+        else:
+            pass
     tle.gpu.barrier_wait(ofull[0])
     f = tl.load(tle.gpu.local_ptr(factor))
-    publish_front(a, f, Output, b * S + split, hb, H, 0, S == 1)
-    publish_front(a1, f, Output, b * S + split, hb, H, 128, S == 1)
-    publish_front(c, f, Output, b * S + split, hb, H, 256, S == 1)
+    sparse_fp8_publish_output(a, f, Output, b * S + split, hb, H, 0, S == 1)
+    sparse_fp8_publish_output(a1, f, Output, b * S + split, hb, H, 128, S == 1)
+    sparse_fp8_publish_output(c, f, Output, b * S + split, hb, H, 256, S == 1)
 
 
 @triton.jit
@@ -717,13 +596,11 @@ def model1_fp8(
     if BUFS == 1:
         kfull = sparse_named_barriers(1, 512, 18)
         kfree = sparse_named_barriers(1, 512, 19)
-        vfull = sparse_named_barriers(1, 256, 20)
-        pfull = sparse_named_barriers(1, 256, 21)
     else:
         kfull = tle.gpu.alloc_barriers(BUFS, arrive_count=1)
         kfree = tle.gpu.alloc_barriers(BUFS, arrive_count=2, init=tle.gpu.READY)
-        vfull = sparse_named_barriers(1, 256, 20)
-        pfull = sparse_named_barriers(1, 256, 21)
+    vfull = sparse_named_barriers(1, 256, 20)
+    pfull = sparse_named_barriers(1, 256, 21)
     vfree = sparse_named_barriers(1, 256, 23)
     ofull = sparse_named_barriers(1, 256, 17)
     tle.gpu.warp_specialize(
@@ -739,8 +616,6 @@ def model1_fp8(
                     sk,
                     skr,
                     ks,
-                    sv,
-                    sv128,
                     sv64,
                     sp,
                     alpha,
@@ -765,7 +640,6 @@ def model1_fp8(
                 producer,
                 (
                     K,
-                    E,
                     KR,
                     Idx,
                     Flags,
@@ -779,7 +653,6 @@ def model1_fp8(
                     kfree,
                     N,
                     T,
-                    H,
                     STRIDE,
                     S,
                     BK,
@@ -923,7 +796,7 @@ def repair(
     STRIDE: tl.constexpr,
     SCALE: tl.constexpr,
 ):
-    # Only CTAs on the slow path participate in the completion count.
+    # The usual scale range needs no second attention pass.
     if tl.load(RepairState) == 0:
         return
     grid = tl.num_programs(0)
@@ -948,12 +821,8 @@ def repair(
                     STRIDE,
                     SCALE,
                 )
-            tl.store(Flags + b, 0)
-    # The last CTA clears the launch flag after every CTA has observed it.
-    done = tl.atomic_add(RepairState + 1, 1, sem="acq_rel")
-    if done == grid - 1:
-        tl.store(RepairState + 1, 0)
-        tl.store(RepairState, 0)
+        else:
+            pass
 
 
 @gluon.jit
@@ -988,139 +857,14 @@ def merge(
         empty, 1.0, denom
     )
     gl.store(out + (batch * H + h) * 512 + d, merged_value.to(gl.bfloat16))
-    if gl.program_id(2) == 0:
-        gl.store(lse + batch * H + h, gl.where(empty, float("inf"), m + gl.log(denom)))
+    gl.store(
+        lse + batch * H + h,
+        gl.where(empty, float("inf"), m + gl.log(denom)),
+        mask=gl.program_id(2) == 0,
+    )
 
 
-@dataclass
-class Model1Handle:
-    inputs: tuple
-    out: torch.Tensor
-    lse: torch.Tensor
-    partial: torch.Tensor
-    stats: torch.Tensor
-    repair_state: torch.Tensor | None
-    flags: torch.Tensor | None
-    tokens: int
-    stride: int
-    scale: float
-    splits: int
-    block: int
-    packed_rope: torch.Tensor | None
-    normalized: torch.Tensor
-    token_scale: torch.Tensor
-    prepack: bool
-    query: torch.Tensor
-    query_scale: torch.Tensor
-
-    def __call__(self):
-        q, qr, qs, k, e, kr, indices = self.inputs
-        b, h, _ = q.shape
-        t = indices.shape[-1]
-        if self.flags is None:
-            one_block[(b, h // 64, self.splits)](
-                q,
-                qr,
-                qs,
-                k,
-                e.view(torch.int64),
-                kr,
-                indices,
-                self.partial,
-                self.stats,
-                self.scale,
-                self.tokens,
-                t,
-                self.stride,
-                h,
-                self.splits,
-                self.block,
-                num_warps=8,
-                num_stages=1,
-            )
-            return self.out, self.lse
-        if self.splits > 1 and t > 640:
-            normalize_query[(b, h // 4)](
-                q, qs, self.query, self.query_scale, h, num_warps=4
-            )
-        if self.prepack:
-            normalize_cache[(triton.cdiv(self.tokens, 32),)](
-                k,
-                e,
-                self.normalized,
-                self.token_scale,
-                self.packed_rope,
-                self.tokens,
-                self.stride,
-                num_warps=8,
-            )
-        model1_fp8[(b, h // 64, self.splits)](
-            self.packed_rope if self.prepack else kr,
-            self.query,
-            qr,
-            self.query_scale,
-            e,
-            indices,
-            self.partial,
-            self.stats,
-            self.flags,
-            self.repair_state,
-            self.normalized,
-            self.token_scale,
-            self.tokens,
-            t,
-            h,
-            self.stride,
-            self.scale,
-            self.splits,
-            self.block,
-            128 // self.block,
-            self.prepack,
-            ptx_options="--register-usage-level=2",
-            num_warps=4,
-            num_stages=1,
-        )
-        if self.splits == 2:
-            merge_two[(b, h // 2)](
-                self.partial, self.stats, self.out, self.lse, h, num_warps=2
-            )
-        elif self.splits > 1:
-            d = 128 if b <= 4 else 512
-            merge[(b, h, 512 // d)](
-                self.partial,
-                self.stats,
-                self.out,
-                self.lse,
-                h,
-                self.splits,
-                d,
-                num_warps=2,
-            )
-        repair[(min(b, 64),)](
-            q,
-            qr,
-            qs,
-            k,
-            e,
-            kr,
-            indices,
-            self.out,
-            self.lse,
-            self.flags,
-            self.repair_state,
-            b,
-            self.tokens,
-            t,
-            h,
-            self.stride,
-            self.scale,
-            num_warps=8,
-            num_stages=1,
-        )
-        return self.out, self.lse
-
-
-def prepare_model1(
+def model1_attention(
     q: torch.Tensor,
     q_rope: torch.Tensor,
     q_scale: torch.Tensor,
@@ -1129,7 +873,7 @@ def prepare_model1(
     *,
     tokens: int,
     scale: float,
-) -> Model1Handle:
+) -> tuple[torch.Tensor, torch.Tensor]:
     batch, heads, width = q.shape
     pages = packed_cache.shape[0]
     topk = indices.shape[-1]
@@ -1199,40 +943,117 @@ def prepare_model1(
     lse = torch.empty((batch, heads), dtype=torch.float32, device=q.device)
     part = out if splits == 1 else out.new_empty((batch, splits, heads, 512))
     stats = lse if splits == 1 else lse.new_empty((batch, splits, heads))
-    flags = (
-        torch.zeros((batch,), dtype=torch.int32, device=q.device) if not exact else None
-    )
-    state = flags.new_zeros(2) if flags is not None else None
-    inputs = (
-        q,
-        q_rope,
-        q_scale,
-        fp8_keys,
-        exponent_words.view(torch.uint8),
-        bf16_keys,
-        indices,
-    )
-    # Ten visits excludes every 1,114,624-token manifest shape.
+    if exact:
+        one_block[(batch, heads // 64, splits)](
+            q,
+            q_rope,
+            q_scale,
+            fp8_keys,
+            exponent_words,
+            bf16_keys,
+            indices,
+            part,
+            stats,
+            scale,
+            tokens,
+            topk,
+            page_stride,
+            heads,
+            splits,
+            block,
+            num_warps=8,
+            num_stages=1,
+        )
+        return out, lse
+    repair_flags = torch.zeros(batch + 1, dtype=torch.int32, device=q.device)
+    flags, repair_state = repair_flags[1:], repair_flags[:1]
+    exponent_bytes = exponent_words.view(torch.uint8)
     prepack = topk > 128 and batch * topk >= 10 * tokens
-    normalized = q.new_empty((tokens, 448)) if prepack else inputs[3]
-    token_scale = q_scale.new_empty((tokens,)) if prepack else q_scale
-    return Model1Handle(
-        inputs,
-        out,
-        lse,
+    if splits > 1 and topk > 640:
+        query = torch.empty_like(q)
+        query_magnitude = q_scale.new_empty((batch, heads))
+        normalize_query[(batch, heads // 4)](
+            q, q_scale, query, query_magnitude, heads, num_warps=4
+        )
+    else:
+        query, query_magnitude = q, q_scale
+    if prepack:
+        normalized = q.new_empty((tokens, 448))
+        token_scale = q_scale.new_empty((tokens,))
+        rope_cache = q_rope.new_empty((tokens, 64))
+        normalize_cache[(triton.cdiv(tokens, 32),)](
+            fp8_keys,
+            exponent_bytes,
+            normalized,
+            token_scale,
+            rope_cache,
+            tokens,
+            page_stride,
+            num_warps=8,
+        )
+    else:
+        normalized, token_scale, rope_cache = fp8_keys, q_scale, bf16_keys
+    model1_fp8[(batch, heads // 64, splits)](
+        rope_cache,
+        query,
+        q_rope,
+        query_magnitude,
+        exponent_bytes,
+        indices,
         part,
         stats,
-        state,
         flags,
+        repair_state,
+        normalized,
+        token_scale,
         tokens,
+        topk,
+        heads,
         page_stride,
         scale,
         splits,
         block,
-        q_rope.new_empty((tokens, 64)) if prepack else None,
-        normalized,
-        token_scale,
+        128 // block,
         prepack,
-        q.new_empty((batch, heads, 448)) if topk > 640 and splits > 1 else q,
-        q_scale.new_empty((batch, heads)) if topk > 640 and splits > 1 else q_scale,
+        ptx_options="--register-usage-level=2",
+        num_warps=4,
+        num_stages=1,
     )
+    if splits == 1:
+        pass  # The attention kernel wrote the final output directly.
+    elif splits == 2:
+        merge_two[(batch, heads // 2)](part, stats, out, lse, heads, num_warps=2)
+    else:
+        d = 128 if batch <= 4 else 512
+        merge[(batch, heads, 512 // d)](
+            part,
+            stats,
+            out,
+            lse,
+            heads,
+            splits,
+            d,
+            num_warps=2,
+        )
+    repair[(min(batch, 64),)](
+        q,
+        q_rope,
+        q_scale,
+        fp8_keys,
+        exponent_bytes,
+        bf16_keys,
+        indices,
+        out,
+        lse,
+        flags,
+        repair_state,
+        batch,
+        tokens,
+        topk,
+        heads,
+        page_stride,
+        scale,
+        num_warps=8,
+        num_stages=1,
+    )
+    return out, lse

@@ -24,7 +24,7 @@ from flaggems_vllm.runtime.backend._nvidia.sparse_mla_compact import (
     sparse_fp8_compact,
     sparse_fp8_tile,
 )
-from flaggems_vllm.runtime.backend._nvidia.sparse_mla_model1 import prepare_model1
+from flaggems_vllm.runtime.backend._nvidia.sparse_mla_model1 import model1_attention
 from flaggems_vllm.runtime.backend._nvidia.sparse_mla_reduce import (
     sparse_fp8_empty,
     sparse_fp8_fast_merge,
@@ -129,7 +129,7 @@ def sparse_attention(
             raise ValueError("Expected query components with singleton query length")
         if q_rope.shape[1] != 1 or q_scale.shape[1] != 1:
             raise ValueError("Expected singleton RoPE and scale query length")
-        output, lse = prepare_model1(
+        output, lse = model1_attention(
             q_nope[:, 0],
             q_rope[:, 0],
             q_scale[:, 0],
@@ -137,7 +137,7 @@ def sparse_attention(
             indices,
             tokens=k_cache_lora.shape[0] * 64 if cache_tokens is None else cache_tokens,
             scale=512**-0.5 if softmax_scale is None else float(softmax_scale),
-        )()
+        )
         return output[:, None], lse[:, :, None]
     if cache_tokens is not None or k_cache_rope is None or k_scale is None:
         raise ValueError("Separate V32 pages require explicit RoPE and scales")

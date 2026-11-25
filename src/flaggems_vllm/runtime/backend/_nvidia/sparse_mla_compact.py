@@ -119,6 +119,8 @@ def sparse_fp8_load_tile(
         0.0,
         volatile=not CAN_ASYNC,
     )
+    scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
+    tl.store(tle.gpu.local_ptr(sk.slot(slot)), cache)
     if HAS_ROPE:
         rope = tl.load(
             KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
@@ -126,10 +128,9 @@ def sparse_fp8_load_tile(
             0.0,
             volatile=not CAN_ASYNC,
         )
-    scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
-    tl.store(tle.gpu.local_ptr(sk.slot(slot)), cache)
-    if HAS_ROPE:
         tl.store(tle.gpu.local_ptr(skr.slot(slot)), rope)
+    else:
+        pass
     tl.store(tle.gpu.local_ptr(scales.slot(slot)), scale)
     tl.store(tle.gpu.local_ptr(masks.slot(slot)), valid.to(tl.int32))
 
@@ -200,14 +201,15 @@ def sparse_fp8_compact_leader(
         Q + batch * qb + heads[:, None] * qh + features[None, :],
         volatile=not CAN_ASYNC,
     )
+    tl.store(tle.gpu.local_ptr(sq), query)
     if HAS_ROPE:
         query_rope = tl.load(
             QR + batch * qrb + heads[:, None] * qrh + ropes[None, :],
             volatile=not CAN_ASYNC,
         )
-    tl.store(tle.gpu.local_ptr(sq), query)
-    if HAS_ROPE:
         tl.store(tle.gpu.local_ptr(sr), query_rope)
+    else:
+        pass
     query_scale = tl.load(QS + batch * qsb + heads * qsh) * (SCALE * 1.4426950408889634)
     amplification = tl.max(tl.abs(query_scale), 0)
     needs_repair = tl.full((), False, tl.int1)
@@ -284,11 +286,15 @@ def sparse_fp8_compact_leader(
                         BLOCK_K=BLOCK_K,
                         HAS_ROPE=HAS_ROPE,
                     )
+                else:
+                    pass
                 logits = tle.gpu.wgmma(
                     sq, sk.slot(slot), out_dtype=tl.float32, trans_b=True
                 )
                 if HAS_ROPE:
                     logits = tle.gpu.wgmma(sr, skr.slot(slot), logits, trans_b=True)
+                else:
+                    pass
                 if BLOCK_K == 64 and step + 1 < block_count:
                     sparse_fp8_load_tile(
                         KV,
@@ -460,6 +466,8 @@ def sparse_fp8_compact_follower(
     value = tl.zeros((64, 256), tl.float32)
     if BLOCK_K == 128:
         extra = tl.zeros((64, 128), tl.float32)
+    else:
+        pass
     for base in range(start, stop, BLOCK_K):
         tle.gpu.barrier_wait(full[0])
         correction = tl.load(tle.gpu.local_ptr(alpha))
@@ -472,10 +480,14 @@ def sparse_fp8_compact_follower(
                 extra,
                 trans_b=True,
             )
+        else:
+            pass
         value = tle.gpu.wgmma(sp, sv1, value, trans_b=True)
         value = tle.gpu.wgmma_wait(0, value)
         if BLOCK_K == 128:
             extra = tle.gpu.wgmma_wait(0, extra)
+        else:
+            pass
         tle.gpu.barrier_arrive(empty[0])
     tle.gpu.barrier_wait(done[0], phaseIdx=0)
     output_scale = tl.load(tle.gpu.local_ptr(factor))
@@ -493,6 +505,8 @@ def sparse_fp8_compact_follower(
             + tl.arange(0, 128)[None, :],
             extra * output_scale[:, None],
         )
+    else:
+        pass
 
 
 @libentry()
@@ -715,14 +729,15 @@ def sparse_fp8_tile(
         Q + batch * qb + heads[:, None] * qh + features[None, :],
         volatile=not CAN_ASYNC,
     )
+    tl.store(tle.gpu.local_ptr(sq), query)
     if HAS_ROPE:
         query_rope = tl.load(
             QR + batch * qrb + heads[:, None] * qrh + ropes[None, :],
             volatile=not CAN_ASYNC,
         )
-    tl.store(tle.gpu.local_ptr(sq), query)
-    if HAS_ROPE:
         tl.store(tle.gpu.local_ptr(sr), query_rope)
+    else:
+        pass
     query_scale = tl.load(QS + batch * qsb + heads * qsh) * (SCALE * 1.4426950408889634)
     amplification = tl.max(tl.abs(query_scale), 0)
     maximum = tl.full((64,), -float("inf"), tl.float32)
@@ -746,6 +761,7 @@ def sparse_fp8_tile(
             0.0,
             volatile=not CAN_ASYNC,
         )
+        tl.store(tle.gpu.local_ptr(sk), cache)
         if HAS_ROPE:
             cache_rope = tl.load(
                 KR + pages[:, None] * krp + slots[:, None] * krt + ropes[None, :],
@@ -753,13 +769,15 @@ def sparse_fp8_tile(
                 0.0,
                 volatile=not CAN_ASYNC,
             )
-        tl.store(tle.gpu.local_ptr(sk), cache)
-        if HAS_ROPE:
             tl.store(tle.gpu.local_ptr(skr), cache_rope)
+        else:
+            pass
         tl.debug_barrier()
-        logits = tle.gpu.wgmma(sq, sk, out_dtype=tl.float32, trans_b=True)
+        content_logits = tle.gpu.wgmma(sq, sk, out_dtype=tl.float32, trans_b=True)
         if HAS_ROPE:
-            logits = tle.gpu.wgmma(sr, skr, logits, trans_b=True)
+            logits = tle.gpu.wgmma(sr, skr, content_logits, trans_b=True)
+        else:
+            logits = content_logits
         logits = tle.gpu.wgmma_wait(0, logits)
         kv_scale = tl.load(KS + pages * ksp + slots * kst, valid, 0.0)
         if amplification * tl.max(kv_scale, 0) > QK_RECOMPUTE_THRESHOLD:
@@ -780,11 +798,12 @@ def sparse_fp8_tile(
                 ik,
                 N,
             )
-            logits = exact
             if HAS_ROPE:
                 rope_scores = tle.gpu.wgmma(sr, skr, out_dtype=tl.float32, trans_b=True)
                 rope_scores = tle.gpu.wgmma_wait(0, rope_scores)
                 logits = exact + rope_scores
+            else:
+                logits = exact
         else:
             pass
         logits = logits * query_scale[:, None] * kv_scale[None, :]

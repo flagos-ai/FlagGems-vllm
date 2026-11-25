@@ -71,14 +71,12 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
                 packed = quantize_sparse_fp8_fixture(*inputs)
             reference, _, reference_lse = self.torch_op(*inputs)
             output, lse = self.gems_op(*packed)
-            assert_sparse_fixture_close(
-                output[:, 0], lse[:, :, 0], reference, reference_lse
-            )
-            if native_v4:
+            channels = (slice(None), slice(448, None)) if native_v4 else (slice(None),)
+            for columns in channels:
                 assert_sparse_fixture_close(
-                    output[:, 0, :, 448:],
+                    output[:, 0, :, columns],
                     lse[:, :, 0],
-                    reference[..., 448:],
+                    reference[..., columns],
                     reference_lse,
                 )
             yield inputs, packed, shape

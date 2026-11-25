@@ -471,7 +471,6 @@ def gather_tile(
 @triton.jit
 def producer(
     K,
-    E,
     KR,
     Idx,
     Flags,
@@ -485,7 +484,6 @@ def producer(
     kfree,
     N,
     T: tl.constexpr,
-    H: tl.constexpr,
     STRIDE: tl.constexpr,
     S: tl.constexpr,
     BK: tl.constexpr,
@@ -500,6 +498,8 @@ def producer(
         if BUFS == 1:
             if step > 0:
                 tle.gpu.barrier_wait(kfree[0])
+            else:
+                pass
         else:
             tle.gpu.barrier_wait(kfree[buf], phaseIdx=cycle)
         if PREPACK:
@@ -594,6 +594,5 @@ def producer(
             tle.gpu.barrier_arrive(kfull[0])
         else:
             tle.gpu.barrier_arrive(kfull[buf], phaseIdx=cycle)
-    if repair:
-        tl.atomic_or(Flags + b, 1, sem="relaxed")
-        tl.atomic_or(RepairState, 1, sem="relaxed")
+    tl.atomic_or(Flags + b, 1, mask=repair != 0, sem="relaxed")
+    tl.atomic_or(RepairState, 1, mask=repair != 0, sem="relaxed")
