@@ -351,26 +351,44 @@ def ascend_native_moe(hidden_states, w1, w2, probabilities, expert_ids):
     return routing.token_combine(expert_outputs, routed.combine_metadata)
 
 
+def ascend_int8_weights(experts, output_size, input_size, dtype):
+    from tests.test_fused_marlin_moe import _gptq_quantize_uint8b128
+
+    device = flaggems_vllm.device
+    codes = torch.empty(
+        (experts, output_size, input_size), device=device, dtype=torch.uint8
+    )
+    scales = torch.empty(
+        (experts, output_size, input_size // GROUP_SIZE), device=device, dtype=dtype
+    )
+    native = torch.empty(
+        (experts, input_size, output_size), device=device, dtype=torch.bfloat16
+    )
+    # Generate and cast one expert at a time while the previous benchmark inputs are live.
+    for expert in range(experts):
+        source = (
+            torch.randn((output_size, input_size), device=device, dtype=dtype) / 10.0
+        )
+        reference, codes[expert], scales[expert] = _gptq_quantize_uint8b128(
+            source, GROUP_SIZE
+        )
+        native[expert].copy_(reference.T)
+    return codes, scales, native
+
+
 def ascend_int8_inputs(shapes, dtype):
     from tests.accuracy_utils import gems_assert_close
-    from tests.test_fused_marlin_moe import (
-        _make_inputs_w8a16_int8,
-        _reference_w8a16_grouped,
-        compute_max_diff,
-    )
+    from tests.test_fused_marlin_moe import _reference_w8a16_grouped, compute_max_diff
 
     geometry = None
     for num_tokens, experts, hidden, intermediate, topk in shapes:
         if geometry != (experts, hidden, intermediate):
-            _, w1, w2, ref1, ref2, _, _, s1, s2 = _make_inputs_w8a16_int8(
-                1, experts, hidden, intermediate, topk, dtype, flaggems_vllm.device
+            torch.manual_seed(0)
+            w1, s1, baseline1 = ascend_int8_weights(
+                experts, 2 * intermediate, hidden, dtype
             )
-            baseline1 = ref1.to(torch.bfloat16).transpose(1, 2).contiguous()
-            baseline2 = ref2.to(torch.bfloat16).transpose(1, 2).contiguous()
-            fp16_references = (
-                (ref1.transpose(1, 2).contiguous(), ref2.transpose(1, 2).contiguous())
-                if dtype == torch.float16
-                else None
+            w2, s2, baseline2 = ascend_int8_weights(
+                experts, hidden, intermediate, dtype
             )
             geometry = (experts, hidden, intermediate)
         torch.manual_seed(num_tokens)
@@ -382,21 +400,31 @@ def ascend_int8_inputs(shapes, dtype):
         ).topk(topk)
         probabilities = torch.softmax(probabilities, dim=-1)
         ids = ids.to(torch.int32)
-        expected = _reference_w8a16_grouped(
-            hidden_states, ref1, ref2, probabilities, ids
-        )
         baseline_hidden = hidden_states.to(torch.bfloat16)
-        baseline_expected = (
-            expected
-            if dtype == torch.bfloat16
-            else _reference_w8a16_grouped(
-                baseline_hidden,
-                baseline1.transpose(1, 2),
-                baseline2.transpose(1, 2),
-                probabilities,
-                ids,
-            )
+        baseline_expected = _reference_w8a16_grouped(
+            baseline_hidden,
+            baseline1.transpose(1, 2),
+            baseline2.transpose(1, 2),
+            probabilities,
+            ids,
         )
+        expected = baseline_expected
+        if dtype != torch.bfloat16:
+            # Keep the FP16 reference bounded even for the largest upstream geometry.
+            expected = torch.zeros_like(hidden_states, dtype=torch.float32)
+            for start in range(0, experts, 8):
+                chunk = slice(start, start + 8)
+                refs = [
+                    (
+                        (w[chunk].unflatten(-1, (-1, GROUP_SIZE)).to(dtype) - 128)
+                        * scale[chunk].unsqueeze(-1)
+                    ).flatten(-2)
+                    for w, scale in ((w1, s1), (w2, s2))
+                ]
+                expected += _reference_w8a16_grouped(
+                    hidden_states, *refs, probabilities, ids - start
+                )
+                del refs
         outputs = (
             ascend_native_moe(
                 baseline_hidden, baseline1, baseline2, probabilities, ids
@@ -419,7 +447,7 @@ def ascend_int8_inputs(shapes, dtype):
             gems_assert_close(error, torch.zeros_like(error), torch.float32, atol=0.04)
         yield hidden_states, w1, w2, s1, s2, baseline1, baseline2, (
             baseline_hidden if dtype == torch.float16 else None
-        ), fp16_references, probabilities, ids
+        ), None, probabilities, ids
 
 
 class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
@@ -433,6 +461,7 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
 
     DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
     DEFAULT_SHAPE_DESC = "M, E, K, N, topk"
+
     DEFAULT_SHAPES = [
         (tokens, experts, hidden, intermediate, topk)
         for experts, hidden, intermediate, topk in (
@@ -445,16 +474,12 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
     ]
 
     def set_shapes(self, shape_file_path=None):
-        if (
-            flaggems_vllm.vendor_name == "ascend"
-            and shape_file_path == self.DEFAULT_SHAPE_FILES
+        if shape_file_path is None or Path(shape_file_path).resolve() == Path(
+            self.DEFAULT_SHAPE_FILES
         ):
-            shape_file_path = str(
-                Path(flaggems_vllm.__file__).parent
-                / "runtime/backend/_ascend/core_shapes.yaml"
-            )
-        else:
-            pass
+            self.shapes = self.DEFAULT_SHAPES.copy()
+            self.shape_desc = self.DEFAULT_SHAPE_DESC
+            return
         super().set_shapes(shape_file_path)
 
     def get_input_iter(self, cur_dtype):

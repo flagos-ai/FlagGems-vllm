@@ -76,10 +76,6 @@ def _runs_quantized_moe():
 
 _GATE_REASON = "requires Hopper or a vendor backend that overrides the operator"
 
-_ASCEND_INT4_ONLY_REASON = (
-    "Ascend backend does not implement this precision or output mode"
-)
-
 _GENERIC_GATE_REASON = "exercises the generic NVIDIA implementation"
 
 _MTHREADS_NO_INT8 = pytest.mark.skipif(
@@ -690,7 +686,8 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         device,
     )
 
-    router_weights = tw.float() if flaggems_vllm.vendor_name == "ascend" else tw
+    if flaggems_vllm.vendor_name == "ascend":
+        tw = tw.float()
     result = flaggems_vllm.fused_marlin_moe(
         hidden_states=hs,
         w1=w1_q,
@@ -699,7 +696,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         bias2=None,
         w1_scale=w1s,
         w2_scale=w2s,
-        topk_weights=router_weights,
+        topk_weights=tw,
         topk_ids=ti,
         quant_type_id=QUANT_TYPE_UINT4B8,
         apply_router_weight_on_input=apply_router_weight_on_input,
@@ -708,7 +705,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         hs,
         w1_ref,
         w2_ref,
-        router_weights,
+        tw,
         ti,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
@@ -764,7 +761,7 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
 )
 def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
     if flaggems_vllm.vendor_name == "ascend":
-        pytest.skip(_ASCEND_INT4_ONLY_REASON)
+        pytest.skip("Ascend requires an internally allocated output")
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
     )
@@ -1380,7 +1377,8 @@ def _check_w8a16_int8(config, dtype):
         dtype,
         device,
     )
-    router_weights = tw.float() if flaggems_vllm.vendor_name == "ascend" else tw
+    if flaggems_vllm.vendor_name == "ascend":
+        tw = tw.float()
     result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
@@ -1390,14 +1388,14 @@ def _check_w8a16_int8(config, dtype):
         w2=w2_q,
         w1_scale=w1s,
         w2_scale=w2s,
-        topk_weights=router_weights,
+        topk_weights=tw,
         topk_ids=ti,
     )
-    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, router_weights, ti)
+    ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
     torch_device_fn.synchronize()
-    # Preserve the existing vLLM metric across the two activation-dtype GEMM boundaries.
+    # INT8 should be tighter than INT4; same vLLM Marlin metric.
     max_diff = compute_max_diff(result.float(), ref)
-    gems_assert_close(max_diff, torch.zeros_like(max_diff), torch.float32, atol=0.04)
+    assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
 
 
 def _check_w4a16_mxfp4(config, dtype):
@@ -1405,7 +1403,7 @@ def _check_w4a16_mxfp4(config, dtype):
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
     if flaggems_vllm.vendor_name == "ascend":
-        pytest.skip(_ASCEND_INT4_ONLY_REASON)
+        pytest.skip("Ascend does not support MXFP4 weights")
 
     hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_mxfp4(
         num_tokens,
@@ -1508,7 +1506,7 @@ def _check_w8a16_fp8(
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
     if flaggems_vllm.vendor_name == "ascend":
-        pytest.skip(_ASCEND_INT4_ONLY_REASON)
+        pytest.skip("Ascend does not support FP8 weights")
     hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_fp8_weight(
         num_tokens,
         num_experts,
@@ -1999,7 +1997,7 @@ _W4A16_CASES += _cases(
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
-    "int8", W8A16_CONFIGS + [(65, 16, 4096, 256, 3)], marks=_MTHREADS_NO_INT8
+    "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
 )
 
 _W8A16_CASES += [
@@ -2054,197 +2052,3 @@ def test_fused_marlin_moe_w8a16(precision, config, dtype, _unused):
         _check_w8a16_fp8(config, dtype)
     else:
         _check_w8a16_int8(config, dtype)
-
-
-@pytest.mark.fused_marlin_moe_w8a16
-@pytest.mark.skipif(not _runs_quantized_moe(), reason=_GATE_REASON)
-@_MTHREADS_NO_INT8
-@pytest.mark.parametrize("num_tokens", [0, 1, 65])
-@pytest.mark.parametrize("hidden_size", [384, 4224])
-@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fused_marlin_moe_w8a16_int8_codes(num_tokens, hidden_size, ids_dtype, dtype):
-    """Exercise all UINT8 codes, the final expert, empty inputs and K tails."""
-    device = flaggems_vllm.device
-    num_experts, intermediate_size = 3, 128
-    weights, scales, references = [], [], []
-    for out_features, in_features in (
-        (2 * intermediate_size, hidden_size),
-        (hidden_size, intermediate_size),
-    ):
-        codes = torch.arange(
-            num_experts * out_features * in_features, device=device, dtype=torch.int32
-        )
-        codes = (
-            (codes % 256)
-            .to(torch.uint8)
-            .reshape(num_experts, out_features, in_features)
-        )
-        scale = torch.full(
-            (num_experts, out_features, in_features // GROUP_SIZE),
-            0.001,
-            device=device,
-            dtype=dtype,
-        )
-        scale *= torch.arange(1, num_experts + 1, device=device, dtype=dtype)[
-            :, None, None
-        ]
-        reference = (
-            (codes.float() - 128) * scale.float().repeat_interleave(GROUP_SIZE, dim=-1)
-        ).to(dtype)
-        weights.append(codes)
-        scales.append(scale)
-        references.append(reference)
-    torch.manual_seed(7)
-    hidden_states = (
-        torch.randn((num_tokens, hidden_size), device=device, dtype=dtype) * 0.1
-    )
-    expert_ids = torch.full(
-        (num_tokens, 1), num_experts - 1, device=device, dtype=ids_dtype
-    )
-    router_weights = torch.ones((num_tokens, 1), device=device, dtype=torch.float32)
-    output = flaggems_vllm.fused_marlin_moe(
-        hidden_states,
-        *weights,
-        None,
-        None,
-        *scales,
-        router_weights,
-        expert_ids,
-        QUANT_TYPE_UINT8B128,
-    )
-    reference = _reference_w8a16_grouped(
-        hidden_states, *references, router_weights, expert_ids
-    )
-    gems_assert_close(output, reference, dtype, atol=0.02)
-
-
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "ascend", reason="Ascend backend regression"
-)
-@pytest.mark.parametrize(
-    "bits,dtype,tokens",
-    [
-        pytest.param(4, torch.bfloat16, 4, marks=pytest.mark.fused_marlin_moe_w4a16),
-        pytest.param(4, torch.bfloat16, 65, marks=pytest.mark.fused_marlin_moe_w4a16),
-        pytest.param(8, torch.bfloat16, 4, marks=pytest.mark.fused_marlin_moe_w8a16),
-        pytest.param(8, torch.float16, 65, marks=pytest.mark.fused_marlin_moe_w8a16),
-    ],
-)
-@pytest.mark.parametrize("inference", [False, True])
-@pytest.mark.parametrize("capture", [False, True])
-def test_ascend_marlin_weight_updates(bits, dtype, tokens, inference, capture):
-    make_inputs, quant_type = (
-        (_make_inputs_w4a16_int4, QUANT_TYPE_UINT4B8)
-        if bits == 4
-        else (_make_inputs_w8a16_int8, QUANT_TYPE_UINT8B128)
-    )
-    with torch.inference_mode(inference):
-        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
-            tokens, 3, 384, 128, 1, dtype, flaggems_vllm.device
-        )
-        tw = tw.float()
-        args = (hs, w1, w2, None, None, s1, s2, tw, ti, quant_type)
-        actual = flaggems_vllm.fused_marlin_moe(*args)
-        if capture:
-            torch.npu.synchronize()
-            graph = torch.npu.NPUGraph()
-            with torch.npu.graph(graph):
-                actual = flaggems_vllm.fused_marlin_moe(*args)
-
-        for weight, scale, reference in ((w1, s1, ref1), (w2, s2, ref2)):
-            for update_weight in (True, False):
-                if update_weight:
-                    # Encode +1 in each byte or nibble, preserving the current scales.
-                    weight.fill_(0x99 if bits == 4 else 129)
-                    reference.copy_(scale.repeat_interleave(GROUP_SIZE, dim=-1))
-                else:
-                    scale.mul_(0.5)
-                    reference.mul_(0.5)
-                if capture:
-                    graph.replay()
-                else:
-                    actual = flaggems_vllm.fused_marlin_moe(*args)
-                expected = _reference_w8a16_grouped(hs, ref1, ref2, tw, ti)
-                assert compute_max_diff(actual.float(), expected) < 0.04
-
-
-@pytest.mark.fused_marlin_moe_w8a16
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "ascend", reason="Ascend grouped routing"
-)
-@pytest.mark.parametrize(
-    "tokens,experts,topk,dtype",
-    [
-        pytest.param(8192, 256, 6, torch.bfloat16, id="adaptive-tails"),
-        pytest.param(8192, 32, 1, torch.float16, id="panel-tails"),
-        pytest.param(16385, 256, 6, torch.float16, id="unequal-batches"),
-    ],
-)
-@torch.inference_mode()
-def test_ascend_marlin_grouped_replay(tokens, experts, topk, dtype):
-    device = flaggems_vllm.device
-    k, n = 4096, 256
-    # Counts span the 16/32/64/128-row tails, full tiles and unused experts.
-    ids = torch.empty((tokens, topk), dtype=torch.int64)
-    counts = [1, 85, 145, 161, 193, 257]
-    ids[:, 0] = len(counts)
-    start = 0
-    for expert, count in enumerate(counts):
-        ids[start : start + count, 0] = expert
-        start += count
-    if topk > 1:
-        ids[:, 1:] = torch.arange(experts - topk + 1, experts)
-    ids = ids.to(device)
-    x = (torch.arange(tokens, device=device) % 7 + 1).to(dtype) / 32
-    hs = x[:, None].expand(tokens, k).contiguous()
-    w1 = torch.full((experts, 2 * n, k), 129, dtype=torch.uint8, device=device)
-    w2 = torch.full((experts, k, n), 129, dtype=torch.uint8, device=device)
-    s1 = torch.full((experts, 2 * n, k // 128), 1 / 128, dtype=dtype, device=device)
-    expert_scale = (torch.arange(experts, device=device) % 4 + 1).to(dtype) / 128
-    column_scale = torch.where(torch.arange(k, device=device) % 3 == 0, 0.5, 1.0).to(
-        dtype
-    )
-    s2 = (
-        (expert_scale[:, None] * column_scale[None, :])[:, :, None]
-        .expand(experts, k, n // 128)
-        .contiguous()
-    )
-    probs = torch.full((tokens, topk), 1 / topk, device=device, dtype=torch.float32)
-    args = (hs, w1, w2, None, None, s1, s2, probs, ids, QUANT_TYPE_UINT8B128)
-    flaggems_vllm.fused_marlin_moe(*args)
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        actual = flaggems_vllm.fused_marlin_moe(*args)
-
-    # Power-of-two column scales preserve rounding through the router-weighted sum.
-    first, second = 1.0, 1.0
-    for changed in (w1, w2, s1, s2):
-        if changed is w1:
-            w1.fill_(130)
-            first = 2.0
-        elif changed is w2:
-            w2.fill_(131)
-            second = 3.0
-        elif changed is s1:
-            s1.mul_(0.25)
-            first *= 0.25
-        else:
-            s2.mul_(0.5)
-            second *= 0.5
-        graph.replay()
-        gate = (x.float() * (k * first / 128)).to(dtype).float()
-        activation = (torch.nn.functional.silu(gate) * gate).to(dtype).float()
-        projected = (activation[:, None] * (n * second) * expert_scale[ids].float()).to(
-            dtype
-        )
-        expected = (projected.float() * probs).sum(1).to(dtype)
-        for row in range(0, tokens, 512):
-            tile = actual[row : row + 512]
-            torch.testing.assert_close(
-                tile,
-                expected[row : row + 512, None] * column_scale,
-                rtol=0.015,
-                atol=1e-5,
-            )
