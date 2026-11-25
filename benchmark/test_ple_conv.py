@@ -88,6 +88,14 @@ class PLEConvNativeBenchmark(base.Benchmark):
         ]
         self.shape_desc = "mode,rows,channels,fuse,kernel,dilation"
 
+    def record_shapes(self, *args, **kwargs):
+        # The NV baseline config stores the positional tensors plus mode and
+        # dilation. query_start_loc, has_initial_states, num_accepted_tokens
+        # and spec_query_len are real call arguments, but they are not in
+        # that config, so recording them makes the tensor signature miss.
+        visible = {key: kwargs[key] for key in ("mode", "dilation") if key in kwargs}
+        return super().record_shapes(*args, **visible)
+
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             binding = dict(

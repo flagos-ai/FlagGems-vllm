@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import warnings
 
 # ruff: noqa: I001
 os.environ["FLAGTREE_AABS"] = "0"
@@ -68,7 +69,6 @@ try:
             gemma_rms_norm(out, x, w, eps)
             return out
 
-    HAS_BASELINE_OP = True
 except Exception as e:
     # Fall back to vllm.model_executor.layers.layernorm.GemmaRMSNorm when
     # the vendor-specific library (flashinfer, lightop, etc.) is absent.
@@ -85,10 +85,15 @@ except Exception as e:
             with torch.inference_mode():
                 return norm(x)
 
-        HAS_BASELINE_OP = True
     except ImportError:
         print(e)
-        HAS_BASELINE_OP = False
+        baseline_op = None
+
+if baseline_op is None:
+    warnings.warn(
+        f"Baseline op of current platform: {vendor} can't be loaded. "
+        "There will be `N/A` outputs in some columns."
+    )
 
 
 class GemmaRmsNormBenchmark(Benchmark):
@@ -120,9 +125,6 @@ class GemmaRmsNormBenchmark(Benchmark):
             yield x, w, eps
 
 
-@pytest.mark.skipif(
-    not HAS_BASELINE_OP, reason=f"Missing baseline ops on current platform: {vendor}"
-)
 @pytest.mark.gemma_rms_norm
 def test_gemma_rms_norm():
     dtypes = [torch.float16]
