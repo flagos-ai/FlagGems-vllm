@@ -84,21 +84,21 @@ def _group_scale(
     Q: tl.constexpr,
     EXACT: tl.constexpr = False,
 ):
-    """Load one scale per output column; the group is constant over the tile."""
+    """Load scales for the requested output columns and reduction groups."""
     expert = tl.cast(expert, tl.int64)
     n = tl.cast(n, tl.int64)
     address = S + expert * SE + n * SN + tl.cast(g, tl.int64) * SG
     if EXACT:
-        s = tl.load(address).to(tl.float32)
+        s = tl.load(address)
     else:
-        s = tl.load(address, valid, other=0).to(tl.float32)
+        s = tl.load(address, valid, other=0)
     if Q == 6:
         # E8M0 255 denotes NaN, including when the weight is zero.
         sb = s.to(tl.uint32)
         scale = (sb << 23).to(tl.float32, bitcast=True)
         scale = tl.where(sb == 0, 5.877471754111438e-39, scale)
         s = tl.where(sb == 255, float("nan"), scale)
-    return s
+    return s.to(tl.float32)
 
 
 @triton.jit
@@ -131,16 +131,19 @@ def _decode_scaled(
         ).to(tl.int32)
     if Q == 0 or Q == 6:
         q = (q >> (4 * (k % 2))) & 15
+    return _scale_weight_codes(q, s, Q, DTYPE)
+
+
+@triton.jit
+def _scale_weight_codes(q, s, Q: tl.constexpr, DTYPE: tl.constexpr):
     if Q == 0:
         v = (q - 8).to(tl.float32)
     elif Q == 1:
         v = (q - 128).to(tl.float32)
     elif Q == 6:
-        mag = q & 7
-        bits = tl.where(
-            mag < 2, mag * (126 << 23), (((mag >> 1) + 126) << 23) | ((mag & 1) << 22)
-        )
-        v = (bits | ((q & 8) << 28)).to(tl.float32, bitcast=True)
+        # The FP16 exponent bias is 14 larger than E2M1's.
+        bits = ((q & 8) << 12) | ((q & 7) << 9)
+        v = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32) * 16384.0
     else:
         bits = ((q & 127) << 20) | ((q & 128) << 24)
         v = bits.to(tl.float32, bitcast=True) * 1.329227995784916e36
@@ -178,6 +181,82 @@ def _decode(
     g = tl.full(k.shape, 0, tl.int64) if GROUP == -1 else (k // GROUP).to(tl.int64)
     s = _group_scale(S, expert, n, g, (n < N) & (k < K), SE, SN, SG, Q, EXACT)
     return _decode_scaled(W, s, expert, n, k, N, K, WE, WN, WK, Q, DTYPE, EXACT)
+
+
+@triton.jit
+def _load_gemm_weight(
+    W,
+    S,
+    expert,
+    n,
+    base,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    WE: tl.constexpr,
+    WN: tl.constexpr,
+    WK: tl.constexpr,
+    SE: tl.constexpr,
+    SN: tl.constexpr,
+    SG: tl.constexpr,
+    Q: tl.constexpr,
+    GROUP: tl.constexpr,
+    DTYPE: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    EXACT: tl.constexpr,
+):
+    # Both operands use rows that are contiguous along K in the native layout.
+    expert = expert.to(tl.int64)
+    n = n.to(tl.int64)[:, None]
+    k = base + tl.arange(0, BK)
+    row = W + expert * WE + n * WN
+    if Q == 0 or Q == 6:
+        packed_k = (base // 2 + tl.arange(0, BK // 2)).to(tl.int64)
+        if EXACT:
+            packed = tl.load(row + packed_k[None, :] * WK)
+        else:
+            packed = tl.load(
+                row + packed_k[None, :] * WK,
+                (n < N) & (packed_k[None, :] < K // 2),
+                other=0x88 if Q == 0 else 0,
+            )
+        packed = packed.to(tl.int32)
+        # Join on the innermost axis so every byte contributes even then odd K.
+        q = tl.reshape(tl.join(packed & 15, packed >> 4), (BN, BK))
+    else:
+        address = row + k[None, :].to(tl.int64) * WK
+        if EXACT:
+            q = tl.load(address).to(tl.int32)
+        else:
+            q = tl.load(
+                address, (n < N) & (k[None, :] < K), other=128 if Q == 1 else 0
+            ).to(tl.int32)
+
+    # A tile inside one scale group uses one scale per output column.
+    if GROUP == -1 or BK <= GROUP:
+        g = 0 if GROUP == -1 else base // GROUP
+        scale = _group_scale(
+            S, expert, n, g, (n < N) & (base < K), SE, SN, SG, Q, EXACT
+        )
+        return _scale_weight_codes(q, scale, Q, DTYPE)
+    else:
+        num_groups: tl.constexpr = BK // GROUP
+        groups = base // GROUP + tl.arange(0, num_groups)
+        scale = _group_scale(
+            S,
+            expert,
+            n,
+            groups[None, :],
+            (n < N) & (groups[None, :] < K // GROUP),
+            SE,
+            SN,
+            SG,
+            Q,
+            EXACT,
+        )
+        grouped_codes = tl.reshape(q, (BN, num_groups, GROUP))
+        value = _scale_weight_codes(grouped_codes, scale[:, :, None], Q, DTYPE)
+        return tl.reshape(value, (BN, BK))
 
 
 @triton.jit
@@ -279,65 +358,58 @@ def _gemm(
     route = route.to(tl.int64)
     valid = (route < R) & (expert >= 0) & (expert < E)
     dtype: tl.constexpr = A.dtype.element_ty
-    acc = tl.zeros((BM, BN), tl.float32)
+    acc_t = tl.zeros((BN, BM), tl.float32)
     if FIRST:
-        up = tl.zeros((BM, BN), tl.float32)
+        up_t = tl.zeros((BN, BM), tl.float32)
     split = tl.program_id(2)
     tiles = tl.cdiv(K, BK * SPLIT_K)
-    # A reduction tile inside one scale group needs a single scale per column,
-    # not one per weight element.
-    HOIST: tl.constexpr = GROUP == -1 or BK <= GROUP
-    # Tiles that divide the problem exactly need no per element bound test.
-    # Dropping it is a large gain while the row tile is small and a loss at
-    # BM=64, where the tile already amortizes the test over more rows.
+    # Tiles that divide the problem exactly need no per-element bound test.
     EXACT: tl.constexpr = BM <= 32 and N % BN == 0 and K % (BK * SPLIT_K) == 0
-    columns: tl.constexpr = 2 * N if FIRST else N
+    arow = route // TOPK if FIRST else route
     for step in range(tiles):
         base = (split * tiles + step) * BK
         k = base + tl.arange(0, BK)
-        arow = route // TOPK if FIRST else route
         a = tl.load(
             A + arow[:, None] * K + k[None, :],
             valid[:, None] if EXACT else valid[:, None] & (k[None, :] < K),
             other=0,
         )
-        if HOIST:
-            g = 0 if GROUP == -1 else base // GROUP
-            sv = _group_scale(
-                S,
-                expert,
-                n[None, :],
-                g,
-                (n[None, :] < columns) & (base < K),
-                SE,
-                SN,
-                SG,
-                Q,
-                EXACT,
-            )
-            w = _decode_scaled(
-                W,
-                sv,
-                expert,
-                n[None, :],
-                k[:, None],
-                columns,
-                K,
-                WE,
-                WN,
-                WK,
-                Q,
-                dtype,
-                EXACT,
-            )
+        a_t = tl.trans(a)
+        if dtype == tl.float16:
+            a_t = a_t.to(tl.float32)
+        w_t = _load_gemm_weight(
+            W,
+            S,
+            expert,
+            n,
+            base,
+            N,
+            K,
+            WE,
+            WN,
+            WK,
+            SE,
+            SN,
+            SG,
+            Q,
+            GROUP,
+            dtype,
+            BN,
+            BK,
+            EXACT,
+        )
+        if dtype == tl.float16:
+            acc_t = tl.dot(w_t.to(tl.float32), a_t, acc_t, input_precision="ieee")
         else:
-            w = _decode(
+            acc_t = tl.dot(w_t, a_t, acc_t)
+        if FIRST:
+            wu_t = _load_gemm_weight(
                 W,
                 S,
                 expert,
-                n[None, :],
-                k[:, None],
-                columns,
+                n + N,
+                base,
+                2 * N,
                 K,
                 WE,
                 WN,
@@ -348,76 +420,17 @@ def _gemm(
                 Q,
                 GROUP,
                 dtype,
+                BN,
+                BK,
                 EXACT,
             )
-        # A partial final output tile must not read the up half as gate data.
-        if not EXACT:
-            w = tl.where(n[None, :] < N, w, 0)
-        if dtype == tl.float16:
-            acc = tl.dot(
-                a.to(tl.float32), w.to(tl.float32), acc, input_precision="ieee"
-            )
-        elif Q == 2:
-            acc = tl.trans(tl.dot(tl.trans(w), tl.trans(a), tl.trans(acc)))
-        else:
-            acc = tl.dot(a, w, acc)
-        if FIRST:
-            if HOIST:
-                svu = _group_scale(
-                    S,
-                    expert,
-                    n[None, :] + N,
-                    g,
-                    (n[None, :] + N < 2 * N) & (base < K),
-                    SE,
-                    SN,
-                    SG,
-                    Q,
-                    EXACT,
-                )
-                wu = _decode_scaled(
-                    W,
-                    svu,
-                    expert,
-                    n[None, :] + N,
-                    k[:, None],
-                    2 * N,
-                    K,
-                    WE,
-                    WN,
-                    WK,
-                    Q,
-                    dtype,
-                    EXACT,
-                )
-            else:
-                wu = _decode(
-                    W,
-                    S,
-                    expert,
-                    n[None, :] + N,
-                    k[:, None],
-                    2 * N,
-                    K,
-                    WE,
-                    WN,
-                    WK,
-                    SE,
-                    SN,
-                    SG,
-                    Q,
-                    GROUP,
-                    dtype,
-                    EXACT,
-                )
             if dtype == tl.float16:
-                up = tl.dot(
-                    a.to(tl.float32), wu.to(tl.float32), up, input_precision="ieee"
-                )
-            elif Q == 2:
-                up = tl.trans(tl.dot(tl.trans(wu), tl.trans(a), tl.trans(up)))
+                up_t = tl.dot(wu_t.to(tl.float32), a_t, up_t, input_precision="ieee")
             else:
-                up = tl.dot(a, wu, up)
+                up_t = tl.dot(wu_t, a_t, up_t)
+    acc = tl.trans(acc_t)
+    if FIRST:
+        up = tl.trans(up_t)
     if SPLIT_K > 1:
         stride = 2 * N if FIRST else N
         offsets = (split * R + route[:, None]) * stride + n[None, :]
