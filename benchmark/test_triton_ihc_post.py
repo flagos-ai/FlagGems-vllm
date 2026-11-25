@@ -9,11 +9,23 @@ from pathlib import Path
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
 from baseline import triton_ihc_post as workloads
 
 from . import base, conftest, consts
+
+_H800_PROTOCOL = "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+
+
+def _positive_finite(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
 
 
 def _native_slot(*args, **kwargs):
@@ -99,24 +111,25 @@ class TritonIhcPostBenchmark(base.Benchmark):
 
     def run(self, *, mode_is_explicit=False):
         config = conftest.Config
-        # optest leaves --mode at its kernel default. Use the existing eager
-        # public-call timer for that entry point as well as --mode operator.
+        # Keep the synchronized public-call comparison for qualified native rows.
+        # Expose an offline record to Benchmark.run only after candidate timing.
         with pytest.MonkeyPatch.context() as scoped:
             if not mode_is_explicit and config.mode == consts.BenchMode.KERNEL:
-                print("iHC post uses --mode operator (synchronized mean, no Graph)")
                 scoped.setattr(config, "mode", consts.BenchMode.OPERATOR)
-            self._offline_shapes = None
-            self._offline_entry = {"shapes": {}}
-            if config.user_desired_metrics == ["latency"]:
-                scoped.setattr(config, "base_data", None)
-            elif config.base_data is not None:
-                entry = config.base_data.get(self.op_name, {})
-                self._offline_shapes = (entry or {}).get("shapes") or {}
-                scoped.setattr(
-                    config,
-                    "base_data",
-                    {**config.base_data, self.op_name: self._offline_entry},
-                )
+            data = config.base_data
+            self._offline_data = None
+            if data and config.user_desired_metrics != ["latency"]:
+                entry = data.get(self.op_name, {})
+                if "shapes" in entry and "variants" not in entry:
+                    # Two layouts can have the same tensor shapes. Select the
+                    # collector's full key through Benchmark.base_variant.
+                    variants = {
+                        key: {"shapes": {key: rows}}
+                        for key, rows in entry["shapes"].items()
+                    }
+                    data = {**data, self.op_name: {"variants": variants}}
+                self._offline_data = data
+            scoped.setattr(config, "base_data", None)
             super().run()
 
     def init_user_config(self):
@@ -130,66 +143,106 @@ class TritonIhcPostBenchmark(base.Benchmark):
             f"operator-wall-clock-mean-{config.warm_up}ms-{config.repetition}ms"
         )
 
-    def _select_offline_row(self, shape_key, config):
-        if self._offline_shapes is None:
+    def _select_offline_row(self, args):
+        data = self._offline_data
+        if data is None:
             return None
-
-        # The shared matcher can fall back to tensor sizes alone. Expose only
-        # this row's exact key/config, then let it do the normal ratio calculation.
-        self._offline_entry["shapes"] = {}
+        shape_key = self.base_variant
         dtype = str(self._dtype)
-        record = (self._offline_shapes.get(shape_key) or {}).get(dtype)
-        reason = "no offline NVIDIA record for this shape key and dtype"
-        if isinstance(record, dict):
-            reference = record.get("config") or {}
-            fields = (
-                "inputs",
-                "outputs",
-                "dims",
-                "mutation",
-                "input_aliasing",
-                "arithmetic",
-                "tolerance",
-                "timing_scope",
-            )
-            latency = record.get("latency_ms")
-            protocol = record.get("timing_protocol")
-            if not isinstance(reference, dict) or not all(
-                reference.get(field) == config[field] for field in fields
-            ):
-                reason = "offline NVIDIA configuration differs from the benchmark"
-            elif (
-                record.get("status") not in (None, "pass", "PASS", "ok")
-                or record.get("graph", False)
-                or not isinstance(latency, (int, float))
-                or isinstance(latency, bool)
-                or not math.isfinite(latency)
-                or latency <= 0
-            ):
-                reason = "offline NVIDIA record is invalid or lacks a positive latency"
-            elif protocol != self._timing_protocol:
-                reason = (
-                    f"offline NVIDIA timing protocol {protocol!r} does not match "
-                    f"{self._timing_protocol!r}"
-                )
-            else:
-                key = str(config["inputs"]["x"]["shape"])
-                self._offline_entry["shapes"] = {key: {dtype: record}}
-                return {
-                    "status": "MATCH",
-                    "shape_key": shape_key,
-                    "latency_ms": latency,
-                    "timing_protocol": protocol,
-                }
-        return {"status": "N/A", "reason": reason}
+        try:
+            variant = data[self.op_name]["variants"][shape_key]
+            record = variant["shapes"][shape_key][dtype]
+        except (KeyError, TypeError):
+            return {"status": "N/A", "reason": "no exact H800 shape key and dtype"}
+
+        reference = record.get("config") if isinstance(record, dict) else None
+        fields = (
+            "inputs",
+            "outputs",
+            "dims",
+            "mutation",
+            "input_aliasing",
+            "arithmetic",
+            "tolerance",
+            "timing_scope",
+        )
+        source = reference.get("source") if isinstance(reference, dict) else None
+        if (
+            not isinstance(source, dict)
+            or source.get("native_api") != self._config["source"]["native_api"]
+            or any(reference.get(field) != self._config[field] for field in fields)
+        ):
+            return {
+                "status": "N/A",
+                "reason": "offline public call or input contract differs",
+            }
+        if (
+            record.get("timing_protocol") != _H800_PROTOCOL
+            or record.get("graph", False)
+            or record.get("status") not in (None, "pass", "PASS", "ok")
+            or not _positive_finite(record.get("latency_ms"))
+        ):
+            return {
+                "status": "N/A",
+                "reason": "invalid offline latency or timing protocol",
+            }
+
+        environment = data.get("_environment")
+        scaling = data.get("_scaling_factors")
+        if not all(
+            isinstance(meta, dict) and meta.get("reference_chip") == "H800"
+            for meta in (environment, scaling)
+        ):
+            return {
+                "status": "N/A",
+                "reason": "latency and scaling must both reference H800",
+            }
+        vendor = flaggems_vllm.vendor_name
+        chip = base.torch_device_fn.get_device_name(args[0].device)
+        result = {
+            "status": "N/A",
+            "shape_key": shape_key,
+            "reference_chip": "H800",
+            "target_chip": chip,
+            "latency_ms": record["latency_ms"],
+            "timing_protocol": _H800_PROTOCOL,
+        }
+        models = [
+            entry["chip"]
+            for entry in scaling.get("chips", [])
+            if isinstance(entry, dict)
+            and entry.get("vendor") == vendor
+            and entry.get("chip")
+        ]
+        # A concrete SKU must agree with the table (e.g. 910B1 vs 910B4).
+        # Leave a family-only device name to the framework's single-vendor rule.
+        device_name = " " + chip.lower().replace("-", " ") + " "
+        if any(char.isdigit() for char in chip) and not any(
+            " " + model.lower().replace("-", " ") + " " in device_name
+            for model in models
+        ):
+            return {**result, "reason": f"no H800 scaling entry for {chip}"}
+        factor = consts.lookup_scaling_factor(
+            data, vendor, record.get("bottle_neck_unit"), self._dtype
+        )
+        if not _positive_finite(factor):
+            return {**result, "reason": "no valid scaling factor for this bottleneck"}
+        conftest.Config.base_data = data
+        return {
+            **result,
+            "status": "MATCH",
+            "scaling_factor": factor,
+            "scaling_chip": models[0] if len(models) == 1 else chip,
+        }
 
     def record_shapes(self, *args, **kwargs):
         # Preserve normal tensor shapes while retaining layout and per-row N/A.
-        return {
+        self._row = {
             "arguments": super().record_shapes(*args, **kwargs),
-            "shape_key": workloads.key_shape(self._binding),
+            "shape_key": self.base_variant,
             "config": self._config,
-            "offline_nvidia": self._offline_status,
+            "offline_nvidia": None,
+            "selected_source": None,
             "native": self._native_status,
             "timing": {
                 "scope": "complete public callable, allocation and contiguous copies",
@@ -203,6 +256,7 @@ class TritonIhcPostBenchmark(base.Benchmark):
             },
             "active_rows": len(self.shapes) * len(self.to_bench_dtypes),
         }
+        return self._row
 
     def get_input_iter(self, dtype):
         native = None
@@ -222,10 +276,12 @@ class TritonIhcPostBenchmark(base.Benchmark):
         self._native = native
         misses = []
         for n, hc, d, layout in self.shapes:
+            conftest.Config.base_data = None
             binding = {"tokens": n, "channels": hc, "hidden": d, "layout": layout}
             args, kwargs = workloads.build_inputs(binding, dtype, self.device)
             snapshots = tuple(value.detach().cpu().clone() for value in args)
-            self._binding, self._dtype = binding, dtype
+            self.base_variant = workloads.key_shape(binding)
+            self._dtype = dtype
             self._snapshots = snapshots
             self._native_status = {
                 "status": "N/A" if native is None else "VALIDATING",
@@ -256,12 +312,23 @@ class TritonIhcPostBenchmark(base.Benchmark):
             assert not _changed_inputs(args, snapshots), "candidate mutated inputs"
             del output
             self._config = workloads.config(binding, dtype)
-            shape_key = workloads.key_shape(binding)
-            self._offline_status = self._select_offline_row(shape_key, self._config)
+            for value, name in zip(args, ("x", "residual", "post")):
+                spec = self._config["inputs"][name]
+                assert (
+                    list(value.shape) == spec["shape"]
+                    and str(value.dtype) == spec["dtype"]
+                )
+                assert (
+                    list(value.stride()) == spec["stride"]
+                    and value.storage_offset() == spec["storage_offset"]
+                ), name
             yield (*args, kwargs)
             if self._native_status["reason"]:
                 misses.append(
-                    {"shape_key": shape_key, "reason": self._native_status["reason"]}
+                    {
+                        "shape_key": self.base_variant,
+                        "reason": self._native_status["reason"],
+                    }
                 )
         if misses:
             # optest selects its nullable-ratio parser from this metadata.
@@ -279,29 +346,52 @@ class TritonIhcPostBenchmark(base.Benchmark):
     def get_latency(self, op, *args, **kwargs):
         # Base.run aborts the iterator for any timing failure. Limit recovery to
         # native failures so candidate rows and standard JSON remain available.
-        candidate = op is self.gems_op
-        if not candidate and self._native_status["status"] != "ACCURACY_PASS":
+        if op is self.gems_op:
+            if self._native_status["status"] == "PASS":
+                latency = super().get_latency(op, *args, **kwargs)
+                self._row["selected_source"] = "native"
+            else:
+                latency = triton.testing.do_bench(
+                    lambda: op(*args, **kwargs),
+                    warmup=25,
+                    rep=100,
+                    return_mode="median",
+                )
+                self._row["timing"].update(
+                    framework="triton.testing.do_bench",
+                    statistic="median",
+                    protocol=_H800_PROTOCOL,
+                    warmup_budget_ms=25,
+                    repetition_budget_ms=100,
+                )
+                offline = self._select_offline_row(args)
+                self._row["offline_nvidia"] = offline
+                if offline and offline["status"] == "MATCH":
+                    self._row["selected_source"] = "nv_baseline"
+            if not _positive_finite(latency):
+                raise ValueError(f"invalid Gems latency: {latency}")
+            assert not _changed_inputs(
+                args, self._snapshots
+            ), "timed Gems callable mutated inputs"
+            return latency
+
+        if self._native_status["status"] != "ACCURACY_PASS":
             return None
         try:
-            latency = super().get_latency(
-                op if candidate else self._native, *args, **kwargs
-            )
-            if not math.isfinite(latency) or latency <= 0:
-                raise ValueError(f"invalid latency: {latency}")
-            changed = _changed_inputs(args, self._snapshots, restore=not candidate)
+            latency = super().get_latency(self._native, *args, **kwargs)
+            if not _positive_finite(latency):
+                raise ValueError(f"invalid native latency: {latency}")
+            changed = _changed_inputs(args, self._snapshots, restore=True)
             if changed:
-                raise AssertionError(f"timed callable mutated inputs {changed}")
+                raise AssertionError(f"timed native callable mutated inputs {changed}")
         except Exception as exc:
-            if candidate:
-                raise
             _changed_inputs(args, self._snapshots, restore=True)
             self._native_status.update(
                 status="N/A",
                 reason=f"native timing failed: {type(exc).__name__}: {exc}",
             )
             return None
-        if not candidate:
-            self._native_status.update(status="PASS", reason=None)
+        self._native_status.update(status="PASS", reason=None)
         return latency
 
 
