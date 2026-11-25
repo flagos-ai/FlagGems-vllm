@@ -51,7 +51,7 @@ import logging
 
 import torch
 import triton
-import triton.language as tl
+import triton.language as tl  # noqa: F401
 
 from flaggems_vllm.utils.code_cache import code_cache_dir
 from flaggems_vllm.utils.code_utils import write_atomic

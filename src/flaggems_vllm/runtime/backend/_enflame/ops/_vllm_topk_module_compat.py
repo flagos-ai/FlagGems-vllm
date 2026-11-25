@@ -357,7 +357,7 @@ def top_k_per_row_decode(
 # ────────────────────────────── wiring ──────────────────────────────
 
 import importlib.util  # noqa: E402
-import logging
+import logging  # noqa: E402
 import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
 

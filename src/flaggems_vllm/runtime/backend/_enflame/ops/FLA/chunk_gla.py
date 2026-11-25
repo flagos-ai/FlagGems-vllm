@@ -2104,7 +2104,7 @@ def chunk_gla(
     return o, final_state
 
 
-import logging
+import logging  # noqa: E402
 
 # GCU: the generic ``flaggems_vllm.ops.FLA.index.prepare_chunk_indices`` takes
 # only (cu_seqlens, chunk_size) while ``ChunkGLAFunction.forward`` passes the

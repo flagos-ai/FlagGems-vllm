@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import functools
 import importlib.util
+import inspect
 import math
 import sys
 from contextlib import contextmanager
@@ -18,6 +20,34 @@ spec = importlib.util.spec_from_file_location(
 )
 workload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(workload)
+
+
+def _adapt_native_op(op):
+    """Adapt the resolved native vLLM op to the workload's calling convention.
+
+    The new-stack vLLM wrapper derives chunk indices from ``cu_seqlens``
+    internally and dropped the explicit ``chunk_indices`` parameter that the
+    flaggems op still accepts (the workload passes it for varlen shapes).
+    Keep only kwargs the native signature still declares so the baseline leg
+    stays measurable; on stacks that still accept them nothing is dropped.
+    """
+    native_params = set(inspect.signature(op).parameters)
+
+    @functools.wraps(op)
+    def wrapper(*args, **kwargs):
+        dropped = [name for name in kwargs if name not in native_params]
+        if dropped:
+            print(
+                f"[native-adapt] {workload.OP_NAME}: dropping kwargs {dropped} "
+                "absent from the native signature"
+            )
+            kwargs = {
+                name: value for name, value in kwargs.items() if name in native_params
+            }
+        return op(*args, **kwargs)
+
+    return wrapper
+
 
 # Only these measured bindings use the bounded native search. Custom and
 # comprehensive-only shapes retain the provider's original configuration list.
