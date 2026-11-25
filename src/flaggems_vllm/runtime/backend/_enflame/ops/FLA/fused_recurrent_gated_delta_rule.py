@@ -107,7 +107,7 @@ def _patch_gcu_compiler_opt():
     _toolkit.gcu_compiler_opt = _shim
 
 
-# _patch_gcu_compiler_opt()  # DISABLED 2026-11-09: 私有 GCUIR shim 实测引入回归,详见 commit b333be6
+# _patch_gcu_compiler_opt()  # DISABLED 2026-11-09: private GCUIR shim regressed; see commit b333be6
 
 
 @triton.jit

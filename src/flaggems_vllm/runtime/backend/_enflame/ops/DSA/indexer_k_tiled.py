@@ -237,9 +237,9 @@ def _install_gcu_matmul_compat():
     toolkit.gcu_compiler_opt = gcu_compiler_opt_compat
 
 
-# _install_gcu_matmul_compat()  # DISABLED 2026-11-09: 私有 GCUIR shim 实测引入回归(降级重试路径
-# 搞挂合法 kernel,同 conftest shim 事故);详见 commit b333be6/e1acdf6 与
-# compiler_issues/vllm_memref_slice_pad_start.md。编译器修复后统一处置。
+# _install_gcu_matmul_compat()  # DISABLED 2026-11-09: private GCUIR shim regressed (downgrade-retry path
+# broke a valid kernel, same as the conftest shim incident); see commits b333be6/e1acdf6 and
+# compiler_issues/vllm_memref_slice_pad_start.md. Revisit after the compiler is fixed.
 
 
 # ===========================================================================
@@ -275,7 +275,7 @@ def _install():
 try:
     _install()
 except Exception:
-    # pytest assertion-rewrite 上下文中 @triton.jit 源定位可能失败
-    # (collect 期动态触碰 generic 模块触发);跳过接线不影响 op 路由
-    # (SpecOpRegistrar 已保证),直连 import 入口的接线由运行期重试兜底。
+    # Under pytest assertion-rewrite, locating @triton.jit sources may fail
+    # (triggered by dynamically touching generic modules during collection); skipping wiring does not affect op routing
+    # (guaranteed by SpecOpRegistrar); direct-import wiring is covered by the runtime retry fallback.
     pass

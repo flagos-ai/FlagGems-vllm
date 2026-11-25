@@ -202,8 +202,8 @@ def _moe_sum_general_kernel(
     # load chain; on GCU400 the dynamic-range loop of the seed kernel leaves
     # those loads unpipelined (0.22 TB/s on (1024,1024,1024) fp16), so the
     # loop is chunked and the U loads of each chunk are unrolled statically
-    # (constexpr TOPK) to put U rows in flight (playbook "topk 归约类 K 次
-    # 跨步 load 的 constexpr TOPK 保序展开"; measured 2.2~8.8x on the bench
+    # (constexpr TOPK) to keep U rows in flight (playbook: "constexpr TOPK in-order unrolling for
+    # strided loads in topk-style reductions"; measured 2.2-8.8x on the bench
     # shapes). EXACT drops the hidden predicate when BLOCK_H divides
     # hidden_size; CONTIG_H drops the h*stride vector multiplies. The k
     # ascending accumulation order is identical to the seed kernel, so the

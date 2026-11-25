@@ -12,24 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GCUIR 新旧格式兼容 shim(共享版,2026-11-09)。
+"""Compatibility shim for old/new GCUIR formats (shared version, 2026-11-09).
 
-背景(220 单机全量复核定位):2026-11-07 20:22 后的 in-process pass 库会在
-GCUIR 里产出三种新格式;较老的外部 gcu-compiler-opt 拒收并报
+Background (identified during a full review on 220 hosts): in-process pass libraries built after
+2026-11-07 20:22 emit three new GCUIR formats that older external gcu-compiler-opt rejects
 ``invalid properties {operandSegmentSizes ...} for op memref_ext.slice_pad_start``
-(两仓 ~70 op 受影响,详见 workspace compiler_issues/vllm_memref_slice_pad_start.md):
+(about 70 ops across both repos are affected; see workspace compiler_issues/vllm_memref_slice_pad_start.md):
 
-1. ``memref_ext.slice_*`` / ``gcu.matmul`` 的 operandSegmentSizes 多一个尾部空
-   variadic 段(尾零);
-2. ``gcu.matmul`` 带 inputPrecision 属性;
-3. ``memref_ext.memset_start`` 带 properties dict。
+1. ``memref_ext.slice_*`` / ``gcu.matmul`` has one extra trailing empty
+   variadic segment (trailing zero);
+2. ``gcu.matmul`` carries an inputPrecision attribute;
+3. ``memref_ext.memset_start`` carries a properties dict.
 
-本 shim 包装 ``triton.backends.enflame.toolkit.gcu_compiler_opt``:首次失败时把
-新格式降级回旧格式重试一次;合法旧格式 IR 不受影响、原错误原样透传。
-单 op 私有版先例(vllm FLA/parallel_nsa.py、sglang hash_topk.py 等 6 处)由此
-共享版收敛——行为一致、作用域为全部 kernel。
+This shim wraps ``triton.backends.enflame.toolkit.gcu_compiler_opt``: on the first failure it
+downgrades the new format back to the old one and retries once; valid old-format IR is unaffected and
+the original error is propagated unchanged. This shared version consolidates six earlier per-op copies
+(vllm FLA/parallel_nsa.py, sglang hash_topk.py, etc.) with identical behavior but applying to all kernels.
 
-工具链升级(外部 gcu-compiler-opt 认识新格式)后本模块整体可移除。
+This module can be removed once the toolchain (external gcu-compiler-opt) understands the new formats.
 """
 
 from __future__ import annotations

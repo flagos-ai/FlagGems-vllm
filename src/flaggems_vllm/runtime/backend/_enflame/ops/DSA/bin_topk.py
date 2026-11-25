@@ -1165,7 +1165,7 @@ def _install():
 try:
     _install()
 except Exception:
-    # pytest assertion-rewrite 上下文中 @triton.jit 源定位可能失败
-    # (collect 期动态触碰 generic 模块触发);跳过接线不影响 op 路由
-    # (SpecOpRegistrar 已保证),直连 import 入口的接线由运行期重试兜底。
+    # Under pytest assertion-rewrite, locating @triton.jit sources may fail
+    # (triggered by dynamically touching generic modules during collection); skipping wiring does not affect op routing
+    # (guaranteed by SpecOpRegistrar); direct-import wiring is covered by the runtime retry fallback.
     pass

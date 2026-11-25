@@ -38,7 +38,7 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_deep_gemm_import_compat im
     install_vllm_deep_gemm_import_compat,
 )
 
-install_vllm_deep_gemm_import_compat()  # 库兼容 shim(非 GCUIR),保留
+install_vllm_deep_gemm_import_compat()  # Library-compat shim (not GCUIR); keep
 
 # vLLM accuracy tests call get_paged_mqa_logits_metadata with torch's
 # multi_processor_count, which the GCU deep_gemm C++ API rejects by
@@ -50,7 +50,7 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_paged_mqa_logits_compat im
     install_vllm_paged_mqa_logits_compat,
 )
 
-install_vllm_paged_mqa_logits_compat()  # 库兼容 shim(非 GCUIR),保留
+install_vllm_paged_mqa_logits_compat()  # Library-compat shim (not GCUIR); keep
 
 # Make vLLM's own fused_experts_impl reference runnable on GCU (tests compare
 # FlagGems fused_moe against it): fall back to a GCU device name when vLLM
@@ -60,16 +60,17 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_moe_ref_compat import (
     install_vllm_moe_ref_compat,
 )
 
-install_vllm_moe_ref_compat()  # 库兼容 shim(非 GCUIR),保留
+install_vllm_moe_ref_compat()  # Library-compat shim (not GCUIR); keep
 
-# flaggems_vllm 的 LibEntry(不同于 LibTuner)未暴露上游测试契约的 cache_key
-# (tests/test_tle_capabilities.py 断言 @libentry() 内核可访问该属性);纯增量
-# 类属性兼容补丁,仅在该属性缺失时生效,委托到 LibEntry 已解析的 jit_function。
+# flaggems_vllm LibEntry (unlike LibTuner) does not expose cache_key, which upstream tests require
+# (tests/test_tle_capabilities.py asserts that @libentry() kernels expose this attribute); additive
+# class-attribute patch that applies only when the attribute is missing and delegates to the
+# jit_function already resolved by LibEntry.
 from flaggems_vllm.runtime.backend._enflame.ops._flaggems_libentry_compat import (
     install_flaggems_libentry_compat,
 )
 
-install_flaggems_libentry_compat()  # 库兼容 shim(非 GCUIR),保留
+install_flaggems_libentry_compat()  # Library-compat shim (not GCUIR); keep
 
 # isort: off
 from flaggems_vllm.runtime.backend._enflame.ops.act_quant import act_quant_triton
@@ -189,7 +190,7 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_inv_rope_ref_compat import
     install_vllm_inv_rope_ref_compat,
 )
 
-install_vllm_inv_rope_ref_compat()  # 库兼容 shim(非 GCUIR),保留
+install_vllm_inv_rope_ref_compat()  # Library-compat shim (not GCUIR); keep
 
 from flaggems_vllm.runtime.backend._enflame.ops.fused_indexer_q_rope_quant import (
     fused_indexer_q_rope_quant,
@@ -408,7 +409,7 @@ from flaggems_vllm.runtime.backend._enflame.ops._vllm_topk_module_compat import 
     install_vllm_topk_module_compat,
 )
 
-install_vllm_topk_module_compat()  # 库兼容 shim(非 GCUIR),保留
+install_vllm_topk_module_compat()  # Library-compat shim (not GCUIR); keep
 
 __all__ = [
     "act_quant_triton",

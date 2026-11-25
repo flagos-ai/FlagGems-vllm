@@ -576,7 +576,7 @@ def _install_vllm_kda_overlay():
 
 
 # Patch vLLM's kda module now if it was imported before this package.
-# _install_vllm_kda_overlay()  # DISABLED 2026-11-09: 私有 GCUIR shim 实测引入回归,详见 commit b333be6
+# _install_vllm_kda_overlay()  # DISABLED 2026-11-09: private GCUIR shim regressed; see commit b333be6
 
 
 __all__ = ["fused_recurrent_kda"]

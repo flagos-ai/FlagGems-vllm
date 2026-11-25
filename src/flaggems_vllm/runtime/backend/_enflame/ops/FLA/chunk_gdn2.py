@@ -34,7 +34,7 @@ import triton.language as tl
 
 from flaggems_vllm.ops.FLA.gdn2_native.chunk_fwd import chunk_gdn2_fwd
 
-# 此仓库的pre index的入口参数没有BT，不支持varlen
+# The pre-index entry point in this repo has no BT argument and does not support varlen
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp2
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
@@ -111,7 +111,7 @@ def softplus_nv(x):
 
 softplus = softplus_nv
 
-# triton实现
+# Triton implementation
 
 # 3. TLE kernels for GDN-2 prefill, BT=16, inference path.
 if HAS_TLE_GDN2:
@@ -1210,7 +1210,7 @@ if HAS_TLE_GDN2:
         )
 
 
-# 4. 唯一公开入口
+# 4. The only public entry point
 def chunk_gdn2(
     q,
     k,

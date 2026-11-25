@@ -138,9 +138,9 @@ def _install_gcuir_matmul_segment_compat():
     toolkit.gcu_compiler_opt = gcu_compiler_opt_compat
 
 
-# _install_gcuir_matmul_segment_compat()  # DISABLED 2026-11-09: 私有 GCUIR shim 实测引入回归(降级重试路径
-# 搞挂合法 kernel,同 conftest shim 事故);详见 commit b333be6/e1acdf6 与
-# compiler_issues/vllm_memref_slice_pad_start.md。编译器修复后统一处置。
+# _install_gcuir_matmul_segment_compat()  # DISABLED 2026-11-09: private GCUIR shim regressed (downgrade-retry path
+# broke a valid kernel, same as the conftest shim incident); see commits b333be6/e1acdf6 and
+# compiler_issues/vllm_memref_slice_pad_start.md. Revisit after the compiler is fixed.
 
 
 def _ensure_i32(tensor):

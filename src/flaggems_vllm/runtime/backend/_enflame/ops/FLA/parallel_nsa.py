@@ -182,9 +182,9 @@ def _install_gcuir_text_compat():
 try:
     _install_gcuir_text_compat()
 except Exception:
-    # pytest assertion-rewrite 上下文中 triton.jit 源定位可能失败(collect 期
-    # 动态触碰模块链触发);shim 失败不影响 op 路由,由 conftest 的共享
-    # gcuir_compat(_gcuir_compat.py)在测试进程统一安装兜底。
+    # Under pytest assertion-rewrite, locating triton.jit sources may fail (triggered
+    # by dynamically touching the module chain during collection); shim failure does not affect op routing,
+    # because conftest installs the shared gcuir_compat (_gcuir_compat.py) fallback in the test process.
     pass
 
 

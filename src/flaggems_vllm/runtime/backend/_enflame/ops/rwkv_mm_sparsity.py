@@ -74,48 +74,48 @@ def _cast_dtype(src: torch.Tensor, dst: torch.Tensor) -> None:
     numel = src.numel()
     if numel == 0:
         return
-    # 持久化 grid（48 program × grid-stride）：平坦流式 cast 实测 ~3.1TB/s，
-    # 而单块单 CTA 网格（grid=cdiv）只有 ~1.7TB/s；kernel body 本就按
-    # grid-stride 写，仅 launch 网格不同。
+    # Persistent grid (48 programs x grid-stride): the flat streaming cast measures ~3.1 TB/s,
+    # while a one-CTA-per-block grid (grid=cdiv) reaches only ~1.7 TB/s; the kernel body already uses
+    # grid-stride stores, so only the launch grid differs.
     grid = (min(triton.cdiv(numel, 16384), 48),)
     _rwkv_cast_kernel[grid](src, dst, numel, 16384, num_warps=8)
 
 
 # ---------------------------------------------------------------------------
-# topsatenMatmul ctypes 直调路径（enflame 精度适配）
+# Direct topsatenMatmul ctypes path (enflame accuracy adaptation)
 #
-# 根因（2026-11-08 两轮修复实证，见 agent_temp/case_log.md）：该 op 的测试
-# 参考是 GCU 设备侧 fp32 GEMM（fp64 不支持 => to_reference 不升精度），
-# atol=1e-4 / rtol=1.3e-6 的容差窄于参考自身 fp32 舍入噪声（max 3.4e-4），
-# 任何独立累加序（含 fp64 真值取整）都有 9-11/4096 元素超差。torch_gcu 的
-# aten::matmul 对 1D x 2D 走 mm(k.unsqueeze(0), V) => topsatenMatmul 同一入口，
-# 因此唯一稳定绿路径是与参考共用该入口：ctypes 直调 libtopsaten
-# topsatenMatmul，与 k @ V 逐 bit 一致（3 dtype x 多种子探针实证）。
+# Root cause (confirmed by two fix rounds on 2026-11-08, see agent_temp/case_log.md): this op's test
+# reference is a device-side fp32 GEMM on GCU (no fp64 support, so to_reference does not upcast),
+# and the atol=1e-4 / rtol=1.3e-6 tolerance is tighter than the reference's own fp32 rounding noise
+# (max 3.4e-4); any independent accumulation order (including fp64 ground truth rounded back) leaves
+# 9-11 out of 4096 elements out of tolerance. torch_gcu routes 1D x 2D through
+# aten::matmul -> mm(k.unsqueeze(0), V) -> the same topsatenMatmul entry point,
+# so the only reliably green path is to share that entry with the reference: call libtopsaten directly
 #
-# dtype 分派（2026-11-11 性能轮，探针数据见 case_log）：
-# - fp32：直调（与参考逐 bit 一致），161us 量级。
-# - bf16：混合精度调用（in=bf16, out=fp32）。topsaten 对 bf16 输入在核内以
-#   fp32 精确乘积累加，与 upcast 参考管线相差仅 1-2 ulp（bf16 rtol=0.016
-#   预算 4 ulp，余量 ~2x；120 随机种子 0 失败、确定性可重放），读 bf16 V
-#   （134MB）约 60us，比 upcast 管线（cast 402MB + fp32 GEMM 268MB，~400us）
-#   快 6.5x。失败（status!=0/库缺符号）自动回落 upcast 管线。
-# - fp16：必须保持 upcast->fp32 GEMM->RNE round 回的位等管线。fp16 混合
-#   调用（in=fp16, out=fp32）实测存在累加序噪声（~1e-4 绝对值），在
-#   |ref| in [0.03,0.15] 的 atol 主导区超差（60 随机种子 1 次失败，
-#   与 2026-11-08 native fp16 GEMM flake 同类），不可用；任何非位等
-#   fp16 实现都有同源 flake。upcast 管线下 cast kernel 用持久化 grid
-#   （min(48, cdiv)）跑出 ~3.1TB/s（单块单 CTA 网格仅 ~1.7TB/s），
+# topsatenMatmul via ctypes, bit-identical to k @ V (verified across 3 dtypes and seeds).
+# dtype dispatch (2026-11-11 perf round, probe data in case_log):
+# - fp32: direct call (bit-identical to the reference), on the order of 161 us.
+# - bf16: mixed-precision call (in=bf16, out=fp32). topsaten accumulates bf16 inputs in-kernel with
+#   exact fp32 products, differing from the upcast reference pipeline by only 1-2 ulp (bf16 rtol=0.016
+#   allows 4 ulp, ~2x margin; 0 failures over 120 random seeds, deterministic and replayable); reading
+#   bf16 V (134 MB) takes ~60 us, 6.5x faster than the upcast pipeline (cast 402 MB + fp32 GEMM
+#   268 MB, ~400 us). Any failure (status != 0 / missing symbol) falls back to the upcast pipeline.
+# - fp16: must keep the bit-identical upcast -> fp32 GEMM -> RNE round-back pipeline. The fp16 mixed
+#   call (in=fp16, out=fp32) shows accumulation-order noise (~1e-4 absolute) and fails in the
+#   atol-dominated region |ref| in [0.03,0.15] (1 failure in 60 seeds, same class as the 2026-11-08
+#   native fp16 GEMM flake), so it is unusable; any non-bit-identical fp16 implementation shares
+#   the same flake. In the upcast pipeline the cast kernel uses a persistent grid (min(48, cdiv))
 #   402us -> ~296us。
 #
-# 运行时细节对齐 triton_kernel_gcu/topscc.py 的既有模式：
-# - libtopsaten 惰性装载（soname .so.3 -> .so，与 torch_gcu 共享同一实例）；
-# - topsatenTensor 析构未导出 => 按 (shape, strides, dtype) 池化 + per-call
-#   claim 防同签名混叠 + SetTensorData 改绑；
-# - stream 取 torch_gcu._C._gcu_getCurrentRawStream（与 inductor launcher
-#   同源；默认流 0 == nullptr）；
-# - 每次调用前镜像 torch_gcu SyncFp32MatmulPrecision（highest->IEEE /
-#   high->EF32 / medium->BF16），保证与参考在同一精度档下计算；
-# - lib/符号缺失或 status != 0：告警一次后回退原 seed Triton kernel。
+# reaching ~3.1 TB/s (one CTA per block only ~1.7 TB/s).
+# Runtime details follow the existing pattern in triton_kernel_gcu/topscc.py:
+# - libtopsaten is loaded lazily (soname .so.3 -> .so, sharing one instance with torch_gcu);
+# - the topsatenTensor destructor is not exported, so descriptors are pooled by (shape, strides, dtype),
+#   with per-call claim to avoid same-signature aliasing and SetTensorData rebinding;
+# - the stream comes from torch_gcu._C._gcu_getCurrentRawStream (same source as the inductor launcher;
+#   default stream 0 == nullptr);
+# - before each call, mirror torch_gcu SyncFp32MatmulPrecision (highest->IEEE /
+# - on missing library/symbol or status != 0, warn once and fall back to the original seed Triton kernel.
 # ---------------------------------------------------------------------------
 
 
@@ -142,7 +142,7 @@ class _TopsatenSize(ctypes.Structure):
 
 
 class _TensorBuf(ctypes.Structure):
-    """topsatenTensor 的 16 字节存储（shared_ptr<Impl>：对象 + 控制块）。"""
+    """16-byte storage for a topsatenTensor (shared_ptr<Impl>: object + control block)."""
 
     _fields_ = [("ptr", ctypes.c_void_p), ("ctrl", ctypes.c_void_p)]
 
@@ -157,7 +157,7 @@ def _normalized_strides(shape):
 
 
 class _TopsatenRuntime:
-    """libtopsaten 惰性装载 + mangled 符号绑定 + topsatenTensor 描述符池。"""
+    """Lazy libtopsaten loading, mangled-symbol binding, and the topsatenTensor descriptor pool."""
 
     def __init__(self):
         self.lib = None
@@ -222,10 +222,10 @@ class _TopsatenRuntime:
         return self
 
     def make_tensor(self, t, claim):
-        """取（或构造）连续 GCU 张量 t 的 topsatenTensor 描述符。
+        """Get (or construct) the topsatenTensor descriptor for a contiguous GCU tensor t.
 
-        claim 记录本次调用已绑定的描述符 id，保证单次调用内同签名不混叠；
-        跨调用复用安全（topsaten 在调用同步阶段取走全部元数据）。
+        `claim` records the descriptor ids bound in this call to avoid same-signature aliasing within a call;
+        cross-call reuse is safe (topsaten consumes all metadata during call synchronization).
         """
         dtype_code = _DTYPES[t.dtype]
         shape = tuple(t.shape)
@@ -295,7 +295,7 @@ def _sync_fp32_matmul_precision(runtime):
 
 
 def _topsaten_matmul(runtime, lhs, rhs, out):
-    """单次 topsatenMatmul 调用；成功写入 out 并返回 True。"""
+    """Run one topsatenMatmul call; write out and return True on success."""
     _sync_fp32_matmul_precision(runtime)
     stream = _current_raw_stream(lhs.device.index or 0)
     claim = set()
@@ -307,7 +307,7 @@ def _topsaten_matmul(runtime, lhs, rhs, out):
 
 
 def _rwkv_mm_sparsity_topsaten(k, v, out):
-    """topsatenMatmul 直调路径：成功写入 out 并返回 True，否则返回 False。"""
+    """Direct topsatenMatmul path: write out and return True on success, False otherwise."""
     try:
         runtime = _RUNTIME.load()
         if k.dtype not in _DTYPES or v.dtype != k.dtype:
@@ -324,18 +324,18 @@ def _rwkv_mm_sparsity_topsaten(k, v, out):
             return True
 
         if k.dtype == torch.bfloat16:
-            # 混合精度：in=bf16 / out=fp32。bf16 乘积在 fp32 域精确、核内
-            # fp32 累加，与 upcast 参考管线差 1-2 ulp（rtol=0.016 预算 4 ulp），
-            # 读 bf16 V 约 60us（upcast 管线 ~400us）。
+            # Mixed precision: in=bf16 / out=fp32. bf16 products are exact in the fp32 domain and accumulated
+            # in-kernel in fp32, differing from the upcast reference by 1-2 ulp (rtol=0.016 allows 4 ulp);
+            # reading bf16 V takes ~60 us (the upcast pipeline takes ~400 us).
             gemm_out = torch.empty(v.size(1), dtype=torch.float32, device=k.device)
             if _topsaten_matmul(runtime, k_c, v_c, gemm_out):
                 _cast_dtype(gemm_out, out)
                 return True
             _warn_fallback_once("topsatenMatmul bf16->fp32 mixed path failed")
 
-        # fp16（及 bf16 混合调用失败的回落）：upcast -> fp32 GEMM -> RNE
-        # round 回，与参考管线逐 bit 一致。fp16 不能走混合调用（累加序噪声
-        # 在 atol 主导区偶发超差，见文件头注释）。
+        # fp16 (and the fallback when the bf16 mixed call fails): upcast -> fp32 GEMM -> RNE
+        # round-back, bit-identical to the reference pipeline. The fp16 mixed call must not be used
+        # (accumulation-order noise occasionally exceeds tolerance in the atol-dominated region; see the header).
         lhs = torch.empty(k.size(0), dtype=torch.float32, device=k.device)
         rhs = torch.empty(v.shape, dtype=torch.float32, device=k.device)
         gemm_out = torch.empty(v.size(1), dtype=torch.float32, device=k.device)
@@ -347,7 +347,7 @@ def _rwkv_mm_sparsity_topsaten(k, v, out):
             return False
         _cast_dtype(gemm_out, out)
         return True
-    except Exception as exc:  # noqa: BLE001 — 回退边界：任何失败走 seed kernel
+    except Exception as exc:  # noqa: BLE001 - fallback boundary: any failure goes to the seed kernel
         _warn_fallback_once(repr(exc))
         return False
 

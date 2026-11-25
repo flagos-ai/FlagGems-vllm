@@ -206,7 +206,7 @@ class ChunkKDAScaledDotKKTFwdBenchmark(Benchmark):
 
 @pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_chunk_kda_scaled_dot_kkt_fwd_perf():
-    # enflame-only gate (2026-11-20 定标): the vLLM import chain
+    # enflame-only gate (calibrated 2026-11-20): the vLLM import chain
     # (vllm.config -> transformers.audio_utils -> torchaudio) can raise OSError
     # from a broken torchaudio/torch c10 ABI pairing in addition to ImportError,
     # neither of which is an op defect. Degrade to latency-only metrics

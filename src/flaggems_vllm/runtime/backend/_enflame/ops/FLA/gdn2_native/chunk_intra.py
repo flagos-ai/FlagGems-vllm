@@ -43,8 +43,8 @@ else:
 
     @triton.jit
     def gather(src, index, axis, _builder=None):
-        # 仅用于让 Triton 解析 inactive branch；
-        # 实际运行时 USE_GATHER=False，不会执行这里。
+        # Only needed so Triton can parse the inactive branch;
+        # At runtime USE_GATHER=False, so this path is never taken.
         return None
 
 
