@@ -37,6 +37,12 @@ from tests.sparse_attn_sharedkv_utils import (
     official_operator,
     output_tensor,
 )
+from tests.test_sparse_attn_sharedkv import (
+    _explicit_call,
+    _explicit_model_prefill_case,
+    _explicit_oracle,
+    _explicit_packed_device_inputs,
+)
 
 from . import base
 
@@ -85,5 +91,35 @@ def test_sparse_attn_sharedkv_perf():
         op_name="sparse_attn_sharedkv",
         torch_op=ascendc_op,
         gems_op=gems_op,
+        dtypes=[torch.bfloat16],
+    ).run()
+
+
+class PagedSparseAttnSharedKVBenchmark(base.Benchmark):
+    DEFAULT_METRICS = ["latency"]
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [(1, 4), (32, 4), (129, 4), (129, 128)]
+        self.shape_desc = "query tokens, compression ratio"
+
+    def get_input_iter(self, dtype):
+        for tokens, ratio in self.shapes:
+            # The fixture reserves an invalid tail row for multi-token inputs.
+            cpu = _explicit_model_prefill_case(ratio, dtype, tokens=max(tokens, 5))
+            if tokens == 1:
+                for field in (0, 5, 6, 9):
+                    cpu[field] = cpu[field][:1]
+            args = _explicit_packed_device_inputs(cpu)
+            actual = _explicit_call(args).cpu().double()
+            expected = _explicit_oracle(cpu)
+            torch.testing.assert_close(actual, expected, rtol=8e-3, atol=2e-4)
+            yield (args,)
+
+
+def test_paged_sparse_attn_sharedkv_perf():
+    PagedSparseAttnSharedKVBenchmark(
+        op_name="sparse_attn_sharedkv",
+        torch_op=None,
+        gems_op=_explicit_call,
         dtypes=[torch.bfloat16],
     ).run()

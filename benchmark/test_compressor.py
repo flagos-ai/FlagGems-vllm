@@ -17,6 +17,12 @@ import torch
 
 import flaggems_vllm
 from tests.compressor_cases import PRODUCTION_CASES, make_inputs
+from tests.test_compressor import (
+    _paged_check_full_compressor,
+    _paged_full_compressor_case,
+    _paged_full_to_device,
+    _paged_public_call,
+)
 
 from . import base
 
@@ -63,3 +69,34 @@ def test_compressor():
     )
     bench.set_gems(flaggems_vllm.compressor)
     bench.run()
+
+
+class PagedCompressorBenchmark(base.Benchmark):
+    DEFAULT_METRICS = ["latency"]
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [(4, 128), (4, 512), (128, 512)]
+        self.shape_desc = "compression ratio, head dimension"
+
+    def get_input_iter(self, dtype):
+        for ratio, dim in self.shapes:
+            args = _paged_full_to_device(
+                _paged_full_compressor_case(ratio=ratio, dim=dim, dtype=dtype)
+            )
+            _paged_check_full_compressor(args)
+            # Each call overwrites the same slots with identical values.
+            yield (args,)
+
+
+@pytest.mark.compressor
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Requires Ascend paged Compressor"
+)
+def test_paged_compressor_perf():
+    # The legacy AscendC interface cannot consume this explicit metadata.
+    PagedCompressorBenchmark(
+        op_name="compressor",
+        gems_op=lambda args: _paged_public_call(*args),
+        torch_op=None,
+        dtypes=[torch.bfloat16],
+    ).run()
