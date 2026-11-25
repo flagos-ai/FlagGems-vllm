@@ -584,29 +584,43 @@ def prefetch_w8_tile(
     copy_token,
     ROWS: tl.constexpr,
     IS_SPLIT_Q: tl.constexpr = False,
+    PAIRED_ROWS: tl.constexpr = False,
 ):
     activation_base = (
         activations.to(tl.pointer_type(tl.uint8))
         + row_tile.to(tl.int64) * ROWS * reduction_size * 2
     )
-    copy_token = copy_w8_tile_async(
-        activation_smem,
-        activation_base,
-        ROWS,
-        reduction_size * 2,
-        128,
-        k_tile * 256,
-        copy_token,
-    )
-    copy_token = copy_w8_tile_async(
-        activation_smem + ROWS * 128,
-        activation_base,
-        ROWS,
-        reduction_size * 2,
-        128,
-        k_tile * 256 + 128,
-        copy_token,
-    )
+    if PAIRED_ROWS:
+        # Two consecutive K16 fragments of eight routes form one 16-row AIU tile.
+        tl.static_assert(ROWS == 8)
+        copy_token = copy_w8_tile_async(
+            activation_smem,
+            activation_base,
+            16,
+            reduction_size,
+            128,
+            k_tile * 128,
+            copy_token,
+        )
+    else:
+        copy_token = copy_w8_tile_async(
+            activation_smem,
+            activation_base,
+            ROWS,
+            reduction_size * 2,
+            128,
+            k_tile * 256,
+            copy_token,
+        )
+        copy_token = copy_w8_tile_async(
+            activation_smem + ROWS * 128,
+            activation_base,
+            ROWS,
+            reduction_size * 2,
+            128,
+            k_tile * 256 + 128,
+            copy_token,
+        )
     if IS_SPLIT_Q:
         # Split the two warp groups into independent 8 KiB swizzled blocks.
         copy_token = copy_w8_tile_async(
@@ -1477,10 +1491,10 @@ def direct_schedule(
     small_fp8_gate = wide_fp8_gate_shape and tokens in (1, 2, 4)
     decode_fp8_gate = (
         wide_fp8_gate_shape
-        and 4 < tokens <= 32
-        and 32 <= routes <= 192
-        # Denser routes reuse expert weights in the grouped projection.
-        and 4 * routes <= 3 * experts
+        and 4 < tokens
+        and 32 <= routes <= 256
+        # Up to one route per expert on average favors direct split-K.
+        and routes <= experts
     )
     direct = direct and (not is_raw_fp8_sparse or (small_fp8_gate and tokens == 4))
     direct = direct or decode_fp8_gate
@@ -3216,6 +3230,7 @@ def silu_and_stage_routed_kernel(
     PERMUTE_K32: tl.constexpr = False,
     SKIP_INACTIVE: tl.constexpr = False,
     SKIP_UNUSED_UPPER_ROWS: tl.constexpr = False,
+    PAIRED_DOWN: tl.constexpr = False,
 ):
     """Fuse SwiGLU with the expert-sorted layout required by GEMM2.
 
@@ -3277,6 +3292,26 @@ def silu_and_stage_routed_kernel(
         store_offset = (
             offs_m[:, None].to(tl.int64) * num_columns + store_k16(offs_n)[None, :]
         )
+        if PAIRED_DOWN:
+            tl.static_assert(BLOCK_SIZE_M == 8)
+            if SKIP_UNUSED_UPPER_ROWS:
+                ninth = start // 16 * 16 + 8
+                short = (
+                    tl.load(
+                        sorted_token_ids_ptr + ninth, ninth < EM, other=num_valid_tokens
+                    )
+                    >= num_valid_tokens
+                )
+            else:
+                short = True
+            if short:
+                # Interleave two K16 fragments as rows 0..7 and 8..15 of a tile.
+                k = store_k16(offs_n)
+                row = (offs_m.to(tl.int64) // 8 * 16 + offs_m % 8)[:, None] + (
+                    (k // 16) % 2 * 8
+                )[None, :]
+                column = k // 32 * 16 + k % 16
+                store_offset = row * (num_columns // 2) + column[None, :]
     elif DEINTERLEAVE_K:
         store_offset = (
             offs_m[:, None].to(tl.int64) * (num_columns // 2)
@@ -3629,61 +3664,70 @@ def square_accumulate(
     c5 = c0
     c6 = c0
     c7 = c0
-    if SCALE_PAIR:
-        tl.static_assert(FP8 and reduction_size == 256)
-        scale0, scale1 = load_w8_packed_scales(scales + expert * SE + n0 * SN, SN, FAST)
-    unroll: tl.constexpr = 2 if FP8 and reduction_size % 256 == 0 else 1
-    for k_tile in tl.range(reduction_size // 128, loop_unroll_factor=unroll):
-        if not SCALE_PAIR:
-            scale0 = tl.load(scales + expert * SE + k_tile * SG + n0 * SN)
-            scale1 = tl.load(scales + expert * SE + k_tile * SG + (n0 + 8) * SN)
-        if k_tile + 1 < reduction_size // 128:
-            copy_token = prefetch_w8_tile(
-                w8_slot_address(qmem, (k_tile + 1) % 2),
-                w8_slot_address(amem, (k_tile + 1) % 2),
-                weight_bytes,
-                activations,
-                QN,
-                reduction_size,
-                row_tile,
-                k_tile + 1,
-                copy_token,
-                16,
-                IS_SPLIT_Q=True,
+    # One packed BF16 load covers two successive K128 groups.
+    tiles_per_scale_load: tl.constexpr = 2 if SCALE_PAIR else 1
+    unroll: tl.constexpr = (
+        2 if FP8 and reduction_size % 256 == 0 and not SCALE_PAIR else 1
+    )
+    for chunk in tl.range(
+        reduction_size // (tiles_per_scale_load * 128), loop_unroll_factor=unroll
+    ):
+        if SCALE_PAIR:
+            scale0, scale1 = load_w8_packed_scales(
+                scales + expert * SE + n0 * SN + chunk * 2 * SG, SN, FAST
             )
-            copy_token = wait_w8_tile(copy_token, True)
-        else:
-            copy_token = wait_w8_tile(copy_token, False)
-        s0 = w8_scale_fragment(scale0, k_tile, SCALE_PAIR, FP8 and FAST)
-        s1 = w8_scale_fragment(scale1, k_tile, SCALE_PAIR, FP8 and FAST)
-        qhere = w8_slot_address(qmem, k_tile % 2)
-        ahere = w8_slot_address(amem, k_tile % 2)
-        for group in tl.static_range(4):
-            (r0, r1, r2, r3) = load_matrix_x4(
-                qhere + (warp // 4) * W8_HALF_TILE_BYTES,
-                (warp % 4) * 16,
-                64,
-                group * 32,
-                copy_token,
-            )
-            for part in tl.static_range(2):
-                q0 = r0 if part == 0 else r1
-                q8 = r2 if part == 0 else r3
-                sub = group * 2 + part
-                if FP8:
-                    a0, a1, a2, a3 = decode_fp8_pair(q0, q8, s0, s1, FAST)
-                    (b0, b1, b2, b3) = load_matrix_x4(
-                        ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, copy_token
-                    )
-                else:
-                    (b0, b1, b2, b3) = load_matrix_x4(
-                        ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, copy_token
-                    )
-                    a0, a1, a2, a3 = decode_int8_fragments(q0, q8, s0, s1)
-                (c0, c1, c2, c3, c4, c5, c6, c7) = mma_bf16_square(
-                    a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7
+        for inner_k in tl.static_range(tiles_per_scale_load):
+            k_tile = chunk * tiles_per_scale_load + inner_k
+            if not SCALE_PAIR:
+                scale0 = tl.load(scales + expert * SE + k_tile * SG + n0 * SN)
+                scale1 = tl.load(scales + expert * SE + k_tile * SG + (n0 + 8) * SN)
+            if k_tile + 1 < reduction_size // 128:
+                copy_token = prefetch_w8_tile(
+                    w8_slot_address(qmem, (k_tile + 1) % 2),
+                    w8_slot_address(amem, (k_tile + 1) % 2),
+                    weight_bytes,
+                    activations,
+                    QN,
+                    reduction_size,
+                    row_tile,
+                    k_tile + 1,
+                    copy_token,
+                    16,
+                    IS_SPLIT_Q=True,
                 )
-        tl.debug_barrier()
+                copy_token = wait_w8_tile(copy_token, True)
+            else:
+                copy_token = wait_w8_tile(copy_token, False)
+            s0 = w8_scale_fragment(scale0, inner_k, SCALE_PAIR, FP8 and FAST)
+            s1 = w8_scale_fragment(scale1, inner_k, SCALE_PAIR, FP8 and FAST)
+            qhere = w8_slot_address(qmem, k_tile % 2)
+            ahere = w8_slot_address(amem, k_tile % 2)
+            for group in tl.static_range(4):
+                (r0, r1, r2, r3) = load_matrix_x4(
+                    qhere + (warp // 4) * W8_HALF_TILE_BYTES,
+                    (warp % 4) * 16,
+                    64,
+                    group * 32,
+                    copy_token,
+                )
+                for part in tl.static_range(2):
+                    q0 = r0 if part == 0 else r1
+                    q8 = r2 if part == 0 else r3
+                    sub = group * 2 + part
+                    if FP8:
+                        a0, a1, a2, a3 = decode_fp8_pair(q0, q8, s0, s1, FAST)
+                        (b0, b1, b2, b3) = load_matrix_x4(
+                            ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, copy_token
+                        )
+                    else:
+                        (b0, b1, b2, b3) = load_matrix_x4(
+                            ahere + sub // 4 * 2048, 0, 16, sub % 4 * 32, copy_token
+                        )
+                        a0, a1, a2, a3 = decode_int8_fragments(q0, q8, s0, s1)
+                    (c0, c1, c2, c3, c4, c5, c6, c7) = mma_bf16_square(
+                        a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, c4, c5, c6, c7
+                    )
+            tl.debug_barrier()
     return (c0, c1, c2, c3, c4, c5, c6, c7)
 
 
@@ -3712,7 +3756,7 @@ def marlin_moe_gemm_grouped_square_kernel(
     scale_flags,
     FP8: tl.constexpr,
     USE32: tl.constexpr = False,
-    PREFETCH_BEFORE_SCALE: tl.constexpr = False,
+    PAIRED_DOWN: tl.constexpr = False,
     SCALE_PAIR: tl.constexpr = False,
     PREFETCH_ROUTES: tl.constexpr = False,
     PACK_WIDTH: tl.constexpr = False,
@@ -3757,7 +3801,7 @@ def marlin_moe_gemm_grouped_square_kernel(
     if not PACK_WIDTH:
         short_tile = tl.load(route_ids + row_tile * 16 + 8) >= VALID
     if short_tile:
-        if PREFETCH_BEFORE_SCALE:
+        if PAIRED_DOWN:
             copy_token = tl.full((256,), 0, tl.int32)
             copy_token = prefetch_w8_tile(
                 weight_smem,
@@ -3771,6 +3815,7 @@ def marlin_moe_gemm_grouped_square_kernel(
                 copy_token,
                 8,
                 True,
+                PAIRED_ROWS=True,
             )
         else:
             copy_token = None
@@ -3806,6 +3851,7 @@ def marlin_moe_gemm_grouped_square_kernel(
                     True,
                     IS_SPLIT_Q=True,
                     initial_dep=copy_token,
+                    PAIRED_ROWS=PAIRED_DOWN,
                     SCALE_PAIR=SCALE_PAIR,
                 )
             else:
@@ -3817,6 +3863,7 @@ def marlin_moe_gemm_grouped_square_kernel(
                     False,
                     IS_SPLIT_Q=True,
                     initial_dep=copy_token,
+                    PAIRED_ROWS=PAIRED_DOWN,
                     SCALE_PAIR=SCALE_PAIR,
                 )
         else:
@@ -3885,7 +3932,7 @@ def marlin_moe_gemm_grouped_square_kernel(
             token1 < VALID,
         )
         return
-    if PREFETCH_BEFORE_SCALE:
+    if PAIRED_DOWN:
         copy_token = tl.full((256,), 0, tl.int32)
         copy_token = prefetch_w8_tile(
             weight_smem,
@@ -4234,6 +4281,7 @@ def w8_narrow_accumulate(
     FAST: tl.constexpr,
     IS_SPLIT_Q: tl.constexpr = False,
     initial_dep=None,
+    PAIRED_ROWS: tl.constexpr = False,
     SCALE_PAIR: tl.constexpr = False,
 ):
     # Two K=128 buffers overlap AIU transfer and eight 16-K MMAs.
@@ -4252,6 +4300,7 @@ def w8_narrow_accumulate(
             copy_token,
             8,
             IS_SPLIT_Q,
+            PAIRED_ROWS=PAIRED_ROWS,
         )
     else:
         copy_token = initial_dep
@@ -4259,67 +4308,85 @@ def w8_narrow_accumulate(
     c1 = c0
     c2 = c0
     c3 = c0
-    if SCALE_PAIR:
-        tl.static_assert(FP8 and reduction_size == 256)
-        scale0, scale1 = load_w8_packed_scales(scales + expert * SE + n0 * SN, SN, FAST)
-    unroll: tl.constexpr = 2 if FP8 and reduction_size % 256 == 0 else 1
-    for k_tile in tl.range(reduction_size // 128, loop_unroll_factor=unroll):
-        if not SCALE_PAIR:
-            scale0 = tl.load(scales + expert * SE + k_tile * SG + n0 * SN)
-            scale1 = tl.load(scales + expert * SE + k_tile * SG + (n0 + 8) * SN)
-        if k_tile + 1 < reduction_size // 128:
-            copy_token = prefetch_w8_tile(
-                shared + (k_tile + 1) % 2 * W8_TILE_BYTES,
-                ashared + (k_tile + 1) % 2 * 2048,
-                qbase,
-                activations,
-                QN,
-                reduction_size,
-                row_tile,
-                k_tile + 1,
-                copy_token,
-                8,
-                IS_SPLIT_Q,
+    # One packed BF16 load covers two successive K128 groups.
+    tiles_per_scale_load: tl.constexpr = 2 if SCALE_PAIR else 1
+    unroll: tl.constexpr = (
+        2 if FP8 and reduction_size % 256 == 0 and not SCALE_PAIR else 1
+    )
+    for chunk in tl.range(
+        reduction_size // (tiles_per_scale_load * 128), loop_unroll_factor=unroll
+    ):
+        if SCALE_PAIR:
+            scale0, scale1 = load_w8_packed_scales(
+                scales + expert * SE + n0 * SN + chunk * 2 * SG, SN, FAST
             )
-            copy_token = wait_w8_tile(copy_token, True)
-        else:
-            copy_token = wait_w8_tile(copy_token, False)
-        s0 = w8_scale_fragment(scale0, k_tile, SCALE_PAIR, FP8 and FAST)
-        s1 = w8_scale_fragment(scale1, k_tile, SCALE_PAIR, FP8 and FAST)
-        here = shared + k_tile % 2 * W8_TILE_BYTES
-        ahere = ashared + k_tile % 2 * 2048
-        warp = inner_n // 16
-        for group in tl.static_range(4):
-            if IS_SPLIT_Q:
-                (r0, r1, r2, r3) = load_matrix_x4(
-                    here + (warp // 4) * W8_HALF_TILE_BYTES,
-                    (warp % 4) * 16,
-                    64,
-                    group * 32,
+        for inner_k in tl.static_range(tiles_per_scale_load):
+            k_tile = chunk * tiles_per_scale_load + inner_k
+            if not SCALE_PAIR:
+                scale0 = tl.load(scales + expert * SE + k_tile * SG + n0 * SN)
+                scale1 = tl.load(scales + expert * SE + k_tile * SG + (n0 + 8) * SN)
+            if k_tile + 1 < reduction_size // 128:
+                copy_token = prefetch_w8_tile(
+                    shared + (k_tile + 1) % 2 * W8_TILE_BYTES,
+                    ashared + (k_tile + 1) % 2 * 2048,
+                    qbase,
+                    activations,
+                    QN,
+                    reduction_size,
+                    row_tile,
+                    k_tile + 1,
                     copy_token,
+                    8,
+                    IS_SPLIT_Q,
+                    PAIRED_ROWS=PAIRED_ROWS,
                 )
+                copy_token = wait_w8_tile(copy_token, True)
             else:
-                (r0, r1, r2, r3) = load_matrix_x4(
-                    here, warp * 16, 128, group * 32, copy_token
-                )
-            for part in tl.static_range(2):
-                q0 = r0 if part == 0 else r1
-                q8 = r2 if part == 0 else r3
-                sub = group * 2 + part
-                if FP8:
-                    if FAST:
-                        (a0, a2, a1, a3) = decode_fp8_pair(q0, q8, s0, s1, True)
-                    else:
-                        (a0, a2, a1, a3) = decode_fp8_pair(q0, q8, s0, s1, False)
+                copy_token = wait_w8_tile(copy_token, False)
+            s0 = w8_scale_fragment(scale0, inner_k, SCALE_PAIR, FP8 and FAST)
+            s1 = w8_scale_fragment(scale1, inner_k, SCALE_PAIR, FP8 and FAST)
+            here = shared + k_tile % 2 * W8_TILE_BYTES
+            ahere = ashared + k_tile % 2 * 2048
+            warp = inner_n // 16
+            for group in tl.static_range(4):
+                if IS_SPLIT_Q:
+                    (r0, r1, r2, r3) = load_matrix_x4(
+                        here + (warp // 4) * W8_HALF_TILE_BYTES,
+                        (warp % 4) * 16,
+                        64,
+                        group * 32,
+                        copy_token,
+                    )
                 else:
-                    a0, a2, a1, a3 = decode_int8_fragments(q0, q8, s0, s1)
-                (b0, b1) = load_activation_fragment_x2(
-                    ahere + sub // 4 * 1024, sub % 4 * 32, lane
-                )
-                (c0, c1, c2, c3) = mma_bf16_m16n8(
-                    a0, a1, a2, a3, b0, b1, c0, c1, c2, c3
-                )
-        tl.debug_barrier()
+                    (r0, r1, r2, r3) = load_matrix_x4(
+                        here, warp * 16, 128, group * 32, copy_token
+                    )
+                if PAIRED_ROWS:
+                    first0, first1, second0, second1 = load_matrix_x4(
+                        ahere, 0, 16, group * 32, copy_token
+                    )
+                for part in tl.static_range(2):
+                    q0 = r0 if part == 0 else r1
+                    q8 = r2 if part == 0 else r3
+                    sub = group * 2 + part
+                    if FP8:
+                        if FAST:
+                            (a0, a2, a1, a3) = decode_fp8_pair(q0, q8, s0, s1, True)
+                        else:
+                            (a0, a2, a1, a3) = decode_fp8_pair(q0, q8, s0, s1, False)
+                    else:
+                        a0, a2, a1, a3 = decode_int8_fragments(q0, q8, s0, s1)
+                    if PAIRED_ROWS:
+                        b0 = first0 if part == 0 else second0
+                        b1 = first1 if part == 0 else second1
+                    else:
+                        (b0, b1) = load_activation_fragment_x2(
+                            ahere + sub // 4 * 1024, sub % 4 * 32, lane
+                        )
+                    (c0, c1, c2, c3) = mma_bf16_m16n8(
+                        a0, a1, a2, a3, b0, b1, c0, c1, c2, c3
+                    )
+            tl.debug_barrier()
     return (c0, c1, c2, c3)
 
 
@@ -4348,7 +4415,7 @@ def marlin_moe_gemm_grouped_narrow_kernel(
     scale_flags,
     FP8: tl.constexpr,
     USE32: tl.constexpr = False,
-    PREFETCH_BEFORE_SCALE: tl.constexpr = False,
+    PAIRED_DOWN: tl.constexpr = False,
     SCALE_PAIR: tl.constexpr = False,
 ):
     # Each warp computes 16 output channels for eight routed rows.
@@ -4385,7 +4452,7 @@ def marlin_moe_gemm_grouped_narrow_kernel(
     ashared = tle_async.gpu.local_ptr(act, (0,)).to(tl.int64).to(tl.int32)
     qbase = weight_bytes + expert * QE + col_tile * 128 * QN
     if FP8:
-        if PREFETCH_BEFORE_SCALE:
+        if PAIRED_DOWN:
             copy_token = tl.full((256,), 0, tl.int32)
             copy_token = prefetch_w8_tile(
                 shared,
@@ -4398,6 +4465,7 @@ def marlin_moe_gemm_grouped_narrow_kernel(
                 0,
                 copy_token,
                 8,
+                PAIRED_ROWS=True,
             )
         else:
             copy_token = None
@@ -4414,6 +4482,7 @@ def marlin_moe_gemm_grouped_narrow_kernel(
                 True,
                 True,
                 initial_dep=copy_token,
+                PAIRED_ROWS=PAIRED_DOWN,
                 SCALE_PAIR=SCALE_PAIR,
             )
         else:
@@ -4424,6 +4493,7 @@ def marlin_moe_gemm_grouped_narrow_kernel(
                 True,
                 False,
                 initial_dep=copy_token,
+                PAIRED_ROWS=PAIRED_DOWN,
                 SCALE_PAIR=SCALE_PAIR,
             )
     else:
@@ -5178,6 +5248,7 @@ def silu_and_stage_grouped(
     permute_k32: bool = False,
     should_skip_inactive: bool = False,
     skip_unused_upper_rows: bool = False,
+    paired_down: bool = False,
 ) -> torch.Tensor:
     n = intermediate1.size(1) // 2
     routed = torch.empty(
@@ -5200,6 +5271,7 @@ def silu_and_stage_grouped(
         PERMUTE_K32=permute_k32,
         SKIP_INACTIVE=should_skip_inactive,
         SKIP_UNUSED_UPPER_ROWS=skip_unused_upper_rows,
+        PAIRED_DOWN=paired_down,
         num_warps=4,
         num_stages=1,
     )
@@ -5221,6 +5293,7 @@ def launch_raw_projection(
     is_down_projection: bool = False,
     raw_w4: bool = False,
     packed_width: bool = False,
+    paired_down: bool = False,
 ) -> None:
     B, B_scale = stage.weight, stage.scale
     em = sorted_token_ids.size(0)
@@ -5287,16 +5360,10 @@ def launch_raw_projection(
             num_stages=1,
         )
         return
-    # The first down-projection tile is shared by both FP8 scale paths.
-    prefetch_before_scale = (
-        quant_type_id == QUANT_TYPE_FP8_E4M3
-        and is_down_projection
-        and routed_a.size(1) == 256
-        and n == 4096
-    )
-    # The two adjacent BF16 scale groups can be loaded and folded together.
+    # Adjacent K groups share an aligned 32-bit scale load.
     scale_pair = (
-        prefetch_before_scale
+        quant_type_id == QUANT_TYPE_FP8_E4M3
+        and routed_a.size(1) % 256 == 0
         and B_scale.dtype == torch.bfloat16
         and stride_sg == 1
         and stride_se % 2 == 0
@@ -5314,10 +5381,10 @@ def launch_raw_projection(
                 is_down_projection
                 and quant_type_id == QUANT_TYPE_FP8_E4M3
                 and routed_a.size(1) == 256
-                and num_valid_tokens >= (3 if prefetch_before_scale else 9) * B.size(0)
+                and num_valid_tokens >= (3 if paired_down else 9) * B.size(0)
             ),
             USE32=use32,
-            PREFETCH_BEFORE_SCALE=prefetch_before_scale,
+            PAIRED_DOWN=paired_down,
             PACK_WIDTH=packed_width,
             SCALE_PAIR=scale_pair,
             num_warps=8,
@@ -5331,7 +5398,7 @@ def launch_raw_projection(
             stage.scale_safe,
             quant_type_id == QUANT_TYPE_FP8_E4M3,
             USE32=use32,
-            PREFETCH_BEFORE_SCALE=prefetch_before_scale,
+            PAIRED_DOWN=paired_down,
             SCALE_PAIR=scale_pair,
             num_warps=8,
             num_stages=1,
@@ -5357,6 +5424,7 @@ def invoke_marlin_moe_gemm_grouped(
     raw_w8: bool = False,
     raw_w4: bool = False,
     packed_width: bool = False,
+    paired_down: bool = False,
 ) -> None:
     B, B_scale = stage.weight, stage.scale
     stride_se, stride_sg, stride_sn = stage.layout.strides
@@ -5378,6 +5446,7 @@ def invoke_marlin_moe_gemm_grouped(
             is_down_projection=is_down_projection,
             raw_w4=raw_w4,
             packed_width=packed_width,
+            paired_down=paired_down,
         )
         return
     batch_m = (
@@ -5563,7 +5632,7 @@ def project_direct_down(
             quant_type_id=call.quant_type_id,
             use_matvec=use_matvec,
             pipeline_stages=(
-                1 if plan.small_fp8_gate else 2 if plan.decode_fp8_gate else None
+                2 if plan.small_fp8_gate or plan.decode_fp8_gate else None
             ),
         )
 
@@ -5766,11 +5835,19 @@ def run_grouped(
         raw_w4=plan.raw_w4,
         packed_width=packed_width,
     )
+    paired_down = (
+        plan.raw_w8
+        and call.quant_type_id == QUANT_TYPE_FP8_E4M3
+        and bm in (8, 16)
+        and call.shape.intermediate == 256
+        and call.shape.hidden == 4096
+    )
     routed_c2 = silu_and_stage_grouped(
         c1,
         sorted_ids,
         padded,
         **staging,
+        paired_down=paired_down,
         skip_unused_upper_rows=(
             plan.raw_w8 and call.quant_type_id == QUANT_TYPE_FP8_E4M3 and bm == 16
         ),
@@ -5790,6 +5867,7 @@ def run_grouped(
         compute_type=call.compute_type,
         quant_type_id=call.quant_type_id,
         is_down_projection=True,
+        paired_down=paired_down,
         raw_w8=plan.raw_w8,
         raw_w4=plan.raw_w4,
         packed_width=packed_width,

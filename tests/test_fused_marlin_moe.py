@@ -1797,6 +1797,30 @@ def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 down projection"
+)
+def test_fused_marlin_moe_fp8_mixed_expert_tiles_ppu():
+    hs, w1, w2, ref1, ref2, weights, ids, s1, s2 = _make_inputs_fp8_weight(
+        24, 8, 4096, 256, 4, torch.bfloat16, flaggems_vllm.device
+    )
+    # Experts 0..3 each have a full 16-row tile and a one-row tail; 4..7 have seven rows.
+    ids[:] = torch.arange(4, device=hs.device)
+    ids[17:] += 4
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, weights, ids, QUANT_TYPE_FP8_E4M3
+    )
+    reference = _reference_w8a16_grouped(hs, ref1, ref2, weights, ids)
+    gems_assert_close(
+        actual,
+        reference.to(hs.dtype),
+        hs.dtype,
+        atol=0.02 * reference.abs().max().item(),
+        rtol=0,
+    )
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
     flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 graph replay"
 )
 @pytest.mark.parametrize("config", [(1, 16, 1024, 128, 6), (88, 64, 1024, 128, 4)])
