@@ -2,18 +2,23 @@
 # Copyright 2026 FlagOS Contributors
 """Public canonical entry; installed vLLM; standard reports with per-case N/A.
 
-The local timer supplies non-Graph device events on every vendor, rather than
-assuming that vendor do_bench implementations use the same timing mechanism.
-For this op --warmup/--iter are iteration counts in kernel mode.
+For matching H800 rows on the four collector backends, use the same non-Graph
+25 ms / 100 ms median as the reference. The standalone event timer takes
+--warmup/--iter as counts.
 """
 
 import ast
+import importlib
+import importlib.metadata
+import importlib.util
 import inspect
 import math
 import statistics
+import sys
 from pathlib import Path
 
 import pytest
+from triton.testing import do_bench
 
 import flaggems_vllm as gems
 from baseline import hc_combine as workload
@@ -23,6 +28,45 @@ from benchmark.conftest import Config, update_result
 from flaggems_vllm.ops.qwen4.hc_combine import _hc_combine_kernel
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_hc_combine import assert_result, reference
+
+_COLLECTOR_BACKENDS = {"ascend", "hygon", "metax", "mthreads"}
+_COLLECTOR_PROTOCOL = "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+
+
+def _matches_collector(row, binding, dtype):
+    if not row or row.get("timing_protocol") != _COLLECTOR_PROTOCOL:
+        return False
+    if row.get("status") not in (None, "ok", "pass", "PASS"):
+        return False
+    stored = row.get("config")
+    expected = workload.config(binding, dtype)
+    fields = ("inputs", "outputs", "dims", "native_api", "mutation", "alias", "graph")
+    return isinstance(stored, dict) and all(
+        stored.get(k) == expected[k] for k in fields
+    )
+
+
+def _ascend_native():
+    module = "vllm_ascend.ops.triton.qwen4_exp.hc"
+    try:
+        return importlib.import_module(module).hc_combine
+    except ModuleNotFoundError as exc:
+        # Some vendor wheels import engine warmup from ops/__init__.py even
+        # though their standalone HC module has no engine dependency.
+        if exc.name != "vllm.model_executor.warmup.jit_warmup":
+            raise
+    dist = importlib.metadata.distribution("vllm-ascend")
+    path = dist.locate_file(module.replace(".", "/") + ".py")
+    spec = importlib.util.spec_from_file_location(module, path)
+    native = importlib.util.module_from_spec(spec)
+    # Triton resolves source through the defining module during compilation.
+    sys.modules[module] = native
+    try:
+        spec.loader.exec_module(native)
+        return native.hc_combine
+    except Exception:
+        del sys.modules[module]
+        raise
 
 
 def _native_slot(*args, **kwargs):
@@ -51,7 +95,17 @@ class HCCombineBenchmark(Benchmark):
         self.native_reason = "native timing disabled by --metrics"
         if "latency_base" in self.to_bench_metrics:
             try:
-                native = workload.native()
+                if gems.vendor_name == "ascend":
+                    try:
+                        native = _ascend_native()
+                    except (ImportError, AttributeError) as exc:
+                        native = workload.native()
+                        if native is None:
+                            raise RuntimeError(
+                                f"vllm_ascend: {exc!r}, vllm: {workload.NATIVE_UNAVAILABLE_REASON}"
+                            ) from exc
+                else:
+                    native = workload.native()
             except Exception as exc:
                 self.native_reason = f"native resolution: {exc!r}"
             else:
@@ -67,7 +121,10 @@ class HCCombineBenchmark(Benchmark):
                     self.native_reason = None
 
     def run(self):
-        offline = (Config.base_data or {}).get(self.op_name)
+        base = Config.base_data or {}
+        offline = base.get(self.op_name)
+        self.collector_rows = set()
+        h800 = base.get("_environment", {}).get("reference_chip") == "H800"
         with pytest.MonkeyPatch.context() as patch:
             if Config.user_desired_metrics == ["latency"]:
                 patch.setattr(Config, "base_data", None)
@@ -80,7 +137,8 @@ class HCCombineBenchmark(Benchmark):
                     if not isinstance(rows, dict):
                         continue
                     try:
-                        n, hc, d, _, _ = ast.literal_eval(key)
+                        dimensions = ast.literal_eval(key)
+                        n, hc, d, _, _ = dimensions
                     except (SyntaxError, TypeError, ValueError):
                         continue
                     if not all(type(value) is int for value in (n, hc, d)):
@@ -93,6 +151,21 @@ class HCCombineBenchmark(Benchmark):
                         and math.isfinite(row["latency_ms"])
                         and row["latency_ms"] > 0
                     }
+                    if gems.vendor_name in _COLLECTOR_BACKENDS and h800:
+                        # The collector's semantic key includes layout and injection.
+                        # Check tensor contracts too before comparing its device time.
+                        binding = dict(
+                            zip(("n", "hc", "d", "layout", "injection"), dimensions)
+                        )
+                        exact_rows = {
+                            str(dtype): exact_rows[str(dtype)]
+                            for dtype in workload.DTYPES
+                            if Config.mode == consts.BenchMode.KERNEL
+                            and _matches_collector(
+                                exact_rows.get(str(dtype)), binding, dtype
+                            )
+                        }
+                        self.collector_rows.update((key, dtype) for dtype in exact_rows)
                     variants[key] = {"shapes": {str([n, hc * d]): exact_rows}}
                 patch.setattr(
                     Config,
@@ -142,6 +215,18 @@ class HCCombineBenchmark(Benchmark):
             warmup=Config.warm_up,
             iterations=Config.repetition,
         )
+        self.collector_timer = (
+            self.base_variant,
+            str(args[0].dtype),
+        ) in self.collector_rows
+        if self.collector_timer:
+            self.detail.update(
+                protocol=_COLLECTOR_PROTOCOL,
+                warmup=None,
+                iterations=None,
+                warmup_budget_ms=25,
+                repetition_budget_ms=100,
+            )
         return self.detail
 
     def get_latency(self, op, *args, **kwargs):
@@ -156,6 +241,10 @@ class HCCombineBenchmark(Benchmark):
             try:
                 actual = op(*args, **kwargs)
                 assert_result(actual, expected)
+                if gems.vendor_name in _COLLECTOR_BACKENDS and (
+                    actual.device != args[0].device or not actual.is_contiguous()
+                ):
+                    raise ValueError("native output device or layout differs")
                 phase = "native timing"
                 latency = self._measure(op, True, *args, **kwargs)
             except Exception as exc:
@@ -168,6 +257,8 @@ class HCCombineBenchmark(Benchmark):
                 native_reason=None,
                 native_file=getattr(inspect.getmodule(op), "__file__", None),
             )
+            if gems.vendor_name == "ascend":
+                self.detail["native_api"] = f"{op.__module__}.{op.__qualname__}"
             return latency
 
         actual = op(*args, **kwargs)
@@ -201,6 +292,10 @@ class HCCombineBenchmark(Benchmark):
     def _measure(self, op, is_native, *args, **kwargs):
         if self.mode == consts.BenchMode.OPERATOR:
             latency = super().get_latency(op, *args, **kwargs)
+        elif self.collector_timer:
+            latency = do_bench(
+                lambda: op(*args, **kwargs), warmup=25, rep=100, return_mode="median"
+            )
         else:
             latency = self._event_latency(op, is_native, *args, **kwargs)
         if not math.isfinite(latency) or latency <= 0:
