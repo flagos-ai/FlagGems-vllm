@@ -1098,8 +1098,13 @@ def _launch_pipeline_choice(kernel, tuner, grid, *args, **meta):
             for name, value in meta.items()
             if name not in ("num_warps", "num_stages")
         }
-        # and keep the rule's block sizes, which every later launch uses:
-        # no automatic block-size adjustment while they are measured
+        # FlagTree's AABS (auto block-size adjustment) shrinks BLOCK_N to the
+        # token count when M < 16 and writes it into the candidate configs.
+        # The candidates would then be timed with a block size that later
+        # launches do not use, and the launch fails with a duplicate BLOCK_N.
+        # Turn it off for this call only; scope() restores the setting even if
+        # the launch raises. Reaching here means the FlagTree pipeline options
+        # exist, so the knob does too.
         from triton import knobs
 
         with knobs.autotuning.scope():

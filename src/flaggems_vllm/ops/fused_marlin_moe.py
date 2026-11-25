@@ -3443,6 +3443,9 @@ _fused_moe_kernel_w8a16_down_fp8 = _w8a16_tuned_kernel(
     key=["BLOCK_SIZE_M", "M_padded", "H", "I", "T", "SMALL_TOKEN_MXQ_PATH"],
     hoist_dimension=True,
     prune_configs_by={"early_config_prune": _prune_w8a16_fp8_down_configs},
+    # The pruning rule is not part of the table name; without a new version,
+    # shapes tuned before it keep the three-stage result it removes.
+    cache_version="prune-small-t-v1",
     reset_to_zero=["OUT"],
 )
 

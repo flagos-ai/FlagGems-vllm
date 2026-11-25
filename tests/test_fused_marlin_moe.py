@@ -25,6 +25,7 @@ fp16/bf16 w_ref returned by quantize_weights so quantization round-off is
 shared by both sides.
 """
 
+import hashlib
 import importlib
 from types import SimpleNamespace
 
@@ -1032,6 +1033,61 @@ def test_fused_marlin_moe_w8a16_library_tuning():
         assert isinstance(kernel.fn, LibTuner)
         assert kernel.fn.configs
         assert all(config.maxnreg is None for config in kernel.fn.configs)
+
+
+def test_fused_marlin_moe_w8a16_fp8_down_prune():
+    """Few tokens and a short K loop drop the deeper pipelines; others keep all."""
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    down = module._fused_moe_kernel_w8a16_down_fp8.fn
+    prune = module._prune_w8a16_fp8_down_configs
+    configs = list(down.configs)
+    assert any(config.num_stages > 1 for config in configs)
+
+    def kept(num_tokens, intermediate):
+        return prune(configs, {"T": num_tokens, "I": intermediate})
+
+    # I=256 gives at most four K iterations: only one-stage candidates stay.
+    assert kept(16, 256)
+    assert {config.num_stages for config in kept(16, 256)} == {1}
+    # More tokens, or a longer K loop, keep every candidate.
+    assert kept(17, 256) == configs
+    assert kept(16, 768) == configs
+
+
+def test_fused_marlin_moe_w8a16_fp8_down_cache_version():
+    """The pruning rule is not in the table name unless the kernel is versioned.
+
+    Pruning only runs on a cache miss, so a table shared with the code before
+    the rule existed would keep serving its three-stage results.
+    """
+    from flaggems_vllm.utils import libentry, libtuner
+
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    down = module._fused_moe_kernel_w8a16_down_fp8.fn
+    assert down.cache_version is not None
+
+    def build(version):
+        return libentry()(
+            libtuner(
+                configs=list(down.configs),
+                key=list(down.keys),
+                cache_version=version,
+            )(module.fused_moe_kernel_w8a16_down)
+        ).fn
+
+    unversioned = build(None)
+    # No version: the hash is the one computed before the parameter existed.
+    assert (
+        unversioned.kernel_hash
+        == hashlib.md5(
+            f"{unversioned.cache_key}{unversioned.configs_hash}".encode("utf-8")
+        ).hexdigest()[:32]
+    )
+    # A version starts a new table, and the same version names the same table.
+    assert build("v1").config_table_name != unversioned.config_table_name
+    assert build("v1").config_table_name == build("v1").config_table_name
+    assert build("v1").config_table_name != build("v2").config_table_name
+    assert down.config_table_name != unversioned.config_table_name
 
 
 @pytest.mark.parametrize("blocks", [(64, 128), (128, 64)])

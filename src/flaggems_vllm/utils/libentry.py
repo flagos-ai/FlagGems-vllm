@@ -254,6 +254,7 @@ class LibTuner(triton.runtime.Autotuner):
         flagtune_expand_op_name=None,
         flagtune_yaml_path=None,
         flagtune_pre_hook=None,
+        cache_version=None,
     ):
         # NOTE(zhengyang): See discussion in https://github.com/triton-lang/triton/pull/4496
         if major_version == 2 or (major_version == 3 and minor_version <= 1):
@@ -330,6 +331,8 @@ class LibTuner(triton.runtime.Autotuner):
         self.__name__ = self.base_fn.__name__
         self.keys = key
         self.strategy: List[Callable[[Any], Any]] = self._normalize_strategy(strategy)
+        # Must be set before `kernel_hash` is first read.
+        self.cache_version = cache_version
         self.config_table_name: str = f"{self.__name__}_{self.kernel_hash}"
         self.benchmark_table_name: str = f"{self.__name__}_{self.cache_key}_benchmark"
         self.cache: BenchmarkCache = libcache[self.config_table_name]
@@ -408,8 +411,13 @@ class LibTuner(triton.runtime.Autotuner):
 
     @cached_property
     def kernel_hash(self) -> str:
+        # The hash covers the kernel source and the candidate list, not the
+        # rules that prune the list per shape. `cache_version` lets a kernel
+        # whose pruning rule changes start a new table. Left unset, the hash is
+        # the same as before, so existing tuning results are kept.
+        version = "" if self.cache_version is None else f"@{self.cache_version}"
         return hashlib.md5(
-            f"{self.cache_key}{self.configs_hash}".encode("utf-8")
+            f"{self.cache_key}{self.configs_hash}{version}".encode("utf-8")
         ).hexdigest()[:32]
 
     @cached_property
@@ -687,8 +695,14 @@ def libtuner(
     flagtune_expand_op_name=None,
     flagtune_yaml_path=None,
     flagtune_pre_hook=None,
+    cache_version=None,
 ):
     """Decorator for triton library autotuner.
+
+    `cache_version` is mixed into the name of the persisted tuning table. Pass
+    it when `prune_configs_by` changes which candidates a shape may use: the
+    pruning only runs on a cache miss, so shapes tuned under the old rule would
+    otherwise keep their old result. Change the value whenever the rule changes.
 
     `strategy` is a function that takes a key and returns a value.
     It accepts a string, which is the name of a registered strategy, or a callable function.
@@ -724,6 +738,7 @@ def libtuner(
             flagtune_expand_op_name=flagtune_expand_op_name,
             flagtune_yaml_path=flagtune_yaml_path,
             flagtune_pre_hook=flagtune_pre_hook,
+            cache_version=cache_version,
         )
 
     return decorator
