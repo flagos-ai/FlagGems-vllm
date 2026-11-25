@@ -149,16 +149,21 @@ def _o_proj_bmm_kernel(
 
 
 def _tile_config(num_tokens: int, n: int):
-    """Per-shape tile chosen from an S5000 sweep of the decode/prefill points.
+    """Per-shape tile chosen from S5000 sweeps of the decode/prefill points.
 
-    Decode is weight-bandwidth bound, so 64-wide n tiles double the CTA count
-    and keep both MP slots busy while the 34-68 MB weight streams in. Prefill is
-    tensor bound, where 128x128 keeps the weight read per k step minimal.
+    Decode is weight-bandwidth bound: 64-wide n tiles (and 32-row m tiles) keep
+    enough CTAs resident to cover the DRAM latency of the 34-68 MB weight
+    stream. The 128-token bucket is the first one whose GEMM is tensor bound,
+    so it keeps 64-wide tiles (more CTAs than 128) but eight warps. From 256
+    up, 128-wide n tiles halve the activation re-reads; the prefill bucket
+    moves to 128x128 with 16 warps, where one CTA per MP is the fastest.
     """
     if num_tokens <= 16:
-        block_m, block_n, group_m, num_warps, num_stages = 16, 64, 1, 4, 2
+        block_m, block_n, group_m, num_warps, num_stages = 16, 64, 1, 4, 3
     elif num_tokens <= 64:
-        block_m, block_n, group_m, num_warps, num_stages = 64, 128, 1, 8, 2
+        block_m, block_n, group_m, num_warps, num_stages = 32, 64, 8, 8, 2
+    elif num_tokens <= 128:
+        block_m, block_n, group_m, num_warps, num_stages = 64, 64, 8, 8, 2
     elif num_tokens <= 512:
         block_m, block_n, group_m, num_warps, num_stages = 64, 128, 8, 8, 2
     else:
@@ -270,6 +275,35 @@ def deep_gemm_fp8_o_proj(
             )
             return wo_b(empty)
 
+        # Everything the GEMM needs that does not depend on the quant result is
+        # prepared before the quant launch: the two kernels are only ~6 us and
+        # ~60 us apart at decode, so Python work placed between them shows up as
+        # an idle gap inside the measured interval.
+        out = torch.empty(
+            (num_tokens, n_groups, o_lora_rank), dtype=torch.bfloat16, device=device
+        )
+        out_g = out.permute(1, 0, 2)
+        block_m, block_n, group_m, num_warps, num_stages = _tile_config(
+            num_tokens, o_lora_rank
+        )
+        grid = (
+            triton.cdiv(num_tokens, block_m) * (o_lora_rank // block_n),
+            n_groups,
+        )
+        weight_strides = weight.stride()
+        weight_scale_strides = weight_scale.stride()
+        out_strides = out_g.stride()
+        gemm_kwargs = {
+            "N": o_lora_rank,
+            "K": reduction,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": _QUANT_BLOCK,
+            "GROUP_M": group_m,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+
         if not prequantized:
             act, act_scale = fused_inv_rope_fp8_quant(
                 o,
@@ -288,17 +322,8 @@ def deep_gemm_fp8_o_proj(
         # swapped, so this stays a view.
         act_g = act.transpose(0, 1)
         act_scale_g = act_scale.transpose(0, 1)
-        out = torch.empty(
-            (num_tokens, n_groups, o_lora_rank), dtype=torch.bfloat16, device=device
-        )
-        out_g = out.permute(1, 0, 2)
-        block_m, block_n, group_m, num_warps, num_stages = _tile_config(
-            num_tokens, o_lora_rank
-        )
-        grid = (
-            triton.cdiv(num_tokens, block_m) * (o_lora_rank // block_n),
-            n_groups,
-        )
+        act_strides = act_g.stride()
+        act_scale_strides = act_scale_g.stride()
         _o_proj_bmm_kernel[grid](
             act_g,
             act_scale_g,
@@ -306,29 +331,22 @@ def deep_gemm_fp8_o_proj(
             weight_scale,
             out_g,
             num_tokens,
-            act_g.stride(0),
-            act_g.stride(1),
-            act_g.stride(2),
-            act_scale_g.stride(0),
-            act_scale_g.stride(1),
-            act_scale_g.stride(2),
-            weight.stride(0),
-            weight.stride(1),
-            weight.stride(2),
-            weight_scale.stride(0),
-            weight_scale.stride(1),
-            weight_scale.stride(2),
-            out_g.stride(0),
-            out_g.stride(1),
-            out_g.stride(2),
-            N=o_lora_rank,
-            K=reduction,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=_QUANT_BLOCK,
-            GROUP_M=group_m,
-            num_warps=num_warps,
-            num_stages=num_stages,
+            act_strides[0],
+            act_strides[1],
+            act_strides[2],
+            act_scale_strides[0],
+            act_scale_strides[1],
+            act_scale_strides[2],
+            weight_strides[0],
+            weight_strides[1],
+            weight_strides[2],
+            weight_scale_strides[0],
+            weight_scale_strides[1],
+            weight_scale_strides[2],
+            out_strides[0],
+            out_strides[1],
+            out_strides[2],
+            **gemm_kwargs,
         )
 
     assert callable(wo_b), "`wo_b` must be a callable linear layer"
