@@ -59,12 +59,13 @@ attention). The GCU port restructures the memory access patterns only:
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 # Libra L600 / GCU400: 48 concurrent CTAs is the tuned persistent-grid width.

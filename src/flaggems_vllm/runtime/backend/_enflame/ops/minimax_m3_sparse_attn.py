@@ -24,9 +24,10 @@ importing ``flaggems_vllm`` never requires it, and an unsupported call raises
 """
 
 import functools
+import logging
 
 import torch
-import logging
+
 logger = logging.getLogger(__name__)
 
 _FLAG_ATTN_HINT = (

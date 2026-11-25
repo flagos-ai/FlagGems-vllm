@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-import logging
+
 logger = logging.getLogger(__name__)
 
 if has_triton_tle(3, 6, 0):

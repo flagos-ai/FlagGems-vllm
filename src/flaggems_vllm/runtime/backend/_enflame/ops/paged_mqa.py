@@ -19,11 +19,13 @@ Native FP8 MMA keeps that computation. Other targets exactly decode E4M3FN
 bytes to BF16 before MMA, preserving the page format and scale addressing.
 """
 
+import logging
+
 import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime.backend._enflame.ops.fp8_storage import decode_e4m3fn
-import logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,8 +130,7 @@ def _paged_mqa_logits_kernel(
             kv_values = decode_e4m3fn(kv_u8).to(tl.bfloat16)
 
         scale_tile = tl.load(
-            (page_base + block_size * head_dim).to(tl.pointer_type(tl.float32))
-            + p_ids
+            (page_base + block_size * head_dim).to(tl.pointer_type(tl.float32)) + p_ids
         )
 
         dots = tl.dot(q_values, tl.trans(kv_values))

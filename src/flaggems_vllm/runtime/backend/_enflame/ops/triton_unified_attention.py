@@ -39,6 +39,7 @@ num_warps in {1, 4} (larger tiles / num_warps=2 hit an ld.lld relocation
 failure, see compiler_issues/ld_lld_relocation.md).
 """
 
+import logging
 import sys
 
 import torch  # noqa: F401
@@ -48,7 +49,7 @@ import triton.language as tl
 from flaggems_vllm.ops.triton_unified_attention import (
     triton_unified_attention as _general_triton_unified_attention,
 )
-import logging
+
 logger = logging.getLogger(__name__)
 
 

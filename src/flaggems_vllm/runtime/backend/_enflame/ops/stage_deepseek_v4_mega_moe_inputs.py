@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 
 import torch
@@ -19,7 +20,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
-import logging
+
 logger = logging.getLogger(__name__)
 
 # Flat-streaming kernel tuning knobs (gcu400 calibrated; see module docstring

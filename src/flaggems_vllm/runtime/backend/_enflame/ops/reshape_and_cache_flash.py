@@ -63,9 +63,7 @@ def reshape_and_cache_flash_kernel(
     src_value_idx = token_idx * value_stride + i
     # The cache row [block_idx, block_offset] holds num_heads * head_size =
     # n contiguous elements, so i alone indexes it (no head decomposition).
-    tgt_key_value_idx = (
-        block_idx.to(tl.int64) * block_stride + block_offset * n + i
-    )
+    tgt_key_value_idx = block_idx.to(tl.int64) * block_stride + block_offset * n + i
 
     tgt_key = tl.load(key + src_key_idx, mask=mask)
     tgt_value = tl.load(value + src_value_idx, mask=mask)

@@ -4,13 +4,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.qwen4.qsa import _is_triton_device
 from flaggems_vllm.runtime import device as runtime_device
-import logging
+
 logger = logging.getLogger(__name__)
 
 _QSA_SPLIT_ALLOWED = (1, 2, 4, 8, 16, 32)

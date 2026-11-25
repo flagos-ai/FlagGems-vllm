@@ -16,6 +16,8 @@ GCU adaptations vs the generic implementation:
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -24,7 +26,7 @@ from flaggems_vllm import runtime
 from flaggems_vllm.ops.data_movement import contiguous_copy
 from flaggems_vllm.runtime.backend._enflame.ops.fp8_storage import encode_e4m3fn
 from flaggems_vllm.utils import libentry, libtuner
-import logging
+
 logger = logging.getLogger(__name__)
 
 INDEX_HEAD_DIM = 128

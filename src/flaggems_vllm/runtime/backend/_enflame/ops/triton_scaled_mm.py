@@ -46,10 +46,12 @@ installed below so this module stays self-sufficient (same pattern as
 parallel_nsa / chunk_gated_delta_rule).
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 

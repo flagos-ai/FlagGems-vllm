@@ -38,13 +38,14 @@ forces the restructures documented on the affected kernels.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 QWEN4_VENDOR_QSA_SOURCE = {

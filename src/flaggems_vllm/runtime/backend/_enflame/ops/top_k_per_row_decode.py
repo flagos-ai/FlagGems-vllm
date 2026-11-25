@@ -190,9 +190,7 @@ def _topk_chunk_threshold_kernel(
             third = tl.maximum(w // 3, one)
             p1 = lo + third
             p2 = tl.minimum(p1 + third, hi)
-            packed = tl.sum(
-                (key >= p1).to(tl.int32) + (key >= p2).to(tl.int32) * SCALE
-            )
+            packed = tl.sum((key >= p1).to(tl.int32) + (key >= p2).to(tl.int32) * SCALE)
             c2 = packed // SCALE
             c1 = packed - c2 * SCALE
             in2 = c2 >= TOPK
@@ -344,9 +342,7 @@ def _topk_merge_threshold_kernel(
                     done = (cnt == TOPK).to(tl.int32)
         else:
             m = lane < n_cand
-            k0 = tl.load(cand_key_ptr + base + lane, mask=m).to(
-                tl.uint32, bitcast=True
-            )
+            k0 = tl.load(cand_key_ptr + base + lane, mask=m).to(tl.uint32, bitcast=True)
             for i in tl.range(0, 32):
                 if done == 0:
                     bit = 31 - i

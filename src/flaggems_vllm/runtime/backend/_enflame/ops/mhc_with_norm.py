@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """MHC fused-op ABI, preserving BF16 materialization before RMS normalization."""
+
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -8,7 +11,7 @@ from flaggems_vllm import runtime
 from flaggems_vllm.ops.data_movement import contiguous_copy
 from flaggems_vllm.runtime.backend._enflame.ops.mhc import mhc_post, mhc_pre
 from flaggems_vllm.utils import libentry, libtuner
-import logging
+
 logger = logging.getLogger(__name__)
 
 

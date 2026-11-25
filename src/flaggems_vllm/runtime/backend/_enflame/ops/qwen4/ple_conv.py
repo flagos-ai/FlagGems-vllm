@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -228,11 +230,7 @@ def _ple_conv_staged_kernel(
                 old = (
                     tl.load(
                         state + (row * ss0 + old_pos.to(tl.int64) * ss2) + c * ss1,
-                        mask=valid
-                        & has_history
-                        & (pos < 0)
-                        & (old_pos >= 0)
-                        & in_ch,
+                        mask=valid & has_history & (pos < 0) & (old_pos >= 0) & in_ch,
                         other=0,
                     )
                     .to(x.dtype.element_ty)

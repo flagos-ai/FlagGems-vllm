@@ -33,6 +33,7 @@ are cast to fp16 in-kernel before ``tl.dot``, which is exact for every
 representable fp8 payload.
 """
 
+import logging
 from typing import List
 
 import torch
@@ -42,7 +43,7 @@ import triton.language as tl
 from flaggems_vllm.runtime import device as runtime_device
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
-import logging
+
 logger = logging.getLogger(__name__)
 
 # GCU launch constraint (compiler_issues/grid_hard_limits.md): grid.x <= 65535.

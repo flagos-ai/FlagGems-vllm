@@ -75,10 +75,12 @@ GCU-specific adaptations (2026-11-07 toolchain, perf retune 2026-11-11):
   both stage1 and stage2), unlike the predicate-tax wins seen elsewhere.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 # Persistent-grid program count: one program per GCU400 SP (moe_sum idiom).

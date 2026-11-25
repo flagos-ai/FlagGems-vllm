@@ -44,10 +44,12 @@ Adaptations forced by the GCU backend (2026-11-07 toolchain):
   compares equal at atol=0.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 # Persistent-grid program count: one program per GCU400 SP, the measured

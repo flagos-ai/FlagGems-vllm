@@ -10,10 +10,12 @@ fail closed when their accelerator/layout contract is not met.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 HAS_TRITON = True

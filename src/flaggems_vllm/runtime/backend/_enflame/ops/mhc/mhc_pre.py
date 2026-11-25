@@ -22,6 +22,7 @@ Key optimizations:
 """
 
 import importlib
+import logging
 import os
 import warnings
 import weakref
@@ -31,7 +32,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre as _general_mhc_pre
-import logging
+
 logger = logging.getLogger(__name__)
 
 _MHC_PRE_MIX_PAD = tl.constexpr(32)

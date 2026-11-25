@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bias-aware sigmoid routing without vLLM compiled extensions."""
 
+import logging
 import os
 
 import torch
@@ -11,7 +12,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-import logging
+
 logger = logging.getLogger(__name__)
 
 # GCU launch limits (triton.backends.enflame.backend.GcuLauncher):

@@ -8,6 +8,7 @@ import logging
 
 import torch
 
+from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL
 from flaggems_vllm.runtime.backend._enflame.ops.FLA.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
@@ -19,7 +20,6 @@ from flaggems_vllm.runtime.backend._enflame.ops.FLA.chunk_o import chunk_fwd_o
 from flaggems_vllm.runtime.backend._enflame.ops.FLA.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
 )
-from flaggems_vllm.ops.FLA.utils import SUPPRESS_LEVEL
 from flaggems_vllm.runtime.backend._enflame.ops.FLA.wy_fast import (
     maybe_set_tle_recompute_allocator,
     recompute_w_u_fwd,

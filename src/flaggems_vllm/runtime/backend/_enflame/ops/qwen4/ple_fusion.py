@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 
@@ -22,7 +23,7 @@ from flaggems_vllm.ops.qwen4.ple_fusion import ple_gate_norm_ as _general_ple_ga
 from flaggems_vllm.ops.qwen4.ple_fusion import (
     ple_prefill_short_conv_ as _general_ple_prefill_short_conv_,
 )
-import logging
+
 logger = logging.getLogger(__name__)
 
 HAS_TRITON = True

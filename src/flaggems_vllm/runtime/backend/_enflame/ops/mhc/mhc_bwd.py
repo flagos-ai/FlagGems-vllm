@@ -25,10 +25,12 @@ Given R = Sinkhorn(M) and upstream gradient dR, we solve for dM using:
 3. Result: dM = (dR - x1 - x2) * R
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 EPS = 1e-10

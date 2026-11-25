@@ -348,12 +348,8 @@ def _pick_first_tile(M, N, elem_size, budget):
     else:
         block_row = max(1, min(block_row, _next_pow2(M)))
     if triton.cdiv(M, block_row) > _GRID_X_LIMIT:
-        cap = _floor_pow2(
-            max(1, _DSM_TILE_BUDGET // (block_col * (4 + elem_size)))
-        )
-        block_row = min(
-            max(block_row, _next_pow2(triton.cdiv(M, _GRID_X_LIMIT))), cap
-        )
+        cap = _floor_pow2(max(1, _DSM_TILE_BUDGET // (block_col * (4 + elem_size))))
+        block_row = min(max(block_row, _next_pow2(triton.cdiv(M, _GRID_X_LIMIT))), cap)
     return block_row, block_col
 
 

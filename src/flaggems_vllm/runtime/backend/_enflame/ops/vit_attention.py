@@ -6,6 +6,7 @@ Import this module before tracing/capture so its custom ops and fake kernels
 are registered. Sequence boundaries remain device inputs on graph replay.
 """
 
+import logging
 import math
 
 import torch
@@ -15,7 +16,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-import logging
+
 logger = logging.getLogger(__name__)
 
 # Flash-tile hyperparameters (GCU400, 2026-11-11 sweep): one program per
