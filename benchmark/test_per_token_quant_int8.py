@@ -17,9 +17,6 @@ import os
 import pytest
 import torch
 import yaml
-from vllm.model_executor.layers.quantization.utils.int8_utils import (
-    per_token_quant_int8 as vllm_per_token_quant_int8,
-)
 
 import flaggems_vllm
 
@@ -83,13 +80,30 @@ def _input_fn(shape, dtype, device):
     yield (x,)
 
 
+def _native_npu_dynamic_quant(x):
+    from torch_npu import npu_dynamic_quant
+
+    q, scale = npu_dynamic_quant(x, dst_type=torch.int8)
+    return q, scale.view(x.shape[:-1] + (1,))
+
+
 @pytest.mark.per_token_quant_int8
 def test_per_token_quant_int8():
+    dtypes = [torch.bfloat16, torch.float16]
+    if flaggems_vllm.vendor_name == "ascend":
+        reference = _native_npu_dynamic_quant
+    else:
+        from vllm.model_executor.layers.quantization.utils.int8_utils import (
+            per_token_quant_int8,
+        )
+
+        reference = per_token_quant_int8
+        dtypes.append(torch.float32)
     bench = PerTokenQuantInt8Benchmark(
         op_name="per_token_quant_int8",
-        torch_op=vllm_per_token_quant_int8,
+        torch_op=reference,
         input_fn=_input_fn,
-        dtypes=[torch.bfloat16, torch.float16, torch.float32],
+        dtypes=dtypes,
     )
     bench.set_gems(flaggems_vllm.per_token_quant_int8)
     bench.run()

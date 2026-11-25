@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 import pytest
 import torch
-from vllm.model_executor.layers.quantization.utils.int8_utils import (
-    per_token_quant_int8 as vllm_per_token_quant_int8,
-)
 
 import flaggems_vllm
 
 from . import accuracy_utils as utils
 from .conftest import QUICK_MODE
+
+ASCEND = flaggems_vllm.vendor_name == "ascend"
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 SHAPES = (
@@ -63,6 +63,38 @@ COMMON_SHAPES = (
         (7, 5137),
     ]
 )
+
+
+def vllm_per_token_quant_int8(x):
+    if not ASCEND:
+        from vllm.model_executor.layers.quantization.utils.int8_utils import (
+            per_token_quant_int8,
+        )
+
+        return per_token_quant_int8(x)
+
+    # The vLLM Triton reference needs a GPU libdevice. Evaluate its arithmetic
+    # independently on the CPU for Ascend, with FP32 scale and inverse scale.
+    shape = x.shape
+    if x.ndim > 2:
+        x = x.view(-1, shape[-1])
+    n = x.shape[-1]
+    m = x.numel() // n
+    if x.ndim < 2:
+        raise IndexError("per_token_quant_int8 expects at least two dimensions")
+
+    values = x.to(device="cpu", dtype=torch.float32).numpy().reshape(m, n)
+    magnitude = np.abs(values)
+    amax = np.fmax.reduce(magnitude, axis=1, keepdims=True, initial=np.float32(1e-10))
+    scale = amax / np.float32(127.0)
+    with np.errstate(invalid="ignore"):
+        scaled = values * (np.float32(127.0) / amax)
+    scaled = np.nan_to_num(scaled, nan=0.0)
+    # Widen before adding 0.5 to avoid rounding an FP32 value just below a tie.
+    rounded = np.copysign(np.floor(np.abs(scaled).astype(np.float64) + 0.5), scaled)
+    q = torch.from_numpy(rounded.astype(np.int8)).reshape(shape)
+    scale = torch.from_numpy(scale).reshape(shape[:-1] + (1,))
+    return q.to(x.device), scale.to(x.device)
 
 
 def _check_quantization(x, quant_op=flaggems_vllm.per_token_quant_int8):
@@ -214,6 +246,7 @@ def test_per_token_quant_int8_invalid_input(case):
 
 
 @pytest.mark.per_token_quant_int8
+@pytest.mark.skipif(ASCEND, reason="Exercises the common GPU kernel's private schedule")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("layout", ["contiguous", "strided", "transposed"])
 @pytest.mark.parametrize(
@@ -287,6 +320,7 @@ def test_per_token_quant_int8_reduction_and_row_tails(
 
 
 @pytest.mark.per_token_quant_int8
+@pytest.mark.skipif(ASCEND, reason="Exercises the common GPU kernel's private schedule")
 @pytest.mark.parametrize("quant_parts", [2, 4, 8, 16])
 @pytest.mark.parametrize("width", [256, 2048])
 @pytest.mark.parametrize("shuffle", [False, True])
