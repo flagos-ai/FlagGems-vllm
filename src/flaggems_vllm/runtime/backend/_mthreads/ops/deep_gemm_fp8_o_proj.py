@@ -76,6 +76,10 @@ logger = logging.getLogger(__name__)
 _QUANT_BLOCK = 128
 # Tensor-metadata signatures whose support verdict has already been computed.
 _SUPPORT_CHECKED = {}
+# TLE path: the weight TMA descriptor and the extern-libs handle are cached
+# (rebuilding the latter costs ~19 us per call).
+_TLE_WEIGHT_DESCS = {}
+_EXTERN_LIBS = None
 
 
 @triton.jit
@@ -214,16 +218,19 @@ def _use_tle(num_tokens: int, n_groups: int) -> bool:
 
     S5000 sweep of the o_proj shapes: the TLE kernel runs at 280-313 TFLOPS
     against the plain kernel's 165, but it needs enough work to fill its
-    persistent 60-CTA grid and it costs ~180 us of launch/descriptor setup per
-    call. Operator-level A/B (both include the quant) puts the crossover at
-    1024 tokens for G=8 (386 vs 573 us) and 512 for G=16 (406 vs 571 us).
+    persistent 60-CTA grid and the JIT dispatch over its 41 parameters costs
+    ~160 us per call (with the descriptor/extern-libs caches below; it was
+    ~280 us before them). Operator-level A/B including the quant: 512/8 269 vs
+    326 us, 512/16 410 vs 568 us, 1024/8 440 vs 573 us, 4096/16 3031 vs 3696 us,
+    while 128/8 (281 vs 119 us) and 256/8 (276 vs 199 us) still favour the
+    plain kernel.
     """
     override = os.environ.get("FLAGGEMS_O_PROJ_TLE")
     if override is not None:
         return override != "0" and TensorDescriptor is not None
     if TensorDescriptor is None:
         return False
-    return num_tokens >= 1024 or (num_tokens >= 512 and n_groups > 8)
+    return num_tokens >= 512 or (num_tokens >= 256 and n_groups > 8)
 
 
 # (BLOCK_M, BLOCK_N, CONSUMER_WARPS, SPLIT_K, PROMOTE) for the TLE path; the
@@ -237,8 +244,8 @@ def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups):
     ``act``/``act_scale`` are token-major ``[tokens, groups, k]``; the kernel
     walks the activation and its scales as ``[groups, tokens, *]`` (the
     ``X_BATCH_MAJOR=1`` layout its TMA descriptor wants) and the weight as
-    ``[groups * n, k]``. A masked-``to`` copy only happens for pre-quantized
-    activations, whose token-major slice is not group-major contiguous.
+    ``[groups * n, k]``. A copy only happens for pre-quantized activations,
+    whose token-major slice is not group-major contiguous.
     """
     block_m, block_n, warps, split_k, promote = _TLE_TILE
     k = act.shape[2]
@@ -247,21 +254,14 @@ def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups):
     act_g = act.transpose(0, 1)
     if not act_g.is_contiguous():
         act_g = act_g.contiguous()
+    # The quant buffer's scales are padded on the token axis. Re-laying them as
+    # a dense [groups, tokens, k_blocks] block is not just descriptor hygiene:
+    # the kernel's per-block row-scale load then walks 128 consecutive floats,
+    # and measured 14% faster at 4096 tokens than indexing the padded buffer.
     scale_g = act_scale.transpose(0, 1)
     if not scale_g.is_contiguous():
         scale_g = scale_g.contiguous()
     row_scale_pad = max(4, triton.next_power_of_2(k_blocks // split_k))
-    x_desc = TensorDescriptor.from_tensor(
-        act_g.view(n_groups * num_tokens, k), block_shape=[block_m, _QUANT_BLOCK]
-    )
-    y_desc = TensorDescriptor.from_tensor(
-        weight.view(n_groups * n, k),
-        block_shape=[block_n // (2 if block_m == 256 else 1), _QUANT_BLOCK],
-    )
-    scale_desc = TensorDescriptor.from_tensor(
-        scale_g.view(n_groups * num_tokens, k_blocks),
-        block_shape=[block_m, row_scale_pad],
-    )
     out_g = out.permute(1, 0, 2)
     derived = _derived_values(
         block_m,
@@ -274,6 +274,17 @@ def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups):
         n_groups,
         out_g.device.index,
         out_g.stride(),
+    )
+    scale_desc = TensorDescriptor.from_tensor(
+        scale_g.view(n_groups * num_tokens, k_blocks),
+        block_shape=[block_m, row_scale_pad],
+    )
+
+    x_desc = TensorDescriptor.from_tensor(
+        act_g.view(n_groups * num_tokens, k), block_shape=[block_m, _QUANT_BLOCK]
+    )
+    y_desc = _weight_desc(
+        weight, n_groups * n, k, block_n // (2 if block_m == 256 else 1)
     )
     jit_fn = getattr(ws_gemm_fp8.fn, "fn", ws_gemm_fp8.fn)
     jit_fn[(derived["NUM_CTAS"],)](
@@ -319,9 +330,30 @@ def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups):
         Z_STRIDE_B=derived["Z_STRIDE_B"],
         X_BATCH_MAJOR=1,
         llc_options=LLC_OPTIONS,
-        extern_libs=extern_libs_thread_index(),
+        extern_libs=_extern_libs(),
         num_warps=warps,
     )
+
+
+def _weight_desc(weight, rows, k, block_n):
+    """Weight TMA descriptor; the weight tensor is a model parameter."""
+    key = (weight.data_ptr(), rows, k, block_n)
+    desc = _TLE_WEIGHT_DESCS.get(key)
+    if desc is None:
+        desc = TensorDescriptor.from_tensor(
+            weight.view(rows, k), block_shape=[block_n, _QUANT_BLOCK]
+        )
+        if len(_TLE_WEIGHT_DESCS) > 32:
+            _TLE_WEIGHT_DESCS.clear()
+        _TLE_WEIGHT_DESCS[key] = desc
+    return desc
+
+
+def _extern_libs():
+    global _EXTERN_LIBS
+    if _EXTERN_LIBS is None:
+        _EXTERN_LIBS = extern_libs_thread_index()
+    return _EXTERN_LIBS
 
 
 def deep_gemm_fp8_o_proj(
