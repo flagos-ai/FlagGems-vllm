@@ -77,12 +77,8 @@ def _pad_indexer_heads_kernel(
     tl.store(Y + i, value, valid)
 
 
-def pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
-    """Append ``pad`` zero heads to ``[T,H,*tail]`` in fresh contiguous storage.
-
-    All strided layouts with nonnegative strides, including broadcast views,
-    are read directly. The inference API preserves storage bits, not autograd.
-    """
+def _prepare_pad_indexer_heads(x: torch.Tensor, pad: int):
+    """Validate the shared interface and allocate fresh output storage."""
     logger.debug("GEMS PAD_INDEXER_HEADS")
     pad = operator.index(pad)
     sizes = tuple(x.shape)
@@ -110,7 +106,16 @@ def pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
     if itemsize not in (1, 2, 4, 8, 16):
         raise NotImplementedError("pad_indexer_heads requires byte-addressable storage")
     shape = (sizes[0], sizes[1] + pad, *sizes[2:])
-    out = torch.empty(shape, dtype=x.dtype, device=device)
+    return torch.empty(shape, dtype=x.dtype, device=device), pad
+
+
+def _launch_pad_indexer_heads(x, out, pad):
+    """Launch the generic copy into an already validated output."""
+    sizes = tuple(x.shape)
+    strides = tuple(x.stride())
+    itemsize = x.element_size()
+    device = x.device
+    shape = tuple(out.shape)
     count = out.numel()
     if count == 0:
         return out
@@ -144,3 +149,13 @@ def pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
             ),
         )
     return out
+
+
+def pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
+    """Append ``pad`` zero heads to ``[T,H,*tail]`` in fresh contiguous storage.
+
+    All strided layouts with nonnegative strides, including broadcast views,
+    are read directly. The inference API preserves storage bits, not autograd.
+    """
+    out, pad = _prepare_pad_indexer_heads(x, pad)
+    return _launch_pad_indexer_heads(x, out, pad)

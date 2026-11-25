@@ -119,6 +119,31 @@ def test_pad_indexer_heads(shape, pad, dtype):
     assert_contract(gems.pad_indexer_heads, storage_input(shape, dtype), pad)
 
 
+@pytest.mark.pad_indexer_heads
+def test_pad_indexer_heads_large_grid():
+    # A flat BLOCK256 launch would require 131072 programs on this workload.
+    assert_contract(
+        gems.pad_indexer_heads, storage_input((8192, 16, 128), torch.float32), 16
+    )
+
+
+@pytest.mark.parametrize("dtype", [*COPY_DTYPES, torch.complex128])
+@pytest.mark.pad_indexer_heads
+def test_pad_indexer_heads_contiguous_offset(dtype):
+    # Exercise misaligned contiguous pointers and complex128 two-unit copies.
+    shape = (7, 16, 3, 5)
+    x = storage_input((math.prod(shape) + 1,), dtype)[1:].reshape(shape)
+    assert x.is_contiguous() and x.storage_offset() == 1
+    assert_contract(gems.pad_indexer_heads, x, 3)
+
+
+@pytest.mark.parametrize("dtype", [*COPY_DTYPES, torch.complex128])
+@pytest.mark.pad_indexer_heads
+def test_pad_indexer_heads_partial_row_batch(dtype):
+    # T=49 selects two rows per tile: the final tile has one invalid row.
+    assert_contract(gems.pad_indexer_heads, storage_input((49, 16, 7), dtype), 3)
+
+
 @pytest.mark.parametrize("dtype", COPY_DTYPES)
 @pytest.mark.parametrize("shape", [(7, 16), (7, 16, 7), (7, 16, 3, 5)])
 @pytest.mark.parametrize("layout", ["row_gap", "tail_gap", "transpose", "broadcast"])
