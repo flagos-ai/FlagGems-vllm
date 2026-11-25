@@ -53,6 +53,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._hygon.ops.megamhc import mega_mhc, mega_mhc_prepare
 from flaggems_vllm.runtime.backend._hygon.ops.megamoe import megamoe_int8
 from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -90,6 +91,8 @@ __all__ = [
     "gemma_rms_norm",
     "inplace_fused_experts",
     "int8_einsum",
+    "mega_mhc",
+    "mega_mhc_prepare",
     "megamoe_int8",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",

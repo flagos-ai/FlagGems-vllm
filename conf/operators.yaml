@@ -1722,6 +1722,20 @@ ops:
     - NeuralNetwork
   stages:
     - alpha: '5.4'
+- id: megamhc
+  description: >-
+    Hygon FlagTree Triton MegaMHC forward for the DeepSeek-V4-Flash Normal BF16
+    profile, combining the residual update, coefficient projection, Sinkhorn
+    mixing, and RMS normalization.
+  for:
+  - vllm.model_executor.layers.mhc.MHCFusedPostPreOp
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: megamoe_int8
   description: 'Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
 
