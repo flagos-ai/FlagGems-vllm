@@ -250,9 +250,11 @@ def _hc_down_silu(x, weight, rank, hc, launch):
         and device.index == torch.cuda.current_device()
         and (x.data_ptr() | weight.data_ptr() | output.data_ptr()) % 16 == 0
     ):
-        launch = _hopper_dense_launcher(device.index, m, k, n, rank, hc, sx[0], sw[0])
-        if launch is not None:
-            launch(x, weight, output)
+        hopper_launch = _hopper_dense_launcher(
+            device.index, m, k, n, rank, hc, sx[0], sw[0]
+        )
+        if hopper_launch is not None:
+            hopper_launch(x, weight, output)
             return (
                 output.as_strided((m, rank), (n, 1), 0),
                 output.as_strided((m, hc), (n, 1), rank),
