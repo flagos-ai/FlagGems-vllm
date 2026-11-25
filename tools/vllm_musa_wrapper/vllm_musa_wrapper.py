@@ -41,6 +41,8 @@ CHECKOUT = pathlib.Path("~/.cache/flaggems/src/vllm-musa").expanduser()
 # the index is passed to that single install instead of being declared globally
 # where it would capture the package for every other vendor.
 VENDOR_INDEX = "https://dl.mthreads.com/repo/api/pypi/pypi/simple"
+SETUPTOOLS_VERSION = "80.10.2"
+
 BUILD_PREREQS = {
     "torchada": ("torchada>=0.1.76", None),
     "tvm_ffi": ("apache-tvm-ffi==0.1.9.post3+musa.1", VENDOR_INDEX),
@@ -199,7 +201,31 @@ def _ensure_build_prereqs() -> None:
         _run([*command, requirement])
 
 
+def _ensure_setuptools() -> None:
+    """Pin the setuptools build used by the vendored extension build."""
+    import importlib.metadata
+
+    try:
+        current = importlib.metadata.version("setuptools")
+    except importlib.metadata.PackageNotFoundError:
+        current = ""
+    if current == SETUPTOOLS_VERSION:
+        return
+    _log(f"installing setuptools=={SETUPTOOLS_VERSION} (found {current or '<none>'})")
+    _run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            f"setuptools=={SETUPTOOLS_VERSION}",
+        ]
+    )
+
+
 def _vendor_wheel() -> pathlib.Path:
+    _ensure_setuptools()
     _ensure_build_prereqs()
     source = _source_tree()
     output = pathlib.Path(tempfile.mkdtemp(prefix="vllm-musa-wheel-"))
