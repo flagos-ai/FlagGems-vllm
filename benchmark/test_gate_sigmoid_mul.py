@@ -81,6 +81,17 @@ def _record(role, binding, dtype, latency_ms, status, reason=None, active_counts
 
 def _check_full_output(output, args, snapshots):
     """One output transfer; 32-row CPU FP64 chunks bound temporary memory."""
+    threads = torch.get_num_threads()
+    if threads == 1:
+        return _check_full_output_cpu(output, args, snapshots)
+    torch.set_num_threads(1)
+    try:
+        return _check_full_output_cpu(output, args, snapshots)
+    finally:
+        torch.set_num_threads(threads)
+
+
+def _check_full_output_cpu(output, args, snapshots):
     a, gate = args
     assert isinstance(output, torch.Tensor), "output must be a Tensor"
     assert output.shape == a.shape, "output shape mismatch"

@@ -8,6 +8,19 @@ DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 
 def reference(q, k, g, beta, scale, bt, lengths=None):
+    # These small FP64 tiles do not benefit from competing intra-op thread pools
+    # when optest runs one accuracy worker per device on the same CPU host.
+    threads = torch.get_num_threads()
+    try:
+        if threads != 1:
+            torch.set_num_threads(1)
+        return _reference_cpu(q, k, g, beta, scale, bt, lengths)
+    finally:
+        if threads != 1:
+            torch.set_num_threads(threads)
+
+
+def _reference_cpu(q, k, g, beta, scale, bt, lengths=None):
     q, k, g, beta = [x.detach().cpu().double() for x in (q, k, g, beta)]
     b, t, h, _ = q.shape
     a = torch.zeros((b, t, h, bt), dtype=torch.float64)
