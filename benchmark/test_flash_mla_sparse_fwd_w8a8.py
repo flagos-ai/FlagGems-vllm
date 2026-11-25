@@ -90,7 +90,7 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
     def get_latency(self, op, *args, **kwargs):
         original, packed, _ = args[0]
         selected = packed if op is self.gems_op else original
-        return super().get_latency(op, *selected)
+        return super().get_latency(op, *selected, **kwargs)
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8

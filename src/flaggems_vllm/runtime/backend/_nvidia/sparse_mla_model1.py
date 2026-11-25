@@ -341,17 +341,16 @@ def leader(
         else:
             pass
         tle.gpu.barrier_wait(vfull[0])
-        # Promote each FP8 MMA tile before adding it to the long FP32 reduction.
-        tile_acc = tl.full((64, 64), 0.0, tl.float32)
+        acc *= beta[:, None]
         for half in tl.static_range(BK // 64):
             vbuf = buf * (BK // 64) + half
-            tile_acc = tle.gpu.wgmma(
+            acc = tle.gpu.wgmma(
                 sp.slot(vbuf),
                 sv64.slot(vbuf),
-                tile_acc,
+                acc,
                 trans_b=True,
             )
-        acc = tl.fma(acc, beta[:, None], tle.gpu.wgmma_wait(0, tile_acc))
+        acc = tle.gpu.wgmma_wait(0, acc)
         if RING > BUFS:
             tail = tle.gpu.wgmma_wait(0, tail)
         else:
@@ -508,32 +507,32 @@ def follower(
             tle.gpu.barrier_arrive(kfree[buf], phaseIdx=cycle)
         tle.gpu.barrier_wait(pfull[0])
         beta = tl.load(tle.gpu.local_ptr(alpha.slot(buf)))
-        tile_a = tl.full((64, 128), 0.0, tl.float32)
-        tile_a1 = tl.full((64, 128), 0.0, tl.float32)
-        tile_c = tl.full((64, 128), 0.0, tl.float32)
+        a *= beta[:, None]
+        a1 *= beta[:, None]
+        c *= beta[:, None]
         for half in tl.static_range(BK // 64):
             vbuf = buf * (BK // 64) + half
-            tile_a = tle.gpu.wgmma(
+            a = tle.gpu.wgmma(
                 sp.slot(vbuf),
                 tle_subslice(sv.slot(vbuf), [0, 0], [128, 64]),
-                tile_a,
+                a,
                 trans_b=True,
             )
-            tile_a1 = tle.gpu.wgmma(
+            a1 = tle.gpu.wgmma(
                 sp.slot(vbuf),
                 tle_subslice(sv.slot(vbuf), [128, 0], [128, 64]),
-                tile_a1,
+                a1,
                 trans_b=True,
             )
-            tile_c = tle.gpu.wgmma(
+            c = tle.gpu.wgmma(
                 sp.slot(vbuf),
                 sv128.slot(vbuf),
-                tile_c,
+                c,
                 trans_b=True,
             )
-        a1 = tl.fma(a1, beta[:, None], tle.gpu.wgmma_wait(0, tile_a1))
-        a = tl.fma(a, beta[:, None], tle.gpu.wgmma_wait(0, tile_a))
-        c = tl.fma(c, beta[:, None], tle.gpu.wgmma_wait(0, tile_c))
+        a1 = tle.gpu.wgmma_wait(0, a1)
+        a = tle.gpu.wgmma_wait(0, a)
+        c = tle.gpu.wgmma_wait(0, c)
         if BUFS == 1 and tl.cdiv(T, BK) > S:
             tle.gpu.barrier_wait(vfree[0])
         else:
@@ -939,6 +938,8 @@ def model1_attention(
             if topk <= 128
             else triton.cdiv(num_blocks, triton.cdiv(num_blocks, target))
         )
+    # Bound FP8 MMA accumulation before the FP32 split reduction.
+    splits = max(splits, triton.cdiv(topk, 4096))
     out = torch.empty((batch, heads, 512), dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((batch, heads), dtype=torch.float32, device=q.device)
     part = out if splits == 1 else out.new_empty((batch, splits, heads, 512))
