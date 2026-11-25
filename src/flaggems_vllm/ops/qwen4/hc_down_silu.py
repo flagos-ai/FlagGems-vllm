@@ -14,18 +14,6 @@ from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 
 logger = logging.getLogger(__name__)
-_IS_ASCEND = runtime.device.vendor_name == "ascend"
-
-
-def _tuned_configs(name, ascend_meta, num_stages):
-    # The 910B workload favors these tiles across the core shapes. Use one
-    # candidate on Ascend to avoid compiling every tile for every shape.
-    if _IS_ASCEND:
-        return [triton.Config(ascend_meta, num_warps=4, num_stages=num_stages)]
-    return runtime.get_tuned_config(name)
-
-
-_GEMV_CONFIGS = _tuned_configs("hc_down_silu_gemv", {"BLOCK_N": 4, "BLOCK_K": 1024}, 1)
 
 
 @triton.jit
@@ -38,7 +26,7 @@ def _hc_down_silu_epilogue(acc, columns, RANK: tl.constexpr, HC: tl.constexpr):
 
 @libentry()
 @libtuner(
-    configs=_GEMV_CONFIGS,
+    configs=runtime.get_tuned_config("hc_down_silu_gemv"),
     key=["SHAPE"],
     strategy=str,
     warmup=5,
@@ -82,9 +70,7 @@ def _hc_down_silu_gemv(
 
 @libentry()
 @libtuner(
-    configs=_tuned_configs(
-        "hc_down_silu_gemm", {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 128}, 2
-    ),
+    configs=runtime.get_tuned_config("hc_down_silu_gemm"),
     key=["SHAPE"],
     strategy=str,
     warmup=5,
@@ -137,10 +123,10 @@ def _hc_down_silu_gemm(
 @libtuner(
     # Current MACA vector loads fail on this large-span path. Scalar K tiles
     # retain the same FP32 reduction and BF16 epilogue without that lowering.
-    configs=(
-        runtime.get_tuned_config("hc_down_silu_wide_gemv")
+    configs=runtime.get_tuned_config(
+        "hc_down_silu_wide_gemv"
         if runtime.device.vendor_name == "metax"
-        else _GEMV_CONFIGS
+        else "hc_down_silu_gemv"
     ),
     key=["SHAPE"],
     strategy=str,
@@ -201,6 +187,10 @@ def hc_down_silu(
     contiguous native workload. Empty M also preserves these packed views.
     """
     logger.debug("GEMS HC_DOWN_SILU")
+    return _hc_down_silu(x, weight, rank, hc, _launch)
+
+
+def _hc_down_silu(x, weight, rank, hc, launch):
     if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
         raise TypeError("hc_down_silu requires tensor inputs")
     if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
@@ -238,6 +228,14 @@ def hc_down_silu(
         )
         > 2**31 - 1
     )
+    dimensions = (m, k, n, rank, hc, sx[0], sw[0])
+    with runtime.torch_device_fn.device(x.device.index):
+        launch(x, weight, output, dimensions, wide)
+    return activation, injection_logits
+
+
+def _launch(x, weight, output, dimensions, wide):
+    m, k, _, rank, hc, _, _ = dimensions
     use_gemv = m <= 4 or k < 2048
     # Measured crossovers at the model workload: H20 favors vectors through
     # M=16, while S5000 favors them throughout the fused model domain and M=49.
@@ -247,24 +245,19 @@ def hc_down_silu(
             use_gemv = m <= 16
         elif runtime.device.vendor_name == "mthreads":
             use_gemv = m <= 49
-    # Both GEMV kernels get the row count from the launch grid. With the
-    # fixed Ascend tile, changing M does not require another compiled kernel.
-    kernel_m = 0 if _IS_ASCEND and (wide or use_gemv) else m
-    shape = (kernel_m, k, n, rank, hc, sx[0], sw[0], int(use_gemv))
-    with runtime.torch_device_fn.device(x.device.index):
-        if wide:
-            _hc_down_silu_wide_gemv[
-                lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))
-            ](x, weight, output, (kernel_m, k, n, rank, hc, sx[0], sw[0], 2))
-        elif use_gemv:
-            _hc_down_silu_gemv[
-                lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))
-            ](x, weight, output, shape)
-        else:
-            _hc_down_silu_gemm[
-                lambda meta: (
-                    triton.cdiv(m, meta["BLOCK_M"]),
-                    triton.cdiv(rank + hc, meta["BLOCK_N"]),
-                )
-            ](x, weight, output, shape)
-    return activation, injection_logits
+    shape = (*dimensions, int(use_gemv))
+    if wide:
+        _hc_down_silu_wide_gemv[
+            lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))
+        ](x, weight, output, (*dimensions, 2))
+    elif use_gemv:
+        _hc_down_silu_gemv[lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))](
+            x, weight, output, shape
+        )
+    else:
+        _hc_down_silu_gemm[
+            lambda meta: (
+                triton.cdiv(m, meta["BLOCK_M"]),
+                triton.cdiv(rank + hc, meta["BLOCK_N"]),
+            )
+        ](x, weight, output, shape)
