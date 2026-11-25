@@ -511,16 +511,7 @@ class ParallelBenchmarkMixin:
             if self.gems_op:
                 metric.latency = self.get_latency(self.gems_op, *args, **kwargs)
             else:
-                if self.op_name == "zero_":
-                    with flaggems_vllm.use_gems():
-                        metric.latency = self.get_latency(
-                            self.torch_op, *args, **kwargs
-                        )
-                else:
-                    with flaggems_vllm.use_gems(exclude=["zero_"]):
-                        metric.latency = self.get_latency(
-                            self.torch_op, *args, **kwargs
-                        )
+                metric.latency = self.get_latency(self.torch_op, *args, **kwargs)
         if "speedup" in self.to_bench_metrics:
             metric.speedup = metric.latency_base / metric.latency
         if "gbps" in self.to_bench_metrics:
@@ -948,7 +939,7 @@ class ParallelW8A8BlockMatmulBenchmark(
         "w8a8_block_matmul",
         (
             "w8a8_block_int8_matmul"
-            if flaggems_vllm.vendor_name == "thead"
+            if flaggems_vllm.vendor_name in ("thead", "metax", "hygon")
             else "w8a8_block_fp8_matmul"
         ),
         "BlasBenchmark",
@@ -1276,13 +1267,16 @@ def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
 
 @pytest.mark.w8a8_block_matmul
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "nvidia", "mthreads"),
+    flaggems_vllm.vendor_name not in ("thead", "metax", "hygon", "nvidia", "mthreads"),
     reason="No W8A8 block matmul backend",
 )
 def test_perf_w8a8_block_matmul():
     if not hasattr(flaggems_vllm, "w8a8_block_matmul"):
         pytest.skip("W8A8 block matmul is unavailable on this architecture")
-    if flaggems_vllm.vendor_name == "thead":
+    if flaggems_vllm.vendor_name == "mthreads":
+        import torchada  # noqa: F401
+
+    if flaggems_vllm.vendor_name in ("thead", "metax", "hygon"):
         if not VLLM_W8A8_BLOCK_INT8_AVAILABLE:
             pytest.skip("W8A8 block matmul benchmark requires the vLLM INT8 baseline")
         torch_op = vllm_w8a8_block_int8_matmul

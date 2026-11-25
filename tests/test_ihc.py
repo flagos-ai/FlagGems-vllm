@@ -14,7 +14,7 @@
 
 """Accuracy tests for iHC (independent Hyper-Connections) operators.
 
-Tests ihc_pre and ihc_post against their PyTorch reference implementations.
+Tests iHC pre against an independent CPU oracle and post against its reference.
 """
 
 from itertools import product
@@ -23,17 +23,9 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.ihc import ihc_post, ihc_post_ref, ihc_pre, ihc_pre_ref
+from flaggems_vllm.ops.ihc import ihc_post, ihc_post_ref, ihc_pre
 
-# vLLM's own iHC Triton kernels, used as a cross-check when vLLM is importable
-# (mirrors the HAS_VLLM pattern in test_mhc_ops.py).
-try:
-    from vllm.models.hy_v4.nvidia.triton_ihc import triton_ihc_post as _vllm_ihc_post
-    from vllm.models.hy_v4.nvidia.triton_ihc import triton_ihc_pre as _vllm_ihc_pre
-
-    HAS_VLLM = True
-except ImportError:
-    HAS_VLLM = False
+from .test_triton_ihc_pre import _ihc_pre_cpu_threads, ihc_pre_reference  # noqa: F401
 
 DEVICE = flaggems_vllm.device
 
@@ -54,6 +46,7 @@ def _make_pre_inputs(n, hc, h, dtype, device=DEVICE):
 
 
 @pytest.mark.ihc_pre
+@pytest.mark.usefixtures("_ihc_pre_cpu_threads")
 @pytest.mark.parametrize("n", _TOKENS)
 @pytest.mark.parametrize("h", _HIDDEN)
 @pytest.mark.parametrize("hc", _HC_MULT)
@@ -61,13 +54,13 @@ def _make_pre_inputs(n, hc, h, dtype, device=DEVICE):
 def test_ihc_pre_vs_ref(n, h, hc, dtype):
     x, weight, scale, base = _make_pre_inputs(n, hc, h, dtype)
     y, post = ihc_pre(x, weight, scale, base, 2.0, 1e-6, 1e-5)
-    y_ref, post_ref = ihc_pre_ref(x, weight, scale, base, 2.0, 1e-6, 1e-5)
+    y_ref, post_ref = ihc_pre_reference(x, weight, scale, base, 2.0, 1e-6, 1e-5)
 
     assert y.shape == (n, h)
     assert post.shape == (n, hc)
     assert y.dtype == dtype and post.dtype == torch.float32
-    torch.testing.assert_close(y, y_ref, rtol=1e-2, atol=2e-2)
-    torch.testing.assert_close(post, post_ref, rtol=1e-5, atol=2e-5)
+    torch.testing.assert_close(y.cpu(), y_ref, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(post.cpu(), post_ref, rtol=1e-5, atol=2e-5)
 
 
 @pytest.mark.ihc_post
@@ -105,38 +98,40 @@ def test_ihc_pre_post_chain(n, h, hc):
     torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
 
 
-# Non-empty token counts for the cross-impl checks (N=0 is covered vs the ref).
+# Preserve every former native-comparison shape using the independent CPU oracle.
 _VLLM_TOKENS = [1, 64, 1024, 8192]
 
 
 @pytest.mark.ihc_pre
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not available")
+@pytest.mark.usefixtures("_ihc_pre_cpu_threads")
 @pytest.mark.parametrize("n", _VLLM_TOKENS)
 @pytest.mark.parametrize("h", _HIDDEN)
 @pytest.mark.parametrize("hc", _HC_MULT)
-def test_ihc_pre_vs_vllm(n, h, hc):
-    """FlagGems-vllm ihc_pre must match vLLM's own iHC Triton kernel."""
+def test_ihc_pre_model_shapes_vs_cpu_ref(n, h, hc):
+    """Keep the legacy wrapper's model-size BF16 coverage independent of vLLM."""
     dtype = torch.bfloat16
     x, weight, scale, base = _make_pre_inputs(n, hc, h, dtype)
     y, post = ihc_pre(x, weight, scale, base, 2.0, 1e-6, 1e-5)
-    # vLLM signature: (x, weight, scale, base, magnitude, hc_eps, norm_eps).
-    y_v, post_v = _vllm_ihc_pre(x, weight, scale, base, 2.0, 1e-6, 1e-5)
-    torch.testing.assert_close(y, y_v, rtol=1e-2, atol=2e-2)
-    torch.testing.assert_close(post, post_v, rtol=1e-5, atol=2e-5)
+    y_ref, post_ref = ihc_pre_reference(x, weight, scale, base, 2.0, 1e-6, 1e-5)
+    torch.testing.assert_close(y.cpu(), y_ref, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(post.cpu(), post_ref, rtol=1e-5, atol=2e-5)
 
 
 @pytest.mark.ihc_post
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM not available")
 @pytest.mark.parametrize("n", _VLLM_TOKENS)
 @pytest.mark.parametrize("h", _HIDDEN)
 @pytest.mark.parametrize("hc", _HC_MULT)
-def test_ihc_post_vs_vllm(n, h, hc):
-    """FlagGems-vllm ihc_post must match vLLM's own iHC Triton kernel."""
+def test_ihc_post_model_shapes_vs_cpu_ref(n, h, hc):
+    """Keep the legacy wrapper's model-size BF16 coverage independent of vLLM."""
     dtype = torch.bfloat16
     torch.manual_seed(42)
     x = torch.randn((n, h), dtype=dtype, device=DEVICE)
     residual = torch.randn((n, hc, h), dtype=dtype, device=DEVICE)
     post = torch.randn((n, hc), dtype=torch.float32, device=DEVICE)
     out = ihc_post(x, residual, post)
-    out_v = _vllm_ihc_post(x, residual, post)
-    torch.testing.assert_close(out, out_v, rtol=0, atol=0)
+
+    # Limit CPU oracle intermediates at the largest model sizes.
+    for start in range(0, n, 32):
+        part = slice(start, start + 32)
+        expected = ihc_post_ref(x[part].cpu(), residual[part].cpu(), post[part].cpu())
+        torch.testing.assert_close(out[part].cpu(), expected, rtol=0, atol=0)

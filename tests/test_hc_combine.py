@@ -3,11 +3,15 @@
 """Independent CPU oracle, public dispatch, boundaries, and legacy regression."""
 
 import builtins
+import importlib.util
 import itertools
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm as gems
 from baseline import hc_combine as baseline
@@ -98,6 +102,7 @@ def test_hc_combine_dtype_matrix(rd, bd, idt):
     b = torch.randn((7, 17), device=gems.device, dtype=bd)
     i = None if idt is None else torch.randn((7, 3), device=gems.device, dtype=idt)
     check((r, b, i, 3))
+    check((r, b, i, 3), lambda r, b, i, h: gems.qwen4_hc_inject_combine(i, b, r, h))
 
 
 @pytest.mark.hc_combine
@@ -135,7 +140,9 @@ def test_hc_combine_overlapping_rows(injection, stride):
         storage = torch.randn((3 * stride + width,), device=gems.device)
         return storage.as_strided((4, width), (stride, 1))
 
-    check((make(21), make(7), None if injection is None else make(3), 3))
+    data = (make(21), make(7), None if injection is None else make(3), 3)
+    check(data)
+    check(data, lambda r, b, i, h: gems.qwen4_hc_inject_combine(i, b, r, h))
 
 
 @pytest.mark.hc_combine
@@ -148,6 +155,10 @@ def test_hc_combine_projection_slice(dtype, injection_dtype):
     residual = torch.randn((9, 72), dtype=dtype, device=gems.device)[1:8, 3:72]
     block = torch.randn((9, 31), dtype=dtype, device=gems.device)[1:8, 5:28]
     check((residual, block, injection, 3))
+    check(
+        (residual, block, injection, 3),
+        lambda r, b, i, h: gems.qwen4_hc_inject_combine(i, b, r, h),
+    )
 
 
 @pytest.mark.hc_combine
@@ -202,6 +213,12 @@ def test_hc_combine_errors(kind):
         i = i.cpu()
     with pytest.raises((ValueError, TypeError)):
         gems.hc_combine(r, b, i, h)
+    with pytest.raises((ValueError, TypeError, RuntimeError)):
+        gems.qwen4_hc_inject_combine(i, b, r, h)
+    if kind == "hcbool":
+        # Reject bool even when it describes an otherwise valid HC=1 workload.
+        with pytest.raises((ValueError, TypeError)):
+            gems.qwen4_hc_inject_combine(i[:, :1], b, b, True)
 
 
 @pytest.mark.hc_combine
@@ -214,19 +231,28 @@ def test_hc_combine_legacy_leading_dims():
         actual.reshape(6, 21),
         reference(r.reshape(6, 21), b.reshape(6, 7), i.reshape(6, 3), 3),
     )
+    for index in range(3):
+        data = [i, b, r]
+        # Swapping equal leading dimensions preserves shape but prevents flattening.
+        data = [tensor[:2, :2].contiguous() for tensor in data]
+        data[index] = data[index].transpose(0, 1)
+        with pytest.raises(ValueError, match="flattenable"):
+            gems.qwen4_hc_inject_combine(*data, 3)
 
 
 @pytest.mark.hc_combine
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("injection", ["none", "same", "fp32"])
-def test_hc_combine_native(dtype, injection):
-    native = baseline.native()
-    if native is None:
-        pytest.skip(baseline.NATIVE_UNAVAILABLE_REASON)
+def test_hc_combine_cpu_reference_tail(dtype, injection):
+    # Keep all nine packed projection-tail configurations against the CPU oracle.
+    # Native qualification belongs to the benchmark, not accuracy tests.
     data, _ = baseline.build_inputs(
         dict(n=7, hc=3, d=513, layout="packed", injection=injection), dtype, gems.device
     )
-    check(data, native)
+    check(data)
+    if injection != "none":
+        r, b, i, h = data
+        check((r, b, i, h), lambda r, b, i, h: gems.qwen4_hc_inject_combine(i, b, r, h))
 
 
 @pytest.mark.hc_combine
@@ -235,7 +261,7 @@ def test_hc_combine_native(dtype, injection):
     ["ready", "versionless", "missing_module", "missing_attribute", "not_callable"],
 )
 def test_hc_combine_native_resolution(monkeypatch, mode):
-    # Resolver fault injection is separate from the numerical native tests above.
+    # Resolver fault injection is separate from candidate numerical accuracy.
     # Successful resolution must return and call the original imported function.
     calls = []
     output = object()
@@ -279,3 +305,73 @@ def test_hc_combine_native_resolution(monkeypatch, mode):
     else:
         assert native is None and not calls
         assert baseline.NATIVE_UNAVAILABLE_REASON
+
+
+@pytest.fixture
+def ascend_hc_combine():
+    """A private copy of the Ascend module, so its LibEntry cache starts empty."""
+    path = Path(gems.__file__).parent / "runtime/backend/_ascend/ops/hc_combine.py"
+    name = "hc_combine_ascend_under_test"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        yield module
+
+
+@pytest.mark.hc_combine
+def test_hc_combine_fixed_launch_reuses_compiled_kernel(ascend_hc_combine, monkeypatch):
+    """The fixed-config launch has to find the kernel LibEntry compiled for it.
+
+    LibEntry stores a kernel under its argument key plus the compile options of
+    the launch that built it. The warm path skips LibEntry and looks the kernel up
+    itself, so a lookup without those options misses every time and the launch
+    silently falls back to the slow path. The result stays correct either way.
+    """
+    module = ascend_hc_combine
+    if not module._COMPILED_LAUNCH_HAS_CONSTEXPRS:
+        pytest.skip("compiled-kernel launch needs Triton 3.3-3.6")
+    config = triton.Config({"BLOCK_D": 128, "LOOP": False}, num_warps=4, num_stages=1)
+    options = {"num_warps": config.num_warps, "num_stages": config.num_stages}
+    kernel = module._hc_combine_runtime_shape
+    monkeypatch.setattr(module, "_FIXED_CONFIG", config)
+    monkeypatch.setattr(module, "_FIXED_LAUNCH_OPTIONS", options)
+    monkeypatch.setattr(
+        module, "_FIXED_LAUNCH_OPTIONS_KEY", kernel._launch_options_key(options)
+    )
+    through_libentry = []
+    run = kernel.run
+
+    def counting_run(*args, **kwargs):
+        through_libentry.append(kwargs["grid"])
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "run", counting_run)
+
+    n, hc, d = 7, 3, 513
+    data, _ = baseline.build_inputs(
+        dict(n=n, hc=hc, d=d, layout="dense", injection="none"),
+        torch.float16,
+        gems.device,
+    )
+    residual, block, injection, _ = data
+    expected = reference(*data)
+    for _ in range(3):
+        out = residual.new_empty(residual.shape)
+        module._launch_hc_combine(
+            residual,
+            block,
+            injection,
+            out,
+            n,
+            d,
+            hc,
+            residual.stride(0),
+            block.stride(0),
+            0,
+        )
+        assert_result(out, expected)
+
+    # Only the cold launch compiles through LibEntry; the warm ones reuse it.
+    assert len(through_libentry) == 1

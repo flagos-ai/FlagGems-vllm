@@ -26,8 +26,8 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post_ref as generic_mhc_post_ref
-from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import _mhc_post_ascend
+
+from .test_mhc_ops import mhc_post_ref as generic_mhc_post_ref
 
 try:
     import torch_npu  # noqa: F401
@@ -81,6 +81,14 @@ def mhc_post_ref(x, h_res, h_out, h_post):
     outer = hpost.float().unsqueeze(-1) * hout_f.unsqueeze(1)
     y = (mix + outer).to(orig_dtype)
     return y.reshape(shape)
+
+
+def _ascend_entry():
+    # Imported lazily: the Ascend backend needs Triton extensions that other
+    # platforms do not ship, and importing it must not break collection there.
+    from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import _mhc_post_ascend
+
+    return _mhc_post_ascend
 
 
 def _make_generic_data(tokens, hc, hidden, seed=42):
@@ -196,19 +204,25 @@ def test_mhc_post_hc2_delegates():
 @requires_ascend
 @pytest.mark.parametrize(
     "variant",
-    ["pipeline", "rows", "concat_reduce"],
-    ids=["pipeline", "rows", "concat_reduce"],
+    ["persistent", "pipeline", "rows", "concat_reduce"],
+    ids=["persistent", "pipeline", "rows", "concat_reduce"],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_mhc_post_ascend_variants(dtype, variant):
-    """All three TLE kernels must agree with the AscendC reference."""
+    """Every TLE kernel must agree with the AscendC reference.
+
+    ``persistent`` is the default fast path (grid-stride over the vector cores,
+    row-wise math, unpadded ``BLOCK_D``); the other three are the older
+    per-token kernels, kept reachable through ``use_persistent=False``.
+    """
     kwargs = {
-        "pipeline": {},
-        "rows": {"use_pipeline": False},
-        "concat_reduce": {"use_concat_reduce": True},
+        "persistent": {},
+        "pipeline": {"use_persistent": False},
+        "rows": {"use_persistent": False, "use_pipeline": False},
+        "concat_reduce": {"use_persistent": False, "use_concat_reduce": True},
     }[variant]
     data = _make_ascend_data(8, 1024, dtype=dtype)
-    out = _mhc_post_ascend(*data, **kwargs)
+    out = _ascend_entry()(*data, **kwargs)
     torch.npu.synchronize()
     ref = mhc_post_ref(*(t.cpu() for t in data))
     _assert_close(out, ref, variant)
@@ -217,6 +231,7 @@ def test_mhc_post_ascend_variants(dtype, variant):
 @requires_ascend
 def test_mhc_post_ascend_tail_and_4d():
     """The private AscendC entry still supports D tails and BSND inputs."""
+    _mhc_post_ascend = _ascend_entry()
     data = _make_ascend_data(8, 1280)
     out = _mhc_post_ascend(*data)
     ref = mhc_post_ref(*(t.cpu() for t in data))

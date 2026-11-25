@@ -20,7 +20,8 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.mhc.hc_head_fused_kernel import hc_head_fused_kernel
+
+from . import base
 
 try:
     from vllm.model_executor.layers.mhc import (
@@ -28,17 +29,30 @@ try:
     )
 
     HAS_VLLM = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_VLLM = False
-from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
-    hc_split_sinkhorn,
-    mhc_split_sinkhorn_torch_ref,
-)
-from flaggems_vllm.ops.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-from flaggems_vllm.ops.mhc.mhc_post import mhc_post
-from flaggems_vllm.ops.mhc.mhc_pre import mhc_pre
 
-from . import base
+# Operators come from the package namespace, never from their module paths: a
+# path import bypasses vendor dispatch, so on Ascend the benchmark would time the
+# generic Triton kernel instead of the specialised one the model runs (and that
+# generic kernel needs a FlagTree knob this build does not ship).
+hc_head_fused_kernel = flaggems_vllm.hc_head_fused_kernel
+hc_split_sinkhorn = flaggems_vllm.hc_split_sinkhorn
+mhc_bwd = flaggems_vllm.mhc_bwd
+mhc_post = flaggems_vllm.mhc_post
+
+# The PyTorch references live in the functional tests now (production code must
+# not fall back to torch compute), so the benchmark imports them from there.
+from tests.test_mhc_ops import (  # noqa: E402 - grouped with the aliases above
+    mhc_bwd_ref,
+    mhc_split_sinkhorn_torch_ref,
+    sinkhorn_forward_ref,
+)
+
+# npu_mhc_pre_clamp_sinkhorn is the Ascend-specialised mhc_pre; the name is absent elsewhere.
+mhc_pre = (
+    getattr(flaggems_vllm, "npu_mhc_pre_clamp_sinkhorn", None) or flaggems_vllm.mhc_pre
+)
 
 VENDOR = flaggems_vllm.vendor_name
 
@@ -55,8 +69,117 @@ _NATIVE_MHC_POST = {
 }
 
 
+# ---------------------------------------------------------------------------
+# vllm-ascend baselines (``torch.ops._C_ascend.npu_hc_pre_v2`` / ``npu_hc_post``)
+# ---------------------------------------------------------------------------
+# These are the AscendC kernels the model runs on Ascend, so they are the most
+# relevant ``latency_base``. Resolved lazily and once: the registration only
+# happens after ``enable_custom_op()``, and that call loads CANN, so it must not
+# run at import/collection time. Unavailable -> the caller falls back.
+_VLLM_ASCEND_PRE = None
+_VLLM_ASCEND_POST = None
+_VLLM_ASCEND_ERROR = None
+_VLLM_ASCEND_RESOLVED = False
+
+
+def _resolve_vllm_ascend_ops():
+    global _VLLM_ASCEND_PRE, _VLLM_ASCEND_POST, _VLLM_ASCEND_ERROR
+    global _VLLM_ASCEND_RESOLVED
+    if _VLLM_ASCEND_RESOLVED:
+        return _VLLM_ASCEND_PRE, _VLLM_ASCEND_POST
+    _VLLM_ASCEND_RESOLVED = True
+    try:
+        import torch_npu  # noqa: F401 - registers the PrivateUse1 backend
+
+        if not torch.npu.is_available():
+            raise RuntimeError("no NPU device available")
+        from vllm_ascend.utils import enable_custom_op
+
+        if not enable_custom_op():
+            raise RuntimeError("vllm_ascend.utils.enable_custom_op() failed")
+        ops = getattr(torch.ops, "_C_ascend", None)
+        if ops is None:
+            raise ImportError("torch.ops._C_ascend is not registered")
+        _VLLM_ASCEND_PRE = getattr(ops, "npu_hc_pre_v2", None)
+        _VLLM_ASCEND_POST = getattr(ops, "npu_hc_post", None)
+    except Exception as exc:  # noqa: BLE001 - availability is environment-specific
+        _VLLM_ASCEND_ERROR = exc
+    return _VLLM_ASCEND_PRE, _VLLM_ASCEND_POST
+
+
+def _vllm_ascend_hc_pre(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits=1,
+):
+    """``npu_hc_pre_v2`` behind the FlagGems ``mhc_pre`` signature and shapes.
+
+    Their ``post`` is ``2 * sigmoid(...)`` against our
+    ``hc_post_mult_value * sigmoid(...)``, hence the rescale; ``hc_eps`` is
+    shared, so this is exact only when both epsilons agree.
+    """
+    hc_mult = residual.shape[-2]
+    if hc_mult != 4:
+        raise NotImplementedError(
+            "npu_hc_pre_v2 supports hc_mult == 4, got {}".format(hc_mult)
+        )
+    if hc_pre_eps != hc_sinkhorn_eps:
+        raise NotImplementedError(
+            "npu_hc_pre_v2 takes one shared hc_eps; "
+            "hc_pre_eps={} != hc_sinkhorn_eps={}".format(hc_pre_eps, hc_sinkhorn_eps)
+        )
+    out, post, comb = _VLLM_ASCEND_PRE(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        hc_mult,
+        sinkhorn_repeat,
+        rms_eps,
+        hc_sinkhorn_eps,
+    )
+    post = (post * (hc_post_mult_value / 2.0)).unsqueeze(-1)
+    return post, comb, out
+
+
+def _vllm_ascend_hc_post(x, residual, post, comb):
+    """``npu_hc_post`` with the argument order the benchmark uses.
+
+    The vendor op insists on a leading batch dim, so it is added and dropped
+    here - the same ``unsqueeze(0)`` / ``squeeze(0)`` the vllm-ascend models do.
+    """
+    if post.shape[-1] == 1:
+        post = post.squeeze(-1)
+    return _VLLM_ASCEND_POST(
+        x.unsqueeze(0),
+        residual.unsqueeze(0),
+        post.unsqueeze(0),
+        comb.unsqueeze(0),
+    ).squeeze(0)
+
+
+def _vllm_ascend_unavailable_reason():
+    return "vllm-ascend npu_hc_* unavailable: {!r}".format(_VLLM_ASCEND_ERROR)
+
+
 def _get_baseline_mhc_post_op():
-    """Vendor-native mhc_post, or None when this vendor ships none."""
+    """Vendor-native mhc_post, or None when this vendor ships none.
+
+    On Ascend vllm-ascend's ``npu_hc_post`` is preferred over ``torch_npu``'s
+    binding when it registers, so ``latency_base`` is the same kernel the model
+    runs.
+    """
+    if VENDOR == "ascend":
+        _, post_op = _resolve_vllm_ascend_ops()
+        if post_op is not None:
+            return _vllm_ascend_hc_post
     entry = _NATIVE_MHC_POST.get(VENDOR)
     if entry is None:
         return None
@@ -75,12 +198,23 @@ def _get_baseline_mhc_post_op():
     if VENDOR == "ascend":
         # npu_mhc_post(residual, h_res, h_out, h_post): mix first, (N, 4) post.
         return lambda x, r, p, m: native(r, m, x, p.squeeze(-1))
+    if VENDOR == "hygon":
+        # aiter mhc_post writes into an out tensor and returns None.
+        def _aiter_mhc_post(x, r, p, m):
+            out = torch.empty_like(r)
+            native(out, x, r, p.reshape(r.shape[0], r.shape[1]), m)
+            return out
+
+        return _aiter_mhc_post
     return native
 
 
-# Ascend: CANN ships aclnnMhcPreSinkhorn, which torch_npu does not bind (and
-# npu_mhc_pre has no kernel on 910B4).  Only argument marshalling happens
-# below, so the measured time is the vendor kernel's.
+# Ascend fallback baseline: CANN ships aclnnMhcPreSinkhorn, which torch_npu does
+# not bind. Only argument marshalling
+# happens below, so the measured time is the vendor kernel's. Preferred over it
+# is vllm-ascend's npu_hc_pre_v2 (see _get_baseline_mhc_pre_op); note that the
+# vendor kernel returns non-finite values for hidden_size <= 2048, which only
+# affects the comparison's meaning, not the timing.
 
 _ASCEND_SYMS = None
 _ASCEND_CACHE = {}
@@ -216,7 +350,7 @@ def _ascend_native_mhc_pre():
     """
     _ascend_load()
 
-    def npu_mhc_pre_ascend_native(
+    def npu_mhc_pre_clamp_sinkhorn_ascend_native(
         residual,
         fn,
         hc_scale,
@@ -267,7 +401,7 @@ def _ascend_native_mhc_pre():
             layer_input.reshape(n, h),
         )
 
-    return npu_mhc_pre_ascend_native
+    return npu_mhc_pre_clamp_sinkhorn_ascend_native
 
 
 # Every entry is a (module, attribute) pair; ascend is resolved by a special case
@@ -282,8 +416,22 @@ _NATIVE_MHC_PRE = {
 
 
 def _get_baseline_mhc_pre_op():
-    """Vendor-native mhc_pre, or None when this vendor ships none."""
+    """Vendor-native mhc_pre, or None when this vendor ships none.
+
+    On Ascend the preference order is: vllm-ascend's ``npu_hc_pre_v2`` (the
+    AscendC kernel behind ``torch.ops._C_ascend``, i.e. what the model runs),
+    then CANN's ``aclnnMhcPreSinkhorn`` bound through ctypes, then no baseline.
+    """
     if VENDOR == "ascend":
+        pre_op, _ = _resolve_vllm_ascend_ops()
+        if pre_op is not None:
+            return _vllm_ascend_hc_pre
+        warnings.warn(
+            "mhc_pre benchmark: falling back to aclnnMhcPreSinkhorn because "
+            + _vllm_ascend_unavailable_reason(),
+            RuntimeWarning,
+            stacklevel=2,
+        )
         try:
             return _ascend_native_mhc_pre()
         except (ImportError, OSError) as exc:
@@ -366,7 +514,7 @@ def test_mhc_post():
 class MHCPreBenchmark(base.Benchmark):
     DEFAULT_SHAPE_DESC = "N, hidden_size"
 
-    def __init__(self, *args, hc_mult=4, sinkhorn_repeat=10, **kwargs):
+    def __init__(self, *args, hc_mult=4, sinkhorn_repeat=20, **kwargs):
         self.hc_mult = hc_mult
         self.sinkhorn_repeat = sinkhorn_repeat
         super().__init__(*args, **kwargs)
@@ -506,7 +654,7 @@ class MHCBwdBenchmark(base.Benchmark):
 
             dist = torch.distributions.uniform.Uniform(0.0, 4.0)
             M = dist.sample((seqlen, n_stream, n_stream)).to(device)
-            R, _P = sinkhorn_forward(M, iters=self.sinkhorn_iters)
+            R, _P = sinkhorn_forward_ref(M, iters=self.sinkhorn_iters)
             dR = torch.randn_like(R)
 
             yield R.detach(), dR

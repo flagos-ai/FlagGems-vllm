@@ -21,16 +21,12 @@ against (currently 3.10, 3.11 or 3.12).
 
 ### Build tools
 
-The package uses `setuptools`. Install the build backend and test/build
-helpers before an editable install:
+The package uses `setuptools` and has no C/CUDA extensions. Install the build
+backend before an editable install:
 
 ```bash
 python -m pip install -U "setuptools>=64,<82" wheel packaging
 ```
-
-`scikit-build-core`, `pybind11`, `cmake` and `ninja` are only needed when
-building optional native extensions or when a vendor wheel is built from
-source; `tools/setup.sh` installs them into its virtual environment.
 
 ### FlagGems dependency
 
@@ -40,7 +36,7 @@ general FlagGems operators internally. Install a matching `flag-gems` release
 
 ```bash
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
 Use `--no-deps` when the vendor image already provides PyTorch/NumPy. In a
@@ -63,6 +59,12 @@ For other backends, use the vendor's PyTorch/Triton instructions. The
 validated combinations live in `src/flaggems_vllm/backends.yaml`; the `deps`, `triton`,
 `flagtree` and `vllm` fields there are the single source of truth used by
 `tools/setup.sh`.
+
+Prefer the backend's `flagtree:` pin over stock Triton where one exists.
+FlagTree provides the TLE (warp-specialization) extensions that several
+operators use for their fast path; without it they fall back to portable
+kernels that are correct but noticeably slower. See
+[step 3 of the manual install](#3-install-the-compiler-flagtree-or-triton).
 
 ## Install from Source
 
@@ -150,12 +152,13 @@ All defaults come from `src/flaggems_vllm/backends.yaml` and can be overridden:
 | `VENV_DIR` | Virtual environment directory (default `.venv`). |
 | `PIP_INDEX_URL` | Primary package index (default: PyPI; use a regional mirror if needed). |
 | `FLAG_GEMS_VERSION` | Override the registry's `flag-gems` pin (default 5.4.0). |
-| `FLAG_GEMS_INDEX` | Index that publishes `flag-gems` (default: FlagOS hosted index). |
+| `FLAG_GEMS_INDEX` | Index that publishes `flag-gems` (default: FlagOS daily index). |
 | `VLLM_VERSION` | Override a profile whose vLLM pin is `vllm==...` (NVIDIA). |
 | `VLLM_PACKAGE` | Full vLLM requirement or wheel URL; wins over `VLLM_VERSION`. |
 | `COMPILER` | `flagtree`, `triton` or `keep`. |
 | `USE_FLAGTREE` | `1` = force FlagTree, `0` = force Triton. |
 | `FLAGTREE_VERSION` / `TRITON_PACKAGE` | Override the compiler pin. |
+| `USE_FLAGCX` | `OFF` skips FlagTree's flagcx wrapper (needed on CUDA 13 hosts; only the distributed TLE ops use it). |
 | `SKIP_BACKEND_DEPS` | `1` = leave the vendor torch stack untouched. |
 | `SKIP_FLAGGEMS` / `SKIP_PROJECT` | Skip FlagGems / FlagGems-vllm install. |
 | `STRICT_TRITON_IMPORT` | `1` = fail when `import triton` fails. |
@@ -215,10 +218,55 @@ python -m pip install "setuptools>=64,<82" wheel packaging pybind11 PyYAML sqlal
 
 # FlagGems runtime
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
-### 3. Install FlagGems-vllm without replacing the vendor stack
+### 3. Install the compiler (FlagTree or Triton)
+
+A vendor image usually ships a matched compiler already, in which case skip
+this step. Note which one you have, because it decides whether the
+warp-specialized (TLE) kernels are reachable:
+
+```bash
+python - <<'PY'
+import importlib
+print("triton:", importlib.import_module("triton").__version__)
+try:
+    importlib.import_module("triton.experimental.tle.language")
+    print("TLE kernels: available")
+except Exception as error:
+    print(f"TLE kernels: unavailable ({type(error).__name__})")
+PY
+```
+
+Several operators carry a TLE fast path and a portable fallback. Both are
+correct, but the fallback is materially slower — sparse FlashMLA prefill, for
+example, runs about 2x slower on stock Triton than on FlagTree. The pin for
+your backend lives in `src/flaggems_vllm/backends.yaml` (`flagtree:` field):
+
+```bash
+# FlagTree replaces triton, so uninstall it first to avoid two providers
+# shadowing each other in site-packages.
+python -m pip uninstall -y triton
+python -m pip install "flagtree==0.7.0" \
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-nvidia/simple/
+```
+
+On a CUDA 13 host, also set `USE_FLAGCX=OFF`. FlagTree's optional `flagcx`
+wrapper loads a CUDA 12 `libcudart` at import time, and only the distributed
+TLE operators need it:
+
+```bash
+export USE_FLAGCX=OFF
+```
+
+Or let the script do all of the above:
+
+```bash
+COMPILER=flagtree bash tools/setup.sh --no-venv nvidia
+```
+
+### 4. Install FlagGems-vllm without replacing the vendor stack
 
 ```bash
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -239,7 +287,7 @@ concern, dropping `--no-deps` is optional:
 python -m pip install --no-build-isolation -e .
 ```
 
-### 4. Install the test dependencies
+### 5. Install the test dependencies
 
 The base test set is backend-neutral:
 
@@ -290,7 +338,7 @@ python -m pip install "vllm-ascend==0.24.0rc1"
 If you do not install vLLM, those tests skip; the rest of the suite still
 runs.
 
-### 5. Point FlagGems-vllm at the right backend
+### 6. Point FlagGems-vllm at the right backend
 
 `flaggems_vllm` auto-detects the accelerator, but explicit selection is more
 predictable in multi-vendor images:
@@ -300,7 +348,7 @@ export FLAGGEMS_VENDOR=ascend   # nvidia, ascend, hygon, metax, ...
 export DNN_VENDOR=ascend        # kept for compatibility with older docs
 ```
 
-### 6. Verify
+### 7. Verify
 
 ```bash
 # Device, vendor and float32 smoke check
@@ -327,7 +375,7 @@ For the full FlagOS vLLM plugin stack, install in this order:
 ```bash
 # 1. FlagGems (general operator backend)
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 
 # 2. FlagGems-vllm (vLLM-specific operators)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -351,12 +399,43 @@ export VLLM_PLUGINS=fl
 
 ### Missing CUDA
 
-If CUDA is not found, set `CUDA_HOME`:
+FlagGems-vllm is a pure-Python package; `pip install` does not access CUDA.
+A "CUDA not found" error is a Triton/PyTorch runtime issue, not an installation
+one. Check the runtime first:
 
 ```bash
+# Confirm PyTorch can see the GPU
+python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+
+# If the CUDA toolkit path is wrong, set it and re-import Triton
 export CUDA_HOME=/usr/local/cuda
-python -m pip install --no-build-isolation -e .
+python -c "import triton"
 ```
+
+If PyTorch or Triton is not correctly installed, refer to the
+"PyTorch, Triton and vLLM" section above, or rebuild the environment with
+`bash tools/setup.sh nvidia`.
+
+### FlagTree imports fail with `libcudart.so.12`
+
+On a CUDA 13 host, `import flaggems_vllm` (or any TLE operator) can fail with:
+
+```text
+OSError: libcudart.so.12: cannot open shared object file
+```
+
+FlagTree's optional `flagcx` wrapper loads a CUDA 12 `libcudart` when the TLE
+language is imported. Only the distributed TLE operators need it, so skip it:
+
+```bash
+export USE_FLAGCX=OFF
+```
+
+The NVIDIA profiles in `src/flaggems_vllm/backends.yaml` already set this, so
+environments built by `tools/setup.sh` inherit it from the venv activation
+script. Export it yourself in a manual install. `tools/setup.sh` also reports
+the compiler and TLE status when it leaves the compiler untouched
+(`COMPILER=keep`, the default for `--no-venv`).
 
 ### Triton Version Mismatch
 

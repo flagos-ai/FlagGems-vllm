@@ -12,13 +12,18 @@ preparation, compilation and capture stay outside the measured scope.
 import json
 import math
 import os
+import statistics
 import subprocess
 import sys
-from functools import partial
+import tempfile
+from functools import lru_cache, partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 import yaml
 
 if __name__ == "__main__":
@@ -31,12 +36,14 @@ if __name__ == "__main__":
 import flaggems_vllm  # noqa: E402
 from benchmark.base import Benchmark  # noqa: E402
 from benchmark.conftest import Config  # noqa: E402
-from benchmark.consts import BenchLevel  # noqa: E402
+from benchmark.consts import BenchLevel, BenchMode  # noqa: E402
 from flaggems_vllm.ops.gdn_w8a16 import quantize_gdn_state_fp8  # noqa: E402
-from tests.test_gdn_w8a16 import (  # noqa: E402
+from flaggems_vllm.runtime import torch_device_fn  # noqa: E402
+from tests.test_gdn_w8a16 import (
     build_int8_gdn_decode_inputs,
     build_int8_gdn_prefill_inputs,
 )
+from tests.test_gdn_w8a16 import make_inputs as make_fp8_gdn_inputs  # noqa: E402
 
 
 def _vllm_bf16(q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t):
@@ -115,28 +122,33 @@ class GdnW8A16Benchmark(Benchmark):
                 raise ValueError("This benchmark covers K=V=128")
             torch.manual_seed(42)
             device = flaggems_vllm.device
-            q = torch.randn(1, n * t, h, key_dim, device=device, dtype=cur_dtype)
-            k = torch.randn_like(q)
-            v = 0.125 * torch.randn(
-                1, n * t, hv, value_dim, device=device, dtype=cur_dtype
-            )
-            g = torch.empty(1, n * t, hv, device=device, dtype=cur_dtype).uniform_(
-                math.log(0.98), math.log(0.995)
-            )
-            beta = torch.rand(1, n * t, hv, device=device, dtype=cur_dtype)
+            q, k, v, g, beta, cu, _ = make_fp8_gdn_inputs(n, t, h, hv, cur_dtype)
             state = torch.zeros(
-                n + 1, hv, key_dim, value_dim, device=device, dtype=cur_dtype
+                n + 1,
+                hv,
+                key_dim,
+                value_dim,
+                device=device,
+                dtype=(
+                    torch.float32
+                    if flaggems_vllm.vendor_name == "mthreads"
+                    else cur_dtype
+                ),
             )
-            state_fp8, state_scale = quantize_gdn_state_fp8(state)
-            cu = torch.arange(0, n * t + 1, t, device=device, dtype=torch.int32)
+            if flaggems_vllm.vendor_name == "mthreads":
+                state = state.transpose(-1, -2)
+            state_fp8, state_scale = quantize_gdn_state_fp8(state.contiguous())
             indices = (
                 torch.arange(1, n + 1, device=device, dtype=torch.int64)[:, None]
                 .expand(n, t)
                 .contiguous()
             )
             inputs = q, k, v, g, beta, state, state_fp8, state_scale, cu, indices, t
-            baseline, _ = _vllm_bf16(*inputs)
-            torch.cuda.synchronize()
+            query_initial, key_initial = q.clone(), k.clone()
+            baseline, _ = self.torch_op(*inputs)
+            torch_device_fn.synchronize()
+            q.copy_(query_initial)
+            k.copy_(key_initial)
             # A zero initial state gives a closed-form first-token output.
             query = q.reshape(n, t, h, key_dim)[:, 0].float()
             key = k.reshape(n, t, h, key_dim)[:, 0].float()
@@ -157,15 +169,140 @@ class GdnW8A16Benchmark(Benchmark):
             yield inputs
 
 
+def _mthreads_bf16(
+    q, k, v, g, beta, state_bf16, state_fp8, state_scale, cu, indices, t
+):
+    from mate.gdn_prefill import chunk_gated_delta_rule
+
+    # The shared FP8 benchmark supplies precomputed gates and KV state;
+    # MATE's precomputed-gate interface takes unbatched QKV and VK state.
+    state = state_bf16.transpose(-1, -2)
+    out, final = chunk_gated_delta_rule(
+        q[0],
+        k[0],
+        v[0],
+        g=g[0],
+        beta=beta[0],
+        initial_state=state,
+        output_state=state,
+        output_final_state=True,
+        cu_seqlens=cu,
+        state_indices=indices[:, 0],
+        use_qk_l2norm_in_kernel=True,
+        is_log_space=True,
+    )
+    return out.unsqueeze(0), final
+
+
+class MthreadsGdnW8A16Benchmark(GdnW8A16Benchmark):
+    def get_latency(self, op, *args, **kwargs):
+        if Config.mode != BenchMode.KERNEL:
+            return super().get_latency(op, *args, **kwargs)
+        synchronize = torch_device_fn.synchronize
+        q, k, _, _, _, state, state_fp8, state_scale, _, _, _ = args
+        buffers = (q, k, state, state_fp8, state_scale)
+        saved = tuple(tensor.clone() for tensor in buffers)
+        samples = max(5, min(30, int(Config.repetition)))
+        warmups = max(1, min(5, int(Config.warm_up)))
+
+        def restore_state():
+            for tensor, original in zip(buffers, saved):
+                tensor.copy_(original)
+            synchronize()
+
+        for _ in range(warmups):
+            restore_state()
+            op(*args, **kwargs)
+        synchronize()
+        activities = torch.profiler.supported_activities()
+        if len(activities) < 2:
+            raise RuntimeError("MUSA GPU profiling is required for GDN kernel timing")
+        cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+        timings = []
+        # MUSA events include Python/graph submission gaps. Profile hardware
+        # activities instead; restore mutable inputs and clear L2 before collection.
+        with tempfile.TemporaryDirectory(prefix="gdn-musa-profile-") as directory:
+            trace_path = Path(directory) / "trace.json"
+            # Arm MUPTI once, then collect marked samples in the same session.
+            with torch.profiler.profile(activities=list(activities)) as profile:
+                restore_state()
+                op(*args, **kwargs)
+                synchronize()
+                for sample in range(samples):
+                    restore_state()
+                    cache.zero_()
+                    synchronize()
+                    with torch.profiler.record_function(f"gdn_sample_{sample}"):
+                        op(*args, **kwargs)
+                        synchronize()
+                # Drain the final target activity before stopping MUPTI.
+                cache.zero_()
+                synchronize()
+            profile.export_chrome_trace(str(trace_path))
+            events = json.loads(trace_path.read_text())["traceEvents"]
+            hardware = [
+                event
+                for event in events
+                if event.get("ph") == "X"
+                and event.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")
+            ]
+            activity_count = None
+            for sample in range(samples):
+                ranges = [
+                    (float(event["ts"]), float(event["ts"]) + float(event["dur"]))
+                    for event in events
+                    if event.get("ph") == "X"
+                    and event.get("cat") == "gpu_user_annotation"
+                    and event.get("name") == f"gdn_sample_{sample}"
+                ]
+                intervals = sorted(
+                    (float(event["ts"]), float(event["ts"]) + float(event["dur"]))
+                    for event in hardware
+                    if any(
+                        float(event["ts"]) >= left - 0.01
+                        and float(event["ts"]) + float(event["dur"]) <= right + 0.01
+                        for left, right in ranges
+                    )
+                )
+                if not intervals:
+                    raise RuntimeError("MUSA profiler returned no GPU activities")
+                if activity_count is None:
+                    activity_count = len(intervals)
+                elif activity_count != len(intervals):
+                    raise RuntimeError("MUSA profiler returned incomplete GPU samples")
+                # Union intervals so overlapping streams are not counted twice.
+                begin, end = intervals[0]
+                elapsed = 0.0
+                for left, right in intervals[1:]:
+                    if left > end:
+                        elapsed += end - begin
+                        begin, end = left, right
+                    else:
+                        end = max(end, right)
+                elapsed += end - begin
+                timings.append(elapsed / 1000.0)
+        restore_state()
+        return statistics.median(timings)
+
+
 @pytest.mark.gdn_w8a16
-@pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "nvidia"
-    or not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] < 9,
-    reason="FP8 GDN requires NVIDIA SM90 or newer",
-)
-def test_gdn_w8a16():
-    bench = GdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_vllm_bf16)
+def test_gdn_w8a16(tmp_path):
+    if flaggems_vllm.vendor_name == "mthreads":
+        bench = MthreadsGdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_mthreads_bf16)
+    elif flaggems_vllm.vendor_name == "metax":
+        run_perf_gdn_w8a16_metax(tmp_path)
+        return
+    elif "gdn_w8a16_int8" in vars(flaggems_vllm):
+        run_perf_gdn_w8a16_int8()
+        return
+    elif (
+        flaggems_vllm.vendor_name == "nvidia"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 9
+    ):
+        bench = GdnW8A16Benchmark(op_name="gdn_w8a16", torch_op=_vllm_bf16)
+    else:
+        pytest.skip("GDN is unsupported on this backend")
     bench.set_gems(_fp8)
     bench.run()
 
@@ -175,11 +312,18 @@ HYGON_INT8_STATE = (
     and flaggems_vllm.gdn_w8a16_int8.__module__
     == "flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16"
 )
+ASCEND_INT8_STATE = (
+    "gdn_w8a16_int8" in vars(flaggems_vllm)
+    and flaggems_vllm.gdn_w8a16_int8.__module__
+    == "flaggems_vllm.runtime.backend._ascend.ops.gdn_w8a16_int8"
+)
 
 
 class Int8StateGdnBenchmark(Benchmark):
     DEFAULT_DTYPES = (
-        [torch.bfloat16, torch.float16] if HYGON_INT8_STATE else [torch.bfloat16]
+        [torch.bfloat16, torch.float16]
+        if HYGON_INT8_STATE or ASCEND_INT8_STATE
+        else [torch.bfloat16]
     )
     DEFAULT_SHAPES = [
         (1, 8192, 32, 128),
@@ -215,7 +359,10 @@ class Int8StateGdnBenchmark(Benchmark):
             ]
 
     def get_input_iter(self, dtype):
-        if HYGON_INT8_STATE:
+        if ASCEND_INT8_STATE:
+            # Register OPP before allocating inputs creates an NPU context.
+            ascend_gdn_native_runtime()
+        elif HYGON_INT8_STATE:
             from vllm.model_executor.layers.fla.ops.chunk import (
                 chunk_gated_delta_rule as prefill,
             )
@@ -246,7 +393,13 @@ class Int8StateGdnBenchmark(Benchmark):
             torch.manual_seed(42)
             if len(shape) == 7:
                 _, reference, args = build_int8_gdn_prefill_inputs(shape, dtype)
-                yield ("prefill", prefill, reference), args
+                if ASCEND_INT8_STATE:
+                    native_call, buffers = prepare_ascend_gdn_prefill_baseline(
+                        reference
+                    )
+                    yield ("prefill", native_call, buffers), args
+                else:
+                    yield ("prefill", prefill, reference), args
                 continue
 
             separate_qkv = shape[0] == "update"
@@ -266,11 +419,6 @@ class Int8StateGdnBenchmark(Benchmark):
                 (tokens, packed, heads, columns), dtype, reduction
             )
             mixed, a, b, a_log, bias, scale, state, out, indices, normalize = reference
-            native_bias = bias.to(dtype)
-            native_indices = indices.to(torch.int32)
-            cu_seqlens = torch.arange(
-                tokens + 1, device=mixed.device, dtype=torch.int32
-            )
             if separate_qkv:
                 q, k, v = torch.split(
                     mixed,
@@ -282,6 +430,19 @@ class Int8StateGdnBenchmark(Benchmark):
                     k.reshape(1, tokens, query_heads, reduction).contiguous(),
                     v.reshape(1, tokens, heads, columns).contiguous(),
                 )
+            if ASCEND_INT8_STATE:
+                kind = "update" if separate_qkv else "decode"
+                if separate_qkv:
+                    reference, args = (qkv, *reference[1:]), (qkv, *args[1:])
+                native_call, buffers = prepare_ascend_gdn_decode_baseline(reference)
+                yield (kind, native_call, buffers), args
+                continue
+            native_bias = bias.to(dtype)
+            native_indices = indices.to(torch.int32)
+            cu_seqlens = torch.arange(
+                tokens + 1, device=mixed.device, dtype=torch.int32
+            )
+            if separate_qkv:
                 if HYGON_INT8_STATE:
                     native_call = partial(
                         update,
@@ -348,8 +509,65 @@ class Int8StateGdnBenchmark(Benchmark):
                     )
                 yield ("decode", native_call, state), args
 
+    def get_latency(self, op, *args, **kwargs):
+        if not ASCEND_INT8_STATE:
+            return super().get_latency(op, *args, **kwargs)
+        if Config.mode != BenchMode.KERNEL:
+            raise ValueError("Ascend stateful GDN measurements require --mode kernel")
+        reference, inputs = args
+        if op is self.torch_op:
+            buffers = reference[2]
+        elif reference[0] == "prefill":
+            buffers = inputs[5:7]
+        else:
+            buffers = inputs[6:9]
+        from triton.backends.ascend.testing import (
+            KernelMonitor,
+            do_bench_npu_mspti,
+            do_bench_npu_profiler,
+        )
+
+        saved = tuple(tensor.clone() for tensor in buffers)
+        do_bench = (
+            do_bench_npu_mspti if KernelMonitor is not None else do_bench_npu_profiler
+        )
+        samples = []
+        warmup, repetitions = min(Config.warm_up, 5), min(Config.repetition, 30)
+        try:
+            for index in range(warmup + repetitions):
+                prepare = True
+
+                def call():
+                    nonlocal prepare
+                    if prepare:
+                        # Both upstream helpers invoke once before profiling.
+                        # Use that call to restore state outside the timed region.
+                        for tensor, original in zip(buffers, saved):
+                            tensor.copy_(original)
+                        torch_device_fn.synchronize()
+                        prepare = False
+                    else:
+                        op(*args, **kwargs)
+
+                if index < warmup:
+                    call()
+                    call()
+                    torch_device_fn.synchronize()
+                else:
+                    samples.append(do_bench(call, warmup=0, active=1))
+        finally:
+            for tensor, original in zip(buffers, saved):
+                tensor.copy_(original)
+        if not samples or any(
+            not math.isfinite(value) or value <= 0 for value in samples
+        ):
+            raise RuntimeError("NPU profiling did not return valid device latencies")
+        return statistics.median(samples)
+
 
 def native_int8_state_gdn_baseline(reference, args):
+    if ASCEND_INT8_STATE:
+        return reference[1]()
     kind, native_call, data = reference
     if kind == "prefill":
         if HYGON_INT8_STATE:
@@ -390,7 +608,7 @@ def native_int8_state_gdn_baseline(reference, args):
 def run_int8_state_gdn(reference, args):
     if reference[0] == "prefill":
         return flaggems_vllm.chunk_gated_delta_rule_w8a16_int8(*args)
-    elif reference[0] == "update" and not HYGON_INT8_STATE:
+    elif reference[0] == "update" and not (HYGON_INT8_STATE or ASCEND_INT8_STATE):
         import flag_gems
 
         tokens = args[0][0].shape[1]
@@ -402,12 +620,178 @@ def run_int8_state_gdn(reference, args):
         return flaggems_vllm.gdn_w8a16_int8(*args)
 
 
-@pytest.mark.gdn_w8a16
-@pytest.mark.skipif(
-    "gdn_w8a16_int8" not in vars(flaggems_vllm),
-    reason="backend does not export INT8-state GDN",
-)
-def test_perf_gdn_w8a16_int8():
+# L2 kernel and launch parameters from vLLM 65711a16, ops/l2norm.py.
+# SPDX-FileCopyrightText: Songlin Yang, Yu Zhang; vLLM contributors.
+@triton.jit
+def _ascend_gdn_baseline_l2norm_kernel(
+    X, Y, eps, M, N: tl.constexpr, BD: tl.constexpr, MBLOCK: tl.constexpr
+):
+    xoffset = tl.program_id(0) * MBLOCK
+    row_idx = xoffset + tl.arange(0, MBLOCK)[:, None]
+    xmask = row_idx < M
+    rindex = tl.arange(0, BD)[None, :]
+    cmask = rindex < N
+    mask = xmask & cmask
+    xs = tl.load(X + (rindex + N * row_idx), mask, other=0.0).to(tl.float32)
+    square = tl.broadcast_to(xs * xs, [MBLOCK, BD])
+    square_sum = tl.sum(tl.where(xmask, square, 0), 1)[:, None]
+    rsqrt = tl.rsqrt(square_sum + eps)
+    tl.store(Y + (rindex + N * row_idx), xs * rsqrt, mask)
+
+
+def _ascend_gdn_baseline_l2norm(x, eps=1e-6):
+    shape = x.shape
+    x = x.view(-1, shape[-1])
+    output = torch.empty_like(x)
+    rows, columns = x.shape
+    block = min(65536 // x.element_size(), triton.next_power_of_2(columns))
+    if columns > block:
+        raise NotImplementedError("GDN baseline normalization exceeds 64KB per row")
+    _ascend_gdn_baseline_l2norm_kernel[(triton.cdiv(rows, 32),)](
+        x, output, eps, rows, columns, block, 32
+    )
+    return output.view(shape)
+
+
+@lru_cache(maxsize=1)
+def ascend_gdn_native_runtime():
+    """Load the standalone latest kernels without the 0.26 model worker."""
+    if os.environ.get("VLLM_PLUGINS") != "":
+        raise RuntimeError(
+            "The standalone GDN baseline requires VLLM_PLUGINS='' before Python starts"
+        )
+    import torch_npu
+    from fla_npu.ops.ascendc import (
+        chunk_gated_delta_rule_fwd,
+        recurrent_gated_delta_rule,
+    )
+    from vllm_ascend.ops.gdn_attn_builder import (
+        _build_non_spec_chunked_prefill_metadata,
+    )
+    from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
+    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+    torch_npu.npu.set_compile_mode(jit_compile=False)
+    init_device_properties_triton()
+    return (
+        chunk_gated_delta_rule_fwd,
+        _ascend_gdn_baseline_l2norm,
+        fused_gdn_gating_patch,
+        _build_non_spec_chunked_prefill_metadata,
+        recurrent_gated_delta_rule,
+    )
+
+
+def prepare_ascend_gdn_decode_baseline(reference):
+    """Native Ascend BF16 activations / FP32 state, including gating and QK norm."""
+    _, normalize_qk, gating, _, recurrent = ascend_gdn_native_runtime()
+    mixed, a, b, a_log, bias, scale, state, out, indices, normalize = reference
+    a, b = (tensor.to(torch.bfloat16) for tensor in (a, b))
+    is_packed = not isinstance(mixed, tuple)
+    if is_packed:
+        mixed = mixed.to(torch.bfloat16)
+        out = torch.empty(out.shape, device=out.device, dtype=torch.bfloat16)
+        tokens, heads, columns, reduction = mixed.shape[0], *state.shape[1:]
+        query_heads = (mixed.shape[1] - heads * columns) // (2 * reduction)
+        query, key, value = mixed.split(
+            (query_heads * reduction, query_heads * reduction, heads * columns),
+            dim=-1,
+        )
+        query = query.view(1, tokens, query_heads, reduction)
+        key = key.view_as(query)
+        value = value.view(tokens, heads, columns)
+    else:
+        query, key, value = (tensor.to(torch.bfloat16) for tensor in mixed)
+        tokens = query.shape[1]
+        value = value.squeeze(0)
+    lengths = torch.tensor([0] + [1] * tokens, device=query.device, dtype=torch.int32)
+    indices = indices.to(torch.int32)
+
+    def _run():
+        gate, beta = gating(a_log, a, b, bias)
+        if normalize:
+            q_norm, k_norm = normalize_qk(query.contiguous()), normalize_qk(
+                key.contiguous()
+            )
+        else:
+            q_norm, k_norm = query, key
+        result = recurrent(
+            q_norm.squeeze(0),
+            k_norm.squeeze(0),
+            value.contiguous(),
+            state,
+            beta=beta.squeeze(0),
+            g=gate.squeeze(0),
+            scale=scale,
+            actual_seq_lengths=lengths,
+            ssm_state_indices=indices,
+        )
+        if is_packed:
+            out.copy_(result.view_as(out))
+            return out, state
+        return result.unsqueeze(0), state
+
+    return _run, (state, out) if is_packed else (state,)
+
+
+def prepare_ascend_gdn_prefill_baseline(reference):
+    """Native chunk metadata is constructed outside the timed public call."""
+    prefill, normalize_qk, _, build_metadata, _ = ascend_gdn_native_runtime()
+    q, k, v, beta = (
+        reference[name].to(torch.bfloat16) for name in ("q", "k", "v", "beta")
+    )
+    state = reference["initial_state"]
+    boundaries = torch.tensor(reference["raw_cu_seqlens"], dtype=torch.int32)
+    builder = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(linear_num_value_heads=v.shape[2])
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        )
+    )
+    plan = build_metadata(builder, boundaries, q.device)
+
+    # Port the A2/A3 DeviceOperator.fla_gdn_prefill call from Ascend 35d8014c.
+    # Metadata is built by 0.26; all native kernels and launch options are current.
+    def _run():
+        q_norm = normalize_qk(q.contiguous()).contiguous()
+        k_norm = normalize_qk(k.contiguous()).contiguous()
+        initial = state.transpose(-1, -2).contiguous()
+        if plan.keep_meta is not None:
+            initial = state[plan.keep_meta].transpose(-1, -2).contiguous()
+        output, final, *_ = prefill(
+            q_norm.transpose(1, 2).contiguous(),
+            k_norm.transpose(1, 2).contiguous(),
+            v.contiguous().transpose(1, 2).contiguous(),
+            reference["g"].to(torch.float32).contiguous(),
+            beta.to(v.dtype).contiguous(),
+            initial_state=initial,
+            output_final_state=True,
+            chunk_size=64,
+            cu_seqlens=(
+                plan.cu_seqlens_host if plan.keep_meta is None else plan.cu_seqlens_kern
+            ),
+            chunk_indices=plan.chunk_indices_chunk64_host,
+            scale=q.shape[-1] ** -0.5,
+            layout="BNSD",
+            use_exp2=False,
+            use_qk_l2norm_in_kernel=False,
+            allow_neg_eigval=False,
+            disable_recompute=True,
+            state_v_first=False,
+        )
+        if plan.keep_meta is not None:
+            full = state.transpose(-1, -2).contiguous()
+            full[plan.keep_meta] = final
+            final = full
+        state.copy_(final.transpose(-1, -2).contiguous())
+        return output, state
+
+    return _run, (state,)
+
+
+def run_perf_gdn_w8a16_int8():
     bench = Int8StateGdnBenchmark(
         op_name="gdn_w8a16", torch_op=native_int8_state_gdn_baseline
     )
@@ -525,17 +909,37 @@ def main(*, rows=None, public_entry=False):
 
     load_general_plugins()
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.fla.ops import chunk_delta_h
-    from vllm.model_executor.layers.fla.ops.fused_recurrent import (
-        fused_recurrent_gated_delta_rule_packed_decode,
-    )
-    from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
-        fused_sigmoid_gating_delta_rule_update,
-    )
-    from vllm.model_executor.layers.fla.ops.index import (
-        prepare_chunk_indices,
-        prepare_chunk_offsets,
-    )
+
+    try:
+        from vllm.third_party.flash_linear_attention.ops import chunk_delta_h
+        from vllm.third_party.flash_linear_attention.ops.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+        from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+        from vllm.third_party.flash_linear_attention.ops.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name not in {
+            "vllm.third_party",
+            "vllm.third_party.flash_linear_attention",
+            "vllm.third_party.flash_linear_attention.ops",
+        }:
+            raise
+        from vllm.model_executor.layers.fla.ops import chunk_delta_h
+        from vllm.model_executor.layers.fla.ops.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+        from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+        from vllm.model_executor.layers.fla.ops.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         ChunkGatedDeltaRule,
     )
@@ -909,8 +1313,7 @@ def _metax_shape_row(shape):
     return {"op": op, "shape": list(shape), "count": 1}
 
 
-@pytest.mark.gdn_w8a16
-def test_perf_gdn_w8a16_metax(tmp_path):
+def run_perf_gdn_w8a16_metax(tmp_path):
     """Use shared shapes with the paired CUDA Graph benchmark and FP32 state."""
     from flaggems_vllm import vendor_name
 

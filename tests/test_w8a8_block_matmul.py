@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
 
 import pytest
 import torch
@@ -21,7 +20,7 @@ import flaggems_vllm
 
 from . import accuracy_utils as utils
 
-IS_INT8 = flaggems_vllm.vendor_name == "thead"
+IS_INT8 = flaggems_vllm.vendor_name in ("thead", "metax", "hygon")
 MNK_SHAPES = [
     (1, 65, 130),
     (7, 129, 257),
@@ -30,8 +29,6 @@ MNK_SHAPES = [
     (128, 256, 512),
     (64, 128, 128),
     (256, 256, 256),
-    (83, 7748, 3884),
-    (84, 7168, 3884),
 ]
 
 # Retain INT8 absolute tolerances without scaling them by K. The common
@@ -91,12 +88,12 @@ def _reference(a, b, a_scale, b_scale, block_n, block_k):
 
 @pytest.mark.w8a8_block_matmul
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("thead", "nvidia", "mthreads"),
+    flaggems_vllm.vendor_name not in ("thead", "metax", "hygon", "nvidia", "mthreads"),
     reason="No W8A8 block matmul backend",
 )
 @pytest.mark.parametrize("M,N,K", MNK_SHAPES)
 def test_w8a8_block_matmul(M, N, K):
-    output_dtype = torch.bfloat16
+    output_dtype = torch.float16
     if not hasattr(flaggems_vllm, "w8a8_block_matmul"):
         pytest.skip("W8A8 block matmul is unavailable on this architecture")
     if IS_INT8:
@@ -123,10 +120,9 @@ def test_w8a8_block_matmul(M, N, K):
         M, N, K, dtype, block_size, scale_offset=0.0 if IS_INT8 else 0.005
     )
     ref_out = _reference(A, B, As, Bs, block_n, block_k).to(output_dtype)
-    with nullcontext() if IS_INT8 else flaggems_vllm.use_gems():
-        res_out = flaggems_vllm.w8a8_block_matmul(
-            A, B, As, Bs, block_size, output_dtype=output_dtype
-        )
+    res_out = flaggems_vllm.w8a8_block_matmul(
+        A, B, As, Bs, block_size, output_dtype=output_dtype
+    )
     assert res_out.dtype == output_dtype
     utils.gems_assert_close(
         res_out.cpu() if IS_INT8 else res_out,

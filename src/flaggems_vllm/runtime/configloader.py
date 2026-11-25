@@ -484,6 +484,16 @@ class ConfigLoader(object):
                 for w in ranges["w"]
             ]
 
+        if op_name.startswith("w8a8_block_int8_") and (
+            "SCHEDULE" in ranges or "VECTOR" in ranges
+        ):
+            meta_map = {k: k for k in ranges if k not in ("s", "w")}
+            param_map = {"META": meta_map, "num_stages": "s", "num_warps": "w"}
+            configs = self.to_gen_config({**ranges, "param_map": param_map})
+            for config in configs:
+                config.pre_hook = pre_hook
+            return configs
+
         if op_name in ("w8a8_block_int8_matmul", "w8a8_block_int8_swap"):
             return [
                 triton.Config(
@@ -705,6 +715,14 @@ class ConfigLoader(object):
             ),
             "w8a8_block_int8_gemv": self._build_single_expand_spec(
                 "w8a8_block_int8_gemv",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
+            ),
+            "w8a8_block_int8_general": self._build_single_expand_spec(
+                "w8a8_block_int8_general",
+                expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
+            ),
+            "w8a8_block_int8_gemv_block": self._build_single_expand_spec(
+                "w8a8_block_int8_gemv_block",
                 expand_yaml_path=self._get_expand_config_path("w8a8_block_int8_matmul"),
             ),
             "w8a8_block_int8_splitk": self._build_single_expand_spec(

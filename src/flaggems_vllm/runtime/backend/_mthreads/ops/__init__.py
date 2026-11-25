@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
+    cooperative_topk,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
@@ -35,20 +38,31 @@ from flaggems_vllm.runtime.backend._mthreads.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.gdn_w8a16 import (
+    chunk_gated_delta_rule_w8a16_fp8,
+    gated_delta_rule_decode_w8a16_fp8,
+    gdn_w8a16,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.runtime.backend._mthreads.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._mthreads.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.logprob import compute_topk_scores
+from flaggems_vllm.runtime.backend._mthreads.ops.mhc_pre_broadcast import (
+    mhc_pre_broadcast,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.persistent_topk import persistent_topk
+from flaggems_vllm.runtime.backend._mthreads.ops.ple_conv import ple_conv
 from flaggems_vllm.runtime.backend._mthreads.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._mthreads.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._mthreads.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -58,22 +72,34 @@ from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
 from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_matmul import (
     w8a8_block_matmul,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.watermark import (
+    draft_watermarking_mask,
+)
 
 __all__ = [
+    "chunk_gated_delta_rule_w8a16_fp8",
+    "compute_topk_scores",
+    "cooperative_topk",
     "dequantize_and_gather_k_cache",
+    "draft_watermarking_mask",
     "flash_attn_varlen_func_w8a8_fp8",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
     "fused_q_kv_rmsnorm",
+    "gated_delta_rule_decode_w8a16_fp8",
+    "gdn_w8a16",
     "gemma_rms_norm",
     "grouped_topk",
     "hc_combine",
     "inplace_fused_experts",
+    "mhc_pre_broadcast",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "ple_conv",
     "ple_state_scatter_",
+    "qsa_prepare",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",

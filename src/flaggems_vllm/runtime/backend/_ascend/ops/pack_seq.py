@@ -40,9 +40,10 @@ def _pack_seq_kernel(
     GRID_D: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    pid_d = pid % GRID_D  # block over feature dimension
-    pid_t = (pid // GRID_D) % GRID_T  # block over time dimension
-    pid_b = pid // (GRID_T * GRID_D)  # batch id
+    first_tile = pid * PER_CORE_ROWS
+    pid_d = first_tile % GRID_D  # block over feature dimension
+    pid_t = (first_tile // GRID_D) % GRID_T  # block over time dimension
+    pid_b = first_tile // (GRID_T * GRID_D)  # batch id
     in_start = 0
     for i in range(pid_b):
         in_start += tl.load(lengths_ptr + i)
