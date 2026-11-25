@@ -1578,6 +1578,12 @@ def test_fused_marlin_moe_w8a16_fp8_ppu(
                 flaggems_vllm.vendor_name != "thead", reason="T-Head bounded dense path"
             ),
         ),
+        pytest.param(
+            512,
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "metax", reason="MetaX dense FP8 path"
+            ),
+        ),
     ],
 )
 @pytest.mark.parametrize("updated_tensor", ["w1", "w2", "w1_scale", "w2_scale"])
@@ -1727,14 +1733,31 @@ def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 graph replay"
+    flaggems_vllm.vendor_name not in ("thead", "metax"),
+    reason="T-Head and MetaX FP8 graph replay",
 )
-@pytest.mark.parametrize("config", [(1, 16, 1024, 128, 6), (88, 64, 1024, 128, 4)])
+@pytest.mark.parametrize(
+    "config",
+    [
+        (1, 16, 1024, 128, 6),
+        (88, 64, 1024, 128, 4),
+        pytest.param(
+            (512, 4, 128, 256, 2),
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "metax", reason="MetaX dense FP8 path"
+            ),
+            id="metax-dense",
+        ),
+    ],
+)
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+@pytest.mark.parametrize(
+    "use_inference_mode", [True, False], ids=["inference", "normal"]
+)
 def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
-    config, apply_router_weight_on_input
+    config, apply_router_weight_on_input, use_inference_mode
 ):
-    with torch.inference_mode():
+    with torch.inference_mode(use_inference_mode):
         args = _make_inputs_fp8_weight(*config, torch.bfloat16, flaggems_vllm.device)
         hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = args
 
@@ -1851,7 +1874,8 @@ def test_fused_marlin_moe_mxfp4_alignment_ppu(hidden_size, intermediate_size):
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+    flaggems_vllm.vendor_name not in ("thead", "metax"),
+    reason="T-Head and MetaX E4M3 byte decoding",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 33])
@@ -1881,26 +1905,80 @@ def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens, num_expe
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+    flaggems_vllm.vendor_name not in ("thead", "metax"),
+    reason="T-Head and MetaX E4M3 byte decoding",
 )
-@pytest.mark.parametrize("num_tokens,num_experts", [(1, 2), (33, 2), (1, 16), (4, 16)])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts",
+    [
+        (1, 2),
+        (33, 2),
+        (1, 16),
+        (4, 16),
+        pytest.param(
+            512,
+            2,
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "metax", reason="MetaX dense FP8 path"
+            ),
+            id="metax-dense",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,group_size",
+    [
+        pytest.param(
+            96,
+            160,
+            -1,
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "thead", reason="T-Head per-channel shape"
+            ),
+            id="ppu-per-channel",
+        ),
+        pytest.param(
+            128,
+            128,
+            128,
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "metax", reason="MetaX group-128 shape"
+            ),
+            id="metax-group128",
+        ),
+    ],
+)
 @pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
-    "special", ["weight_nan", "scale_inf", "scale_nan", "scale_large"]
+    "special", ["weight_nan", "weight_neg_nan", "scale_inf", "scale_nan", "scale_large"]
 )
 def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
-    num_tokens, num_experts, scale_dtype, special
+    num_tokens,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    group_size,
+    scale_dtype,
+    special,
 ):
     hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
-        num_tokens, num_experts, 96, 160, 2, torch.bfloat16, flaggems_vllm.device, -1
+        num_tokens,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        2,
+        torch.bfloat16,
+        flaggems_vllm.device,
+        group_size,
     )
     # Positive subnormal codes isolate scale overflow from cancellation error.
     w1.view(torch.uint8).fill_(1)
     w2.view(torch.uint8).fill_(1)
     hs.fill_(1e-15)
     s1 = s1.to(scale_dtype)
-    if special == "weight_nan":
-        w1.view(torch.uint8)[0, 0, 0] = 127
+    s2 = s2.to(scale_dtype)
+    if special in ("weight_nan", "weight_neg_nan"):
+        w1.view(torch.uint8)[0, 0, 0] = 127 if special == "weight_nan" else 255
     else:
         s1.fill_(
             {"scale_inf": float("inf"), "scale_nan": float("nan"), "scale_large": 1e20}[
@@ -1920,12 +1998,149 @@ def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
         topk_weights=tw,
         topk_ids=ti,
         quant_type_id=QUANT_TYPE_FP8_E4M3,
-        group_size=-1,
+        group_size=group_size,
     )
     reference = _reference_swiglu_moe(hs, w1_ref, w2_ref, tw, ti)
     gems_assert_close(
         actual, reference.to(hs.dtype), hs.dtype, equal_nan=True, reduce_dim=128
     )
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX FP16 E4M3 NaN decoding"
+)
+@pytest.mark.parametrize("num_tokens", [1, 16, 512])
+@pytest.mark.parametrize("nan_code", [0x7F, 0xFF])
+def test_fused_marlin_moe_w8a16_fp8_fp16_nan_metax(num_tokens, nan_code):
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
+        num_tokens, 2, 128, 128, 2, torch.float16, flaggems_vllm.device, 128
+    )
+    w1.view(torch.uint8).fill_(0x30)
+    w2.view(torch.uint8).fill_(0x30)
+    w1.view(torch.uint8)[0, 0, 0] = nan_code
+    hs.fill_(0.5)
+    s1.fill_(0.01)
+    s2.fill_(0.01)
+    w1_ref = (w1.float() * s1.expand(w1.shape)).to(hs.dtype)
+    w2_ref = (w2.float() * s2.expand(w2.shape)).to(hs.dtype)
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, tw, ti, QUANT_TYPE_FP8_E4M3
+    )
+    reference = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+    gems_assert_close(
+        actual, reference.to(hs.dtype), hs.dtype, equal_nan=True, reduce_dim=128
+    )
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax",
+    reason="MetaX N_TILES>1 Stage 2 FP8 NaN fixup coverage",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("intermediate_size", [256, 384])
+@pytest.mark.parametrize("nan_code", [0x7F, 0xFF])
+def test_fused_marlin_moe_w8a16_fp8_w2_ntiles_nan_metax(
+    dtype, intermediate_size, nan_code
+):
+    # M=32, E=8, topk=2 -> 8 routes/expert (SPARSE_TIER); H=512 -> N_TILES=8.
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
+        32, 8, 512, intermediate_size, 2, dtype, flaggems_vllm.device, 128
+    )
+    w1.view(torch.uint8).fill_(0x30)
+    w2.view(torch.uint8).fill_(0x30)
+    hs.fill_(0.5)
+    s1.fill_(0.01)
+    s2.fill_(0.01)
+    w2_nan = w2.clone()
+    w2_nan.view(torch.uint8)[0, 5, 3] = nan_code
+    w1_ref = (w1.float() * s1.repeat_interleave(128, dim=-1)).to(dtype)
+    w2_ref = (w2_nan.float() * s2.repeat_interleave(128, dim=-1)).to(dtype)
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2_nan, None, None, s1, s2, tw, ti, QUANT_TYPE_FP8_E4M3
+    )
+    reference = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
+    assert torch.isnan(actual).any()
+    gems_assert_close(
+        actual, reference.to(dtype), dtype, equal_nan=True, reduce_dim=intermediate_size
+    )
+    # Clean call after NaN fixup must not leak NaN via a stale flag.
+    clean = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, tw, ti, QUANT_TYPE_FP8_E4M3
+    )
+    assert not torch.isnan(clean).any()
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX bounded dense workspace"
+)
+@pytest.mark.parametrize("inplace", [False, True])
+def test_fused_marlin_moe_w8a16_dense_workspace_metax(monkeypatch, inplace):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
+        512, 4, 256, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    kwargs = dict(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=s1,
+        w2_scale=s2,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_FP8_E4M3,
+    )
+    reference = flaggems_vllm.fused_marlin_moe(**kwargs)
+    # Force multi-chunk expert w1 dequant (2 expert chunks) and multi-tile down routing.
+    monkeypatch.setattr(backend, "FP8_DENSE_MAX_WORKSPACE_BYTES", 2 << 20)
+    monkeypatch.setattr(backend, "DOWN_ROUTE_MAX_BYTES", 256 << 10)
+    flaggems_vllm.fused_marlin_moe(**kwargs)
+    hs_in = hs.clone() if inplace else hs
+    torch_device_fn.synchronize()
+    initial_bytes = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual = flaggems_vllm.fused_marlin_moe(
+        **dict(kwargs, hidden_states=hs_in), inplace=inplace
+    )
+    torch_device_fn.synchronize()
+    output_bytes = 0 if inplace else hs.numel() * hs.element_size()
+    assert torch.cuda.max_memory_allocated() - initial_bytes <= (2 << 20) + output_bytes
+    gems_assert_equal(actual, reference)
+    del actual
+    if inplace:
+        del hs_in
+    torch_device_fn.synchronize()
+    expected_after = initial_bytes - (hs.numel() * hs.element_size() if inplace else 0)
+    assert torch.cuda.memory_allocated() == expected_after
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "metax", reason="MetaX 4-byte weight alignment check"
+)
+@pytest.mark.parametrize("quant", [QUANT_TYPE_FP8_E4M3, QUANT_TYPE_UINT4B8])
+@pytest.mark.parametrize("num_tokens", [1, 16])
+def test_fused_marlin_moe_alignment_metax(quant, num_tokens):
+    make_inputs = (
+        _make_inputs_fp8_weight
+        if quant == QUANT_TYPE_FP8_E4M3
+        else _make_inputs_w4a16_int4
+    )
+    hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
+        num_tokens, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    raw = torch.empty(w1.numel() + 1, device=w1.device, dtype=torch.uint8)
+    raw[1:].copy_(w1.view(torch.uint8).reshape(-1))
+    w1_unaligned = raw[1:].view(w1.dtype).reshape(w1.shape)
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        flaggems_vllm.fused_marlin_moe(
+            hs, w1_unaligned, w2, None, None, s1, s2, tw, ti, quant
+        )
 
 
 # -----------------------------------------------------------------------------
