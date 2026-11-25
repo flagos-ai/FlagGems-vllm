@@ -82,7 +82,7 @@ iluvatar = [
     # resolved from specific repos, and there are no tools to resolve them.
     "opencv-python-headless @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/opencv-python-headless/5.1.0.95+flagos/opencv_python_headless-5.1.0.95+flagos-cp37-abi3-manylinux_2_17_x86_64.whl#sha256=5a4424b67ccf9482198c6f881c10038029844df5ec16cf2066a4422089b4944d",
     "compressed-tensors @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/compressed-tensors/0.17.0+flagos/compressed_tensors-0.17.0+flagos-py3-none-any.whl#sha256=42eb84cf77034f6bcb258681b93eebbb6037b6946198879f6a223dc5b2d15440",
-    "numpy<2",
+    "numpy<3",
 ]
 
 hygon = [
