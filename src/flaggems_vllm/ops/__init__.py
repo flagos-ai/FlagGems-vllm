@@ -75,6 +75,10 @@ from flaggems_vllm.ops.flash_attn_varlen_func_w8a8_fp8 import (
     flash_attn_varlen_func_w8a8_fp8,
 )
 from flaggems_vllm.ops.flash_mla import flash_mla
+from flaggems_vllm.ops.flash_topk import (
+    flash_topk_decode,
+    flash_topk_prefill,
+)
 from flaggems_vllm.ops.flash_mla_sparse_fwd_w8a8 import (
     flash_mla_sparse_fwd_w8a8,
 )
@@ -351,6 +355,8 @@ __all__ = [
     "flash_mla_sparse_fwd_w8a8",
     "flash_mla_with_kvcache",
     "flash_mla_with_kvcache_w8a8",
+    "flash_topk_decode",
+    "flash_topk_prefill",
     "fp32_router_gemm",
     "fp8_einsum",
     "fp8_fp4_mqa_logits",
