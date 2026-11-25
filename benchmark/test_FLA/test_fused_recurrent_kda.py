@@ -6,6 +6,7 @@ import json
 import math
 import os
 import statistics
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,14 @@ from benchmark.conftest import Config, update_result
 from benchmark.consts import BenchMode
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_FLA.test_fused_recurrent_kda import assert_result, reference
+
+# Measure the vendor implementation, matching tests/test_FLA/test_fused_recurrent_kda.py.
+try:
+    _gems_op = import_module(
+        f"flaggems_vllm.runtime.backend._{gems.vendor_name}.FLA"
+    ).fused_recurrent_kda
+except (ModuleNotFoundError, AttributeError):
+    _gems_op = gems.fused_recurrent_kda
 
 
 def _measure(fn, data, state):
@@ -64,11 +73,13 @@ class FusedRecurrentKDABenchmark(Benchmark):
         self.native_reason = None
         if gems_only:
             self.native_reason = "native timing disabled by --metrics"
-        elif gems.vendor_name == "ascend":
-            self.native_reason = (
-                "Ascend native KDA disabled: native accuracy is unstable"
-            )
         else:
+            # Try every vendor's native entry point. On Ascend this resolves
+            # vllm-ascend's Triton KDA, which matches this kernel within bf16
+            # noise (see test_fused_recurrent_kda_matches_vllm_ascend). The
+            # per-case accuracy gate below still runs assert_result against the
+            # fp64 oracle, so an inaccurate native is dropped from the speedup
+            # columns instead of being reported.
             try:
                 self.native_op = baseline.native()
                 self.native_reason = baseline.NATIVE_UNAVAILABLE_REASON
@@ -184,6 +195,6 @@ def test_fused_recurrent_kda():
     FusedRecurrentKDABenchmark(
         op_name=baseline.OP_NAME,
         torch_op=_native_slot,
-        gems_op=gems.fused_recurrent_kda,
+        gems_op=_gems_op,
         is_inplace=baseline.IS_INPLACE,
     ).run()
