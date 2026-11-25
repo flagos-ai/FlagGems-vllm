@@ -27,36 +27,6 @@ import flaggems_vllm  # noqa: E402
 from . import accuracy_utils as utils  # noqa: E402
 from . import conftest as cfg  # noqa: E402
 
-try:
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm as _VllmGemmaRMSNorm
-
-    _HAS_VLLM_GEMMA = True
-except ImportError:
-    _HAS_VLLM_GEMMA = False
-
-
-def _vllm_gemma_rms_norm(x, w, eps):
-    """Reference using vllm.model_executor.layers.layernorm.GemmaRMSNorm."""
-    # vLLM's CustomOp must be instantiated inside a vLLM config context;
-    # newer vLLM raises "Current vLLM config is not set" otherwise.
-    from vllm.config import VllmConfig, set_current_vllm_config
-
-    N = x.shape[-1]
-    with set_current_vllm_config(VllmConfig()):
-        norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
-    norm.weight = torch.nn.Parameter(w.float())
-    norm = norm.to(x.device)
-    with torch.inference_mode():
-        return norm(x)
-
-
-def _torch_gemma_rms_norm(x, w, eps):
-    x = x.to(dtype=torch.float32)
-    w = w.to(dtype=torch.float32)
-    rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
-    return (1 + w) * x * rrms
-
-
 # hidden_size of the gemma-3 series models
 _gemma_rms_norm_ns = [1152, 3840, 5376]
 # Batch size
@@ -75,11 +45,15 @@ def test_gemma_rms_norm(shape, dtype):
     w = torch.randn((N), dtype=dtype, device=flaggems_vllm.runtime.device.name)
     eps = 1e-5
 
-    if _HAS_VLLM_GEMMA:
-        ref_out = _vllm_gemma_rms_norm(x, w, eps)
-    else:
-        ref_out = _torch_gemma_rms_norm(x, w, eps)
+    def _torch_gemma_rms_norm(x, w, eps):
+        x = x.to(dtype=torch.float32)
+        w = w.to(dtype=torch.float32)
+        rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
+        return (1 + w) * x * rrms
 
-    res_out = flaggems_vllm.gemma_rms_norm(x, w, eps)
+    ref_out = _torch_gemma_rms_norm(x, w, eps)
+
+    with flaggems_vllm.use_gems():
+        res_out = flaggems_vllm.gemma_rms_norm(x, w, eps)
 
     utils.gems_assert_close(res_out, ref_out, dtype)

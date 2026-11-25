@@ -52,24 +52,6 @@ def convert_fp8(
         dst.copy_(src)
 
 
-try:
-    import vllm._custom_ops  # noqa: F401
-
-    _HAS_VLLM_CONCAT_AND_CACHE_MLA = hasattr(
-        torch.ops._C_cache_ops, "concat_and_cache_mla"
-    )
-except (ImportError, RuntimeError):
-    _HAS_VLLM_CONCAT_AND_CACHE_MLA = False
-
-
-def _vllm_concat_and_cache_mla(
-    kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-):
-    torch.ops._C_cache_ops.concat_and_cache_mla(
-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-    )
-
-
 @pytest.mark.skipif(vendor_name == "hygon", reason="Issue #2800: RuntimeError")
 @pytest.mark.concat_and_cache_mla
 @pytest.mark.parametrize("kv_lora_rank", [512])
@@ -112,24 +94,6 @@ def test_concat_and_cache_mla(
         kv_cache = _create_mla_cache(
             num_blocks, block_size, entry_size, dtype, kv_cache_dtype, device
         )
-
-        if (
-            _HAS_VLLM_CONCAT_AND_CACHE_MLA
-            and device.startswith("cuda")
-            and kv_cache_dtype == "auto"
-        ):
-            ref_kv_cache = kv_cache.clone()
-            _vllm_concat_and_cache_mla(
-                kv_c, k_pe, ref_kv_cache, slot_mapping, kv_cache_dtype, scale
-            )
-            flaggems_vllm.concat_and_cache_mla(
-                kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-            )
-            utils.gems_assert_close(
-                kv_cache, utils.to_reference(ref_kv_cache), kv_cache.dtype
-            )
-            return
-
         ref_temp = utils.to_reference(
             torch.zeros(*kv_cache.shape, dtype=dtype, device=device)
         )
@@ -148,9 +112,10 @@ def test_concat_and_cache_mla(
             convert_fp8(ref_kv_cache, ref_temp, scale.item(), kv_dtype=kv_cache_dtype)
         else:
             ref_kv_cache = utils.to_reference(ref_temp)
-        flaggems_vllm.concat_and_cache_mla(
-            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-        )
+        with flaggems_vllm.use_gems():
+            flaggems_vllm.concat_and_cache_mla(
+                kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+            )
 
         if kv_cache_dtype == "fp8":
             result_temp = torch.empty_like(kv_cache, dtype=torch.uint8)

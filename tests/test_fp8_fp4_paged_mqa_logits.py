@@ -216,7 +216,15 @@ def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
             phys_pages = block_table[b_idx, logical_pages]
             flat_indices = phys_pages * BLOCK_KV + page_offsets
 
-            k_flat = kv_data[flat_indices].contiguous().view(torch.float8_e4m3fn)
+            # torch_gcu P21 defect: aten::index (t[idx]) on uint8 wide rows
+            # silently reads wrong rows for some index counts (560/772 hit in
+            # this suite); torch.index_select is the semantically identical
+            # 1-D gather and dispatches to a correct kernel on every vendor.
+            k_flat = (
+                torch.index_select(kv_data, 0, flat_indices)
+                .contiguous()
+                .view(torch.float8_e4m3fn)
+            )
             k_scale_flat = kv_scales[flat_indices]
 
             # Reference output using the dense reference

@@ -58,6 +58,35 @@ COMPRESSED_PAGES_PER_REQUEST = COMPRESSED_LENGTH // PAGE_SIZE
 ROTARY_DIM = 64
 MROPE_SECTION = (11, 11, 10)
 
+# GCU (enflame): advanced indexing whose index tensors broadcast against each
+# other lowers to a topsaten "repeat" that aborts the whole process
+# (op_aten_repeat_base.h:386 -> TOPSATEN_STATUS_BAD_PARAM, gcu_utils.cpp:74;
+# P21 archive torch_gcu_aten_runtime_defects).  On that vendor the affected
+# lookups below are routed through flattened 1D advanced indexing instead --
+# numerically identical aten ops; other backends keep the original form.
+_P21_BROADCAST_INDEX = flaggems_vllm.vendor_name == "enflame"
+
+
+def _broadcast_lookup(table, row_idx, col_idx):
+    """table[row_idx, col_idx] with a P21-safe flattened fallback."""
+    if not _P21_BROADCAST_INDEX:
+        return table[row_idx, col_idx]
+    linear = row_idx * table.shape[1] + col_idx
+    return table.reshape(-1)[linear]
+
+
+def _paged_rows(cache, pages, offsets):
+    """cache[pages, offsets[None, :], 0] with a P21-safe flattened fallback."""
+    if not _P21_BROADCAST_INDEX:
+        return cache[pages, offsets[None, :], 0]
+    row = cache.shape[1] * cache.shape[2] * cache.shape[3]
+    column = cache.shape[2] * cache.shape[3]
+    head = pages * row + offsets[None, :] * column
+    linear = head[..., None] + torch.arange(
+        cache.shape[3], device=cache.device, dtype=head.dtype
+    )
+    return cache.reshape(-1)[linear]
+
 
 class Qwen4Benchmark(base.GenericBenchmark):
     """Use the common benchmark runner with Qwen4 decode row counts."""
@@ -201,15 +230,17 @@ def _torch_qsa_mqa(q, cache, table, requests, positions, lengths, ratio):
     column = torch.arange(columns, device=q.device, dtype=torch.int64)
     logical_page = column // cache.shape[1]
     page_offset = column % cache.shape[1]
-    physical_page = table[safe_request[:, None], logical_page[None, :]].to(torch.int64)
+    physical_page = _broadcast_lookup(
+        table, safe_request[:, None], logical_page[None, :]
+    ).to(torch.int64)
     valid = (
         (column[None, :] < visible[:, None])
         & (physical_page >= 0)
         & (physical_page < cache.shape[0])
     )
-    keys = cache[
-        physical_page.clamp(0, cache.shape[0] - 1), page_offset[None, :], 0
-    ].float()
+    keys = _paged_rows(
+        cache, physical_page.clamp(0, cache.shape[0] - 1), page_offset
+    ).float()
     logits = torch.relu(torch.matmul(q.float(), keys.transpose(1, 2))).sum(
         1
     ) / math.sqrt(QSA_DIM)
@@ -343,7 +374,7 @@ def _torch_qsa_compress(
     source_positions = positions[:, None] - offsets[None, :]
     logical_pages = source_positions // raw_cache.shape[1]
     page_offsets = source_positions % raw_cache.shape[1]
-    physical_pages = block_table[request[:, None], logical_pages]
+    physical_pages = _broadcast_lookup(block_table, request[:, None], logical_pages)
     pooled = (
         (
             raw_cache[physical_pages, page_offsets, 0]
@@ -472,8 +503,8 @@ def _torch_qsa_fused_compress(
         axes[:, 1, None],
         torch.where(use_width[None, :], axes[:, 2, None], axes[:, 0, None]),
     )
-    cos = cos_sin[rope_positions, frequency]
-    sin = cos_sin[rope_positions, frequency + rotary_dim // 2]
+    cos = _broadcast_lookup(cos_sin, rope_positions, frequency)
+    sin = _broadcast_lookup(cos_sin, rope_positions, frequency + rotary_dim // 2)
     first = normalized[:, : rotary_dim // 2]
     second = normalized[:, rotary_dim // 2 : rotary_dim]
     stored = normalized.clone()

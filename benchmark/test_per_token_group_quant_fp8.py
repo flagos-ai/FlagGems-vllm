@@ -185,8 +185,6 @@ CORE_SHAPES = [
     (83, 512, 64),
     (2048, 4096, 256),
     (2048, 13824, 512),
-    # 285B profiling shape: prefill 8×H100, 8×TP, per-token FP8 quant
-    (524288, 128, 128),
 ]
 
 

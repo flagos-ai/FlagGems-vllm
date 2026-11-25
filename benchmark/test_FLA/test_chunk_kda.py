@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import itertools
 import math
-import os
 from importlib import import_module
 
 import pytest
@@ -32,83 +30,7 @@ try:
 except ModuleNotFoundError:
     from flaggems_vllm.ops.FLA import chunk_kda
 
-VENDOR = flaggems_vllm.vendor_name
-
-chunk_kda_vllm_fused_gate = None
-supports_lower_bound = False
-l2norm_fwd = None
-
-# chunk_kda moved across vLLM releases; probe each known location in turn.
-_VLLM_KDA_MODULES = [
-    "vllm.third_party.flash_linear_attention.ops.kda",  # 0.26+
-    "vllm.model_executor.layers.fla.ops.kda",  # 0.25
-]
-
-if VENDOR == "nvidia":
-    for _module_name in _VLLM_KDA_MODULES:
-        try:
-            _kda_module = import_module(_module_name)
-        except ImportError:
-            continue
-        break
-    else:
-        raise ImportError(
-            "No vLLM chunk_kda module found; tried %s" % _VLLM_KDA_MODULES
-        )
-
-    # The model layer calls the fused-gate entry, not plain chunk_kda: the
-    # latter expects an already-activated gate and an already-sigmoided beta,
-    # and silently drops A_log / dt_bias / lower_bound through **kwargs.
-    chunk_kda_vllm_fused_gate = getattr(_kda_module, "chunk_kda_with_fused_gate", None)
-    if callable(chunk_kda_vllm_fused_gate):
-        supports_lower_bound = (
-            "lower_bound" in inspect.signature(chunk_kda_vllm_fused_gate).parameters
-        )
-
-elif VENDOR == "ascend":
-    import torch_npu
-
-    torch_npu.npu.config.allow_internal_format = True
-
-    try:
-        from vllm_ascend.utils import enable_custom_op
-
-        custom_ops_enabled = enable_custom_op()
-    except ImportError:
-        custom_ops_enabled = False
-
-    try:
-        from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
-    except ImportError:
-        try:
-            from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
-        except ImportError:
-            l2norm_fwd = None
-
-    # The AscendC KDA prefill kernel: this is the operator vllm-ascend itself
-    # calls (``vllm_ascend.ops.kda.run_chunk_kda`` -> ``fla_npu.ops.ascendc``),
-    # so it is the true native baseline. Importing it is not enough -- the
-    # aclnn entry behind it only exists on A5-class parts -- so availability is
-    # probed with one live 64-token call (see _fla_npu_kda_available).
-    try:
-        from fla_npu.ops.ascendc import chunk_kda_fwd as fla_npu_chunk_kda
-    except ImportError as exc:
-        fla_npu_chunk_kda = None
-        fla_npu_chunk_kda_error = f"import failed: {exc!r}"
-    else:
-        fla_npu_chunk_kda_error = None
-
-    # vllm-ascend's Triton KDA prefill entry: its software fallback, used when
-    # the AscendC kernel is unavailable.
-    try:
-        from vllm_ascend.ops.triton.kda.kda import (
-            chunk_kda_with_fused_gate as chunk_kda_vllm_ascend,
-        )
-    except ImportError:
-        chunk_kda_vllm_ascend = None
-
 LOWER_BOUND = -5.0
-CHUNK_SIZE = 64  # vllm-ascend 0.26.0rc1 _KDA_CHUNK_SIZE; fwd supports 32/64/128
 DEFAULT_H = 96
 DEFAULT_D = 128
 FIXED_CASES = [
@@ -121,291 +43,166 @@ VARLEN_CASES = [
 FLASHKDA_CASES = FIXED_CASES + VARLEN_CASES
 
 
-# -----------------------------------------------------------------------------
-# Baselines
-# -----------------------------------------------------------------------------
-
-
 def _chunk_kda_inference_op(*args, **kwargs):
     with torch.inference_mode():
         return chunk_kda(*args, **kwargs)
 
 
-def _chunk_kda_vllm_inference_op(*args, **kwargs):
-    q, k, v, g, beta = args
-    beta_sigmoid = beta.float().sigmoid()
-    fused_kwargs = {
-        "scale": kwargs["scale"],
-        "initial_state": kwargs["initial_state"],
-        "output_final_state": kwargs.get("output_final_state", True),
-        "use_qk_l2norm_in_kernel": kwargs.get("use_qk_l2norm_in_kernel", True),
-        "cu_seqlens": kwargs.get("cu_seqlens"),
-    }
-    if supports_lower_bound:
-        fused_kwargs["lower_bound"] = kwargs.get("lower_bound", LOWER_BOUND)
+def _naive_kda_lowerbound_gate(
+    g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float = LOWER_BOUND,
+) -> torch.Tensor:
+    H, _ = g.shape[-2:]
+    g = g.float()
+    if dt_bias is not None:
+        g = g + dt_bias.view(H, -1)
+    return lower_bound * torch.sigmoid(A_log.view(H, 1).float().exp() * g)
 
-    with torch.inference_mode():
-        return chunk_kda_vllm_fused_gate(
-            q,
-            k,
-            v,
-            g,
-            beta_sigmoid,
-            kwargs["A_log"],
-            kwargs["dt_bias"],
-            **fused_kwargs,
+
+def _naive_recurrent_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+):
+    dtype = v.dtype
+    B, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[-1]
+    G = HV // H
+    if scale is None:
+        scale = K**-0.5
+
+    q, k, v, g, beta = map(lambda x: x.to(torch.float), [q, k, v, g, beta])
+    q = q.repeat_interleave(G, dim=2) * scale
+    k = k.repeat_interleave(G, dim=2)
+
+    state = k.new_zeros(B, HV, K, V).to(q)
+    if initial_state is not None:
+        state = state + initial_state
+
+    out = torch.zeros_like(v)
+    for i in range(T):
+        q_i, k_i, v_i, g_i, beta_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
+        state = state * g_i[..., None].exp()
+        state = state + torch.einsum(
+            "b h k, b h v -> b h k v",
+            beta_i[..., None] * k_i,
+            v_i - (k_i[..., None] * state).sum(-2),
         )
+        out[:, i] = torch.einsum("b h k, b h k v -> b h v", q_i, state)
+
+    return out.to(dtype), state if output_final_state else None
 
 
-def _canonical_chunk_indices(cu_seqlens, chunk_size):
-    """Build the AscendC chunk_indices: [seq_id, chunk_id] per chunk."""
-    return [
-        value
-        for seq_id, (start, end) in enumerate(zip(cu_seqlens[:-1], cu_seqlens[1:]))
-        for chunk_id in range((end - start + chunk_size - 1) // chunk_size)
-        for value in (seq_id, chunk_id)
-    ]
-
-
-def _chunk_kda_ascendc_inference_op(*args, **kwargs):
-    """vllm-ascend AscendC chunk_kda baseline.
-
-    Mirrors vllm_ascend/ops/kimi_kda.py on 0.26.0rc1:
-    - kda_gate_cumsum performs gate activation and chunk-local cumsum;
-    - q/k l2norm and beta sigmoid happen at the model layer;
-    - chunk_kda_fwd returns 12 values; take output and final state.
-    """
-    q, k, v, g, beta = args
-    with torch.inference_mode():
-        cu_seqlens = kwargs.get("cu_seqlens")
-        cu_seqlens_list = None if cu_seqlens is None else cu_seqlens.tolist()
-        chunk_indices = _canonical_chunk_indices(cu_seqlens_list, CHUNK_SIZE)
-
-        q_n = l2norm_fwd(q.contiguous())
-        k_n = l2norm_fwd(k.contiguous())
-        beta_s = beta.float().sigmoid()
-        gate_cumsum = torch.ops._C_ascend.kda_gate_cumsum(
-            g.contiguous(),
-            CHUNK_SIZE,
-            A_log=kwargs["A_log"].reshape(-1).contiguous(),
-            dt_bias=kwargs["dt_bias"].contiguous(),
-            cu_seqlens=cu_seqlens_list,
-            use_gate_in_kernel=True,
-            safe_gate=True,
-            lower_bound=kwargs.get("lower_bound", LOWER_BOUND),
-            layout="BSND",
-        )
-        result = torch.ops._C_ascend.chunk_kda_fwd(
-            q_n,
-            k_n,
-            v.contiguous(),
-            gate_cumsum,
-            beta_s,
-            kwargs["scale"],
-            CHUNK_SIZE,
-            layout="BSND",
-            initial_state=kwargs["initial_state"],
-            output_final_state=True,
-            cu_seqlens=cu_seqlens_list,
-            chunk_indices=chunk_indices,
-            return_intermediate=False,
-        )
-        return result[0], result[1]
-
-
-def _chunk_kda_fla_npu_inference_op(*args, **kwargs):
-    """AscendC chunk_kda baseline (the operator vllm-ascend ships in production).
-
-    ``chunk_kda_fwd`` applies the bounded gate in-kernel from the raw gate plus
-    ``A_log``/``dt_bias``. Its in-kernel L2-norm/beta-sigmoid variant
-    (``aclnnChunkKdaFwdV2``) is not available here, so -- exactly like
-    vllm-ascend's own ``run_chunk_kda`` -- q/k normalisation and beta's sigmoid
-    are done at this layer and only the gate is fused. ``dt_bias`` must be
-    flattened to ``[H*K]`` fp32; a 2-D tensor is rejected with 161002.
-    """
-    q, k, v, g, beta = args
-    cu_seqlens = kwargs.get("cu_seqlens")
-    with torch.inference_mode():
-        out = fla_npu_chunk_kda(
-            torch.nn.functional.normalize(q.float(), p=2.0, dim=-1, eps=1e-6).to(
-                q.dtype
-            ),
-            torch.nn.functional.normalize(k.float(), p=2.0, dim=-1, eps=1e-6).to(
-                k.dtype
-            ),
-            v,
-            g,
-            beta.float().sigmoid(),
-            kwargs["scale"],
-            CHUNK_SIZE,
-            layout="BSND",
-            initial_state=kwargs["initial_state"],
-            output_final_state=kwargs.get("output_final_state", True),
-            cu_seqlens=None if cu_seqlens is None else cu_seqlens.tolist(),
-            disable_recompute=True,
-            return_intermediate_states=True,
-            state_v_first=True,
-            safe_gate=True,
-            lower_bound=kwargs.get("lower_bound", LOWER_BOUND),
-            use_gate_in_kernel=True,
-            A_log=kwargs["A_log"].reshape(-1).contiguous(),
-            # The aclnn entry requires the gate bias flattened to [H*K] fp32;
-            # a 2-D [H, K] tensor is rejected with 161002 (PARAM_INVALID).
-            dt_bias=kwargs["dt_bias"].reshape(-1).contiguous(),
-        )
-    return out[0], out[1]
-
-
-_fla_npu_kda_probe = None
-
-
-def _fla_npu_kda_available():
-    """Whether the AscendC chunk_kda kernel actually executes on this device.
-
-    The import succeeds even where the aclnn kernel is absent, so the check is
-    one live call on a minimal K=V=128 shape; the aclnn entry rejects the launch
-    immediately with "GetWorkspaceSize failed: 161002" on parts without it.
-    """
-    global _fla_npu_kda_probe
-    if _fla_npu_kda_probe is None:
-        if fla_npu_chunk_kda is None:
-            _fla_npu_kda_probe = (False, fla_npu_chunk_kda_error or "not importable")
-        else:
-            try:
-                torch.manual_seed(0)
-                dev = flaggems_vllm.device
-                t, h, d = CHUNK_SIZE, 1, 128
-                q = torch.randn(1, t, h, d, device=dev, dtype=torch.bfloat16)
-                init = torch.zeros(1, h, d, d, device=dev, dtype=torch.float32)
-                fla_npu_chunk_kda(
-                    q,
-                    q.clone(),
-                    q.clone(),
-                    q.clone(),
-                    torch.sigmoid(torch.randn(1, t, h, device=dev)),
-                    1.0 / math.sqrt(d),
-                    CHUNK_SIZE,
-                    layout="BSND",
-                    initial_state=init,
-                    output_final_state=True,
-                    disable_recompute=True,
-                    return_intermediate_states=True,
-                    safe_gate=True,
-                    lower_bound=LOWER_BOUND,
-                    use_gate_in_kernel=True,
-                    A_log=torch.rand(h, device=dev, dtype=torch.float32),
-                    dt_bias=torch.randn(h * d, device=dev, dtype=torch.float32),
-                    state_v_first=True,
-                )
-                torch.npu.synchronize()
-                _fla_npu_kda_probe = (True, None)
-            except Exception as exc:
-                _fla_npu_kda_probe = (False, f"{type(exc).__name__}: {exc}")
-    return _fla_npu_kda_probe
-
-
-def _chunk_kda_vllm_ascend_inference_op(*args, **kwargs):
-    """vllm-ascend Triton KDA prefill baseline.
-
-    ``chunk_kda_with_fused_gate`` takes the raw gate plus
-    ``A_log``/``dt_bias``/``lower_bound`` and does the q/k L2 norm in-kernel;
-    beta is sigmoided by the caller, matching the AscendC baseline above.
-    """
-    q, k, v, g, beta = args
-    with torch.inference_mode():
-        return chunk_kda_vllm_ascend(
-            q,
-            k,
-            v,
-            g,
-            beta.float().sigmoid(),
-            kwargs["A_log"].reshape(-1).contiguous(),
-            kwargs["dt_bias"].contiguous(),
-            scale=kwargs["scale"],
-            initial_state=kwargs["initial_state"],
-            output_final_state=kwargs.get("output_final_state", True),
-            use_qk_l2norm_in_kernel=kwargs.get("use_qk_l2norm_in_kernel", True),
-            cu_seqlens=kwargs.get("cu_seqlens"),
-            safe_gate=True,
-            lower_bound=kwargs.get("lower_bound", LOWER_BOUND),
-        )
-
-
-def _ascendc_available():
-    """The AscendC KDA custom ops are registered and usable."""
-    return (
-        custom_ops_enabled
-        and callable(l2norm_fwd)
-        and hasattr(torch.ops._C_ascend, "kda_gate_cumsum")
-        and hasattr(torch.ops._C_ascend, "chunk_kda_fwd")
-    )
-
-
-# The Triton KDA entry is a correctness-equivalent native baseline, but on
-# Ascend 910B it cannot run the benchmark's core shapes: T=8192 / H=96 / D=128
-# pushes a 32768-block grid through its chunk_gla_fwd_o stage, which trips the
-# device watchdog ("aicore execution times out", ~2 s per launch) while this
-# repo's kernel finishes the same workload in ~39 ms. It is therefore opt-in,
-# so the benchmark skips with a precise reason instead of dying on a timeout.
-_VLLM_ASCEND_KDA_ENV = "FLAGGEMS_BENCH_VLLM_ASCEND_KDA"
-
-
-def _vllm_ascend_kda_opt_in():
-    value = os.environ.get(_VLLM_ASCEND_KDA_ENV, "")
-    return value.strip().lower() in ("1", "true", "on", "yes")
-
-
-def _get_baseline_op():
-    if VENDOR == "nvidia":
-        return _chunk_kda_vllm_inference_op
-
-    if VENDOR == "ascend":
-        if _ascendc_available():
-            return _chunk_kda_ascendc_inference_op
-        if _fla_npu_kda_available()[0]:
-            return _chunk_kda_fla_npu_inference_op
-        if chunk_kda_vllm_ascend is not None and _vllm_ascend_kda_opt_in():
-            return _chunk_kda_vllm_ascend_inference_op
+def _state_to_kv_layout(
+    state: torch.Tensor | None,
+    state_v_first: bool,
+) -> torch.Tensor | None:
+    if state is None:
         return None
+    if state_v_first:
+        return state.transpose(-1, -2).contiguous()
+    return state
 
-    return None
+
+def _state_from_kv_layout(
+    state: torch.Tensor | None,
+    state_v_first: bool,
+) -> torch.Tensor | None:
+    if state is None:
+        return None
+    if state_v_first:
+        return state.transpose(-1, -2).contiguous()
+    return state
+
+
+def _chunk_kda_torch_reference_op(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale=None,
+    initial_state=None,
+    output_final_state=False,
+    safe_gate=True,
+    lower_bound=LOWER_BOUND,
+    A_log=None,
+    dt_bias=None,
+    state_v_first=False,
+    cu_seqlens=None,
+    **kwargs,
+):
+    if not safe_gate:
+        raise ValueError("chunk_kda torch reference currently expects safe_gate=True")
+    if A_log is None or dt_bias is None:
+        raise ValueError("chunk_kda torch reference requires A_log and dt_bias")
+
+    with torch.inference_mode():
+        q = F.normalize(q.float(), p=2.0, dim=-1)
+        k = F.normalize(k.float(), p=2.0, dim=-1)
+        g = _naive_kda_lowerbound_gate(g, A_log, dt_bias, lower_bound=lower_bound)
+        beta = beta.float().sigmoid()
+
+        if cu_seqlens is None:
+            out, final_state = _naive_recurrent_kda(
+                q=q,
+                k=k,
+                v=v.float(),
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=_state_to_kv_layout(initial_state, state_v_first),
+                output_final_state=output_final_state,
+            )
+            return out.to(v.dtype), _state_from_kv_layout(final_state, state_v_first)
+
+        cu_seqlens_list = cu_seqlens.detach().cpu().tolist()
+        outs, final_states = [], []
+        for i, (start, end) in enumerate(
+            zip(cu_seqlens_list[:-1], cu_seqlens_list[1:])
+        ):
+            initial_state_i = (
+                initial_state[i : i + 1] if initial_state is not None else None
+            )
+            out_i, final_state_i = _naive_recurrent_kda(
+                q=q[:, start:end],
+                k=k[:, start:end],
+                v=v[:, start:end].float(),
+                g=g[:, start:end],
+                beta=beta[:, start:end],
+                scale=scale,
+                initial_state=_state_to_kv_layout(initial_state_i, state_v_first),
+                output_final_state=output_final_state,
+            )
+            outs.append(out_i)
+            if output_final_state:
+                final_states.append(_state_from_kv_layout(final_state_i, state_v_first))
+
+        out = torch.cat(outs, dim=1).to(v.dtype)
+        final_state = torch.cat(final_states, dim=0) if output_final_state else None
+        return out, final_state
 
 
 class ChunkKDABenchmark(Benchmark):
-    """Benchmark FlagGems-vllm chunk_kda against the vendor-native baseline.
-
-    NVIDIA:
-        vLLM native chunk_kda_with_fused_gate
-
-    Ascend:
-        vllm-ascend AscendC (kda_gate_cumsum + chunk_kda_fwd)
-
-    Other vendors:
-        no native baseline: only FlagGems latency is measured, and when
-        --base-data is given the H800 latency scaled by _scaling_factors is
-        reported as the 'vs Base' comparison instead.
-    """
-
     DEFAULT_DTYPES = [torch.bfloat16]
     DEFAULT_METRICS = ["latency_base", "latency", "speedup"]
-    BASELINE_METRICS = ("latency_base", "speedup")
     DEFAULT_SHAPES = [
         tuple(itertools.chain(seq_lens, [DEFAULT_H, DEFAULT_D]))
         for seq_lens in FLASHKDA_CASES
     ]
     DEFAULT_SHAPE_DESC = "seq_lens..., H, D"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if self.torch_op is None:
-            self.metrics = [
-                metric for metric in self.metrics if metric not in self.BASELINE_METRICS
-            ]
-            self.to_bench_metrics = self.metrics
-
-    def set_shapes(self, shape_file_path=None):
-        _ = shape_file_path
-        self.shapes = self.DEFAULT_SHAPES
+    def init_user_config(self):
+        super().init_user_config()
+        if any(len(shape) < 3 for shape in self.shapes):
+            self.shapes = self.DEFAULT_SHAPES
 
     def get_input_iter(self, cur_dtype):
         for shape in self.shapes:
@@ -467,49 +264,16 @@ class ChunkKDABenchmark(Benchmark):
                 "dt_bias": dt_bias,
                 "state_v_first": True,
                 "cu_seqlens": cu_seqlens,
-                "chunk_size": 32 if VENDOR == "mthreads" else 16,
+                "chunk_size": 32 if flaggems_vllm.vendor_name == "mthreads" else 16,
             },
         )
 
 
 @pytest.mark.chunk_kda
 def test_chunk_kda():
-    baseline_op = _get_baseline_op()
-
-    if VENDOR == "nvidia":
-        assert callable(
-            chunk_kda_vllm_fused_gate,
-        ), "vLLM native chunk_kda_with_fused_gate is not available"
-
-    elif VENDOR == "ascend":
-        if baseline_op is None:
-            # ChunkKDABenchmark drops the baseline metrics when torch_op is
-            # None, so still measure the FlagGems latency and say why there is
-            # no SpeedUp column.
-            _, fla_npu_reason = _fla_npu_kda_available()
-            print(f"[chunk_kda] AscendC chunk_kda_fwd unusable: {fla_npu_reason}")
-            if chunk_kda_vllm_ascend is not None:
-                print(
-                    "[chunk_kda] vllm-ascend's Triton chunk_kda fallback is "
-                    "opt-in because it trips the 910B device watchdog on these "
-                    f"shapes ({_VLLM_ASCEND_KDA_ENV}=1 to time it). "
-                    "Reporting FlagGems latency only."
-                )
-            else:
-                print(
-                    "[chunk_kda] no vllm-ascend chunk_kda baseline available; "
-                    "reporting FlagGems latency only."
-                )
-        chosen = {
-            _chunk_kda_ascendc_inference_op: "torch.ops._C_ascend KDA ops",
-            _chunk_kda_fla_npu_inference_op: "fla_npu AscendC chunk_kda_fwd",
-            _chunk_kda_vllm_ascend_inference_op: "vllm-ascend Triton chunk_kda",
-        }.get(baseline_op, "unknown")
-        print(f"[chunk_kda] baseline: {chosen}")
-
     bench = ChunkKDABenchmark(
         op_name="chunk_kda",
-        torch_op=baseline_op,
+        torch_op=_chunk_kda_torch_reference_op,
     )
     bench.set_gems(_chunk_kda_inference_op)
     bench.run()

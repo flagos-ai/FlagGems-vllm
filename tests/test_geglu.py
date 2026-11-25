@@ -50,7 +50,8 @@ def test_geglu(shape, dtype):
     ref_out = tex.geglu(input_tensor, None)
     ref_out = utils.to_reference(ref_out)
 
-    res_out = flaggems_vllm.geglu(input_tensor)
+    with flaggems_vllm.use_gems():
+        res_out = flaggems_vllm.geglu(input_tensor)
     utils.gems_assert_close(res_out, ref_out, dtype)
 
 

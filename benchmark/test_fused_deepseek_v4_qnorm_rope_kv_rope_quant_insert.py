@@ -25,7 +25,7 @@ from . import base
 
 torch_device_fn = flaggems_vllm.runtime.torch_device_fn
 
-_FP8E4NV_CAPABLE_VENDORS = frozenset({"ascend", "metax", "mthreads", "thead"})
+_FP8E4NV_CAPABLE_VENDORS = frozenset({"ascend", "metax", "mthreads"})
 
 
 def is_support_fp8e4nv():

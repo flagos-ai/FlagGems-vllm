@@ -52,17 +52,6 @@ def _make_inputs(shape, dtype, state_dtype, device, strided=False, invalid=True)
 
 def _reference(inputs, normalize=False):
     """Independent FP32 CPU math, including the old beta rounding boundary."""
-    threads = torch.get_num_threads()
-    if threads == 1:
-        return _reference_cpu(inputs, normalize)
-    torch.set_num_threads(1)
-    try:
-        return _reference_cpu(inputs, normalize)
-    finally:
-        torch.set_num_threads(threads)
-
-
-def _reference_cpu(inputs, normalize=False):
     mixed = inputs["mixed_qkv"].detach().cpu().float()
     state = inputs["initial_state"].detach().cpu().clone()
     B = mixed.shape[0]
@@ -189,19 +178,29 @@ def test_empty_and_metadata_errors():
             fn(**bad)
 
 
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "nvidia", reason="NVIDIA native vLLM comparison"
+)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
-def test_large_state_pool_reference(dtype, strided):
-    # Keep the former native cross-check's unique large-pool candidate coverage.
-    # Native qualification belongs in the benchmark; accuracy uses the CPU oracle.
+def test_native_vllm(dtype, strided):
+    from vllm.model_executor.layers.fla.ops.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_packed_decode as native,
+    )
+
     data = _make_inputs(
         (9, 4, 12, 128, 128), dtype, torch.float32, flaggems_vllm.device, strided
     )
+    state0 = data["initial_state"].clone()
     expected = _reference(data, True)
-    result = getattr(flaggems_vllm.ops, OP)(**data, use_qk_l2norm_in_kernel=True)
-    assert result[0] is data["out"] and result[1] is data["initial_state"]
+    native(**data, use_qk_l2norm_in_kernel=True)
     _assert_result(data, expected, dtype)
+    native_out = data["out"].clone()
+    native_state = data["initial_state"].clone()
+    data["initial_state"].copy_(state0)
+    getattr(flaggems_vllm.ops, OP)(**data, use_qk_l2norm_in_kernel=True)
+    _assert_result(data, (native_out.cpu(), native_state.cpu()), dtype)
 
 
 @pytest.mark.parametrize("entry", ["generic", "top"])

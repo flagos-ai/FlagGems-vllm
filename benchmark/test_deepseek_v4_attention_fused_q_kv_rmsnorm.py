@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
-
 import pytest
 import torch
 
@@ -51,15 +49,20 @@ try:
             fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
         )
 
+    elif vendor == "enflame":
+        # GCU has no vendor-native aten op for this fusion; vLLM's upstream
+        # Triton kernel is the native baseline (it compiles on GCU through
+        # FlagTree) and is the reference the historical speedups were
+        # measured against.
+        from vllm.v1.attention.ops.deepseek_v4_ops import (
+            fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
+        )
+
+    _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = reference_fused_q_kv_rmsnorm is not None
 except Exception as e:
     print(e)
     reference_fused_q_kv_rmsnorm = None
-
-if reference_fused_q_kv_rmsnorm is None:
-    warnings.warn(
-        f"Baseline op of current platform: {vendor} can't be loaded. "
-        "There will be `N/A` outputs in some columns."
-    )
+    _HAS_REFERENCE_FUSED_Q_KV_RMSNORM = False
 
 
 class FusedQKVRMSNormBenchmark(base.Benchmark):
@@ -119,5 +122,9 @@ class FusedQKVRMSNormBenchmark(base.Benchmark):
 
 
 @pytest.mark.fused_q_kv_rmsnorm
+@pytest.mark.skipif(
+    not _HAS_REFERENCE_FUSED_Q_KV_RMSNORM,
+    reason="requires fused_q_kv_rmsnorm reference implementation",
+)
 def test_fused_q_kv_rmsnorm_benchmark():
     FusedQKVRMSNormBenchmark().run()

@@ -20,6 +20,10 @@ import flaggems_vllm
 from . import base
 
 USE_SOFT_CAST = flaggems_vllm.vendor_name == "ascend"
+# GCU (enflame): topsaten index_put does not support Float8_e4m3fn
+# (TOPSATEN_STATUS_NOT_SUPPORT at at::_ops::_index_put_impl_), so the
+# reference scatters the same bytes through the raw uint8 storage view.
+USE_UINT8_SCATTER = flaggems_vllm.vendor_name == "enflame"
 
 
 def _default_fp8_dtype():
@@ -148,11 +152,17 @@ def torch_indexer(k, kv_cache, slot_mapping, quant_block_size, scale_fmt):
             )
     else:
         fp8_val = scaled_val.reshape(num_valid, head_dim).to(fp8_dtype)
-        values_view = (
-            flat_cache[:, : block_size * head_dim]
-            .view(fp8_dtype)
-            .unflatten(1, (block_size, head_dim))
-        )
+        if USE_UINT8_SCATTER:
+            values_view = flat_cache[:, : block_size * head_dim].unflatten(
+                1, (block_size, head_dim)
+            )
+            fp8_val = fp8_val.view(torch.uint8)
+        else:
+            values_view = (
+                flat_cache[:, : block_size * head_dim]
+                .view(fp8_dtype)
+                .unflatten(1, (block_size, head_dim))
+            )
     values_view[block_id, block_offset] = fp8_val
 
     scales_view = (
@@ -245,12 +255,6 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
                 quant_block_size,
             )
             for num_tokens in (8192, 32768, 65536)
-        ]
-        # 285B profiling shapes: head_dim=128 (K cache for MLA, block_size=16)
-        # Prefill M=8192 and decode M=128 from CSV [[8192, 128], [1301, 64, 132]]
-        self.shapes += [
-            (8192, 1302, 16, 128, 128),
-            (128, 20, 16, 128, 128),
         ]
 
     def get_input_iter(self, dtype):

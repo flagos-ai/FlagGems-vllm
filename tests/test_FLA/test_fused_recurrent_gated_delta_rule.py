@@ -101,18 +101,6 @@ def build(case, dtype, device, normalize=True):
 
 
 def reference(data):
-    # Small per-sequence reductions should not compete for full CPU thread pools.
-    threads = torch.get_num_threads()
-    if threads == 1:
-        return _reference_cpu(data)
-    torch.set_num_threads(1)
-    try:
-        return _reference_cpu(data)
-    finally:
-        torch.set_num_threads(threads)
-
-
-def _reference_cpu(data):
     q, k, v = (data[x].detach().cpu().double() for x in ("q", "k", "v"))
     g = data["g"].cpu().double() if data["g"] is not None else None
     beta = data["beta"].cpu().double() if data["beta"] is not None else None
@@ -189,7 +177,6 @@ def assert_result(result, expected, dtype):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
-@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("normalize", [True, False])
@@ -218,7 +205,6 @@ def test_recurrent_contract(case, dtype, normalize, entry):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
-@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("tiny", [False, True])
 def test_recurrent_optional_gate_and_beta(dtype, tiny):
@@ -232,7 +218,6 @@ def test_recurrent_optional_gate_and_beta(dtype, tiny):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
-@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize(
     "kind", ["layout", "scale", "indices", "accepted", "state", "dtype"]
 )
@@ -257,7 +242,6 @@ def test_recurrent_invalid_metadata(kind):
 
 
 @pytest.mark.fused_recurrent_gated_delta_rule_fwd
-@pytest.mark.fused_recurrent_gated_delta_rule
 @pytest.mark.parametrize("entry", ["generic", "top"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(9, 4, 12, 64, 32), (1, 16, 64, 128, 128)])

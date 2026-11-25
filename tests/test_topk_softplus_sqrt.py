@@ -196,11 +196,13 @@ def _run_topk(
     )
 
     if variant == "default":
-        flaggems_vllm.topk_softplus_sqrt(*args, **kwargs)
+        with flaggems_vllm.use_gems():
+            flaggems_vllm.topk_softplus_sqrt(*args, **kwargs)
     elif vendor == "ascend":
-        flaggems_vllm.topk_softplus_sqrt(
-            *args, **kwargs, use_ascend_tle=(variant == "tle")
-        )
+        with flaggems_vllm.use_gems():
+            flaggems_vllm.topk_softplus_sqrt(
+                *args, **kwargs, use_ascend_tle=(variant == "tle")
+            )
     elif _backend_tle_op is not None:
         op = _backend_tle_op if variant == "tle" else _backend_baseline_op
         op(*args, **kwargs)

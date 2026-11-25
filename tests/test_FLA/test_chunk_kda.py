@@ -20,7 +20,6 @@ import torch
 import torch.nn.functional as F
 
 import flaggems_vllm
-from baseline import native_api
 
 try:
     chunk_kda = import_module(
@@ -31,52 +30,6 @@ except ModuleNotFoundError:
 
 LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
-# Two independent bf16 implementations differ by more than the fp32 ground
-# truth does, so the vendor-API comparison gets its own (still tight) budget.
-NATIVE_ASSERT_RATIO = 0.02
-
-
-def _load_vllm_ascend_chunk_kda():
-    """vllm-ascend's native KDA prefill entry, or None when unavailable.
-
-    ``chunk_kda_with_fused_gate`` is the vendor API that matches this
-    operator's contract: raw gate plus ``A_log``/``dt_bias``/``lower_bound``
-    and in-kernel q/k L2 norm, with beta already sigmoided by the caller.
-    """
-    if flaggems_vllm.vendor_name != "ascend":
-        return None
-    try:
-        from vllm_ascend.ops.triton.kda.kda import chunk_kda_with_fused_gate
-    except Exception:  # ImportError, or a tree without the KDA kernels
-        return None
-    return chunk_kda_with_fused_gate
-
-
-def _load_fla_npu_chunk_kda():
-    """The AscendC KDA prefill kernel vllm-ascend ships in production."""
-    if flaggems_vllm.vendor_name != "ascend":
-        return None
-    try:
-        from fla_npu.ops.ascendc import chunk_kda_fwd as native
-    except Exception:
-        return None
-    return native
-
-
-VLLM_ASCEND_CHUNK_KDA = _load_vllm_ascend_chunk_kda()
-FLANPU_CHUNK_KDA = _load_fla_npu_chunk_kda()
-# Non-Ascend platforms reference vLLM's own KDA instead of a vendor NPU API.
-VLLM_CHUNK_KDA, VLLM_CHUNK_KDA_SOURCE = (
-    (None, None) if flaggems_vllm.vendor_name == "ascend" else native_api.chunk_kda()
-)
-REF_SOURCES = ["torch"]
-if FLANPU_CHUNK_KDA is not None:
-    REF_SOURCES.append("flanpu")
-if VLLM_ASCEND_CHUNK_KDA is not None:
-    REF_SOURCES.append("vllm_ascend")
-if VLLM_CHUNK_KDA is not None and flaggems_vllm.vendor_name == "nvidia":
-    # The vLLM native kernel is only used as a reference on NVIDIA.
-    REF_SOURCES.append("vllm")
 
 
 pytestmark = pytest.mark.chunk_kda
@@ -214,151 +167,6 @@ def _reference_chunk_kda(
     return out, final_state
 
 
-def _flanpu_chunk_kda_reference(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    *,
-    scale,
-    initial_state,
-    output_final_state,
-    A_log,
-    dt_bias,
-    state_v_first,
-    cu_seqlens,
-):
-    """Reference output/final state from the AscendC chunk_kda_fwd kernel.
-
-    Its in-kernel L2-norm/beta-sigmoid variant (aclnnChunkKdaFwdV2) rejects the
-    launch here, so -- as in vllm-ascend's own run_chunk_kda -- q/k are
-    normalised and beta sigmoided at this layer and only the gate is fused.
-    ``dt_bias`` must be flattened to [H*K] fp32; a 2-D tensor returns 161002.
-    """
-    if not state_v_first:
-        raise pytest.skip("AscendC KDA reference assumes a [V, K] final state")
-    if initial_state is None:
-        raise pytest.skip("AscendC KDA reference needs an explicit initial_state")
-    try:
-        out = FLANPU_CHUNK_KDA(
-            F.normalize(q.float(), p=2.0, dim=-1, eps=1e-6).to(q.dtype),
-            F.normalize(k.float(), p=2.0, dim=-1, eps=1e-6).to(k.dtype),
-            v,
-            g,
-            beta.float().sigmoid(),
-            scale,
-            64,
-            layout="BSND",
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=None if cu_seqlens is None else cu_seqlens.tolist(),
-            disable_recompute=True,
-            return_intermediate_states=True,
-            state_v_first=True,
-            safe_gate=True,
-            lower_bound=LOWER_BOUND,
-            use_gate_in_kernel=True,
-            A_log=A_log.reshape(-1).contiguous(),
-            dt_bias=dt_bias.reshape(-1).contiguous(),
-        )
-    except (RuntimeError, ValueError) as exc:
-        raise pytest.skip(f"AscendC chunk_kda_fwd rejects this case: {exc}")
-    return out[0], out[1]
-
-
-def _vllm_chunk_kda_reference(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    *,
-    scale,
-    initial_state,
-    output_final_state,
-    A_log,
-    dt_bias,
-    state_v_first,
-    cu_seqlens,
-):
-    """Reference from vLLM's own KDA prefill (non-Ascend platforms).
-
-    Same call shape as the vllm-ascend helper: raw gate plus
-    ``A_log``/``dt_bias``/``lower_bound``, with beta pre-sigmoided and the q/k
-    L2 norm done in-kernel.
-    """
-    if q.shape[2] != v.shape[2]:
-        raise pytest.skip("vLLM KDA does not support GQA (H != HV)")
-    # vLLM's native entry has no state_v_first switch and only accepts the
-    # [N, HV, V, K] (v-first) state layout; transpose around the call.
-    if initial_state is not None and not state_v_first:
-        initial_state = initial_state.transpose(-1, -2)
-    o, final_state = VLLM_CHUNK_KDA(
-        q,
-        k,
-        v,
-        g,
-        beta.float().sigmoid(),
-        A_log.reshape(-1),
-        dt_bias,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu_seqlens,
-        safe_gate=True,
-        lower_bound=LOWER_BOUND,
-    )
-    if final_state is not None and not state_v_first:
-        final_state = final_state.transpose(-1, -2)
-    return o, final_state
-
-
-def _vllm_ascend_chunk_kda_reference(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    *,
-    scale,
-    initial_state,
-    output_final_state,
-    A_log,
-    dt_bias,
-    state_v_first,
-    cu_seqlens,
-):
-    """Reference output/final state from vllm-ascend's native KDA kernel."""
-    if not state_v_first:
-        raise pytest.skip("vllm-ascend KDA always reports a [V, K] final state")
-    if initial_state is None:
-        # vllm_ascend/ops/triton/kda/kda.py dereferences initial_state
-        # unconditionally, so the vendor path cannot express "no initial state".
-        raise pytest.skip("vllm-ascend KDA requires an explicit initial_state")
-    if q.shape[2] != g.shape[2]:
-        # The vendor kernel returns NaN for grouped-query attention heads
-        # (H != HV), so it cannot serve as a reference there.
-        raise pytest.skip("vllm-ascend KDA does not support GQA (H != HV)")
-    return VLLM_ASCEND_CHUNK_KDA(
-        q,
-        k,
-        v,
-        g,
-        beta.float().sigmoid(),
-        A_log.reshape(-1),
-        dt_bias,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu_seqlens,
-        safe_gate=True,
-        lower_bound=LOWER_BOUND,
-    )
-
-
 def _make_inputs(
     *,
     seq_lens: list[int],
@@ -431,23 +239,19 @@ def _assert_close(
     name: str,
     actual: torch.Tensor,
     expected: torch.Tensor,
-    ref_source: str = "torch",
 ) -> None:
     actual = actual.float()
     expected = expected.float()
-    limit = ASSERT_RATIO if ref_source == "torch" else NATIVE_ASSERT_RATIO
     abs_err = _abs_err(expected, actual)
     err_ratio = _err_ratio(expected, actual)
     msg = (
-        f"{name} diff: {abs_err:.6f} ratio: {err_ratio:.6f} "
-        f"(limit {limit}) "
-        f"[ref={ref_source}]"
+        f"{name} diff: {abs_err:.6f} ratio: {err_ratio:.6f} " f"(limit {ASSERT_RATIO})"
     )
     if abs_err <= 1e-6:
         return
     assert not torch.isnan(expected).any(), f"{name}: NaN detected in reference"
     assert not torch.isnan(actual).any(), f"{name}: NaN detected in actual"
-    assert err_ratio < limit, msg
+    assert err_ratio < ASSERT_RATIO, msg
 
 
 @pytest.mark.parametrize(
@@ -575,9 +379,8 @@ def _assert_close(
         ),
     ],
 )
-@pytest.mark.parametrize("ref_source", REF_SOURCES)
 @torch.inference_mode()
-def test_chunk_kda_matches_torch_reference(case, ref_source):
+def test_chunk_kda_matches_torch_reference(case):
     torch.manual_seed(42)
     args, kwargs = _make_inputs(
         seq_lens=case["seq_lens"],
@@ -593,12 +396,7 @@ def test_chunk_kda_matches_torch_reference(case, ref_source):
     )
 
     actual, actual_final = chunk_kda(*args, **kwargs)
-    ref = {
-        "flanpu": _flanpu_chunk_kda_reference,
-        "vllm_ascend": _vllm_ascend_chunk_kda_reference,
-        "vllm": _vllm_chunk_kda_reference,
-    }.get(ref_source, _reference_chunk_kda)
-    expected, expected_final = ref(
+    expected, expected_final = _reference_chunk_kda(
         *args,
         scale=kwargs["scale"],
         initial_state=kwargs["initial_state"],
@@ -609,9 +407,9 @@ def test_chunk_kda_matches_torch_reference(case, ref_source):
         cu_seqlens=kwargs["cu_seqlens"],
     )
 
-    _assert_close("o", actual, expected, ref_source=ref_source)
+    _assert_close("o", actual, expected)
     if case["output_final_state"]:
-        _assert_close("ht", actual_final, expected_final, ref_source=ref_source)
+        _assert_close("ht", actual_final, expected_final)
     else:
         assert actual_final is None
         assert expected_final is None

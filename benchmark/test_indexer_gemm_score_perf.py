@@ -23,8 +23,9 @@ from tests.test_indexer_gemm_score import build_inputs
 
 from . import base
 
-if flaggems_vllm.vendor_name != "ascend":
-    pytest.skip("indexer_gemm_score requires Ascend", allow_module_level=True)
+_mod = importlib.import_module(
+    "flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score"
+)
 
 try:
     import torch_npu  # noqa: F401
@@ -33,11 +34,8 @@ try:
 except (ImportError, AttributeError):
     _NPU_AVAILABLE = False
 
-if not _NPU_AVAILABLE:
-    pytest.skip("indexer_gemm_score requires an Ascend NPU", allow_module_level=True)
-
-_mod = importlib.import_module(
-    "flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score"
+pytestmark = pytest.mark.skipif(
+    not _NPU_AVAILABLE, reason="indexer_gemm_score requires an Ascend NPU"
 )
 
 # Production context: GLM-5.3-Flash-W8A8 serving profile (random 16k-in /
@@ -149,9 +147,13 @@ def _torch_reference(qbar, cache, cum_q, seq_lens, bt, positions):
 
 
 @pytest.mark.indexer_gemm_score
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend",
+    reason="the optimized indexer GEMM scorer targets Ascend",
+)
 def test_indexer_gemm_score_perf():
     IndexerGemmScoreBenchmark(
-        op_name="indexer_gemm_score",
+        op_name="indexer_gemm_score_vs_matvec",
         torch_op=_matvec,
         gems_op=flaggems_vllm.indexer_gemm_score,
         dtypes=[torch.float32],

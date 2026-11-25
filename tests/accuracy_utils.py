@@ -113,15 +113,6 @@ FUSED_INV_ROPE_FP8_QUANT_SHAPES = {
     "TMA_ALIGNED_SCALES": [False, True],
     "SEEDS": [0, 42],
 }
-DEEP_GEMM_FP8_O_PROJ_SHAPES = {
-    # (num_tokens, num_heads, n_groups, o_lora_rank, hidden_size)
-    "CONFIGS": (
-        [(16, 64, 8, 1024, 7168)]
-        if QUICK_MODE
-        else [(1, 8, 1, 1024, 7168), (16, 64, 8, 1024, 7168)]
-    ),
-    "SEEDS": [0],
-}
 DISTRIBUTION_SHAPES = [(20, 320, 15)]
 REDUCTION_SHAPES = [(2, 32)] if QUICK_MODE else [(1, 2), (4096, 256), (200, 40999, 3)]
 REDUCTION_SMALL_SHAPES = (
@@ -307,18 +298,10 @@ def to_cpu(res, ref):
     return res
 
 
-def gems_assert_close(
-    res, ref, dtype, equal_nan=False, reduce_dim=1, atol=1e-4, rtol=None
-):
+def gems_assert_close(res, ref, dtype, equal_nan=False, reduce_dim=1, atol=1e-4):
     res = to_cpu(res, ref)
     flaggems_vllm.testing.assert_close(
-        res,
-        ref,
-        dtype,
-        equal_nan=equal_nan,
-        reduce_dim=reduce_dim,
-        atol=atol,
-        rtol=rtol,
+        res, ref, dtype, equal_nan=equal_nan, reduce_dim=reduce_dim, atol=atol
     )
 
 
@@ -345,24 +328,3 @@ def init_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def gems_log_prefix(fn):
-    """Derive the expected log prefix from the resolved function module.
-
-    The generic implementation logs with the ``"GEMS"`` prefix, while
-    vendor-specific overrides log with ``"GEMS_<VENDOR>"``.
-    """
-    module_parts = fn.__module__.split(".")
-    if f"_{flaggems_vllm.vendor_name}" in module_parts:
-        return f"GEMS_{flaggems_vllm.vendor_name.upper()}"
-    return "GEMS"
-
-
-def gems_log_logger(fn):
-    """Return the logger name used by an operator implementation.
-
-    Operator modules log with ``logging.getLogger(__name__)``, so the logger
-    name is just the resolved function's module.
-    """
-    return fn.__module__

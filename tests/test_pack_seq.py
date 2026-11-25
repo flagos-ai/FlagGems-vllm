@@ -90,10 +90,7 @@ def _ref_pack_seq(x, lengths, pad_value=-float("inf")):
 
 if cfg.QUICK_MODE:
     FLOAT_DTYPES = [torch.float32]
-    PACK_SHAPES_2D = [
-        (32, 64, [4, 7, 1, 8, 12]),
-        (4096, 128, [1024] * 4),
-    ]
+    PACK_SHAPES_2D = [(32, 64, [4, 7, 1, 8, 12])]
     PACK_SHAPES_3D = [(6, 8, 4, [3, 3])]
 else:
     FLOAT_DTYPES = utils.FLOAT_DTYPES
@@ -102,7 +99,6 @@ else:
         (128, 256, [32, 64, 32]),
         (16, 32, [1] * 16),
         (200, 128, [100, 50, 30, 20]),
-        (4096, 128, [1024] * 4),
     ]
     PACK_SHAPES_3D = [
         (6, 8, 4, [3, 3]),

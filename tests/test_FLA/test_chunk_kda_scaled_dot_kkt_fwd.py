@@ -8,19 +8,6 @@ DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 
 def reference(q, k, g, beta, scale, bt, lengths=None):
-    # These small FP64 tiles do not benefit from competing intra-op thread pools
-    # when optest runs one accuracy worker per device on the same CPU host.
-    threads = torch.get_num_threads()
-    try:
-        if threads != 1:
-            torch.set_num_threads(1)
-        return _reference_cpu(q, k, g, beta, scale, bt, lengths)
-    finally:
-        if threads != 1:
-            torch.set_num_threads(threads)
-
-
-def _reference_cpu(q, k, g, beta, scale, bt, lengths=None):
     q, k, g, beta = [x.detach().cpu().double() for x in (q, k, g, beta)]
     b, t, h, _ = q.shape
     a = torch.zeros((b, t, h, bt), dtype=torch.float64)
@@ -107,29 +94,19 @@ def check(args, bt, out_dtype, lengths=None, indexed=False, scale=0.37):
     return actual, kw
 
 
-OUTPUT_DTYPE_CASE = ((1, 65, 2, 255), 64)
-FIXED_CASES = [
-    ((1, 1, 1, 1), 16),
-    ((1, 15, 2, 15), 16),
-    ((1, 17, 1, 31), 16),
-    ((2, 33, 2, 64), 32),
-    ((1, 63, 2, 65), 64),
-    ((1, 64, 1, 128), 64),
-    OUTPUT_DTYPE_CASE,
-    ((1, 129, 1, 256), 128),
-]
-
-
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("out_dtype", DTYPES)
 @pytest.mark.parametrize(
-    "shape,bt,dtype,out_dtype",
+    "shape,bt",
     [
-        # Exercise all casts on the tail case and FP32 output at every shape.
-        (shape, bt, dtype, out_dtype)
-        for shape, bt in FIXED_CASES
-        for dtype in DTYPES
-        for out_dtype in (
-            DTYPES if (shape, bt) == OUTPUT_DTYPE_CASE else (torch.float32,)
-        )
+        ((1, 1, 1, 1), 16),
+        ((1, 15, 2, 15), 16),
+        ((1, 17, 1, 31), 16),
+        ((2, 33, 2, 64), 32),
+        ((1, 63, 2, 65), 64),
+        ((1, 64, 1, 128), 64),
+        ((1, 65, 2, 255), 64),
+        ((1, 129, 1, 256), 128),
     ],
 )
 @pytest.mark.chunk_kda_scaled_dot_kkt_fwd
@@ -137,19 +114,9 @@ def test_fixed(dtype, out_dtype, shape, bt):
     check(inputs(*shape, dtype, bt), bt, out_dtype)
 
 
-@pytest.mark.parametrize(
-    "lengths,indexed,dtype",
-    [
-        # Exercise both metadata paths and every input dtype on the ragged case.
-        ([0, 1, 17, 0, 65], indexed, dtype)
-        for indexed in (False, True)
-        for dtype in DTYPES
-    ]
-    + [
-        pytest.param([32, 32], False, torch.bfloat16, id="equal-segments"),
-        pytest.param([1, 1, 1], True, torch.float16, id="singleton-segments"),
-    ],
-)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("lengths", [[0, 1, 17, 0, 65], [32, 32], [1, 1, 1]])
 @pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_packed(dtype, indexed, lengths):
     check(
@@ -178,15 +145,9 @@ def test_long_path(dtype, packed, gate):
     check(args, 64, torch.float32, lengths, indexed=packed)
 
 
-@pytest.mark.parametrize(
-    "dtype,gate_dtype,beta_dtype",
-    [
-        # Cover every pair of dtypes across q/k, gate, and beta.
-        (dtype, gate_dtype, DTYPES[(i + j) % len(DTYPES)])
-        for i, dtype in enumerate(DTYPES)
-        for j, gate_dtype in enumerate(DTYPES)
-    ],
-)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("gate_dtype", DTYPES)
+@pytest.mark.parametrize("beta_dtype", DTYPES)
 @pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_auxiliary_dtypes(dtype, gate_dtype, beta_dtype):
     q, k, g, beta = inputs(1, 33, 2, 31, dtype, 32)

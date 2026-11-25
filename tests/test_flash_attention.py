@@ -687,7 +687,17 @@ def test_flash_fwd_dropout(
         q, k, v, scale, is_causal, dropout_p=dropout_p, return_debug_mask=True
     )
 
-    dropout_ratio = torch.sum(debug_softmax < 0) / torch.sum(debug_softmax != 0)
+    neg = torch.sum(debug_softmax < 0)
+    nonzero = torch.sum(debug_softmax != 0)
+    if vendor_name == "enflame":
+        # torch_gcu P21-family defect: aten true-division of int64 tensors
+        # returns 0.0 on GCU (TORCH_GCU_ENABLE_INT64_AND_UINT64=1 does not
+        # help). Route the same counts through fp32 -- exact for counts
+        # below 2^24, i.e. every debug-mask this test allocates -- so the
+        # measured ratio reflects the real kernel output.
+        neg = neg.to(torch.float32)
+        nonzero = nonzero.to(torch.float32)
+    dropout_ratio = neg / nonzero
     np.testing.assert_allclose(dropout_ratio.to("cpu"), dropout_p, rtol=5e-2)
 
 

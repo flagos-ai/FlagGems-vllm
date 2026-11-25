@@ -29,11 +29,10 @@ import pytest
 import torch
 
 import flaggems_vllm
+from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
+from tests.test_top_k_top_p import top_k_top_p_ref
 
 from . import base
-
-if flaggems_vllm.vendor_name != "ascend":
-    pytest.skip("top_k_top_p requires Ascend", allow_module_level=True)
 
 torch_npu = pytest.importorskip("torch_npu")
 
@@ -49,6 +48,14 @@ HAS_NATIVE_OP = hasattr(torch_npu, "npu_top_k_top_p")
 
 def _native_top_k_top_p(logits, p, k, **_):
     return torch_npu.npu_top_k_top_p(logits, k=k, p=p)
+
+
+def _ref_top_k_top_p(logits, p, k, **_):
+    return top_k_top_p_ref(logits, p=p, k=k)
+
+
+def _gems_top_k_top_p(logits, p, k, **kw):
+    return top_k_top_p(logits, p=p, k=k, **kw)
 
 
 class TopKTopPBenchmark(base.Benchmark):
@@ -80,29 +87,24 @@ class TopKTopPBenchmark(base.Benchmark):
 
 
 @pytest.mark.top_k_top_p
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend",
+    reason="the optimized top_k_top_p targets Ascend",
+)
 def test_top_k_top_p_perf():
-    from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
-
-    def gems_op(logits, p, k, **kwargs):
-        return top_k_top_p(logits, p=p, k=k, **kwargs)
-
     if HAS_NATIVE_OP:
         # the replaced operator: torch_npu.npu_top_k_top_p
         torch_op = _native_top_k_top_p
         op_name = "top_k_top_p"
     else:
         # extension-free environments: torch-chain reference instead
-        from tests.test_top_k_top_p import top_k_top_p_ref
-
-        def torch_op(logits, p, k, **_):
-            return top_k_top_p_ref(logits, p=p, k=k)
-
+        torch_op = _ref_top_k_top_p
         op_name = "top_k_top_p_vs_torch_ref"
 
     benchmark = TopKTopPBenchmark(
         op_name=op_name,
         torch_op=torch_op,
-        gems_op=gems_op,
+        gems_op=_gems_top_k_top_p,
         dtypes=[torch.float32],
     )
     benchmark.run()

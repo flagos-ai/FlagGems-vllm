@@ -94,9 +94,10 @@ def test_apply_repetition_penalty(shape, penalty, dtype, mask_mode):
     )
     ref = utils.to_reference(logits_vllm, True).to(dtype)
 
-    flaggems_vllm.apply_repetition_penalties(
-        logits, prompt_mask, output_mask, penalties
-    )
+    with flaggems_vllm.use_gems():
+        flaggems_vllm.apply_repetition_penalties(
+            logits, prompt_mask, output_mask, penalties
+        )
     res = utils.to_reference(logits, True).to(dtype)
 
     utils.gems_assert_close(res, ref, dtype)

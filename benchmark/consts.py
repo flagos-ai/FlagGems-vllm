@@ -125,10 +125,6 @@ class BenchmarkMetrics:
     # Why the baseline comparison was skipped (op/shape/dtype missing).
     # None means "matched" or "--base-data not enabled". Excluded from metrics.
     base_miss_reason: Optional[str] = None
-    # GPU time share from model profiling YAML (--model-profile).
-    # Format: {"prefill": {"pct": 1.44, "calls": 3240}, "decode": {...}}
-    # None when --model-profile is not provided.
-    time_share: Optional[dict] = None
     # Error message
     error_msg: Optional[str] = None
 
@@ -137,7 +133,6 @@ ALL_AVAILABLE_METRICS = set(map(lambda x: x.name, fields(BenchmarkMetrics))) - {
     "legacy_shape",
     "shape_detail",
     "base_miss_reason",
-    "time_share",
 }
 
 DEFAULT_METRICS = [
@@ -500,14 +495,6 @@ def _detect_self_chip():
         return ""
 
 
-# Device-level achievable bandwidth ratio vs the baseline reference, measured
-# with the same 512 MiB copy kernel on both chips (do_bench, 2026-11-20):
-# C550 1396.4 GB/s, H800-class H100 3001.4 GB/s.  The peak-to-peak ratio
-# (0.4725) describes the memory system's theoretical gap; this one describes
-# what a streaming workload actually reaches, and wins for mem records.
-_ACHIEVABLE_BW_RATIO = {"metax C550": 0.46525}
-
-
 # Cache the device name once; it doesn't change within a run.
 _SELF_CHIP = _detect_self_chip()
 
@@ -528,9 +515,7 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
     Factor comes from base_data["_scaling_factors"] (written by the collector
     into the same file as the latencies). Matching is by vendor AND concrete
     chip model, so that e.g. nvidia H800 and H100 don't collide. Prefers
-    measured-achievable over nominal. A chip entry may also carry an
-    ``achievable`` block with device-level measurements (e.g. a copy
-    kernel's streaming bandwidth), which is consulted first. Returns None when the vendor / chip / resource /
+    measured over nominal. Returns None when the vendor / chip / resource /
     dtype isn't covered, so the caller falls back to the raw latency ratio.
 
     The reference chip (e.g. the H800 the baseline was collected on) is itself
@@ -556,11 +541,7 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
             chip = candidates[0] if len(candidates) == 1 else None
         if chip is None:
             return None
-        if resource == "bandwidth_gbps":
-            key = f"{chip.get('vendor')} {chip.get('chip')}"
-            if key in _ACHIEVABLE_BW_RATIO:
-                return _ACHIEVABLE_BW_RATIO[key]
-        for prefer in ("achievable", "measured", "nominal"):
+        for prefer in ("measured", "nominal"):
             block = chip.get(prefer)
             if not block:
                 continue
@@ -608,26 +589,18 @@ class BenchmarkResult:
         if self.result[0].gbps is not None:
             col_names.append(f"{'Torch GBPS ':>20}")
             col_names.append(f"{'Gems GBPS ':>20}")
-        # Show Time Share column only when profiling data is attached.
-        show_time_share = any(m.time_share is not None for m in self.result)
-        if show_time_share:
-            col_names.append(f"{'Time Share (prefill/decode)':>30}")
         col_names.append(f"{'Size Detail':>20}\n")
         header_col_names = " ".join(col_names)
         header_break = "-" * len(header_col_names) + "\n"
         header = header_title + header_col_names + header_break
 
         metrics_lines = "".join(
-            self._format_metrics(ele, show_vs_base, show_time_share)
-            for ele in self.result
+            self._format_metrics(ele, show_vs_base) for ele in self.result
         )
         return header + metrics_lines
 
     def _format_metrics(
-        self,
-        metrics: BenchmarkMetrics,
-        show_vs_base: bool = False,
-        show_time_share: bool = False,
+        self, metrics: BenchmarkMetrics, show_vs_base: bool = False
     ) -> str:
         # self.gen_legacy_shape(metrics)
         # legacy_shape_str = (
@@ -667,34 +640,9 @@ class BenchmarkResult:
             data_line += f"{tflops_str:>20}"
         if metrics.gbps is not None:
             data_line += f"{torch_gbps_str:>20}{gems_gbps_str:>20}"
-        if show_time_share:
-            data_line += f"{self._format_time_share(metrics.time_share):>30}"
         data_line += " " * 10
         data_line += f"{shape_detail_str}\n"
         return data_line
-
-    @staticmethod
-    def _format_time_share(time_share: Optional[dict]) -> str:
-        """Render profiling metadata as 'pf {pct}%/{calls}x | dc {pct}%/{calls}x'.
-
-        A missing phase shows '-' for both fields.
-        """
-        if not time_share:
-            return "N/A"
-
-        def _phase(key):
-            block = time_share.get(key)
-            if not isinstance(block, dict):
-                return "-", "-"
-            pct = block.get("pct")
-            calls = block.get("calls")
-            pct_s = f"{pct:.2f}%" if isinstance(pct, (int, float)) else "-"
-            calls_s = f"{int(calls)}x" if isinstance(calls, int) else "-"
-            return pct_s, calls_s
-
-        pf_pct, pf_calls = _phase("prefill")
-        dc_pct, dc_calls = _phase("decode")
-        return f"pf {pf_pct}/{pf_calls} | dc {dc_pct}/{dc_calls}"
 
     def gen_legacy_shape(self, metrics: BenchmarkMetrics) -> Optional[int]:
         first_shape = (
