@@ -84,6 +84,20 @@ def _short_projection(
 
 
 @triton.jit
+def _load_stride_two(
+    row, col, valid_rows, D: tl.constexpr, BM: tl.constexpr, WIDTH: tl.constexpr
+):
+    # Load contiguous pairs and discard the unused lane in local memory.
+    # The last pair may end at the storage boundary of the original view.
+    offset = 2 * col + tl.arange(0, 2 * WIDTH)
+    lanes = tl.load(
+        row + offset[None, :], valid_rows[:, None] & (offset[None, :] < 2 * D - 1), 0
+    )
+    even, _ = tl.split(tl.reshape(lanes, (BM, WIDTH, 2)))
+    return even.to(tl.float32)
+
+
+@triton.jit
 def _project_and_gate(
     X,
     W,
@@ -102,6 +116,8 @@ def _project_and_gate(
     MAG: tl.constexpr,
     EPS: tl.constexpr,
     NORM: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    CHANNEL_STRIDE: tl.constexpr,
 ):
     m = tl.program_id(0) * BM + tl.arange(0, BM)
     k = tl.arange(0, BK)
@@ -112,11 +128,17 @@ def _project_and_gate(
     sq = tl.full((BM,), 0, tl.float32)
     for i in range(triton.cdiv(H * D, BK)):
         off = i * BK + k
-        x = tl.load(
-            X + m[:, None] * (H * D) + off[None, :],
-            (m[:, None] < N) & (off[None, :] < H * D),
-            0,
-        ).to(tl.float32)
+        if CHANNEL_STRIDE:
+            channel = i // (D // BK)
+            col = (i - channel * (D // BK)) * BK
+            row = X + m[:, None] * TOKEN_STRIDE + channel * CHANNEL_STRIDE
+            x = _load_stride_two(row, col, m < N, D, BM, BK)
+        else:
+            x = tl.load(
+                X + m[:, None] * (H * D) + off[None, :],
+                (m[:, None] < N) & (off[None, :] < H * D),
+                0,
+            ).to(tl.float32)
         w = tl.load(
             W + c[:, None] * (H * D) + off[None, :],
             (c[:, None] < 2 * H) & (off[None, :] < H * D),
@@ -154,9 +176,13 @@ def _project_and_gate(
         mask = (m[:, None] < N) & (off[None, :] < D)
         y = tl.full((BM, BD), 0, tl.float32)
         for j in tl.static_range(H):
-            x = tl.load(X + (m[:, None] * H + j) * D + off[None, :], mask, 0).to(
-                tl.float32
-            )
+            if CHANNEL_STRIDE:
+                row = X + m[:, None] * TOKEN_STRIDE + j * CHANNEL_STRIDE
+                x = _load_stride_two(row, i * BD, m < N, D, BM, BD)
+            else:
+                x = tl.load(X + (m[:, None] * H + j) * D + off[None, :], mask, 0).to(
+                    tl.float32
+                )
             y += gates[j][:, None] * x
         tl.store(Y + m[:, None] * D + off[None, :], y, mask)
 
@@ -209,7 +235,13 @@ def _launch(x, weight, scale, base, magnitude, hc_eps, norm_eps, pipeline):
         return _launch_ihc_pre(
             x, weight, scale, base, magnitude, hc_eps, norm_eps, pipeline
         )
-    x = x.contiguous()
+    token_stride = channel_stride = 0
+    if not x.is_contiguous():
+        sn, sc, sd = x.stride()
+        if k > 1024 and sd == 2 and sc > 0 and n * sn + h * sc + 2 * d < 2**31:
+            token_stride, channel_stride = sn, sc
+        else:
+            x = x.contiguous()
     y = x.new_empty((n, d))
     post = weight.new_empty((n, h))
     if k <= 1024:
@@ -217,7 +249,11 @@ def _launch(x, weight, scale, base, magnitude, hc_eps, norm_eps, pipeline):
         launch = _short_launch
     else:
         # A wider projection tile amortizes the K loop on prefill.
-        bm, bk, bd = 16, (1024 if n >= 64 else 512), (1024 if n >= 512 else 512)
+        bm, bk, bd = (
+            16,
+            (1024 if n >= 64 or channel_stride else 512),
+            (1024 if n >= 512 else 512),
+        )
         launch = _fused_launch
     pointers = (x, weight, scale, base, y, post)
     parameters = (
@@ -233,6 +269,8 @@ def _launch(x, weight, scale, base, magnitude, hc_eps, norm_eps, pipeline):
         hc_eps,
         norm_eps,
     )
+    if k > 1024:
+        parameters += (token_stride, channel_stride)
     grid = (triton.cdiv(n, bm), 1, 1)
     launch.bind(grid, pointers, parameters)(*pointers, *parameters)
     return y, post
