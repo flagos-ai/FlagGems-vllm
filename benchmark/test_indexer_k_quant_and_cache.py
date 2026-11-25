@@ -256,6 +256,12 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
             )
             for num_tokens in (8192, 32768, 65536)
         ]
+        # 285B profiling shapes: head_dim=128 (K cache for MLA, block_size=16)
+        # Prefill M=8192 and decode M=128 from CSV [[8192, 128], [1301, 64, 132]]
+        self.shapes += [
+            (8192, 1302, 16, 128, 128),
+            (128, 20, 16, 128, 128),
+        ]
 
     def get_input_iter(self, dtype):
         for (

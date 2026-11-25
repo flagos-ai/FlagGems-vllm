@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import warnings
 
 # ruff: noqa: I001
 os.environ["FLAGTREE_AABS"] = "0"
@@ -26,7 +27,6 @@ import flaggems_vllm  # noqa: E402
 from benchmark.base import Benchmark  # noqa: E402
 
 vendor = flaggems_vllm.vendor_name
-baseline_op = None
 try:
     if vendor == "nvidia" or vendor == "thead":
 
@@ -71,19 +71,37 @@ try:
 
     elif vendor == "enflame":
 
-        # GCU exposes no vendor gemma_rmsnorm kernel; benchmark against the
-        # same torch reference math as tests/test_gemma_rms_norm.py (fp32
-        # intermediates, no cast back to the input dtype = conservative arm).
         def baseline_op(x, w, eps=1e-5):
             x = x.to(dtype=torch.float32)
             w = w.to(dtype=torch.float32)
             rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
             return (1 + w) * x * rrms
 
-    HAS_BASELINE_OP = baseline_op is not None
 except Exception as e:
-    print(e)
-    HAS_BASELINE_OP = False
+    # Fall back to vllm.model_executor.layers.layernorm.GemmaRMSNorm when
+    # the vendor-specific library (flashinfer, lightop, etc.) is absent.
+    try:
+        from vllm.model_executor.layers.layernorm import (
+            GemmaRMSNorm as _VllmGemmaRMSNorm,
+        )
+
+        def baseline_op(x, w, eps=1e-5):
+            N = x.shape[-1]
+            norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
+            norm.weight = torch.nn.Parameter(w.float())
+            norm = norm.to(x.device)
+            with torch.inference_mode():
+                return norm(x)
+
+    except ImportError:
+        print(e)
+        baseline_op = None
+
+if baseline_op is None:
+    warnings.warn(
+        f"Baseline op of current platform: {vendor} can't be loaded. "
+        "There will be `N/A` outputs in some columns."
+    )
 
 
 class GemmaRmsNormBenchmark(Benchmark):
@@ -115,9 +133,6 @@ class GemmaRmsNormBenchmark(Benchmark):
             yield x, w, eps
 
 
-@pytest.mark.skipif(
-    not HAS_BASELINE_OP, reason=f"Missing baseline ops on current platform: {vendor}"
-)
 @pytest.mark.gemma_rms_norm
 def test_gemma_rms_norm():
     dtypes = [torch.float16]

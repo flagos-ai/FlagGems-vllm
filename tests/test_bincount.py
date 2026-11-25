@@ -48,27 +48,6 @@ def _assert_bincount_weights_close(res, ref, ref_inp, ref_weights):
     per-bin accumulation length, which the plain ``gems_assert_close``
     tolerance (atol=1e-4 + dtype rtol) does not model.
 
-    For a bin receiving k weights with L1 mass L = sum(|w|), every partial
-    sum stays within [-L, L] (triangle inequality), so for ANY (atomic,
-    order-opaque) accumulation order:
-      * each half-domain rounded addition contributes <= 0.5 * ULP(L),
-        i.e. <= k * 0.5 * ULP(L) in total;
-      * the single final rounding of the fp32-accumulated result adds
-        <= 0.5 * ULP(L) (|sum| <= L and ULP is monotone);
-      * the fp32 accumulation error itself is <= k * L * 2**-23.
-    Hence |flaggems - reference| <= (k + 1) * 0.5 * ULP(L) + k * L * 2**-23
-    per bin, with ULP taken in the weights dtype (L >= |value|, so the
-    bound also holds under cancellation). k and L are computed exactly on
-    the CPU in fp64. Measured on GCU over the full shape grid this bound
-    holds with >= 2x margin (worst observed ratio 0.50 across 72
-    shape-dtype-seed probes); fp32 weights keep the plain
-    gems_assert_close path (both sides accumulate in fp32).
-
-    The comparison runs on CPU copies so a genuine mismatch still reports
-    a normal AssertionError: torch_gcu currently kills the process inside
-    torch.testing.assert_close's mismatch-message path when the failing
-    tensors live on the device (see compiler_issues/
-    torch_gcu_assert_close_mismatch_msg_sigabort.md).
     """
     dtype = ref_weights.dtype
     assert res.dtype == dtype
@@ -130,7 +109,7 @@ def test_accuracy_bincount_with_weights(size, max_val, dtype):
         res_out = torch.bincount(inp, weights=weights)
 
     if flaggems_vllm.vendor_name == "enflame":
-        # enflame-only gate (2026-11-20 定标): this backend's fp32-accumulation
+        # enflame-only gate: this backend's fp32-accumulation
         # semantics diverge from native half-domain accumulation; use the
         # noise-model tolerance + CPU-copy compare instead of the default.
         _assert_bincount_weights_close(res_out, ref_out, ref_inp, ref_weights)
@@ -211,7 +190,7 @@ def test_accuracy_bincount_weights_edge_cases(dtype):
         res_out = torch.bincount(inp, weights=weights)
 
     if flaggems_vllm.vendor_name == "enflame":
-        # enflame-only gate (2026-11-20 定标): this backend's fp32-accumulation
+        # enflame-only gate: this backend's fp32-accumulation
         # semantics diverge from native half-domain accumulation; use the
         # noise-model tolerance + CPU-copy compare instead of the default.
         _assert_bincount_weights_close(res_out, ref_out, ref_inp, ref_weights)
