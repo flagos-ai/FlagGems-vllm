@@ -80,7 +80,18 @@ iluvatar = [
 ]
 
 hygon = [
-    "aiter-dtk",
+    # Match the DTK 26.10 runtime image's torch2.11 stack.  The sourcefind
+    # index in optest supplies the HCU builds; do not add --no-deps so uv can
+    # replace the image's torch2.13 packages.
+    "torch==2.11.0+dtk2610.2611121723.gc86da8",
+    "torchvision==0.26.0+dtk2610.torch2110.2610231707.gd9d99a",
+    "torchaudio==2.11.0+dtk2610.torch2110.2610262102.g1da530",
+    "flash-attn==2.8.4+dtk2610.torch2110.2610092228.g50fdfe",
+    "apex==1.7.0+dtk2610.torch2110.2610271839.gfa848d",
+    "lightop==0.6.0+dtk2610.torch2110.2610222215.gdf8246",
+    "aiter==0.1.7+dtk2610.torch2110.2610102002.g61e581",
+    "vllm==0.28.1+dtk2610.torch2110.2610191943.g29071f",
+    "vllm-hcu==0.28.1rc1.dev491+dtk2610.torch2110.2611231313.g0729e9",
     "scikit-learn>=1.4,<2.0",
     "xgboost==3.2.0; python_version < '3.12'",
     "xgboost==3.3.0; python_version >= '3.12'",
