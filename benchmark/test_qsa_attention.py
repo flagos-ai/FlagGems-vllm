@@ -4,10 +4,15 @@ from functools import partial
 import pytest
 import torch
 
-from flaggems_vllm import qsa_sparse_paged_attention
+from flaggems_vllm import qsa_sparse_paged_attention, vendor_name
 
 from . import base
 from .qwen4_references import sparse_reference
+
+pytestmark = pytest.mark.skipif(
+    vendor_name != "thead",
+    reason="Legacy QSA ABI is retained only by T-Head; other backends use test_qsa_sparse_paged_attention.py",
+)
 
 
 class SparseBenchmark(base.GenericBenchmark):

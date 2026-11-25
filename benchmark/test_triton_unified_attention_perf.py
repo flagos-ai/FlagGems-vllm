@@ -12,21 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Performance benchmark for triton_unified_attention.
-
-Uses the repository's own benchmark framework (benchmark/base.Benchmark,
---level/--warmup/--iter/--record options) instead of the external
-pytest-benchmark plugin, so the file runs in any environment that can run
-the other benchmark/ files. The five BENCH_CONFIGS below keep the exact
-decode/prefill cases of the original pytest-benchmark parametrization.
-"""
+"""Performance benchmark for triton_unified_attention."""
 
 import pytest
 import torch
 
-import flaggems_vllm
-
-from . import base
+from flaggems_vllm.ops.triton_unified_attention import triton_unified_attention
 
 BENCH_CONFIGS = [
     # Decode: B=1, KV=1024, GQA 32:8, head_size=128
@@ -92,8 +83,8 @@ BENCH_CONFIGS = [
 ]
 
 
-def _make_inputs(config, dtype, device):
-    """Create inputs matching the triton_unified_attention signature."""
+def _make_inputs(config, device="cuda"):
+    dtype = torch.bfloat16
     num_seqs = config["num_seqs"]
     query_lens = config["query_lens"]
     context_lens = config["context_lens"]
@@ -171,29 +162,16 @@ def _make_inputs(config, dtype, device):
     )
 
 
-class TritonUnifiedAttentionBenchmark(base.Benchmark):
-    """Benchmark for triton_unified_attention (vLLM paged attention)."""
-
-    def __init__(self, config, **kwargs):
-        self.config = config
-        super().__init__(**kwargs)
-
-    def set_shapes(self, shape_file_path=None):
-        self.shapes = [self.config]
-        self.shape_desc = "num_seqs, query_len, kv_len, Hq, Hkv, head_size"
-
-    def get_input_iter(self, dtype):
-        yield _make_inputs(self.config, dtype, self.device)
-
-
-@pytest.mark.triton_unified_attention
 @pytest.mark.parametrize("config", BENCH_CONFIGS)
-def test_triton_unified_attention_perf(config):
-    bench = TritonUnifiedAttentionBenchmark(
-        config,
-        op_name="triton_unified_attention",
-        torch_op=None,
-        dtypes=[torch.bfloat16],
-        gems_op=flaggems_vllm.triton_unified_attention,
-    )
-    bench.run()
+def test_triton_unified_attention_perf(config, benchmark):
+    inputs = _make_inputs(config)
+
+    # warmup
+    triton_unified_attention(*inputs)
+    torch.cuda.synchronize()
+
+    def run():
+        triton_unified_attention(*inputs)
+        torch.cuda.synchronize()
+
+    benchmark(run)

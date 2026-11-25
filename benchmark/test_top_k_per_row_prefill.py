@@ -102,15 +102,10 @@ def _non_tle_top_k_per_row_prefill(
         s_threshold_bin_idx_ptr,
         s_final_bin_size_ptr,
         s_found_topk_values_ptr,
-        NUM_ROWS=num_rows,
         TOPK=top_k,
         BLOCK_SIZE=block_size,
-        CANONICAL_OUTPUT=(
-            logits.shape[1]
-            >= _top_k_per_row_prefill_module.CANONICAL_OUTPUT_VOCAB_THRESHOLD
-        ),
         ROW_OFFSET=0,
-        num_warps=_top_k_per_row_prefill_module._num_warps(block_size),
+        num_warps=block_size // 32,
     )
 
 
@@ -135,6 +130,11 @@ class TopKPerRowPrefillBenchmark(base.Benchmark):
             (12961, 4100, 512, 4360, 1),
             (16380, 5115, 512, 5376, 1),
             (4100, 1025, 512, 1288, 1),
+            # 285B profiling shapes (prefill 8×H100 TP=8):
+            #   shape1: [[8192, 8192], [8192], [8192], [8192, 2048]]  topk=2048
+            #   shape2: [[8192, 16384], ...]  topk=2048
+            (8192, 8192, 2048, 8192, 1),
+            (8192, 16384, 2048, 16384, 1),
         ]
 
     def get_input_iter(self, dtype):

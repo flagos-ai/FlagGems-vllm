@@ -27,10 +27,7 @@ try:
     )
 
     HAS_VLLM_FUSED_MOE = True
-except (ImportError, OSError):
-    # OSError: the vllm -> transformers -> torchaudio import chain raises
-    # OSError (not ImportError) when the installed libtorchaudio.so is
-    # binary-incompatible with the current torch build.
+except ImportError:
     HAS_VLLM_FUSED_MOE = False
 
 
@@ -87,6 +84,10 @@ class FusedMoEBenchmark(base.Benchmark):
             (64, 256, 2048, 128, 8),
             (512, 256, 2048, 128, 8),
             (1035, 256, 2048, 128, 8),
+            # 285B profiling shapes: prefill M=8192, decode M=1; 256 experts, topk=8
+            # CSV: fused_moe_kernel shape1 [[8192,4096],...] and [[1],...]
+            (8192, 256, 4096, 4096, 8),
+            (1, 256, 4096, 4096, 8),
         ]
 
     def get_input_iter(self, cur_dtype):

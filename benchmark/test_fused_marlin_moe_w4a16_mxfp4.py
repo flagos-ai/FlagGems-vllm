@@ -32,11 +32,7 @@ try:
 
     VLLM_QUANT_TYPE_FP4 = scalar_types.float4_e2m1f
     HAS_VLLM_FUSED_MARLIN_MOE = True
-except (ImportError, OSError):
-    # torchaudio (pulled in via the transformers import chain inside vllm) can
-    # fail with OSError on ABI-mismatched builds; treat it like a missing
-    # baseline so the skipif marker degrades the benchmark instead of erroring
-    # out at collection time (same guard style as test_attn_res.py).
+except ImportError:
     HAS_VLLM_FUSED_MARLIN_MOE = False
 
 # vLLM 0.6.2 on Hygon registers no Marlin MoE ops (torch.ops._moe_C is empty),
@@ -47,7 +43,7 @@ try:
     )
 
     HAS_VLLM_FUSED_EXPERTS = True
-except (ImportError, OSError):
+except ImportError:
     HAS_VLLM_FUSED_EXPERTS = False
 
 import flaggems_vllm
