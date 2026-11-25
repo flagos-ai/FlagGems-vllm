@@ -633,14 +633,13 @@ def _fused_marlin_moe_impl(
 
     element_size = hidden_states.element_size()
     projection_bytes_per_token = topk * (n + k) * element_size
-    large_projection = max(k, n) >= 4096
 
     def auxiliary_workspace_bytes(tokens):
         if tokens == 0:
             return 0
         r = tokens * topk
-        direct, bm, shared, split_k = _batch_config(
-            r, e, large_projection, apply_router_weight_on_input
+        direct, bm, shared, gate_split, down_split = _batch_config(
+            r, e, k, n, quant_type_id, apply_router_weight_on_input
         )
         if direct:
             routing = 0
@@ -649,9 +648,11 @@ def _fused_marlin_moe_impl(
             routing = blocks * (bm + 1) + (e + 1) ** 2 + 1
         else:
             routing = e * triton.cdiv(r, bm) * bm + 2 * e + 1
-        split = 0
-        if split_k > 1 and not (direct and quant_type_id == QUANT_TYPE_UINT8B128):
-            split = split_k * r * max(2 * n, k)
+        # The two projection partials are allocated and released in order.
+        split = r * max(
+            gate_split * 2 * n if gate_split > 1 else 0,
+            down_split * k if down_split > 1 else 0,
+        )
         return 4 * (routing + split)
 
     batch_tokens = m
@@ -699,10 +700,10 @@ def _fused_marlin_moe_impl(
     return out
 
 
-def _batch_config(r, e, large_projection, apply_router_weight_on_input):
+def _batch_config(r, e, k, n, quant_type_id, apply_router_weight_on_input):
     # Reuse expert weights when routes repeat; large banks make repeated
     # direct loads more expensive than the small route-alignment kernels.
-    direct = r <= (2 if large_projection else 16)
+    direct = r <= (2 if max(k, n) >= 4096 else 16)
     bm = 64 if r >= 32 * e else 32 if r >= 16 * e else 16
     # The shared aligner has four stages and a quadratic expert-count buffer.
     # Amortize that overhead on grouped batches with enough routes per expert.
@@ -712,9 +713,15 @@ def _batch_config(r, e, large_projection, apply_router_weight_on_input):
     # Keep the original accumulation order when routing weights precede
     # activation: rounding differences can be amplified by the gated product.
     split_k = (
-        8 if large_projection and r <= 32 and not apply_router_weight_on_input else 1
+        8
+        if r <= 32
+        and not apply_router_weight_on_input
+        and not (direct and quant_type_id == QUANT_TYPE_UINT8B128)
+        else 1
     )
-    return direct, bm, shared_routing, split_k
+    gate_split = split_k if k >= 4096 else 1
+    down_split = split_k if n >= 4096 else 1
+    return direct, bm, shared_routing, gate_split, down_split
 
 
 def _run_moe_batch(
@@ -737,8 +744,8 @@ def _run_moe_batch(
     n = n2 // 2
     topk = topk_ids.shape[1]
     r = m * topk
-    direct, bm, shared_routing, split_k = _batch_config(
-        r, e, max(k, n) >= 4096, apply_router_weight_on_input
+    direct, bm, shared_routing, gate_split, down_split = _batch_config(
+        r, e, k, n, quant_type_id, apply_router_weight_on_input
     )
     cap = triton.cdiv(r, bm) * bm
     with torch.cuda.device(hidden_states.device):
@@ -772,9 +779,9 @@ def _run_moe_batch(
                 counts, route_metadata, e, triton.next_power_of_2(e), num_warps=4
             )
         blocks = r if direct else min(r, triton.cdiv(r, bm) + e - 1)
-        for a, w, s, c, first, nk, kk in (
-            (hidden_states, w1, w1_scale, intermediate, True, n, k),
-            (intermediate, w2, w2_scale, result, False, k, n),
+        for a, w, s, c, first, nk, kk, split_k in (
+            (hidden_states, w1, w1_scale, intermediate, True, n, k, gate_split),
+            (intermediate, w2, w2_scale, result, False, k, n, down_split),
         ):
             if quant_type_id == QUANT_TYPE_FP8_E4M3:
                 w = w.view(torch.uint8)
