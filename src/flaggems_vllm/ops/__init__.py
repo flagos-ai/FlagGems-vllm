@@ -19,7 +19,9 @@ from flaggems_vllm.ops.act_quant import act_quant_triton
 from flaggems_vllm.ops.add_rms_norm import add_rms_norm
 from flaggems_vllm.ops.logit_bias import apply_logit_bias
 from flaggems_vllm.ops.apply_repetition_penalties import apply_repetition_penalties
+from flaggems_vllm.ops.matmul_persistent import matmul_persistent
 from flaggems_vllm.ops.top_k_top_p import top_k_top_p
+from flaggems_vllm.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.ops.attn_res import attn_res
 from flaggems_vllm.ops.bad_words import apply_bad_words
 from flaggems_vllm.ops.beam_search_score import beam_search_score, beam_search_score_
@@ -36,6 +38,7 @@ from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
 )
 from flaggems_vllm.ops.cross_entropy_loss import cross_entropy_loss
 from flaggems_vllm.ops.cutlass_scaled_mm import cutlass_scaled_mm
+from flaggems_vllm.ops.deep_gemm_fp8_o_proj import deep_gemm_fp8_o_proj
 from flaggems_vllm.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
 )
@@ -89,6 +92,7 @@ from flaggems_vllm.ops.fp8_fp4_paged_mqa_logits_graph import (
     fp8_fp4_paged_mqa_logits_graph,
 )
 from flaggems_vllm.ops.fused_add_rms_norm import fused_add_rms_norm
+from flaggems_vllm.ops.fused_q import fused_q
 from flaggems_vllm.ops.fused_allreduce_rms_norm import (
     fused_allreduce_rms_norm,
 )
@@ -184,6 +188,7 @@ from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size_triton,
 )
 from flaggems_vllm.ops.moe_sum import moe_sum
+from flaggems_vllm.ops.marlin_gemm import marlin_gemm
 from flaggems_vllm.ops.mrope import mrope
 from flaggems_vllm.ops.mul import mul, mul_
 from flaggems_vllm.ops.mv import mv
@@ -274,6 +279,7 @@ from flaggems_vllm.ops.kpool import (
     kpool_decode_update_and_maybe_write_cache_batched,
     kpool_seed_tail_cache,
 )
+from flaggems_vllm.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.ops.mhc_with_norm import (
     mhc_fused_post_pre_with_norm,
     mhc_pre_with_norm,
@@ -296,6 +302,7 @@ __all__ = [
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
     "apply_thinking_budget",
+    "apply_trace_tokens",
     "attn_res",
     "beam_search_score",
     "beam_search_score_",
@@ -326,6 +333,7 @@ __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "cross_entropy_loss",
     "cutlass_scaled_mm",
+    "deep_gemm_fp8_o_proj",
     "dequantize_and_gather_k_cache",
     "dgeglu",
     "dispatch_fused_moe_kernel",
@@ -361,6 +369,7 @@ __all__ = [
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
+    "fused_q",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
     "fused_recurrent_gated_delta_rule_packed_decode",
@@ -395,6 +404,9 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "mamba_mixer",
+    "marlin_gemm",
+    "matmul_persistent",
     "mhc_bwd",
     "mhc_fused_post_pre_with_norm",
     "mhc_post",

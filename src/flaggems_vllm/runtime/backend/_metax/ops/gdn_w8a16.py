@@ -978,6 +978,14 @@ def _decode(
 if gluon is not None:
 
     @gluon.jit
+    def _packed_sum_three(x, y, z, a, b, c):
+        return x + a, y + b, z + c
+
+    @gluon.jit
+    def _packed_sum_pair(x, y, a, b):
+        return x + a, y + b
+
+    @gluon.jit
     def _packed_decode_128(
         Q,
         K,
@@ -994,18 +1002,20 @@ if gluon is not None:
         VS: gl.constexpr,
         SCALE: gl.constexpr,
         WIDE: gl.constexpr,
-        PROJECT: gl.constexpr,
+        BV: gl.constexpr,
+        PROJECTION: gl.constexpr,
+        K_LANES: gl.constexpr,
+        K_VEC: gl.constexpr,
     ):
         # Keep Q/K in the state tile's register layout: no shared-memory
         # layout conversion or CTA barrier between normalization and GEMV.
-        layout: gl.constexpr = gl.BlockedLayout([1, 4], [8, 8], [1, 1], [1, 0])
-        BV: gl.constexpr = 16
-        pid = gl.program_id(0)
-        tile, h, n = (
-            pid % (128 // BV),
-            (pid // (128 // BV)) % 32,
-            pid // (32 * (128 // BV)),
+        layout: gl.constexpr = gl.BlockedLayout(
+            [1, K_VEC], [64 // K_LANES, K_LANES], [1, 1], [1, 0]
         )
+        pid = gl.program_id(0)
+        tile = pid % (128 // BV)
+        h = (pid // (128 // BV)) % 32
+        n = pid // (32 * (128 // BV))
         slot = gl.load(Ids + n).to(gl.int64)
         if not WIDE:
             # Preserve every nonpositive int64 padding value before narrowing.
@@ -1017,31 +1027,63 @@ if gluon is not None:
         state = gl.load(S + off, slot > 0, 0)
         q = gl.load(Q + n * QS + (h // 2) * 128 + d).to(gl.float32)
         k = gl.load(K + n * KS + (h // 2) * 128 + d).to(gl.float32)
-        q2, k2 = gl.sum(q * q, 0), gl.sum(k * k, 0)
-        q *= gl.rsqrt(q2 + 1e-6)
-        k *= gl.rsqrt(k2 + 1e-6)
+        if PROJECTION == 1:
+            q2, k2, kq = gl.reduce((q * q, k * k, k * q), 0, _packed_sum_three)
+        else:
+            q2, k2 = gl.sum(q * q, 0), gl.sum(k * k, 0)
+        if PROJECTION:
+            # Adding epsilon keeps finite norm inputs above the subnormal range.
+            qs = SCALE * gl.exp2(-0.5 * gl.log2(q2 + 1e-6))
+            ks = gl.exp2(-0.5 * gl.log2(k2 + 1e-6))
+            if PROJECTION == 2:
+                q *= qs
+                k *= ks
+        else:
+            q *= gl.rsqrt(q2 + 1e-6)
+            k *= gl.rsqrt(k2 + 1e-6)
         gate = gl.load(A + n * 32 + h).to(gl.float32) + gl.load(Bias + h)
-        sp = gl.where(gate <= 20, gl.log(1 + gl.exp(gate)), gate)
-        decay = gl.exp(-gl.exp(gl.load(AL + h)) * sp)
-        beta = 1.0 / (1.0 + gl.exp(-gl.load(B + n * 32 + h).to(gl.float32)))
+        if PROJECTION:
+            log2e: gl.constexpr = 1.4426950408889634
+            sp2 = gl.where(
+                gate <= 20, gl.log2(1.0 + gl.exp2(gate * log2e)), gate * log2e
+            )
+            decay = gl.exp2(-gl.exp2(gl.load(AL + h) * log2e) * sp2)
+            beta = 1.0 / (
+                1.0 + gl.exp2(-gl.load(B + n * 32 + h).to(gl.float32) * log2e)
+            )
+        else:
+            sp = gl.where(gate <= 20, gl.log(1 + gl.exp(gate)), gate)
+            decay = gl.exp(-gl.exp(gl.load(AL + h)) * sp)
+            denom = 1.0 + gl.exp(-gl.load(B + n * 32 + h).to(gl.float32))
+            beta = 1.0 / denom
         beta = beta.to(B.dtype.element_ty).to(gl.float32)
         v = gl.load(V + n * VS + h * 128 + vd).to(gl.float32)
-        state *= decay
-        if PROJECT:
-            # Project the decayed state before the dependent rank-one update:
-            # (state + residual * k) @ q = state @ q + residual * (k @ q).
+        if PROJECTION == 1:
             sk = gl.sum(state * k[None, :], 1)
-            sq = gl.sum(state * (q * SCALE)[None, :], 1)
-            kq = gl.sum(k * (q * SCALE), 0)
-            residual = (v - sk) * beta
-            state += residual[:, None] * k[None, :]
-            out = sq + residual * kq
+            sq = gl.sum(state * q[None, :], 1)
+            correction = ((v - sk * (decay * ks)) * beta) * ks
+            state = state * decay + correction[:, None] * k[None, :]
+            gl.store(S + off, state, slot > 0)
+            out = (sq * decay + correction * kq) * qs
+        elif PROJECTION == 2:
+            sk, sq = gl.reduce(
+                (state * k[None, :], state * q[None, :]), 1, _packed_sum_pair
+            )
+            kq = gl.sum(k * q, 0)
+            correction = (v - sk * decay) * beta
+            out = sq * decay + correction * kq
+            gl.store(O + (n * 32 + h) * 128 + vd, gl.where(slot > 0, out, 0.0))
+            state = state * decay + correction[:, None] * k[None, :]
+            gl.store(S + off, state, slot > 0)
         else:
+            state *= decay
             residual = (v - gl.sum(state * k[None, :], 1)) * beta
             state += residual[:, None] * k[None, :]
             out = gl.sum(state * (q * SCALE)[None, :], 1)
-        gl.store(O + (n * 32 + h) * 128 + vd, gl.where(slot > 0, out, 0.0))
-        gl.store(S + off, state, slot > 0)
+        if PROJECTION != 2:
+            gl.store(O + (n * 32 + h) * 128 + vd, gl.where(slot > 0, out, 0.0))
+        if not PROJECTION:
+            gl.store(S + off, state, slot > 0)
 
 
 def _mixed_workspace_plan(tokens, sequences, value_heads, target=64):
@@ -1068,7 +1110,14 @@ def _run_mixed_chunk(args, scale):
     hv, dv = v.shape[2:]
     n = cu.numel() - 1
     bv = 32 if n <= 2 else 64
-    target = 96 if q.dtype == torch.bfloat16 and n == 16 and t >= 4096 else 64
+    target = 64
+    if q.dtype == torch.bfloat16 and t >= 4096:
+        if n in (2, 4, 16):
+            target = 96
+        elif n in (3, 14):
+            target = 80
+        if n == 2:
+            bv = 64
     total, c, _ = _mixed_workspace_plan(t, n, hv, target=target)
     if not c:
         raise NotImplementedError("GDN chunk workspace cannot fit one chunk")
@@ -1096,7 +1145,8 @@ def _run_mixed_chunk(args, scale):
     # F carries state; S is never modified. All mappings are derived from Cu
     # on device, so replay remains valid when Cu contents change.
     for base in range(0, total, c):
-        _gdn_chunk_prep[(c, hv)](
+        active_chunks = min(c, total - base)
+        _gdn_chunk_prep[(active_chunks, hv)](
             base,
             c,
             q,
@@ -1120,7 +1170,7 @@ def _run_mixed_chunk(args, scale):
             wide,
             num_warps=4,
         )
-        _gdn_chunk_wy[(c, hv, tr.cdiv(max(dk, dv), bw))](
+        _gdn_chunk_wy[(active_chunks, hv, tr.cdiv(max(dk, dv), bw))](
             base,
             c,
             k,
@@ -1176,7 +1226,7 @@ def _run_mixed_chunk(args, scale):
             num_stages=1,
             pipeline="cpasync-mixed",
         )
-        _gdn_chunk_output[(c, hv, tr.cdiv(dv, obv))](
+        _gdn_chunk_output[(active_chunks, hv, tr.cdiv(dv, obv))](
             base,
             c,
             q,
@@ -1591,7 +1641,7 @@ def _fused_decode(
     if n and any(out.data_ptr() == t.data_ptr() for t in tensors[:-1]):
         raise ValueError("output must not alias an input")
     if (
-        n in (1, 3)
+        0 < n <= 64
         and q.dtype == torch.bfloat16
         and gluon is not None
         and not isinstance(qkv, tuple)
@@ -1603,8 +1653,13 @@ def _fused_decode(
         and not fma
         and round_beta
     ):
+        # Smaller value tiles expose more independent state rows on C550.
+        # Mode 1 projects raw Q/K; mode 2 projects the normalized vectors.
+        projection = 1 if n <= 2 or n >= 32 else 2 if n in (3, 7) or n >= 16 else 0
+        k_lanes = 32 if n >= 16 else 16 if projection else 8
+        tile_v = 4 if n >= 32 else 8
         with torch.cuda.device(q.device):
-            _packed_decode_128[(n * hv * 8,)](
+            _packed_decode_128[(n * hv * (128 // tile_v),)](
                 q,
                 k,
                 v,
@@ -1620,10 +1675,13 @@ def _fused_decode(
                 v.stride(1),
                 dk**-0.5 if scale is None else scale,
                 state.numel() >= 2**31,
-                n == 3,
+                tile_v,
+                projection,
+                k_lanes,
+                2 if n >= 32 else 4,
                 num_warps=1,
                 num_stages=1,
-                enable_fp_fusion=False,
+                enable_fp_fusion=(projection == 2),
             )
         return out, state
     if bv is None:

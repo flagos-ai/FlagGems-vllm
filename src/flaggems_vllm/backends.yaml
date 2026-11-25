@@ -144,7 +144,7 @@ backends:
     # opencv-python-headless>=4.13, which needs numpy>=2, so a numpy==1.26.4 pin
     # makes the vLLM install unsatisfiable. The vLLM step resolves it.
     deps:
-      - flagcx==0.14.0rc2.post2+cuda13.3
+      - flagcx==0.14.1+cuda13.3
       - torch==2.11.0+cu130
       - torchaudio==2.11.0+cu130
       - torchvision==0.26.0+cu130
