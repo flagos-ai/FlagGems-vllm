@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 
 import flaggems_vllm
 from tests.test_flash_mla_sparse_fwd_w8a8 import (
@@ -21,6 +24,7 @@ from tests.test_flash_mla_sparse_fwd_w8a8 import (
     assert_sparse_fixture_close,
     flashmla_reference,
     make_sparse_inputs,
+    native_v4_inputs,
     quantize_sparse_fp8_fixture,
 )
 
@@ -39,20 +43,44 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
         )
         self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
 
+    def set_more_shapes(self):
+        if (
+            Path(base.Config.shape_file).resolve()
+            != Path(__file__).with_name("core_shapes.yaml").resolve()
+        ):
+            return []
+        suite = Path(__file__).with_name("model_shapes") / "sparse_mla_w8a8.yaml"
+        with suite.open() as stream:
+            return [
+                tuple(shape) for shape in yaml.safe_load(stream)[self.op_name]["shapes"]
+            ]
+
     def get_input_iter(self, dtype):
         for shape in self.shapes:
-            if len(shape) not in (7, 10):
+            native_v4 = shape[-1] == "v4"
+            parameters = shape[:-1] if native_v4 else shape
+            if len(parameters) not in (7, 10):
                 raise ValueError(
                     "Sparse MLA shapes need SQ,HQ,DQK,SKV,HKV,TOPK,DV, "
                     "optionally followed by sink,topk_length,seed"
                 )
-            inputs = make_sparse_inputs(shape, dtype=dtype)
-            packed = quantize_sparse_fp8_fixture(*inputs)
+            inputs = make_sparse_inputs(parameters, dtype=dtype)
+            if native_v4:
+                inputs, packed = native_v4_inputs(inputs)
+            else:
+                packed = quantize_sparse_fp8_fixture(*inputs)
             reference, _, reference_lse = self.torch_op(*inputs)
             output, lse = self.gems_op(*packed)
             assert_sparse_fixture_close(
                 output[:, 0], lse[:, :, 0], reference, reference_lse
             )
+            if native_v4:
+                assert_sparse_fixture_close(
+                    output[:, 0, :, 448:],
+                    lse[:, :, 0],
+                    reference[..., 448:],
+                    reference_lse,
+                )
             yield inputs, packed, shape
 
     def unpack_to_args_kwargs(self, input_tuple):
