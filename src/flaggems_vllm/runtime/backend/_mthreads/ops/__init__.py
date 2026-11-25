@@ -49,6 +49,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.logprob import compute_topk_scores
 from flaggems_vllm.runtime.backend._mthreads.ops.mhc_pre_broadcast import (
     mhc_pre_broadcast,
 )
@@ -78,6 +79,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.watermark import (
 __all__ = [
     "chunk_gated_delta_rule_w8a16_fp8",
     "cooperative_topk",
+    "compute_topk_scores",
     "dequantize_and_gather_k_cache",
     "draft_watermarking_mask",
     "flash_attn_varlen_func_w8a8_fp8",
