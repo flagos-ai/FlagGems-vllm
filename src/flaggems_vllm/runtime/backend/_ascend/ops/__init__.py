@@ -55,9 +55,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_weight_scale import
 from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import (
     fused_inv_rope_int8_quant,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe_w4a16_int4 import (
-    fused_marlin_moe,
-)
+from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
