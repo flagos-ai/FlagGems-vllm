@@ -174,6 +174,7 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_qsa_mqa_paged,
     qwen4_vendor_store_qsa_rows,
     qsa_prepare,
+    ple_gate,
 )
 from flaggems_vllm.ops.minimax_m3_sparse_attn import (
     minimax_m3_sparse_attn,
@@ -432,6 +433,7 @@ __all__ = [
     "ple_conv",
     "ple_gate_norm",
     "ple_gate_norm_",
+    "ple_gate",
     "ple_prefill_short_conv_",
     "ple_short_conv_",
     "ple_state_gather",

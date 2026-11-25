@@ -51,6 +51,8 @@ from flaggems_vllm.ops.qwen4.qsa_sparse_paged_attention import (
     qsa_sparse_paged_attention,
 )
 
+from .ple_gate import ple_gate  # noqa: F401
+
 __all__ = [
     "grouped_gemma_rmsnorm",
     "hc_combine",
