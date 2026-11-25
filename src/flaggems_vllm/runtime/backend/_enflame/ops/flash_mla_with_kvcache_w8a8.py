@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from itertools import accumulate
 from typing import Optional, Sequence, Tuple
@@ -29,7 +30,7 @@ from flaggems_vllm.ops.flash_mla import (
     _get_tensor_descriptor_cls,
 )
 from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
-import logging
+
 logger = logging.getLogger(__name__)
 
 HAS_TLE = runtime.device.vendor_name == "nvidia" and has_triton_tle_attrs(

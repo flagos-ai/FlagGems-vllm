@@ -7,6 +7,7 @@ reader. Norm and RoPE remain FP32 until the final BF16/FP8 store. This module
 uses no vLLM compiled extension and does not quantize query tensors.
 """
 
+import logging
 import os
 
 import torch
@@ -15,7 +16,7 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-import logging
+
 logger = logging.getLogger(__name__)
 
 

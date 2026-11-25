@@ -246,7 +246,9 @@ def _fused_inv_rope_fp8_quant_group_pair(
     if pid_token >= num_tokens:
         head_in_group_ = tl.arange(0, heads_per_group)
         addrs = (
-            scale_ptr + g * scale_stride_group + pid_token
+            scale_ptr
+            + g * scale_stride_group
+            + pid_token
             + head_in_group_ * scale_stride_k
         )
         if TMA_ALIGNED_SCALES:
@@ -314,9 +316,7 @@ def _fused_inv_rope_fp8_quant_group_pair(
         else:
             scales = s_raw
             scales_exp = tl.reshape(
-                tl.broadcast_to(
-                    tl.reshape(scales, (2, CHUNKS_PER_HEAD, 1)), x3_shape
-                ),
+                tl.broadcast_to(tl.reshape(scales, (2, CHUNKS_PER_HEAD, 1)), x3_shape),
                 (PAIR_DIM,),
             )
             x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Data movement used by model fused operators; no Torch copy/cast launches."""
+
+import logging
 import math
 
 import torch
@@ -9,7 +11,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime.backend._enflame.ops.concat_mla_q import concat_mla_q
 from flaggems_vllm.utils import libentry, libtuner
-import logging
+
 logger = logging.getLogger(__name__)
 
 

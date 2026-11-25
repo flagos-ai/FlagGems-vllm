@@ -19,6 +19,9 @@ except ImportError:
     tle = None
     HAS_TLE = False
 
+from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
+from flaggems_vllm.ops.FLA.utils import check_shared_mem, input_guard
+
 # GCU: use the enflame-local chunk_h copy (int32-safe-domain state-slot
 # addressing -- the generic int64 "loaded-scalar addressing" form matches the
 # documented GCU abort/corruption pattern in varlen runs).
@@ -30,11 +33,7 @@ from flaggems_vllm.runtime.backend._enflame.ops.FLA.chunk_h import (
 # GCU: use the enflame-local cumsum copy -- the generic vector kernel puts
 # (NT, B*H) on grid.y/z which exceeds the GCU 255 cap for T=16384 / B*H=256
 # bench shapes (OutOfResources abort); the local copy folds them into grid.x.
-from flaggems_vllm.runtime.backend._enflame.ops.FLA.cumsum_gla import (
-    chunk_local_cumsum,
-)
-from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
-from flaggems_vllm.ops.FLA.utils import check_shared_mem, input_guard
+from flaggems_vllm.runtime.backend._enflame.ops.FLA.cumsum_gla import chunk_local_cumsum
 
 RCP_LN2 = 1.4426950216
 
@@ -2105,6 +2104,8 @@ def chunk_gla(
     return o, final_state
 
 
+import logging
+
 # GCU: the generic ``flaggems_vllm.ops.FLA.index.prepare_chunk_indices`` takes
 # only (cu_seqlens, chunk_size) while ``ChunkGLAFunction.forward`` passes the
 # newer ``cu_seqlens_cpu`` kwarg. Accept and drop it here so this module is
@@ -2112,7 +2113,7 @@ def chunk_gla(
 from flaggems_vllm.ops.FLA.index import (  # noqa: E402
     prepare_chunk_indices as _generic_prepare_chunk_indices,
 )
-import logging
+
 logger = logging.getLogger(__name__)
 
 

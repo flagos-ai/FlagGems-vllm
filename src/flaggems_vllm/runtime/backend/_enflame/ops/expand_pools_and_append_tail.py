@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Expand selected pool indices and append the incomplete token tail."""
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import device as runtime_device
-import logging
+
 logger = logging.getLogger(__name__)
 
 

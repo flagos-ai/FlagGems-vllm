@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
-import logging
+
 logger = logging.getLogger(__name__)
 
 # GCU400 perf profile (measured on this op, L600):

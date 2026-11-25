@@ -6,12 +6,14 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import device
-import logging
+
 logger = logging.getLogger(__name__)
 
 # GCU launch limits (triton.backends.enflame.backend.GcuLauncher):

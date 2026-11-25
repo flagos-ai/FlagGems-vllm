@@ -44,6 +44,7 @@ GCU adaptations vs the generic implementation:
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -53,7 +54,7 @@ import triton.language as tl
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flaggems_vllm.runtime import device as _runtime_device
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-import logging
+
 logger = logging.getLogger(__name__)
 
 try:

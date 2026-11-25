@@ -543,9 +543,7 @@ def flash_fwd_kernel(
             # for non-causal non-local IS_EVEN_MN launches (need_mask is
             # false), so the frame tile computes the same softmax/partial sum
             # the plain loop would.
-            masking_cols: tl.constexpr = (
-                BLOCK_N if PLAIN_TAIL_VIA_FRAME else 0
-            )
+            masking_cols: tl.constexpr = BLOCK_N if PLAIN_TAIL_VIA_FRAME else 0
         else:
             masking_cols: tl.constexpr = BLOCK_N
     elif (

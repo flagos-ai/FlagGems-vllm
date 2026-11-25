@@ -48,6 +48,7 @@ expansion hooks are deliberately omitted for the fast kernel so the curated
 space stays authoritative; the fallback kernel keeps its original tuner.
 """
 
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -57,7 +58,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
-import logging
+
 logger = logging.getLogger(__name__)
 
 

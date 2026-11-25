@@ -24,6 +24,7 @@ MNNVL virtual-memory handles; FlagGems executes the collective and post-ops.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -35,7 +36,7 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-import logging
+
 logger = logging.getLogger(__name__)
 
 try:

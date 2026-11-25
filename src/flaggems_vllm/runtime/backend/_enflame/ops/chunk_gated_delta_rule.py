@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 
 import torch
@@ -28,7 +29,7 @@ from flaggems_vllm.ops.FLA.fused_cumsum_kkt_solve_tril import (
 )
 from flaggems_vllm.utils import libentry
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
-import logging
+
 logger = logging.getLogger(__name__)
 
 if has_triton_tle_attrs(

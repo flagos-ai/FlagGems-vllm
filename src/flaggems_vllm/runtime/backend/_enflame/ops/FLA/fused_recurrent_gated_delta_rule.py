@@ -4,6 +4,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
 """Stride-aware recurrent GDN with vLLM's value-major state cache."""
 
+import logging
 import math
 import os
 import re
@@ -13,7 +14,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.runtime import device
-import logging
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------

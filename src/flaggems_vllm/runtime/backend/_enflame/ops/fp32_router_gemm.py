@@ -6,6 +6,8 @@ to FP32 on load; router weights and returned logits stay FP32. No bias is
 applied here. Unsupported dimensions or larger batches are explicitly rejected.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -13,7 +15,7 @@ import triton.language as tl
 from flaggems_vllm.runtime import device as runtime_device
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-import logging
+
 logger = logging.getLogger(__name__)
 
 

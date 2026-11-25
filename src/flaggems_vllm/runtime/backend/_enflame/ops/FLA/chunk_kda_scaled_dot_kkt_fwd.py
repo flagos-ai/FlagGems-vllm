@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent causal KDA Gram matrices with cumulative log2 gates."""
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
-import logging
+
 logger = logging.getLogger(__name__)
 
 

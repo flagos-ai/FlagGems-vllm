@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple
 
 import torch
@@ -28,7 +29,7 @@ from flaggems_vllm import runtime
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
 from flaggems_vllm.utils.device_info import get_device_capability, get_sm_count
-import logging
+
 logger = logging.getLogger(__name__)
 
 # Older Triton dependency scanners resolve attributes even in constexpr branches.

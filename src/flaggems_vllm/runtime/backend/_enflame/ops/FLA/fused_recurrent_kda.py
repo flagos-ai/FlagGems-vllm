@@ -39,6 +39,7 @@ GCU adaptations vs the generic implementation:
   compiles the upstream kernel.
 """
 
+import logging
 import math
 import os
 import sys
@@ -50,7 +51,7 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
-import logging
+
 logger = logging.getLogger(__name__)
 
 

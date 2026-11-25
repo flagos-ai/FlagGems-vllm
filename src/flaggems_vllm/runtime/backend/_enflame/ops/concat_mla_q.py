@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
 """In-place MLA query concatenation without a Torch compute fallback."""
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
-import logging
+
 logger = logging.getLogger(__name__)
 
 # GCU400 launch constraints (measurements in the moe_sum adaptation):

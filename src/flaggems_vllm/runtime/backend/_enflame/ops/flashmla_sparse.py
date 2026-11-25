@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import re
 from typing import Optional, Tuple
@@ -22,7 +23,7 @@ import triton.language as tl
 
 from flaggems_vllm.utils.tle_capabilities import supports_sparse_mla_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-import logging
+
 logger = logging.getLogger(__name__)
 
 # ===========================================================================

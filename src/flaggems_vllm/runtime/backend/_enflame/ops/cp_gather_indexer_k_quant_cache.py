@@ -33,6 +33,7 @@
 # - int64 appears only as a scalar base fold (block base, dst base when the
 #   output exceeds 2**31 bytes); all lane arithmetic stays int32.
 
+import logging
 import sys
 
 import torch
@@ -42,7 +43,7 @@ import triton.language as tl
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache as _general_cp_gather_indexer_k_quant_cache,
 )
-import logging
+
 logger = logging.getLogger(__name__)
 
 

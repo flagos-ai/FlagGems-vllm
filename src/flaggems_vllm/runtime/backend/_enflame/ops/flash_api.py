@@ -20,6 +20,7 @@ import triton
 
 import flaggems_vllm
 from flaggems_vllm import runtime
+from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._enflame.ops.flash_kernel import (
     block_m_splitkv_heuristic,
     block_n_splitkv_heuristic,
@@ -28,9 +29,8 @@ from flaggems_vllm.runtime.backend._enflame.ops.flash_kernel import (
     flash_fwd_splitkv_combine_kernel,
     flash_fwd_splitkv_kernel,
     flash_varlen_fwd_kernel,
+    is_even_mn,
 )
-from flaggems_vllm.runtime.backend._enflame.ops.flash_kernel import is_even_mn
-from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils.random_utils import philox_backend_seed_offset
 
 logger = logging.getLogger(__name__)
@@ -1342,9 +1342,7 @@ def mha_fwd(
             if (
                 (is_local or is_causal)
                 and D < 192
-                and not is_even_mn(
-                    Q, K, 64, 128, window_size_left, window_size_right
-                )
+                and not is_even_mn(Q, K, 64, 128, window_size_left, window_size_right)
             ):
                 kernel = flash_fwd_kernel_local_uneven[grid]
             else:

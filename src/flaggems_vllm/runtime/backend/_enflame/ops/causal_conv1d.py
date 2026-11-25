@@ -45,12 +45,14 @@ of two so the channel-block count respects the 255 limit on ``grid.y``;
 below the 65535 cap).
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm.utils import libentry
-import logging
+
 logger = logging.getLogger(__name__)
 
 

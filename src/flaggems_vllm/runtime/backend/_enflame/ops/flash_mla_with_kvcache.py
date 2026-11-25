@@ -19,6 +19,7 @@ Only supports sm90 (Hopper) architecture.
 """
 
 import dataclasses
+import logging
 import os
 from typing import Optional, Tuple
 
@@ -27,7 +28,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
-import logging
+
 logger = logging.getLogger(__name__)
 
 if has_triton_tle(3, 6, 0):

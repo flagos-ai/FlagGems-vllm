@@ -42,6 +42,7 @@
 #    softmax chain) and the output rescale is folded into tl.dot(acc=).
 #    Variable block counts (tensor) keep the original dynamic loop.
 
+import logging
 import os
 import warnings
 
@@ -59,7 +60,6 @@ from flaggems_vllm.ops.FLA.mean_pooling import mean_pooling
 from flaggems_vllm.ops.FLA.parallel_nsa_compression import parallel_nsa_compression
 from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp, log
 from flaggems_vllm.ops.FLA.utils import _bitonic_merge, check_shared_mem, input_guard
-import logging
 
 logger = logging.getLogger(__name__)
 
