@@ -1695,7 +1695,7 @@ ops:
   kind:
   - NeuralNetwork
   stages:
-  - alpha: '5.5'
+  - beta: '0.3'
 - id: mamba_mixer
   description: Triton implementation of the Mamba mixer operator for vLLM inference.
   for:
