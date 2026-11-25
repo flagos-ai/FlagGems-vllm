@@ -8,9 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 import triton
-import triton.language as tl
 
-from benchmark import base
+from benchmark import base, consts
+from benchmark.conftest import TEST_RESULTS, update_result
 from flaggems_vllm import device as DEVICE
 from flaggems_vllm import runtime
 from flaggems_vllm.ops import batch_shard as impl
@@ -23,193 +23,28 @@ pytestmark = [
     ),
 ]
 
-# Unchanged reference kernels from vLLM commit
-# 947dd62c0700851a79b0a8f32cb823e25a003b31,
-# vllm/v1/worker/gpu/sample/batch_shard.py.
-
-
-@triton.jit(
-    do_not_specialize=["max_num_logits_per_req", "num_src_cols", "packed_stride"]
-)
-def _pack_sampler_output_kernel(
-    packed_ptr,
-    packed_stride,
-    sampled_token_ids_ptr,
-    sampled_token_ids_stride,
-    num_sampled_ptr,
-    num_rejected_ptr,
-    num_nans_ptr,
-    local_cu_num_logits_ptr,
-    max_num_logits_per_req,
-    num_src_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    row_ptr = packed_ptr + req_idx * packed_stride
-
-    token_ids = tl.load(
-        sampled_token_ids_ptr + req_idx * sampled_token_ids_stride + cols,
-        mask=cols < num_src_cols,
-        other=0,
+# Reference kernels provided by vLLM 0.32.
+try:
+    from vllm.v1.worker.gpu.sample.batch_shard import (
+        _pack_logprobs_kernel,
+        _pack_sampler_output_kernel,
+        _unpack_gathered_output_kernel,
+        _unpack_logprobs_kernel,
     )
-    tl.store(row_ptr + cols, token_ids, mask=cols < max_num_logits_per_req)
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
-    tl.store(row_ptr + max_num_logits_per_req, num_sampled.to(tl.int64))
-    num_rejected = tl.load(num_rejected_ptr + req_idx)
-    tl.store(row_ptr + max_num_logits_per_req + 1, num_rejected.to(tl.int64))
-    if num_nans_ptr is not None:
-        # num_nans is per logits row; reduce it per request. The replicated
-        # samplers report per-row counts that downstream zips per request,
-        # so a per-request sum is the well-defined equivalent.
-        start = tl.load(local_cu_num_logits_ptr + req_idx)
-        num_req_logits = tl.load(local_cu_num_logits_ptr + req_idx + 1) - start
-        nans = tl.load(num_nans_ptr + start + cols, mask=cols < num_req_logits, other=0)
-        tl.store(
-            row_ptr + max_num_logits_per_req + 2, tl.sum(nans.to(tl.int64), axis=0)
-        )
-
-
-@triton.jit(do_not_specialize=["max_num_logits_per_req", "gathered_stride"])
-def _unpack_gathered_output_kernel(
-    gathered_ptr,
-    gathered_stride,
-    gathered_src_indices_ptr,
-    sampled_token_ids_ptr,
-    num_sampled_ptr,
-    num_rejected_ptr,
-    num_nans_ptr,
-    max_num_logits_per_req,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    src = tl.load(gathered_src_indices_ptr + req_idx)
-    row_ptr = gathered_ptr + src * gathered_stride
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < max_num_logits_per_req
-
-    token_ids = tl.load(row_ptr + cols, mask=mask)
-    tl.store(
-        sampled_token_ids_ptr + req_idx * max_num_logits_per_req + cols,
-        token_ids,
-        mask=mask,
+except Exception as exc:
+    # Native extension initialization can fail even when vLLM is installed.
+    REFERENCE_KERNELS = {}
+    VLLM_REFERENCE_UNAVAILABLE_REASON = (
+        "vLLM batch_shard reference unavailable: " f"{type(exc).__name__}: {exc}"
     )
-    num_sampled = tl.load(row_ptr + max_num_logits_per_req)
-    tl.store(num_sampled_ptr + req_idx, num_sampled.to(tl.int32))
-    num_rejected = tl.load(row_ptr + max_num_logits_per_req + 1)
-    tl.store(num_rejected_ptr + req_idx, num_rejected.to(tl.int32))
-    if num_nans_ptr is not None:
-        num_nans = tl.load(row_ptr + max_num_logits_per_req + 2)
-        tl.store(num_nans_ptr + req_idx, num_nans.to(tl.int32))
-
-
-@triton.jit(
-    do_not_specialize=[
-        "max_num_logits_per_req",
-        "num_logprob_cols",
-        "num_src_cols",
-        "send_ids_stride",
-        "send_logprobs_stride",
-        "src_ids_stride",
-        "src_logprobs_stride",
-    ]
-)
-def _pack_logprobs_kernel(
-    send_ids_ptr,
-    send_ids_stride,
-    send_logprobs_ptr,
-    send_logprobs_stride,
-    src_ids_ptr,
-    src_ids_stride,
-    src_logprobs_ptr,
-    src_logprobs_stride,
-    selected_token_ranks_ptr,
-    local_cu_num_logits_ptr,
-    max_num_logits_per_req,
-    num_logprob_cols,
-    num_src_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    pos = tl.program_id(1)
-    start = tl.load(local_cu_num_logits_ptr + req_idx)
-    if pos < tl.load(local_cu_num_logits_ptr + req_idx + 1) - start:
-        src = start + pos
-        dst = req_idx * max_num_logits_per_req + pos
-        cols = tl.arange(0, BLOCK_SIZE)
-        # A rank whose sub-batch has no draft tokens runs the regular sampler
-        # while others run the rejection sampler, and their column counts can
-        # differ (e.g. logprob_token_ids widening); the two masks pad or
-        # truncate to the agreed width.
-        src_mask = cols < num_src_cols
-        dst_mask = cols < num_logprob_cols
-        ids = tl.load(src_ids_ptr + src * src_ids_stride + cols, mask=src_mask, other=0)
-        logprobs = tl.load(
-            src_logprobs_ptr + src * src_logprobs_stride + cols,
-            mask=src_mask,
-            other=float("-inf"),
-        )
-        ids_row = send_ids_ptr + dst * send_ids_stride
-        tl.store(ids_row + cols, ids.to(tl.int64), mask=dst_mask)
-        rank = tl.load(selected_token_ranks_ptr + src)
-        tl.store(ids_row + num_logprob_cols, rank.to(tl.int64))
-        tl.store(
-            send_logprobs_ptr + dst * send_logprobs_stride + cols,
-            logprobs.to(tl.float32),
-            mask=dst_mask,
-        )
-
-
-@triton.jit(
-    do_not_specialize=[
-        "max_num_logits_per_req",
-        "num_logprob_cols",
-        "gathered_ids_stride",
-        "gathered_logprobs_stride",
-    ]
-)
-def _unpack_logprobs_kernel(
-    gathered_ids_ptr,
-    gathered_ids_stride,
-    gathered_logprobs_ptr,
-    gathered_logprobs_stride,
-    gathered_src_indices_ptr,
-    cu_num_logits_ptr,
-    logprob_token_ids_ptr,
-    logprobs_ptr,
-    selected_token_ranks_ptr,
-    max_num_logits_per_req,
-    num_logprob_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    pos = tl.program_id(1)
-    start = tl.load(cu_num_logits_ptr + req_idx)
-    if pos < tl.load(cu_num_logits_ptr + req_idx + 1) - start:
-        src = tl.load(gathered_src_indices_ptr + req_idx) * max_num_logits_per_req + pos
-        dst = start + pos
-        cols = tl.arange(0, BLOCK_SIZE)
-        mask = cols < num_logprob_cols
-        src_ids_row = gathered_ids_ptr + src * gathered_ids_stride
-        ids = tl.load(src_ids_row + cols, mask=mask)
-        tl.store(logprob_token_ids_ptr + dst * num_logprob_cols + cols, ids, mask=mask)
-        rank = tl.load(src_ids_row + num_logprob_cols)
-        tl.store(selected_token_ranks_ptr + dst, rank)
-        logprobs = tl.load(
-            gathered_logprobs_ptr + src * gathered_logprobs_stride + cols, mask=mask
-        )
-        tl.store(logprobs_ptr + dst * num_logprob_cols + cols, logprobs, mask=mask)
-
-
-REFERENCE_KERNELS = {
-    name: globals()[name]
-    for name in [
-        "_pack_logprobs_kernel",
-        "_pack_sampler_output_kernel",
-        "_unpack_gathered_output_kernel",
-        "_unpack_logprobs_kernel",
-    ]
-}
+else:
+    REFERENCE_KERNELS = {
+        "_pack_sampler_output_kernel": _pack_sampler_output_kernel,
+        "_unpack_gathered_output_kernel": _unpack_gathered_output_kernel,
+        "_pack_logprobs_kernel": _pack_logprobs_kernel,
+        "_unpack_logprobs_kernel": _unpack_logprobs_kernel,
+    }
+    VLLM_REFERENCE_UNAVAILABLE_REASON = None
 
 
 SAMPLER_SHAPES = [
@@ -241,6 +76,21 @@ SAMPLER_EXTRA_SHAPES = EXTRA_SHAPES[:4] + [
 ]
 
 
+# Core covers small/medium/large batches, wide rows, and each edge scenario.
+CORE_SAMPLER_SHAPES = [
+    (1, 1, 1, "dense"),
+    (32, 4, 1, "dense"),
+    (128, 8, 1, "dense"),
+    (2048, 16, 1, "dense"),
+] + SAMPLER_EXTRA_SHAPES
+CORE_LOGPROB_SHAPES = [
+    (1, 1, 1, "dense"),
+    (32, 8, 6, "dense"),
+    (128, 8, 21, "dense"),
+    (512, 8, 65, "dense"),
+] + EXTRA_SHAPES
+
+
 def make_case(
     name,
     n,
@@ -255,6 +105,7 @@ def make_case(
     with_nans=True,
     source_cols=None,
     seed=19,
+    validate=True,
 ):
     device = DEVICE if device is None else device
     metadata_dtype = torch.int32 if index_dtype is None else index_dtype
@@ -278,12 +129,12 @@ def make_case(
         strides = (stride, 1) if len(shape) == 2 else (1,)
         offset = 3 if scenario == "strided" else 0
         value = storage.as_strided(shape, strides, offset)
-        if output:
+        if output and validate:
             ref = storage.cpu().clone()
             outputs.append(storage)
             expected.append(ref)
             views.append(ref.as_strided(shape, strides, offset))
-        else:
+        elif not output:
             value.copy_(random(shape, dt))
         return value
 
@@ -319,15 +170,16 @@ def make_case(
         sampled = buffer((n,), metadata_dtype)
         rejected = buffer((n,), metadata_dtype)
         nans = buffer((total,), metadata_dtype) if with_nans else None
-        dst = views[0]
-        dst[:, :k] = 0
-        dst[:, :src_width] = tokens.cpu()
-        dst[:, k] = sampled.cpu().long()
-        dst[:, k + 1] = rejected.cpu().long()
-        if with_nans:
-            nans_cpu = nans.cpu()
-            for i in range(n):
-                dst[i, k + 2] = nans_cpu[cu_cpu[i] : cu_cpu[i + 1]].long().sum()
+        if validate:
+            dst = views[0]
+            dst[:, :k] = 0
+            dst[:, :src_width] = tokens.cpu()
+            dst[:, k] = sampled.cpu().long()
+            dst[:, k + 1] = rejected.cpu().long()
+            if with_nans:
+                nans_cpu = nans.cpu()
+                for i in range(n):
+                    dst[i, k + 2] = nans_cpu[cu_cpu[i] : cu_cpu[i + 1]].long().sum()
         args = (
             packed,
             packed.stride(0),
@@ -350,12 +202,13 @@ def make_case(
         sampled = buffer((n,), torch.int32, output=True)
         rejected = buffer((n,), torch.int32, output=True)
         nans = buffer((n,), torch.int32, output=True) if with_nans else None
-        selected = gathered.cpu()[idx.cpu().long()]
-        views[0].copy_(selected[:, :k])
-        views[1].copy_(selected[:, k].int())
-        views[2].copy_(selected[:, k + 1].int())
-        if with_nans:
-            views[3].copy_(selected[:, k + 2].int())
+        if validate:
+            selected = gathered.cpu()[idx.cpu().long()]
+            views[0].copy_(selected[:, :k])
+            views[1].copy_(selected[:, k].int())
+            views[2].copy_(selected[:, k + 1].int())
+            if with_nans:
+                views[3].copy_(selected[:, k + 2].int())
         args = (gathered, gathered.stride(0), idx, tokens, sampled, rejected, nans, k)
         block = triton.next_power_of_2(k)
     elif name == "_pack_logprobs_kernel":
@@ -364,21 +217,22 @@ def make_case(
         src_ids = buffer((total, src_width), id_dtype, strided)
         src_probs = buffer((total, src_width), dtype, strided)
         rank = buffer((total,), id_dtype)
-        src_ids_cpu, src_probs_cpu, rank_cpu = (
-            src_ids.cpu(),
-            src_probs.cpu(),
-            rank.cpu(),
-        )
-        for i in range(n):
-            begin, end = int(cu_cpu[i]), int(cu_cpu[i + 1])
-            count = end - begin
-            dst = slice(i * k, i * k + count)
-            views[0][dst, :c] = 0
-            views[1][dst] = -float("inf")
-            width = min(c, src_width)
-            views[0][dst, :width] = src_ids_cpu[begin:end, :width].long()
-            views[0][dst, c] = rank_cpu[begin:end].long()
-            views[1][dst, :width] = src_probs_cpu[begin:end, :width].float()
+        if validate:
+            src_ids_cpu, src_probs_cpu, rank_cpu = (
+                src_ids.cpu(),
+                src_probs.cpu(),
+                rank.cpu(),
+            )
+            for i in range(n):
+                begin, end = int(cu_cpu[i]), int(cu_cpu[i + 1])
+                count = end - begin
+                dst = slice(i * k, i * k + count)
+                views[0][dst, :c] = 0
+                views[1][dst] = -float("inf")
+                width = min(c, src_width)
+                views[0][dst, :width] = src_ids_cpu[begin:end, :width].long()
+                views[0][dst, c] = rank_cpu[begin:end].long()
+                views[1][dst, :width] = src_probs_cpu[begin:end, :width].float()
         args = (
             ids,
             ids.stride(0),
@@ -404,18 +258,19 @@ def make_case(
         ids = buffer((total, c), torch.int64, output=True)
         probs = buffer((total, c), torch.float32, output=True)
         ranks = buffer((total,), torch.int64, output=True)
-        ids_cpu, probs_cpu, idx_cpu = (
-            gathered_ids.cpu(),
-            gathered_probs.cpu(),
-            idx.cpu(),
-        )
-        for i in range(n):
-            begin, end = int(cu_cpu[i]), int(cu_cpu[i + 1])
-            start = int(idx_cpu[i]) * k
-            count = end - begin
-            views[0][begin:end] = ids_cpu[start : start + count, :c]
-            views[1][begin:end] = probs_cpu[start : start + count]
-            views[2][begin:end] = ids_cpu[start : start + count, c]
+        if validate:
+            ids_cpu, probs_cpu, idx_cpu = (
+                gathered_ids.cpu(),
+                gathered_probs.cpu(),
+                idx.cpu(),
+            )
+            for i in range(n):
+                begin, end = int(cu_cpu[i]), int(cu_cpu[i + 1])
+                start = int(idx_cpu[i]) * k
+                count = end - begin
+                views[0][begin:end] = ids_cpu[start : start + count, :c]
+                views[1][begin:end] = probs_cpu[start : start + count]
+                views[2][begin:end] = ids_cpu[start : start + count, c]
         args = (
             gathered_ids,
             gathered_ids.stride(0),
@@ -444,6 +299,8 @@ def make_case(
 
 
 def run_reference(case):
+    if not REFERENCE_KERNELS:
+        pytest.skip(VLLM_REFERENCE_UNAVAILABLE_REASON)
     grid = (case.n, case.k) if "logprobs" in case.name else (case.n,)
     REFERENCE_KERNELS[case.name][grid](*case.args, BLOCK_SIZE=case.block)
 
@@ -489,7 +346,52 @@ def check_case(case):
 
 
 class BatchShardBenchmark(base.Benchmark):
+    def run(self):
+        previous = len(TEST_RESULTS.get(self.op_name, {}).get("details", []))
+        try:
+            super().run()
+        finally:
+            self._record_operator_results(previous)
+
+    def _record_operator_results(self, previous):
+        # Keep kernel names for baseline lookup; publish one record per dtype
+        # under the operator mark so optest does not overwrite sibling kernels.
+        for record in TEST_RESULTS.get(self.op_name, {}).get("details", [])[previous:]:
+            if self.torch_op is None:
+                record["native_baseline_skip_reason"] = (
+                    VLLM_REFERENCE_UNAVAILABLE_REASON
+                )
+            details = TEST_RESULTS.get("gather_sampler_output", {}).get("details", [])
+            merged = next(
+                (
+                    item
+                    for item in details
+                    if all(
+                        item[key] == record[key] for key in ("dtype", "mode", "level")
+                    )
+                ),
+                None,
+            )
+            if merged is None:
+                update_result(
+                    "gather_sampler_output",
+                    {
+                        **record,
+                        "op_name": "gather_sampler_output",
+                        "result": list(record["result"]),
+                    },
+                )
+            else:
+                merged["result"].extend(record["result"])
+
     def set_shapes(self, shape_file_path=None):
+        if base.Config.bench_level == consts.BenchLevel.CORE:
+            self.shapes = (
+                CORE_LOGPROB_SHAPES
+                if "logprobs" in self.kernel_name
+                else CORE_SAMPLER_SHAPES
+            )
+            return
         self.shapes = (
             LOGPROB_SHAPES + EXTRA_SHAPES
             if "logprobs" in self.kernel_name
@@ -518,7 +420,12 @@ class BatchShardBenchmark(base.Benchmark):
             yield from self._iter_cases(dtype, with_nans)
 
     def _iter_cases(self, dtype, with_nans):
+        # Check one dense configuration plus each edge scenario per dtype/NaN mode.
+        # The remaining rows measure performance without building CPU oracles.
+        checked_scenarios = set()
         for n, k, c, scenario in self.shapes:
+            validate = scenario not in checked_scenarios
+            checked_scenarios.add(scenario)
             self._with_nans = with_nans
             self._case = make_case(
                 self.kernel_name,
@@ -530,16 +437,21 @@ class BatchShardBenchmark(base.Benchmark):
                 dtype=dtype if dtype.is_floating_point else torch.float32,
                 id_dtype=dtype if not dtype.is_floating_point else torch.int64,
                 with_nans=with_nans,
+                validate=validate,
             )
-            run_candidate(self._case)
-            check_case(self._case)
-            run_reference(self._case)
-            check_case(self._case)
+            if validate:
+                run_candidate(self._case)
+                check_case(self._case)
+                if REFERENCE_KERNELS:
+                    run_reference(self._case)
+                    check_case(self._case)
             yield ({"case": self._case},)
 
 
 @pytest.mark.parametrize("kernel_name", KERNEL_NAMES)
 def test_gather_sampler_output_perf(kernel_name):
+    if not REFERENCE_KERNELS:
+        print(VLLM_REFERENCE_UNAVAILABLE_REASON)
     dtypes = {
         "_pack_sampler_output_kernel": [torch.int32, torch.int64],
         "_unpack_gathered_output_kernel": [torch.int64],
@@ -553,7 +465,7 @@ def test_gather_sampler_output_perf(kernel_name):
     }
     bench = BatchShardBenchmark(
         op_name=kernel_name,
-        torch_op=run_reference,
+        torch_op=run_reference if REFERENCE_KERNELS else None,
         dtypes=dtypes[kernel_name],
     )
     bench.kernel_name = kernel_name
