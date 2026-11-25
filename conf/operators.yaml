@@ -1664,6 +1664,28 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: lightning_attention
+  description: MiniMax Lightning Attention Prefill with causal decay and FP32 history snapshots.
+  for:
+  - lightning_attention
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.5'
+- id: lightning_attention_decode
+  description: MiniMax single-token Lightning Attention with an in-place recurrent state update.
+  for:
+  - lightning_attention_decode
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.5'
 - id: lightning_indexer
   description: 'TLE implementation of the Ascend paged-attention Lightning Indexer:
 

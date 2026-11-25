@@ -558,7 +558,15 @@ if _runtime.device.vendor_name == "ascend":
     from flaggems_vllm.runtime.backend._ascend.fused import (
         attention as ascend_attention,
     )
+    from flaggems_vllm.runtime.backend._ascend.ops.lightning_attention import (
+        lightning_attention,
+        lightning_attention_decode,
+    )
 
     flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
     flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
-    __all__.append("flash_attn_varlen_func_w8a8")
+    __all__ += [
+        "flash_attn_varlen_func_w8a8",
+        "lightning_attention",
+        "lightning_attention_decode",
+    ]

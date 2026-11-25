@@ -55,3 +55,6 @@ __all__ = [
     "gumbel_sample",
     "use_symm_mem",
 ]
+
+if vendor_name == "ascend":
+    __all__ += ["lightning_attention", "lightning_attention_decode"]
