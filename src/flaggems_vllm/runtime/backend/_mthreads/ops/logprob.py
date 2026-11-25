@@ -957,9 +957,9 @@ def _sorted_topk_indices(
     )
     run_size = sort_chunk
     if sorted_stride >= 8 * sort_chunk:
-        _merge_four_sorted_runs_kernel[
-            (batch_size, sorted_stride // (4 * sort_chunk))
-        ](source, destination, sorted_stride, RUN_SIZE=sort_chunk, num_warps=8)
+        _merge_four_sorted_runs_kernel[(batch_size, sorted_stride // (4 * sort_chunk))](
+            source, destination, sorted_stride, RUN_SIZE=sort_chunk, num_warps=8
+        )
         source, destination = destination, source
         run_size = 4 * sort_chunk
     while run_size < sorted_stride:
@@ -1002,6 +1002,7 @@ def _sorted_topk_indices(
             PACK_SAMPLED=pack_sampled,
         )
     return indices
+
 
 def compute_topk_scores(
     logits: torch.Tensor,

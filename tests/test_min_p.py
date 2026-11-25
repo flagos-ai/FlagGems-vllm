@@ -19,7 +19,9 @@ from . import conftest as cfg
 
 pytestmark = [
     pytest.mark.apply_min_p,
-    pytest.mark.skipif(vllm_reference is None, reason="vLLM min-p reference is unavailable"),
+    pytest.mark.skipif(
+        vllm_reference is None, reason="vLLM min-p reference is unavailable"
+    ),
     pytest.mark.skipif(
         DEVICE == "cpu" or not runtime.torch_device_fn.is_available(),
         reason="requires the active accelerator",
