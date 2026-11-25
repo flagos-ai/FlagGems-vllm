@@ -43,6 +43,7 @@ rounding).
 
 import contextlib
 import logging
+import os
 from typing import Callable, Optional, Sequence, Tuple, Union
 
 import torch
@@ -58,6 +59,17 @@ from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_bmm import (
+    LLC_OPTIONS,
+    _derived_values,
+    extern_libs_thread_index,
+    ws_gemm_fp8,
+)
+
+try:  # TMA descriptors are only needed by the TLE path.
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:  # pragma: no cover - older FlagTree builds
+    TensorDescriptor = None
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +209,121 @@ def _weight_supported(
     )
 
 
+def _use_tle(num_tokens: int, n_groups: int) -> bool:
+    """Whether the TLE (SQMMA warp-specialized) GEMM beats the plain one.
+
+    S5000 sweep of the o_proj shapes: the TLE kernel runs at 280-313 TFLOPS
+    against the plain kernel's 165, but it needs enough work to fill its
+    persistent 60-CTA grid and it costs ~180 us of launch/descriptor setup per
+    call. Operator-level A/B (both include the quant) puts the crossover at
+    1024 tokens for G=8 (386 vs 573 us) and 512 for G=16 (406 vs 571 us).
+    """
+    override = os.environ.get("FLAGGEMS_O_PROJ_TLE")
+    if override is not None:
+        return override != "0" and TensorDescriptor is not None
+    if TensorDescriptor is None:
+        return False
+    return num_tokens >= 1024 or (num_tokens >= 512 and n_groups > 8)
+
+
+# (BLOCK_M, BLOCK_N, CONSUMER_WARPS, SPLIT_K, PROMOTE) for the TLE path; the
+# 128x128/16-warp tile is the fastest at every token count above the crossover.
+_TLE_TILE = (128, 128, 16, 1, 0)
+
+
+def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups):
+    """Block-scaled FP8 batched GEMM through the TLE warp-specialized kernel.
+
+    ``act``/``act_scale`` are token-major ``[tokens, groups, k]``; the kernel
+    walks the activation and its scales as ``[groups, tokens, *]`` (the
+    ``X_BATCH_MAJOR=1`` layout its TMA descriptor wants) and the weight as
+    ``[groups * n, k]``. A masked-``to`` copy only happens for pre-quantized
+    activations, whose token-major slice is not group-major contiguous.
+    """
+    block_m, block_n, warps, split_k, promote = _TLE_TILE
+    k = act.shape[2]
+    n = weight.shape[1]
+    k_blocks = k // _QUANT_BLOCK
+    act_g = act.transpose(0, 1)
+    if not act_g.is_contiguous():
+        act_g = act_g.contiguous()
+    scale_g = act_scale.transpose(0, 1)
+    if not scale_g.is_contiguous():
+        scale_g = scale_g.contiguous()
+    row_scale_pad = max(4, triton.next_power_of_2(k_blocks // split_k))
+    x_desc = TensorDescriptor.from_tensor(
+        act_g.view(n_groups * num_tokens, k), block_shape=[block_m, _QUANT_BLOCK]
+    )
+    y_desc = TensorDescriptor.from_tensor(
+        weight.view(n_groups * n, k),
+        block_shape=[block_n // (2 if block_m == 256 else 1), _QUANT_BLOCK],
+    )
+    scale_desc = TensorDescriptor.from_tensor(
+        scale_g.view(n_groups * num_tokens, k_blocks),
+        block_shape=[block_m, row_scale_pad],
+    )
+    out_g = out.permute(1, 0, 2)
+    derived = _derived_values(
+        block_m,
+        block_n,
+        warps,
+        split_k,
+        num_tokens,
+        n,
+        k_blocks,
+        n_groups,
+        out_g.device.index,
+        out_g.stride(),
+    )
+    jit_fn = getattr(ws_gemm_fp8.fn, "fn", ws_gemm_fp8.fn)
+    jit_fn[(derived["NUM_CTAS"],)](
+        x_desc,
+        y_desc,
+        scale_desc,
+        scale_g,
+        weight_scale,
+        out_g,
+        out_g,
+        num_tokens,
+        n,
+        k_blocks,
+        scale_g.stride(1),
+        scale_g.stride(0),
+        scale_g.stride(2),
+        weight_scale.stride(0),
+        weight_scale.stride(1),
+        weight_scale.stride(2),
+        out_g.stride(1),
+        out_g.stride(0),
+        out_g.stride(2),
+        derived["num_units"],
+        derived["num_m_tiles"],
+        derived["partial_plane"],
+        BATCH=n_groups,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        CONSUMER_WARPS=warps,
+        SPLIT_K=split_k,
+        PROMOTE=promote,
+        NUM_N_TILES=derived["NUM_N_TILES"],
+        UNIT_K_BLOCKS=derived["UNIT_K_BLOCKS"],
+        GROUP_M=derived["GROUP_M"],
+        NUM_CTAS=derived["NUM_CTAS"],
+        STAGES=derived["STAGES"],
+        MMA_LAYOUT=derived["MMA_LAYOUT"],
+        ROW_LAYOUT=derived["ROW_LAYOUT"],
+        N_SLICES=derived["N_SLICES"],
+        STAGE_ROW_SCALES=derived["STAGE_ROW_SCALES"],
+        ROW_SCALE_PAD=derived["ROW_SCALE_PAD"],
+        Z_STRIDE_M=derived["Z_STRIDE_M"],
+        Z_STRIDE_B=derived["Z_STRIDE_B"],
+        X_BATCH_MAJOR=1,
+        llc_options=LLC_OPTIONS,
+        extern_libs=extern_libs_thread_index(),
+        num_warps=warps,
+    )
+
+
 def deep_gemm_fp8_o_proj(
     o,
     positions: torch.Tensor,
@@ -326,6 +453,7 @@ def deep_gemm_fp8_o_proj(
         out = torch.empty(
             (num_tokens, n_groups, o_lora_rank), dtype=torch.bfloat16, device=device
         )
+        use_tle = TensorDescriptor is not None and _use_tle(num_tokens, n_groups)
         out_g = out.permute(1, 0, 2)
         block_m, block_n, group_m, num_warps, num_stages = _tile_config(
             num_tokens, o_lora_rank
@@ -361,37 +489,40 @@ def deep_gemm_fp8_o_proj(
                 tma_aligned_scales=False,
             )
 
-        # Both producers hand back token-major tensors; the kernel walks them
-        # group-major, which is the same storage with the leading strides
-        # swapped, so this stays a view.
-        act_g = act.transpose(0, 1)
-        act_scale_g = act_scale.transpose(0, 1)
-        act_strides = act_g.stride()
-        act_scale_strides = act_scale_g.stride()
-        _o_proj_bmm_kernel[grid](
-            act_g,
-            act_scale_g,
-            weight,
-            weight_scale,
-            out_g,
-            num_tokens,
-            act_strides[0],
-            act_strides[1],
-            act_strides[2],
-            act_scale_strides[0],
-            act_scale_strides[1],
-            act_scale_strides[2],
-            weight_strides[0],
-            weight_strides[1],
-            weight_strides[2],
-            weight_scale_strides[0],
-            weight_scale_strides[1],
-            weight_scale_strides[2],
-            out_strides[0],
-            out_strides[1],
-            out_strides[2],
-            **gemm_kwargs,
-        )
+        if use_tle:
+            _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups)
+        else:
+            # Both producers hand back token-major tensors; the kernel walks them
+            # group-major, which is the same storage with the leading strides
+            # swapped, so this stays a view.
+            act_g = act.transpose(0, 1)
+            act_scale_g = act_scale.transpose(0, 1)
+            act_strides = act_g.stride()
+            act_scale_strides = act_scale_g.stride()
+            _o_proj_bmm_kernel[grid](
+                act_g,
+                act_scale_g,
+                weight,
+                weight_scale,
+                out_g,
+                num_tokens,
+                act_strides[0],
+                act_strides[1],
+                act_strides[2],
+                act_scale_strides[0],
+                act_scale_strides[1],
+                act_scale_strides[2],
+                weight_strides[0],
+                weight_strides[1],
+                weight_strides[2],
+                weight_scale_strides[0],
+                weight_scale_strides[1],
+                weight_scale_strides[2],
+                out_strides[0],
+                out_strides[1],
+                out_strides[2],
+                **gemm_kwargs,
+            )
 
     assert callable(wo_b), "`wo_b` must be a callable linear layer"
     return wo_b(out.flatten(1))
