@@ -1,19 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""Public canonical entry; installed vLLM; standard reports with per-case N/A.
+"""Compare each public call to qualified local native or a matched H800 record."""
 
-The local timer supplies non-Graph device events on every vendor, rather than
-assuming that vendor do_bench implementations use the same timing mechanism.
-For this op --warmup/--iter are iteration counts in kernel mode.
-"""
-
-import ast
 import inspect
 import math
+import re
 import statistics
 from pathlib import Path
 
 import pytest
+import triton
 
 import flaggems_vllm as gems
 from baseline import hc_down_silu as workload
@@ -24,6 +20,33 @@ from flaggems_vllm.runtime import torch_device_fn
 from tests.test_hc_down_silu import assert_result, reference
 
 EVENT_PROTOCOL = "device-events-median-counts-v1"
+H800_PROTOCOL = "triton-do-bench-no-graph-25ms-warmup-100ms-median"
+
+
+def _positive(value):
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
+def _mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _target_chip():
+    try:
+        name = torch_device_fn.get_device_name()
+    except (AttributeError, RuntimeError):
+        return ""
+    # DTK can return just the family ("BW"). optest resolves the board model
+    # from hy-smi, and lists multiple models separately on heterogeneous hosts.
+    if gems.vendor_name == "hygon" and name == "BW":
+        try:
+            from flagos_optest.gpu_check import probe_accelerator_metadata
+        except ImportError:
+            return name
+        board = probe_accelerator_metadata("hygon").get("device")
+        if board and "," not in board:
+            return board
+    return name
 
 
 def _native_slot(*args, **kwargs):
@@ -68,69 +91,102 @@ class HCDownSiluBenchmark(Benchmark):
                     self.native_reason = None
 
     def run(self):
-        offline = (Config.base_data or {}).get(self.op_name)
-        self.offline_rejections = {}
+        self.reference_data = _mapping(Config.base_data)
+        if Config.user_desired_metrics == ["latency"]:
+            self.reference_data = {}
+        self.target_chip = (
+            _target_chip() if self.reference_data and not Config.query else ""
+        )
+        # Benchmark.run computes compared_speedup for every visible record,
+        # even without a scaling factor. Expose only the selected fallback.
         with pytest.MonkeyPatch.context() as patch:
-            if Config.user_desired_metrics == ["latency"]:
-                patch.setattr(Config, "base_data", None)
-            elif isinstance(offline, dict):
-                # Select the full semantic collector key before shape lookup.
-                # The standalone collector's duration-based timer is different
-                # from this event-count protocol. Unqualified records stay N/A.
-                variants = {}
-                entries = offline.get("shapes", {})
-                if "variants" in offline:
-                    entries = {
-                        key: next(iter(value.get("shapes", {}).values()), {})
-                        for key, value in offline["variants"].items()
-                        if isinstance(value, dict)
-                    }
-                for key, rows in entries.items():
-                    try:
-                        m, k, n, rank, hc, layout = ast.literal_eval(key)
-                    except (SyntaxError, TypeError, ValueError):
-                        continue
-                    if not isinstance(rows, dict):
-                        continue
-                    qualified = {}
-                    for dtype, row in rows.items():
-                        if not isinstance(row, dict):
-                            continue
-                        latency = row.get("latency_ms")
-                        binding = dict(
-                            zip(workload.FIELDS, (m, k, n, rank, hc, layout))
-                        )
-                        reason = workload.unsupported_reason(binding, dtype)
-                        if (
-                            Config.mode != consts.BenchMode.KERNEL
-                            or row.get("timing_protocol") != EVENT_PROTOCOL
-                            or row.get("warmup") != max(1, Config.warm_up)
-                            or row.get("iterations") != max(1, Config.repetition)
-                        ):
-                            reason = "offline timing protocol/budget does not match"
-                        if (
-                            type(latency) not in (int, float)
-                            or not math.isfinite(latency)
-                            or latency <= 0
-                        ):
-                            reason = "offline latency is not positive and finite"
-                        if reason:
-                            self.offline_rejections[(key, dtype)] = dict(
-                                reason=reason, original_latency_ms=latency
-                            )
-                        else:
-                            qualified[dtype] = row
-                    variants[key] = {"shapes": {str([m, k]): qualified}}
-                patch.setattr(
-                    Config,
-                    "base_data",
-                    {**Config.base_data, self.op_name: {"variants": variants}},
-                )
+            patch.setattr(Config, "base_data", None)
             super().run()
+
+    def _select_reference(self, dtype):
+        data = self.reference_data
+        entry = _mapping(data.get(self.op_name))
+        key = self.base_variant
+        shape = str(self.detail["config"]["inputs"]["x"]["shape"])
+        rows = _mapping(entry.get("shapes")).get(key)
+        if "variants" in entry:
+            variant = _mapping(_mapping(entry["variants"]).get(key))
+            shapes = _mapping(variant.get("shapes"))
+            rows = shapes.get(shape, shapes.get(key, {}))
+        row = _mapping(_mapping(rows).get(str(dtype)))
+        latency = row.get("latency_ms")
+        self.detail["offline_latency_ms"] = latency
+        if self.detail["native_status"] == "PASS":
+            return "native"
+
+        scaling = _mapping(data.get("_scaling_factors"))
+        config = self.detail["config"]
+        reason = None
+        if not row:
+            reason = "no H800 record for this configuration and dtype"
+        elif not _positive(latency):
+            reason = row.get("reason") or "offline latency is not positive and finite"
+        elif row.get("status") not in (None, "ok") or config["scope"] != "native-model":
+            reason = row.get("reason") or "unsupported H800 native configuration"
+        elif (
+            self.mode != consts.BenchMode.KERNEL
+            or row.get("timing_protocol") != H800_PROTOCOL
+        ):
+            reason = "offline timing protocol does not match"
+        elif (
+            _mapping(data.get("_environment")).get("reference_chip") != "H800"
+            or scaling.get("reference_chip") != "H800"
+        ):
+            reason = "reference and scaling factors must both identify H800"
+        elif any(
+            _mapping(row.get("config")).get(k) != v
+            for k, v in config.items()
+            if k != "native_version"
+        ):
+            reason = "offline configuration or public call scope does not match"
+        elif row.get("bottle_neck_unit") not in ("mem", "tensor", "cuda"):
+            reason = "offline bottleneck is missing or unknown"
+        else:
+            # The common lookup accepts a vendor's sole chip even on a different
+            # SKU. Filter by actual model first, including MTT S5000 / MTT-S5000.
+            name = self.target_chip.lower().replace("-", " ")
+            chips = [
+                chip
+                for chip in scaling.get("chips") or []
+                if isinstance(chip, dict)
+                and chip.get("vendor") == gems.vendor_name
+                and isinstance(chip.get("chip"), str)
+                and chip["chip"]
+                and re.search(
+                    r"\b" + re.escape(chip["chip"].lower().replace("-", " ")) + r"\b",
+                    name,
+                )
+            ]
+            scoped = {
+                "_scaling_factors": {**scaling, "chips": chips},
+                self.op_name: {"shapes": {shape: {str(dtype): row}}},
+            }
+            unit = row["bottle_neck_unit"]
+            factor = consts.lookup_scaling_factor(scoped, gems.vendor_name, unit, dtype)
+            if len(chips) == 1 and _positive(factor):
+                Config.base_data = scoped
+                self.detail.update(
+                    offline_scaling_factor=factor,
+                    offline_bottleneck=unit,
+                    offline_target_chip=chips[0]["chip"],
+                )
+                return "H800"
+            reason = f"no matching {unit} scaling factor for {self.target_chip!r}"
+
+        self.detail["offline_rejection"] = dict(
+            reason=reason, original_latency_ms=latency
+        )
+        return "gems_only"
 
     def get_input_iter(self, dtype):
         misses = []
         for shape in self.shapes:
+            Config.base_data = None
             self.binding = dict(zip(workload.FIELDS, shape))
             self.base_variant = str(workload.key_shape(self.binding))
             args, kwargs = workload.build_inputs(self.binding, dtype, gems.device)
@@ -170,9 +226,7 @@ class HCDownSiluBenchmark(Benchmark):
             warmup=max(1, Config.warm_up),
             iterations=max(1, Config.repetition),
             budget_unit="counts" if self.mode == consts.BenchMode.KERNEL else "ms",
-            offline_rejection=self.offline_rejections.get(
-                (self.base_variant, str(args[0].dtype))
-            ),
+            offline_rejection=None,
         )
         return self.detail
 
@@ -206,17 +260,29 @@ class HCDownSiluBenchmark(Benchmark):
             )
             return latency
 
-        actual = op(*args, **kwargs)
-        assert_result(actual, expected, *args)
+        self.detail["selected_source"] = self._select_reference(args[0].dtype)
+        try:
+            actual = op(*args, **kwargs)
+            assert_result(actual, expected, *args)
+            latency = self._measure(op, False, *args, **kwargs)
+        except Exception as exc:
+            raise RuntimeError(f"Gems {self.base_variant}: {exc!r}") from exc
         self.detail["candidate_status"] = "PASS"
-        return self._measure(op, False, *args, **kwargs)
+        return latency
 
     def _measure(self, op, is_native, *args, **kwargs):
         if self.mode == consts.BenchMode.OPERATOR:
             latency = super().get_latency(op, *args, **kwargs)
+        elif not is_native and self.detail["selected_source"] == "H800":
+            self.detail.update(
+                protocol=H800_PROTOCOL, warmup=25, iterations=100, budget_unit="ms"
+            )
+            latency = triton.testing.do_bench(
+                lambda: op(*args, **kwargs), warmup=25, rep=100, return_mode="median"
+            )
         else:
             latency = self._event_latency(op, is_native, *args, **kwargs)
-        if not math.isfinite(latency) or latency <= 0:
+        if not _positive(latency):
             raise ValueError(f"invalid hc_down_silu latency: {latency!r}")
         return latency
 
