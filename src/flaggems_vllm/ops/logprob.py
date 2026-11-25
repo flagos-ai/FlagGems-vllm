@@ -869,6 +869,15 @@ def _topk_indices(
     if k > vocab_size:
         raise RuntimeError("selected index k out of range")
     pack_sampled = sampled_token_ids is not None
+    if runtime.device.vendor_name == "ascend":
+        # Dedicated NPU selection lives in the backend-specific module so the
+        # shared operator file stays vendor-agnostic: the packed uint64 keys
+        # used below cannot be compiled by the Ascend toolchain.
+        from flaggems_vllm.runtime.backend._ascend.ops.logprob import (
+            _launch_topk_indices,
+        )
+
+        return _launch_topk_indices(logits, k, sampled_token_ids)
     if k <= 32:
         batch_size = logits.shape[0]
         block_size = 1024
@@ -1054,6 +1063,9 @@ def compute_topk_scores(
         max_per_req_token_ids == 0
         and num_logprobs == vocab_size
         and vocab_size > (1024 if batch_size < _BATCH_CLUSTER_THRESHOLD else 512)
+        # The fused chunk-sort kernels use packed uint64 keys that Ascend
+        # cannot compile; the Ascend path returns plain indices instead.
+        and runtime.device.vendor_name != "ascend"
     )
     if fused_full:
         scores = logits.new_empty((batch_size, vocab_size + 1), dtype=torch.float32)
