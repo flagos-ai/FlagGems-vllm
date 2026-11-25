@@ -78,11 +78,11 @@ def _torch_gather(cstate, idx):
     return staged, local
 
 
-@pytest.mark.kda_conv_gather
+@pytest.mark.gather_conv_state
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="targets Ascend")
-def test_kda_conv_gather_perf():
+def test_gather_conv_state_perf():
     KdaConvGatherBenchmark(
-        op_name="kda_conv_gather",
+        op_name="gather_conv_state",
         torch_op=_torch_gather,
         gems_op=flaggems_vllm.gather_conv_state,
         dtypes=[torch.bfloat16],
