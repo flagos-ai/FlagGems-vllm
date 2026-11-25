@@ -10,7 +10,9 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from .sm90_shared_memory_helpers import _shared_address
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_shared_memory_helpers import (
+    _shared_address,
+)
 
 
 @triton.jit

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from typing import Mapping, cast
 
-from . import sm90_eager_p384_rs_wgmma as _base
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_eager_p384_rs_wgmma as _base,
+)
 
 TOKENS = 13021
 SHAPE_CONFIG = _base.P384ShapeConfig(TOKENS)

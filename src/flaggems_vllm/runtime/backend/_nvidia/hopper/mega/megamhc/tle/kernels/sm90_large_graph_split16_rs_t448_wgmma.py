@@ -30,7 +30,9 @@ def _set_exact_environment() -> None:
 
 _set_exact_environment()
 
-from . import sm90_large_graph_split16_rs_wgmma as _implementation  # noqa: E402
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (  # noqa: E402
+    sm90_large_graph_split16_rs_wgmma as _implementation,
+)
 
 if _implementation.TOKENS != TOKENS:
     raise RuntimeError(

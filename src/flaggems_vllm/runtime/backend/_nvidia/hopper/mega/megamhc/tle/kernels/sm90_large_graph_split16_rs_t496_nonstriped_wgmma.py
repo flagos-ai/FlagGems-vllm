@@ -18,7 +18,9 @@ if _current not in (None, str(TOKENS)):
 os.environ[_TOKEN_ENV] = str(TOKENS)
 
 
-from . import sm90_large_graph_split16_rs_t464_nonstriped_wgmma as _shared  # noqa: E402
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (  # noqa: E402
+    sm90_large_graph_split16_rs_t464_nonstriped_wgmma as _shared,
+)
 
 if _shared.TOKENS != TOKENS:
     raise RuntimeError(

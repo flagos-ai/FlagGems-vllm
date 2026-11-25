@@ -10,7 +10,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .fused_post_gemm_t64 import T64BM64DotPlan
+    from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.fused_post_gemm_t64 import (
+        T64BM64DotPlan,
+    )
 
 __all__ = [
     "EAGER_TOKENS",
@@ -25,11 +27,15 @@ __all__ = [
 def __getattr__(name: str) -> Any:
     """Load shape dispatch lazily without compiling unrelated kernels."""
     if name == "T64BM64DotPlan":
-        from . import fused_post_gemm_t64
+        from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle import (
+            fused_post_gemm_t64,
+        )
 
         return getattr(fused_post_gemm_t64, name)
     if name in __all__:
-        from . import dispatch
+        from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle import (
+            dispatch,
+        )
 
         return getattr(dispatch, name)
     raise AttributeError(name)

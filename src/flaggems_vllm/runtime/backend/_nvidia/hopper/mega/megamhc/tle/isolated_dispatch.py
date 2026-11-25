@@ -30,8 +30,13 @@ from contextlib import contextmanager
 from types import ModuleType
 from typing import Iterator, Mapping
 
-from .plan_launch_spec import launch_spec_for_plan
-from .prepared_launcher import PreparedCompiledLauncher, prepare_launch_spec
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.plan_launch_spec import (
+    launch_spec_for_plan,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.prepared_launcher import (
+    PreparedCompiledLauncher,
+    prepare_launch_spec,
+)
 
 _TLE_PACKAGE = __package__
 _KERNEL_PREFIX = f"{_TLE_PACKAGE}.kernels."
@@ -88,7 +93,7 @@ def prepare_isolated_safe_launcher(
     outputs: Mapping[str, object],
 ) -> PreparedCompiledLauncher:
     """Compile one exact-T launcher while isolating import-time variants."""
-    from . import dispatch
+    from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle import dispatch
 
     tokens = dispatch._tokens_from_inputs(inputs)
     with _INITIALIZATION_LOCK, _clean_tle_environment():

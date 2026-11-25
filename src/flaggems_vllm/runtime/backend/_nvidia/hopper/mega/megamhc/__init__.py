@@ -14,7 +14,7 @@
 
 """Public contract scaffolding for the Hopper MegaMHC kernel."""
 
-from .api import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.api import (
     DEEPSEEK_V4_FLASH_PROFILE,
     MegaMHCContext,
     MegaMHCLauncher,
@@ -24,7 +24,9 @@ from .api import (
     MegaMHCWorkspace,
     mega_mhc,
 )
-from .factory import create_mega_mhc_context
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.factory import (
+    create_mega_mhc_context,
+)
 
 __all__ = [
     "DEEPSEEK_V4_FLASH_PROFILE",

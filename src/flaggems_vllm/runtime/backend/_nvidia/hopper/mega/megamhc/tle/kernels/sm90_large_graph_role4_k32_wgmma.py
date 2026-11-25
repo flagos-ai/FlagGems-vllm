@@ -44,9 +44,15 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from .. import fused_post_gemm_t64 as _t64
-from . import sm90_cp_async_helpers as _fn_cp
-from . import sm90_routing_helpers as _routing_helpers
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle import (
+    fused_post_gemm_t64 as _t64,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_cp_async_helpers as _fn_cp,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_routing_helpers as _routing_helpers,
+)
 
 LOGICAL_TOKEN_BUCKETS = (
     272,

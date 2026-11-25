@@ -26,15 +26,19 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from .sm90_eager_p256_manual512_projection_n32_ptx import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_eager_p256_manual512_projection_n32_ptx import (  # noqa: E501
     _manual512_p256_projection_n32_ptx,
 )
-from .sm90_eager_p256_routing import _routing_finalize_no_barrier
-from .sm90_eager_t1028_p256_manual512_token_tail_ptx import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_eager_p256_routing import (
+    _routing_finalize_no_barrier,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_eager_t1028_p256_manual512_token_tail_ptx import (  # noqa: E501
     _token_shard_combine_bf16x8_ptx,
     _token_shard_normalize_bf16x8_ptx,
 )
-from .sm90_small_family import _physical_thread_id_x
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_small_family import (
+    _physical_thread_id_x,
+)
 
 TOKENS = 1028
 HIDDEN = 4096

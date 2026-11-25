@@ -20,7 +20,10 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Mapping
 
-from .prepared_launcher import LaunchSpec, PreparedLaunchContractError
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.prepared_launcher import (
+    LaunchSpec,
+    PreparedLaunchContractError,
+)
 
 _DYNAMIC_BOUND_INDICES = (0, 1, 2, 3, 8, 9, 10, 11)
 _STATIC_BOUND_INDICES = (4, 5, 6, 7)

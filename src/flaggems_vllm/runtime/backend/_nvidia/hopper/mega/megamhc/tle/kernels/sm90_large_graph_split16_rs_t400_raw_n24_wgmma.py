@@ -15,8 +15,10 @@ from typing import Mapping
 import triton
 import triton.language as tl
 
-from . import sm90_large_graph_split16_rs_t400_nonstriped_wgmma as _t400
-from .sm90_wgmma_m64n24_raw_helpers import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_large_graph_split16_rs_t400_nonstriped_wgmma as _t400,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_wgmma_m64n24_raw_helpers import (
     _raw_m64n24k64_accumulate,
     _store_raw_n24_partials,
 )

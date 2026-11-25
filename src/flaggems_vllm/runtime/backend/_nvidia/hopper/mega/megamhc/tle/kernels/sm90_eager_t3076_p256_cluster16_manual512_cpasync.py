@@ -29,17 +29,21 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from .sm90_eager_p256_manual512_projection_split_ptx import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_eager_p256_manual512_projection_split_ptx import (  # noqa: E501
     _manual512_p256_projection_split_ptx,
 )
-from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_eager_p256_manual512_token_tail_exact1024_ptx import (  # noqa: E501
     _token_shard_combine_exact1024_bf16x8_ptx as _token_shard_combine_bf16x8_ptx,
 )
-from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_eager_p256_manual512_token_tail_exact1024_ptx import (  # noqa: E501
     _token_shard_normalize_exact1024_bf16x8_ptx as _token_shard_normalize_bf16x8_ptx,
 )
-from .sm90_eager_p256_routing import _routing_finalize_no_barrier
-from .sm90_small_family import _physical_thread_id_x
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_eager_p256_routing import (
+    _routing_finalize_no_barrier,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_small_family import (
+    _physical_thread_id_x,
+)
 
 TOKENS = 3076
 HIDDEN = 4096

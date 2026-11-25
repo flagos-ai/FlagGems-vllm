@@ -42,9 +42,15 @@ for _name, _expected in _EXACT_ENVIRONMENT.items():
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
-from .. import fused_post_gemm_t64 as _t64  # noqa: E402
-from . import sm90_eager_p384_rs_wgmma as _p384_tail_helpers  # noqa: E402
-from . import sm90_large_graph_split16_rs_wgmma as _implementation  # noqa: E402
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle import (  # noqa: E402
+    fused_post_gemm_t64 as _t64,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (  # noqa: E402
+    sm90_eager_p384_rs_wgmma as _p384_tail_helpers,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (  # noqa: E402
+    sm90_large_graph_split16_rs_wgmma as _implementation,
+)
 
 _base = _implementation._base
 _t400_tail_quad_post_ptx = _p384_tail_helpers._serial_quad_post_ptx

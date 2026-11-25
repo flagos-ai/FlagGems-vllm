@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from . import sm90_eager_t3076_p256_cluster16_manual512_cpasync as _base
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_eager_t3076_p256_cluster16_manual512_cpasync as _base,
+)
 
 TOKENS = 3805
 NUM_M_TILES = (TOKENS + _base.BLOCK_M - 1) // _base.BLOCK_M

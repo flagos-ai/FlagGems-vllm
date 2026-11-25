@@ -31,11 +31,21 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from .. import fused_post_gemm_t64 as _t64
-from . import sm90_cp_async_helpers as _fn_cp
-from . import sm90_eager_t1028_p256_wgmma as _eager
-from . import sm90_large_graph_role4_k32_wgmma as _base
-from . import sm90_shared_memory_helpers as _quad
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle import (
+    fused_post_gemm_t64 as _t64,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_cp_async_helpers as _fn_cp,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_eager_t1028_p256_wgmma as _eager,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_large_graph_role4_k32_wgmma as _base,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_shared_memory_helpers as _quad,
+)
 
 if _base.LOGICAL_TOKENS < 400:
     raise ValueError("split16 RS family requires a T=400..512 bucket")

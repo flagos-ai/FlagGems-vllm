@@ -33,9 +33,15 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from .. import fused_post_gemm_t64 as _t64
-from . import sm90_routing_helpers as _routing_helpers
-from . import sm90_small_family as _small
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle import (
+    fused_post_gemm_t64 as _t64,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_routing_helpers as _routing_helpers,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_small_family as _small,
+)
 
 SUPPORTED_TOKENS = frozenset((12991, 13005, 13021, 16384))
 HIDDEN = 4096
@@ -1959,7 +1965,9 @@ def prepare_p384_plan(
         raise ValueError("all tensors must be on one CUDA device")
     # Encoding and the 128-byte H2D copy happen during plan preparation,
     # never in the timed one-kernel interval.
-    from .sm90_global_tensormap_helpers import _encode_global_tensor_map
+    from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels.sm90_global_tensormap_helpers import (
+        _encode_global_tensor_map,
+    )
 
     fn_tensormap_storage = _encode_global_tensor_map(tensors[4])
     kernel_tensors = (*tensors, fn_tensormap_storage)

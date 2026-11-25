@@ -24,7 +24,9 @@ if _logical_tokens not in (None, "64"):
     )
 os.environ[_LOGICAL_TOKENS_ENV] = "64"
 
-from .kernels import sm90_padded_m64_wgmma as _base  # noqa: E402
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (  # noqa: E402
+    sm90_padded_m64_wgmma as _base,
+)
 
 if _base.LOGICAL_TOKENS != 64:
     raise RuntimeError(

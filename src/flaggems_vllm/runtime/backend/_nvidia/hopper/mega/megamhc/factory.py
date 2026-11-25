@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from .api import (
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.api import (
     DEEPSEEK_V4_FLASH_PROFILE,
     MegaMHCContext,
     MegaMHCProfile,
@@ -31,7 +31,9 @@ from .api import (
 )
 
 if TYPE_CHECKING:
-    from .tle.prepared_launcher import PreparedCompiledLauncher
+    from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.prepared_launcher import (
+        PreparedCompiledLauncher,
+    )
 
 
 def _exact_token(value: object, name: str) -> int:
@@ -292,9 +294,15 @@ def create_mega_mhc_context(
             "rmsnorm_eps": profile.norm_eps,
             "rmsnorm_scale": profile.norm_scale,
         }
-        from .tle.dispatch import MissingTLECaseError
-        from .tle.isolated_dispatch import prepare_isolated_safe_launcher
-        from .tle.prepared_launcher import UnsupportedPreparedRuntimeError
+        from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.dispatch import (
+            MissingTLECaseError,
+        )
+        from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.isolated_dispatch import (
+            prepare_isolated_safe_launcher,
+        )
+        from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.prepared_launcher import (
+            UnsupportedPreparedRuntimeError,
+        )
 
         try:
             prepared = prepare_isolated_safe_launcher(inputs, outputs)

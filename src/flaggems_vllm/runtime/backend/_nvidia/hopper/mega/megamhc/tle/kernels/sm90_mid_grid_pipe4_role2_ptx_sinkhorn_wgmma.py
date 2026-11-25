@@ -37,8 +37,12 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from .. import fused_post_gemm_t64 as _t64
-from . import sm90_routing_helpers as _routing_helpers
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle import (
+    fused_post_gemm_t64 as _t64,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.kernels import (
+    sm90_routing_helpers as _routing_helpers,
+)
 
 PADDED_TOKENS = 256
 LOGICAL_TOKEN_BUCKETS = (
