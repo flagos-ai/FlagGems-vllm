@@ -33,7 +33,6 @@ from flaggems_vllm import runtime
 from flaggems_vllm.flagtune.inference.cost_model import tensor_dtypes
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
 # The active candidates use unified CTA pipelines (WS=False).
 _TLE_PRIMITIVES = (
@@ -49,29 +48,21 @@ _TLE_PRIMITIVES = (
     "gpu.wgmma",
     "gpu.wgmma_wait",
 )
-HAS_TLE = has_triton_tle_attrs(
-    ("pipe", "gpu.alloc", "gpu.smem", "gpu.copy", "gpu.wgmma", "gpu.wgmma_wait"),
-    3,
-    6,
-    0,
-)
+
+
+try:
+    from triton.experimental.tle import is_tle_supported
+    from triton.experimental.tle import language as tle
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:
+    is_tle_supported = None
+    tle = None
+    TensorDescriptor = None
 
 
 def _supports_w8a8_tle():
-    if not HAS_TLE:
-        return False
-    try:
-        from triton.experimental.tle import is_tle_supported
-    except ImportError:
-        return False
-    return is_tle_supported(_TLE_PRIMITIVES)
+    return is_tle_supported is not None and is_tle_supported(_TLE_PRIMITIVES)
 
-
-if HAS_TLE:
-    import triton.experimental.tle.language as tle
-    from triton.tools.tensor_descriptor import TensorDescriptor
-else:
-    tle = None
 
 EXPAND_CONFIG_FILENAME = os.path.normpath(
     os.path.join(
