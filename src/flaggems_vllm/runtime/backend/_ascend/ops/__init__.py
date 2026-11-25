@@ -99,6 +99,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.logprob import compute_topk_scores
 from flaggems_vllm.runtime.backend._ascend.ops.matmul_persistent import (
     matmul_persistent,
 )
@@ -163,6 +164,7 @@ __all__ = [
     "compressor",
     "compressor_prepared",
     "compute_slot_mappings",
+    "compute_topk_scores",
     "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
     "deep_gemm_fp8_o_proj",
