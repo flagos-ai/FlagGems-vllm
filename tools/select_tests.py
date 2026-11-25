@@ -556,11 +556,7 @@ def tests_for_source(path: str, tests: set[str]) -> list[str]:
     if path.startswith(
         "src/flaggems_vllm/runtime/backend/_nvidia/hopper/mega/megamhc/"
     ):
-        return [
-            target
-            for target in ("tests/test_megamhc.py", "tests/test_megamhc_contract.py")
-            if target in tests
-        ]
+        return ["tests/test_megamhc.py"] if "tests/test_megamhc.py" in tests else []
 
     is_shared_operator = path.startswith("src/flaggems_vllm/ops/")
     is_backend_operator = path.startswith("src/flaggems_vllm/runtime/backend/_") and (

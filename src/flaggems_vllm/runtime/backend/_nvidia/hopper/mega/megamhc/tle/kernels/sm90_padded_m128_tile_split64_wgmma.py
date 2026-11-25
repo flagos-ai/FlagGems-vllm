@@ -287,14 +287,7 @@ def _tile_split64_math_and_routing(
     tle.gpu.barrier_wait(producer_ready)
     tle.gpu.barrier_wait(grid_acquire_ready)
 
-    lane = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, %laneid;",
-        constraints="=r",
-        args=[],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
+    lane = _t64._physical_thread_id_x() % 32
     if pid < JIT_LOGICAL_TOKENS:
         packed_sum = 0.0
         for source_split in tl.static_range(0, JIT_NUM_SPLITS):

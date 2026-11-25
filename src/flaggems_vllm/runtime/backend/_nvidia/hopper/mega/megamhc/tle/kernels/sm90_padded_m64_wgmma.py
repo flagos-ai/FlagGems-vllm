@@ -34,11 +34,10 @@ selected 128-CTA grid can be resident while polling.
 
 The grid barrier intentionally does not claim CUDA cluster semantics.  It is
 safe only when the complete cooperative grid can be resident concurrently.
-On the target H800 that means post-compilation occupancy must prove enough
-resident CTAs for the selected 128-CTA grid.
-Preparation records this as an unvalidated admission precondition; the path is
-not report eligible until a GPU-side occupancy query, watchdog run, strict
-correctness suite, and Graph replay validation have all passed.
+Preparation therefore queries the compiled kernel's occupancy and the active
+Hopper device's multiprocessor count before the first launch; no H100/H800 SM
+count is assumed.  Unsupported or undersized devices fail closed before this
+software barrier can run.
 
 Workspace and the initial zero counter are allocated before capture.  Ordered
 launches/replays may reuse a plan because the barrier ticket is monotonic;
@@ -328,125 +327,6 @@ def _overlap_hidden_tail(
 
 
 @triton.jit
-def _overlap_routing_tail(
-    mixes_ready,
-    pre_ready,
-    mixes_shared,
-    pre_shared,
-    new_post_mix_ptr,
-    new_comb_res_mix_ptr,
-    hc_pre_eps,
-    hc_post_scale,
-    sinkhorn_eps,
-):
-    """One logical routing warp: publish Pre, then finish Sinkhorn."""
-    lane = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, %laneid;",
-        constraints="=r",
-        args=[],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
-    projection_mask = lane < JIT_PROJECTION_OUTPUTS
-    tle.gpu.barrier_wait(mixes_ready)
-    mixes = tl.load(
-        tle.gpu.local_ptr(mixes_shared, (lane,)),
-        mask=projection_mask,
-        other=0.0,
-    )
-    pre_mix = tl.sigmoid(mixes) + hc_pre_eps
-    post_mix = tl.sigmoid(mixes) * hc_post_scale
-
-    pre_pointer = tle.gpu.local_ptr(pre_shared, (lane,))
-    pre_address = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, $1;",
-        constraints="=r,r",
-        args=[pre_pointer],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred p;
-          setp.lt.u32 p, $3, 4;
-          @p st.shared.f32 [$1], $2;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,r,f,r",
-        args=[pre_address, pre_mix, lane],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-    post_base = tl.cast(new_post_mix_ptr, tl.uint64)
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred ge4, lt8, p;
-          .reg .u32 index;
-          .reg .u64 offset, address;
-          setp.ge.u32 ge4, $3, 4;
-          setp.lt.u32 lt8, $3, 8;
-          and.pred p, ge4, lt8;
-          sub.u32 index, $3, 4;
-          mul.wide.u32 offset, index, 4;
-          add.u64 address, $1, offset;
-          @p st.global.f32 [address], $2;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,l,f,r",
-        args=[post_base, post_mix, lane],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-    tle.gpu.barrier_arrive(pre_ready)
-
-    routing_mask = (lane >= 2 * JIT_HC_MULT) & (lane < JIT_PROJECTION_OUTPUTS)
-    sinkhorn = tl.where(routing_mask, mixes, 0.0)
-    row_max = _warp_reduce4_max(sinkhorn)
-    sinkhorn = tl.exp(sinkhorn - row_max)
-    row_sum = _warp_reduce4_sum(sinkhorn)
-    sinkhorn = sinkhorn * _fast_rcp_ftz_f32(row_sum)
-    sinkhorn += sinkhorn_eps
-    column_sum = _warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
-    sinkhorn *= _fast_rcp_ftz_f32(column_sum)
-    for _ in tl.range(1, JIT_SINKHORN_ITERS):
-        row_sum = _warp_reduce4_sum(sinkhorn) + sinkhorn_eps
-        sinkhorn *= _fast_rcp_ftz_f32(row_sum)
-        column_sum = _warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
-        sinkhorn *= _fast_rcp_ftz_f32(column_sum)
-    comb_base = tl.cast(new_comb_res_mix_ptr, tl.uint64)
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred ge8, lt24, p;
-          .reg .u32 index;
-          .reg .u64 offset, address;
-          setp.ge.u32 ge8, $3, 8;
-          setp.lt.u32 lt24, $3, 24;
-          and.pred p, ge8, lt24;
-          sub.u32 index, $3, 8;
-          mul.wide.u32 offset, index, 4;
-          add.u64 address, $1, offset;
-          @p st.global.f32 [address], $2;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,l,f,r",
-        args=[comb_base, sinkhorn, lane],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
 def _direct_hidden_tail(
     pre_ready,
     pre_shared,
@@ -718,15 +598,8 @@ def _direct_routing_tail(
     route4_shared,
 ):
     """Reduce four 32-split quarters and release Pre immediately."""
-    lane = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, %laneid;",
-        constraints="=r",
-        args=[],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
     physical_thread = _physical_thread_id_x()
+    lane = physical_thread % 32
     worker_warp = (physical_thread - JIT_CTA_THREADS) // 32
     routing_active = worker_warp == 0
     packed_mask = routing_active & (lane <= JIT_PROJECTION_OUTPUTS)
@@ -1798,17 +1671,15 @@ def prepare_tle_sm90_mega_mhc(
         "default_selected": True,
         "report_eligible": True,
         "result_scope": "small_padded_bm64_split128_tf32_production",
-        "occupancy_validated": False,
+        "occupancy_validation": "public_prepared_launcher_before_first_launch",
         "residency_precondition": {
-            "target_gpu": "NVIDIA H800 SXM",
-            "minimum_sm_count": GRID_CTAS,
-            "target_sm_count": 132,
-            "minimum_resident_ctas_per_sm": 1,
             "required_total_resident_ctas": GRID_CTAS,
             "admission_equation": (
                 "active_blocks_per_sm * multiprocessor_count >= " f"{GRID_CTAS}"
             ),
-            "must_query_compiled_kernel_occupancy_before_launch": True,
+            "compiled_kernel_occupancy_query": True,
+            "active_device_sm_count_query": True,
+            "fail_closed_before_first_launch": True,
             "watchdog_required": True,
         },
         "reference_cuda_winner": {

@@ -115,25 +115,6 @@ def _t400_issue_fn_cp_async_n24(
 
 
 @triton.jit
-def _store_shared_bf16x4_zero(shared_address):
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .b32 z;
-          mov.u32 z, 0;
-          st.shared.v2.b32 [$1], {z, z};
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,r",
-        args=[shared_address],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
 def _t400_exact_tail_root(
     x_ptr,
     residual_ptr,

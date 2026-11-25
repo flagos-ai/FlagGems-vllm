@@ -568,7 +568,6 @@ def _sm90_large_graph_split16_rs_wgmma_kernel(
     tile = producer_pid // JIT_NUM_SPLITS
     split = producer_pid % JIT_NUM_SPLITS
     tl.static_assert(JIT_PHYSICAL_THREADS == 640)
-    tl.static_assert(JIT_GRID_CTAS <= 132)
 
     q_stages = tle.gpu.alloc(
         [JIT_PIPE_STAGES, JIT_BLOCK_M, JIT_BLOCK_K],

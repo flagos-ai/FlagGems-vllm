@@ -6,6 +6,11 @@ warps 0..11 produce BF16 A and four FP32 Fn routes while warps 12..15 execute
 the persistent RS-WGMMA loop.  Full M64 tiles use sixteen H256 splits and the
 final M4 tile uses eight H512 splits, for 264 CTAs in one kernel launch.
 
+The tile-local global barrier is used only under cooperative launch. Before
+first launch, the public prepared launcher queries this compiled kernel's
+occupancy and the active device's actual SM count, and fails closed unless all
+264 CTAs can be resident concurrently.
+
 Production uses the complete phase-3 x8 tail, a 128-element tail chunk,
 cp.async Fn staging, and ``maxnreg=64``.  Historical phase, tail-mode, TMA,
 and register-count experiment switches are intentionally not exposed here.
@@ -93,16 +98,14 @@ def _shared_address(pointer):
 
 @triton.jit
 def _tile_split_barrier(tile_state_ptr, participant_last):
-    """Reusable eight-CTA release/acquire barrier followed by CTA sync.
+    """Reusable tile-local release/acquire barrier followed by CTA sync.
 
-    The full T=1028 grid has 136 blocks and the compiled kernel admits two
-    blocks on each of 132 SMs (capacity 264), so all participants are
-    resident.  Only thread zero updates/spins on the tile-local epoch; the
-    remaining 511 threads wait at the CTA barrier.  The caller must enter
-    after a full-CTA publish rendezvous: projection PTX ends with bar.sync,
-    while routing/combine call ``_manual512_cta_sync`` explicitly.  Keeping
-    that precondition at the producer boundary avoids a duplicate CTA barrier
-    inside this helper without weakening the release/acquire chain.
+    The full T=1028 grid has 264 blocks. The prepared launcher admits it from
+    compiled occupancy times the active device's actual SM count before this
+    cooperative kernel can run. Only thread zero updates and spins on the
+    tile-local epoch. The other 511 threads wait at the CTA barrier.
+    The projection PTX ends with bar.sync to publish the CTA's stores before
+    the leader arrives, so this helper needs only the exit CTA barrier.
     """
     physical_thread = _physical_thread_id_x()
     _ = tl.inline_asm_elementwise(
@@ -115,10 +118,10 @@ def _tile_split_barrier(tile_state_ptr, participant_last):
           @!leader bra.uni DG_TLE_MHC_T1028_TILE_CTA_SYNC;
           add.u64 phase_address, $1, 4;
           ld.acquire.gpu.global.u32 old_phase, [phase_address];
-          // acq_rel RMWs form the transitive chain across all eight CTA
-          // arrivals; the last leader then publishes that chain through the
-          // phase release.  Waiter leaders acquire the phase, and the final
-          // CTA barrier transfers their acquired visibility to every thread.
+          // acq_rel RMWs chain all CTA arrivals for the tile. The last leader
+          // publishes that chain through the phase release. Waiter leaders
+          // acquire the phase and the final CTA barrier makes the stores
+          // visible to every thread.
           atom.acq_rel.gpu.global.inc.u32 prior, [$1], $3;
           setp.eq.u32 last, prior, $3;
           @last bra.uni DG_TLE_MHC_T1028_TILE_LAST;
@@ -202,7 +205,6 @@ def _sm90_eager_t1028_p256_manual512_cpasync_kernel(
     new_post_mix_ptr,
     new_comb_res_mix_ptr,
     y_bf16_ptr,
-    debug_partials_ptr,
     partials_ptr,
     tile_states_ptr,
     tail_squares_ptr,
@@ -315,9 +317,9 @@ def _sm90_eager_t1028_p256_manual512_cpasync_kernel(
 
     # The isolated projection PTX has already converged all sixteen warps
     # and written columns 0..24 directly into the compact split plane.
-    # All 136 CTAs fit concurrently (2 blocks/SM x 132 SMs = 264).
-    # The acquire/release barrier makes all eight split partials visible
-    # before split zero performs this tile's uniform manual512 tail.
+    # Cooperative launch plus post-JIT occupancy admission guarantees that
+    # every CTA participating in the tile-local barrier is resident. The
+    # acquire/release chain publishes each tile's split partials.
     _tile_split_barrier(tile_states_ptr + tile * 2, num_splits - 1)
     if JIT_X8_TAIL:
         physical_thread = _physical_thread_id_x()
@@ -327,8 +329,8 @@ def _sm90_eager_t1028_p256_manual512_cpasync_kernel(
             partials_ptr + (tile * JIT_MAX_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N + 25
         )
         if JIT_TAIL_PHASE >= 2:
-            # Eight warp owners per split route disjoint rows.  The eight
-            # split CTAs therefore cover all 64 tokens concurrently.
+            # One warp per owned row, with four rows per split on full tiles.
+            # On the M4 tail, only the first split owns live routing rows.
             if physical_warp < rows_per_split:
                 route_row = split * rows_per_split + physical_warp
                 packed_route = 0.0
@@ -359,10 +361,9 @@ def _sm90_eager_t1028_p256_manual512_cpasync_kernel(
             _manual512_cta_sync()
 
         if JIT_TAIL_PHASE >= 3:
-            # Each routing owner keeps at most four rows and processes all
-            # H4096 columns.  The retired 64KiB projection ring stores the
-            # complete BF16 boundary, so no second cross-CTA barrier or
-            # eight-way square reduction is needed.
+            # Each CTA performs the complete H4096 reduction for its live
+            # rows. The retired 64KiB projection ring stores the BF16
+            # boundary, eliminating a cross-CTA square reduction.
             owned_row_base = split * rows_per_split
             owned_rows = tl.maximum(
                 0, tl.minimum(rows_per_split, live_rows - owned_row_base)
@@ -533,7 +534,6 @@ def _require_tensor(value, *, name, shape, dtype):
 @dataclass(frozen=True)
 class EagerT1028P256Manual512ProjectionPlan:
     tensors: tuple[torch.Tensor, ...]
-    debug_partials: torch.Tensor
     partials: torch.Tensor
     tile_states: torch.Tensor
     tail_squares: torch.Tensor
@@ -548,7 +548,6 @@ class EagerT1028P256Manual512ProjectionPlan:
     def _kernel_args(self) -> tuple[object, ...]:
         return (
             *self.tensors,
-            self.debug_partials,
             self.partials,
             self.tile_states,
             self.tail_squares,
@@ -562,6 +561,7 @@ class EagerT1028P256Manual512ProjectionPlan:
             num_warps=NUM_WARPS,
             num_stages=1,
             num_ctas=1,
+            launch_cooperative_grid=True,
             maxnreg=self.maxnreg,
         )
 
@@ -571,6 +571,7 @@ class EagerT1028P256Manual512ProjectionPlan:
             num_warps=NUM_WARPS,
             num_stages=1,
             num_ctas=1,
+            launch_cooperative_grid=True,
             maxnreg=self.maxnreg,
         )
 
@@ -655,9 +656,6 @@ def prepare_tle_sm90_projection(
 
     maxnreg = MAXNREG
     device = tensors[0].device
-    debug_partials = torch.empty(
-        (MAX_SPLITS, TOKENS, 2048), dtype=torch.float32, device=device
-    )
     partials = torch.empty(
         (NUM_M_TILES, MAX_SPLITS, BLOCK_M, BLOCK_N),
         dtype=torch.float32,
@@ -678,9 +676,14 @@ def prepare_tle_sm90_projection(
         "kernel_symbol": ("_sm90_eager_t1028_p256_manual512_cpasync_kernel"),
         "grid_ctas": GRID_CTAS,
         "num_m_tiles": NUM_M_TILES,
-        "num_splits": "16 full tiles / 8 partial tile",
-        "split_hidden": "H256 full tiles / H512 partial tile",
-        "active_k64_blocks": "4 full tiles / 8 partial tile",
+        "uses_cuda_cluster": False,
+        "uses_global_tile_barrier": True,
+        "launch_cooperative_grid": True,
+        "requires_full_grid_residency": True,
+        "occupancy_validation": "public_prepared_launcher_before_first_launch",
+        "num_splits": "16 per full tile / 8 for the partial tile",
+        "split_hidden": "H256 on full tiles / H512 on the partial tile",
+        "active_k64_blocks": "4 per full-tile CTA / 8 per partial-tile CTA",
         "cta_mapping": (
             "pid<256: tile=pid//16 split=pid%16; " "pid>=256: tile=16 split=pid-256"
         ),
@@ -703,7 +706,6 @@ def prepare_tle_sm90_projection(
     }
     return EagerT1028P256Manual512ProjectionPlan(
         tensors=tensors,
-        debug_partials=debug_partials,
         partials=partials,
         tile_states=tile_states,
         tail_squares=tail_squares,

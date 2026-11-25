@@ -38,6 +38,7 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from .. import fused_post_gemm_t64 as _t64
+from . import sm90_routing_helpers as _routing_helpers
 
 PADDED_TOKENS = 256
 LOGICAL_TOKEN_BUCKETS = (
@@ -100,7 +101,6 @@ JIT_HIDDEN = tl.constexpr(HIDDEN)
 JIT_HC_MULT = tl.constexpr(HC_MULT)
 JIT_PROJECTION_OUTPUTS = tl.constexpr(PROJECTION_OUTPUTS)
 JIT_FLAT_HIDDEN = tl.constexpr(FLAT_HIDDEN)
-JIT_SINKHORN_ITERS = tl.constexpr(SINKHORN_ITERS)
 JIT_BLOCK_M = tl.constexpr(BLOCK_M)
 JIT_BLOCK_N = tl.constexpr(BLOCK_N)
 JIT_NUM_M_TILES = tl.constexpr(NUM_M_TILES)
@@ -466,48 +466,6 @@ def _tile_split32_producer(
 
 
 @triton.jit
-def _sinkhorn_nineteen_warp_iterations(value, epsilon):
-    """Run the repeated 4x4 Sinkhorn body as a warp-local PTX loop."""
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred again;
-          .reg .u32 iteration;
-          .reg .f32 x, t, total, inverse;
-          mov.f32 x, $1;
-          mov.u32 iteration, 19;
-        DG_TLE_MHC_MID_SINKHORN_LOOP:
-          mov.f32 total, x;
-          shfl.sync.bfly.b32 t, total, 2, 31, 0xffffffff;
-          add.rn.f32 total, total, t;
-          shfl.sync.bfly.b32 t, total, 1, 31, 0xffffffff;
-          add.rn.f32 total, total, t;
-          add.rn.f32 total, total, $2;
-          rcp.approx.ftz.f32 inverse, total;
-          mul.rn.f32 x, x, inverse;
-          mov.f32 total, x;
-          shfl.sync.bfly.b32 t, total, 4, 31, 0xffffffff;
-          add.rn.f32 total, total, t;
-          shfl.sync.bfly.b32 t, total, 24, 31, 0xffffffff;
-          add.rn.f32 total, total, t;
-          add.rn.f32 total, total, $2;
-          rcp.approx.ftz.f32 inverse, total;
-          mul.rn.f32 x, x, inverse;
-          add.u32 iteration, iteration, 0xffffffff;
-          setp.ne.u32 again, iteration, 0;
-          @again bra.uni DG_TLE_MHC_MID_SINKHORN_LOOP;
-          mov.f32 $0, x;
-        }
-        """,
-        constraints="=f,f,f",
-        args=[value, epsilon],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def _role2_routing_finalize_explicit(
     pre_shared,
     mix_scales_ptr,
@@ -601,7 +559,9 @@ def _role2_routing_finalize_explicit(
     sinkhorn += sinkhorn_eps
     column_sum = _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
     sinkhorn *= _t64._fast_rcp_ftz_f32(column_sum)
-    sinkhorn = _sinkhorn_nineteen_warp_iterations(sinkhorn, sinkhorn_eps)
+    sinkhorn = _routing_helpers._sinkhorn_nineteen_warp_iterations(
+        sinkhorn, sinkhorn_eps
+    )
     comb_base = tl.cast(new_comb_res_mix_ptr, tl.uint64)
     _ = tl.inline_asm_elementwise(
         asm="""
@@ -766,15 +726,8 @@ def _tile_split32_math_and_routing(
     tle.gpu.barrier_wait(producer_ready)
     tle.gpu.barrier_wait(grid_acquire_ready)
 
-    lane = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, %laneid;",
-        constraints="=r",
-        args=[],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
     physical_thread = _t64._physical_thread_id_x()
+    lane = physical_thread % 32
     worker_warp = (physical_thread - JIT_CTA_THREADS) // 32
     if worker_warp == 0:
         token = pid

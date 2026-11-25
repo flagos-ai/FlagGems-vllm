@@ -19,6 +19,7 @@ import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from math import prod
 from types import MappingProxyType
 
 _TRUE_ENV_VALUES = frozenset(("1", "ON", "TRUE"))
@@ -35,6 +36,25 @@ class UnsupportedPreparedRuntimeError(PreparedLauncherError):
 
 class PreparedLaunchContractError(PreparedLauncherError):
     """Raised when a Plan's explicit LaunchSpec is internally inconsistent."""
+
+
+@dataclass(frozen=True)
+class CooperativeGridAdmission:
+    """Post-compilation proof that a cooperative grid can be resident."""
+
+    grid_ctas: int
+    active_blocks_per_sm: int
+    multiprocessor_count: int
+    resident_cta_capacity: int
+
+
+@dataclass(frozen=True)
+class ClusterLaunchAdmission:
+    """Post-compilation proof that the requested CTA cluster is supported."""
+
+    cluster_dims: tuple[int, int, int]
+    required_cluster_size: int
+    maximum_cluster_size: int
 
 
 @dataclass(frozen=True)
@@ -167,10 +187,22 @@ class LaunchSpec:
     static_bound_values: tuple[object, ...]
     static_bound_alignments: tuple[int, ...]
     label: str = "megamhc"
+    requires_full_grid_residency: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "args", tuple(self.args))
         object.__setattr__(self, "kwargs", MappingProxyType(dict(self.kwargs)))
+        cooperative_launch = self.kwargs.get("launch_cooperative_grid", False)
+        if not isinstance(cooperative_launch, bool):
+            raise PreparedLaunchContractError(
+                "launch_cooperative_grid must be a boolean"
+            )
+        if self.requires_full_grid_residency is None:
+            object.__setattr__(self, "requires_full_grid_residency", cooperative_launch)
+        elif bool(self.requires_full_grid_residency) != cooperative_launch:
+            raise PreparedLaunchContractError(
+                "requires_full_grid_residency must match launch_cooperative_grid"
+            )
         object.__setattr__(
             self, "token_count", _positive_integer("token_count", self.token_count)
         )
@@ -246,6 +278,142 @@ class _RuntimeAdapters:
     current_device: Callable[[], object]
     current_stream: Callable[[object], object]
     validate_node_launch_bindings: Callable[[object, object, object], None]
+    device_properties: Callable[[object], Mapping[str, object]]
+    cooperative_launch_supported: Callable[[object], bool]
+    active_blocks_per_sm: Callable[[object, int, int], int]
+    maximum_cluster_size: Callable[
+        [
+            object,
+            int,
+            int,
+            tuple[int, int, int],
+            tuple[int, int, int],
+        ],
+        int,
+    ]
+
+
+def _cuda_success(error: object, operation: str) -> None:
+    try:
+        status = int(error)
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedPreparedRuntimeError(
+            f"{operation} returned an invalid CUDA status"
+        ) from exc
+    if status:
+        raise UnsupportedPreparedRuntimeError(
+            f"{operation} failed with CUDA status {status}"
+        )
+
+
+def _cuda_occupancy_count(error: object, value: object, operation: str) -> int:
+    _cuda_success(error, operation)
+    try:
+        count = operator.index(value)
+    except TypeError as exc:
+        raise UnsupportedPreparedRuntimeError(
+            f"{operation} returned invalid occupancy"
+        ) from exc
+    if count < 0:
+        raise UnsupportedPreparedRuntimeError(
+            f"{operation} returned negative occupancy {count}"
+        )
+    return count
+
+
+def _load_occupancy_function(compiled: object) -> object:
+    from triton.runtime.errors import OutOfResources
+
+    try:
+        getattr(compiled, "_init_handles")()
+    except OutOfResources as exc:
+        raise UnsupportedPreparedRuntimeError(str(exc)) from exc
+    return getattr(compiled, "function")
+
+
+def _cooperative_launch_supported(device: object) -> bool:
+    try:
+        from cuda.bindings import driver as cuda_driver
+
+        error, value = cuda_driver.cuDeviceGetAttribute(
+            cuda_driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH,
+            int(operator.index(device)),
+        )
+    except (AttributeError, ImportError, TypeError, ValueError) as exc:
+        raise UnsupportedPreparedRuntimeError(
+            "CUDA driver bindings do not expose cooperative-launch capability"
+        ) from exc
+    _cuda_success(error, "cuDeviceGetAttribute(COOPERATIVE_LAUNCH)")
+    return bool(value)
+
+
+def _active_blocks_per_sm(compiled: object, block_threads: int, shared: int) -> int:
+    try:
+        from cuda.bindings import driver as cuda_driver
+
+        function = _load_occupancy_function(compiled)
+        error, active = cuda_driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            function,
+            block_threads,
+            shared,
+        )
+    except (AttributeError, ImportError, TypeError, ValueError) as exc:
+        raise UnsupportedPreparedRuntimeError(
+            "compiled kernel occupancy cannot be queried through CUDA"
+        ) from exc
+    return _cuda_occupancy_count(
+        error, active, "cuOccupancyMaxActiveBlocksPerMultiprocessor"
+    )
+
+
+def _maximum_cluster_size(
+    compiled: object,
+    block_threads: int,
+    shared: int,
+    grid3: tuple[int, int, int],
+    cluster_dims: tuple[int, int, int],
+) -> int:
+    """Query the compiled kernel's supported cluster size on this device."""
+    try:
+        from cuda.bindings import driver as cuda_driver
+
+        function = _load_occupancy_function(compiled)
+        required_cluster_size = prod(cluster_dims)
+        if required_cluster_size > 8:
+            error = cuda_driver.cuFuncSetAttribute(
+                function,
+                cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                1,
+            )[0]
+            _cuda_success(error, "cuFuncSetAttribute(NON_PORTABLE_CLUSTER_SIZE)")
+
+        config = cuda_driver.CUlaunchConfig()
+        config.gridDimX = grid3[0] * cluster_dims[0]
+        config.gridDimY = grid3[1] * cluster_dims[1]
+        config.gridDimZ = grid3[2] * cluster_dims[2]
+        config.blockDimX = block_threads
+        config.blockDimY = 1
+        config.blockDimZ = 1
+        config.sharedMemBytes = shared
+        config.hStream = 0
+        cluster_attribute = cuda_driver.CUlaunchAttribute()
+        cluster_attribute.id = (
+            cuda_driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+        )
+        cluster_attribute.value.clusterDim.x = cluster_dims[0]
+        cluster_attribute.value.clusterDim.y = cluster_dims[1]
+        cluster_attribute.value.clusterDim.z = cluster_dims[2]
+        config.attrs = [cluster_attribute]
+        config.numAttrs = 1
+        error, maximum = cuda_driver.cuOccupancyMaxPotentialClusterSize(
+            function,
+            config,
+        )
+    except (AttributeError, ImportError, OverflowError, TypeError, ValueError) as exc:
+        raise UnsupportedPreparedRuntimeError(
+            "compiled kernel cluster capability cannot be queried through CUDA"
+        ) from exc
+    return _cuda_occupancy_count(error, maximum, "cuOccupancyMaxPotentialClusterSize")
 
 
 def _default_runtime_adapters() -> _RuntimeAdapters:
@@ -262,6 +430,10 @@ def _default_runtime_adapters() -> _RuntimeAdapters:
         current_device=driver.active.get_current_device,
         current_stream=driver.active.get_current_stream,
         validate_node_launch_bindings=validate_node_launch_bindings,
+        device_properties=driver.active.utils.get_device_properties,
+        cooperative_launch_supported=_cooperative_launch_supported,
+        active_blocks_per_sm=_active_blocks_per_sm,
+        maximum_cluster_size=_maximum_cluster_size,
     )
 
 
@@ -300,6 +472,156 @@ def _canonical_grid(
     return grid3  # type: ignore[return-value]
 
 
+def _compiled_launch_resources(compiled: object) -> tuple[int, int]:
+    """Return the physical CTA size and dynamic shared memory after JIT."""
+    metadata = getattr(compiled, "metadata", None)
+    try:
+        block_threads = (
+            _positive_integer("compiled num_warps", getattr(metadata, "num_warps")) * 32
+        )
+        shared = operator.index(getattr(metadata, "shared"))
+    except (AttributeError, TypeError, PreparedLaunchContractError) as exc:
+        raise UnsupportedPreparedRuntimeError(
+            "compiled kernel does not expose num_warps/shared occupancy metadata"
+        ) from exc
+    if shared < 0:
+        raise UnsupportedPreparedRuntimeError(
+            "compiled kernel reports a negative shared-memory size"
+        )
+    return block_threads, shared
+
+
+def _canonical_cluster_dims(value: object) -> tuple[int, int, int]:
+    try:
+        dimensions = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise PreparedLaunchContractError(
+            "cluster_dims must contain exactly three positive integers"
+        ) from exc
+    if len(dimensions) != 3:
+        raise PreparedLaunchContractError(
+            "cluster_dims must contain exactly three positive integers"
+        )
+    return tuple(
+        _positive_integer("cluster_dims", dimension) for dimension in dimensions
+    )  # type: ignore[return-value]
+
+
+def _admit_cluster_launch(
+    spec: LaunchSpec,
+    compiled: object,
+    grid3: tuple[int, int, int],
+    runtime: _RuntimeAdapters,
+) -> ClusterLaunchAdmission | None:
+    """Fail before first launch unless the compiled CTA cluster is supported."""
+    declared_dims = spec.kwargs.get("cluster_dims")
+    if declared_dims is None:
+        return None
+    cluster_dims = _canonical_cluster_dims(declared_dims)
+    num_ctas = _positive_integer("num_ctas", spec.kwargs.get("num_ctas", 1))
+    metadata = getattr(compiled, "metadata", None)
+    if num_ctas != 1 or getattr(metadata, "num_ctas", None) != 1:
+        raise UnsupportedPreparedRuntimeError(
+            "explicit cluster_dims admission requires one CTA per program"
+        )
+    try:
+        compiled_dims = _canonical_cluster_dims(getattr(metadata, "cluster_dims", ()))
+    except PreparedLaunchContractError as exc:
+        raise UnsupportedPreparedRuntimeError(
+            "compiled kernel does not expose three-dimensional cluster metadata"
+        ) from exc
+    if compiled_dims != cluster_dims:
+        raise UnsupportedPreparedRuntimeError(
+            f"compiled cluster dimensions {compiled_dims} do not match "
+            f"LaunchSpec {cluster_dims}"
+        )
+    block_threads, shared = _compiled_launch_resources(compiled)
+    maximum = runtime.maximum_cluster_size(
+        compiled,
+        block_threads,
+        shared,
+        grid3,
+        cluster_dims,
+    )
+    required = prod(cluster_dims)
+    if required > maximum:
+        raise UnsupportedPreparedRuntimeError(
+            f"{spec.label} requires a {required}-CTA cluster, but the compiled "
+            f"kernel and active device support at most {maximum}; select a "
+            "smaller-cluster specialization"
+        )
+    return ClusterLaunchAdmission(
+        cluster_dims=cluster_dims,
+        required_cluster_size=required,
+        maximum_cluster_size=maximum,
+    )
+
+
+def _admit_cooperative_grid(
+    spec: LaunchSpec,
+    compiled: object,
+    grid3: tuple[int, int, int],
+    runtime: _RuntimeAdapters,
+    device: object,
+) -> CooperativeGridAdmission | None:
+    """Fail before first launch unless the complete cooperative grid fits."""
+    if not spec.requires_full_grid_residency:
+        return None
+    metadata = getattr(compiled, "metadata", None)
+    if getattr(metadata, "launch_cooperative_grid", None) is not True:
+        raise UnsupportedPreparedRuntimeError(
+            f"{spec.label} requires cooperative launch, but the compiled "
+            "kernel does not enable it"
+        )
+    if not runtime.cooperative_launch_supported(device):
+        raise UnsupportedPreparedRuntimeError(
+            f"{spec.label} requires cooperative launch, but the device does not "
+            "support it"
+        )
+    num_ctas = _positive_integer("num_ctas", spec.kwargs.get("num_ctas", 1))
+    if num_ctas != 1 or getattr(metadata, "num_ctas", None) != 1:
+        raise UnsupportedPreparedRuntimeError(
+            "cooperative full-grid admission currently supports one CTA per "
+            "program only"
+        )
+    if "cluster_dims" in spec.kwargs:
+        raise UnsupportedPreparedRuntimeError(
+            "cooperative full-grid admission does not accept clustered launches"
+        )
+
+    block_threads, shared = _compiled_launch_resources(compiled)
+
+    properties = runtime.device_properties(device)
+    try:
+        multiprocessor_count = _positive_integer(
+            "multiprocessor_count", properties["multiprocessor_count"]
+        )
+    except (KeyError, TypeError, PreparedLaunchContractError) as exc:
+        raise UnsupportedPreparedRuntimeError(
+            "device properties do not expose multiprocessor_count"
+        ) from exc
+    active_blocks = runtime.active_blocks_per_sm(
+        compiled,
+        block_threads,
+        shared,
+    )
+    resident_capacity = active_blocks * multiprocessor_count
+    grid_ctas = prod(grid3)
+    if grid_ctas > resident_capacity:
+        raise UnsupportedPreparedRuntimeError(
+            f"{spec.label} cooperative grid has {grid_ctas} CTAs, but the "
+            f"compiled kernel admits only {active_blocks} CTA/SM across "
+            f"{multiprocessor_count} SMs ({resident_capacity} resident CTAs); "
+            "select a lower-grid specialization"
+        )
+    return CooperativeGridAdmission(
+        grid_ctas=grid_ctas,
+        active_blocks_per_sm=active_blocks,
+        multiprocessor_count=multiprocessor_count,
+        resident_cta_capacity=resident_capacity,
+    )
+
+
 def _global_bindings(jit_function: object) -> tuple[tuple[object, ...], ...]:
     bindings = []
     used = getattr(jit_function, "used_global_vals", {})
@@ -334,6 +656,8 @@ class PreparedCompiledLauncher:
     _current_stream: Callable[[object], object]
     _owner_thread: int
     _global_bindings: tuple[tuple[object, ...], ...]
+    cooperative_grid_admission: CooperativeGridAdmission | None
+    cluster_launch_admission: ClusterLaunchAdmission | None
     kernel_name: str
     label: str
 
@@ -575,6 +899,19 @@ def prepare_launch_spec(
         )
     runtime.validate_node_launch_bindings(compiled, bound_args, specialization)
     grid3 = _canonical_grid(spec.grid, bound_args)
+    cooperative_grid_admission = _admit_cooperative_grid(
+        spec,
+        compiled,
+        grid3,
+        runtime,
+        device,
+    )
+    cluster_launch_admission = _admit_cluster_launch(
+        spec,
+        compiled,
+        grid3,
+        runtime,
+    )
     try:
         runner = compiled[grid3]
     except (AttributeError, TypeError) as exc:
@@ -604,12 +941,16 @@ def prepare_launch_spec(
         _current_stream=runtime.current_stream,
         _owner_thread=threading.get_ident(),
         _global_bindings=_global_bindings(spec.jit_function),
+        cooperative_grid_admission=cooperative_grid_admission,
+        cluster_launch_admission=cluster_launch_admission,
         kernel_name=str(getattr(compiled, "name", type(compiled).__name__)),
         label=spec.label,
     )
 
 
 __all__ = [
+    "ClusterLaunchAdmission",
+    "CooperativeGridAdmission",
     "LaunchSpec",
     "PreparedCompiledLauncher",
     "PreparedLaunchContractError",

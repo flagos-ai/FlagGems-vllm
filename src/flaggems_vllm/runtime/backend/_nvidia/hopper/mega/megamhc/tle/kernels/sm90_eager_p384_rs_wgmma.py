@@ -34,7 +34,7 @@ import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from .. import fused_post_gemm_t64 as _t64
-from . import sm90_eager_t1028_p256_k32_ptx_best_recovered as _common
+from . import sm90_routing_helpers as _routing_helpers
 from . import sm90_small_family as _small
 
 SUPPORTED_TOKENS = frozenset((12991, 13005, 13021, 16384))
@@ -1571,7 +1571,9 @@ def _routing_finalize_predicated(
     sinkhorn += sinkhorn_eps
     column_sum = _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
     sinkhorn *= _t64._fast_rcp_ftz_f32(column_sum)
-    sinkhorn = _common._sinkhorn_nineteen_warp_iterations(sinkhorn, sinkhorn_eps)
+    sinkhorn = _routing_helpers._sinkhorn_nineteen_warp_iterations(
+        sinkhorn, sinkhorn_eps
+    )
     comb_base = tl.cast(new_comb_res_mix_ptr, tl.uint64)
     _ = tl.inline_asm_elementwise(
         asm="""
@@ -1950,7 +1952,7 @@ def prepare_p384_plan(
         ),
     )
     tensors = tuple(
-        _common._require_tensor(value, name=name, shape=shape, dtype=dtype)
+        _routing_helpers._require_tensor(value, name=name, shape=shape, dtype=dtype)
         for value, name, shape, dtype in specs
     )
     if len({tensor.device for tensor in tensors}) != 1:

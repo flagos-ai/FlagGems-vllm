@@ -228,7 +228,13 @@ def create_mega_mhc_context(
     capture.  The first four tensors describe the dynamic ABI for one physical
     token bucket; the four model tensors are retained as layer-static
     bindings.  Kernel selection, LaunchSpec construction, and FlagTree JIT
-    preparation are entirely internal to FlagGems-vLLM.
+    preparation are entirely internal to FlagGems-vLLM.  Cooperative and
+    clustered specializations require the CUDA Python driver bindings
+    (``cuda.bindings.driver``) for launch admission.
+
+    Raises ``NotImplementedError`` if the specialization or its launch
+    requirements are unsupported on the active device.  Callers with a
+    native implementation can handle that exception during context setup.
     """
     if profile != DEEPSEEK_V4_FLASH_PROFILE:
         raise NotImplementedError(
@@ -288,10 +294,11 @@ def create_mega_mhc_context(
         }
         from .tle.dispatch import MissingTLECaseError
         from .tle.isolated_dispatch import prepare_isolated_safe_launcher
+        from .tle.prepared_launcher import UnsupportedPreparedRuntimeError
 
         try:
             prepared = prepare_isolated_safe_launcher(inputs, outputs)
-        except MissingTLECaseError as exc:
+        except (MissingTLECaseError, UnsupportedPreparedRuntimeError) as exc:
             raise NotImplementedError(str(exc)) from exc
         return _create_context_from_prepared(
             fn,

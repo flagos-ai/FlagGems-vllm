@@ -72,8 +72,7 @@ def _evict_variant_modules() -> None:
         (
             name
             for name in sys.modules
-            if name.startswith(_KERNEL_PREFIX)
-            or name in _MUTABLE_TOP_LEVEL_MODULES
+            if name.startswith(_KERNEL_PREFIX) or name in _MUTABLE_TOP_LEVEL_MODULES
         ),
         key=lambda name: name.count("."),
         reverse=True,

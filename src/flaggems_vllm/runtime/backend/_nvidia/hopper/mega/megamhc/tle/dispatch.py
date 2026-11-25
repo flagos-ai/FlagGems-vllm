@@ -42,14 +42,6 @@ def _padded_m64_environment(tokens: int) -> Mapping[str, str]:
     return {"DG_TLE_MHC_PADDED_WGMMA_LOGICAL_TOKENS": str(tokens)}
 
 
-def _p256_cluster_environment(tokens: int) -> Mapping[str, str]:
-    return {
-        "DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_GLOBAL_TILE_BARRIER": (
-            "1" if tokens == 4100 else "0"
-        )
-    }
-
-
 def _logical_environment(tokens: int, prefix: str) -> Mapping[str, str]:
     return {f"{prefix}_LOGICAL_TOKENS": str(tokens)}
 
@@ -90,12 +82,12 @@ _EAGER_CASES = {
                     ".kernels.sm90_eager_t1028_p256_manual512_cpasync"),
     2048: _CaseSpec("eager-t2048-p256-manual512",
                     ".kernels.sm90_eager_t2048_p256_manual512_cpasync"),
-    3076: _CaseSpec("eager-t3076-p256-cluster16-n24",
-                    ".kernels.sm90_eager_t3076_p256_cluster16_manual512_cpasync", _p256_cluster_environment),
+    3076: _CaseSpec("eager-t3076-p256-cluster8-n24",
+                    ".kernels.sm90_eager_t3076_p256_cluster16_manual512_cpasync"),
     3805: _CaseSpec("eager-t3805-p1024-cluster4-n24",
-                    ".kernels.sm90_eager_t3805_p1024_cluster4_manual512_cpasync", _p256_cluster_environment),
-    4100: _CaseSpec("eager-t4100-p1024-resident4-n24",
-                    ".kernels.sm90_eager_t4100_p1024_cluster4_manual512_cpasync", _p256_cluster_environment),
+                    ".kernels.sm90_eager_t3805_p1024_cluster4_manual512_cpasync"),
+    4100: _CaseSpec("eager-t4100-p1024-cluster4-n24",
+                    ".kernels.sm90_eager_t4100_p1024_cluster4_manual512_cpasync"),
     **{
         token: _CaseSpec(f"eager-t{token}-p384-manual512-tma",
                          f".kernels.sm90_eager_t{token}_p384_rs_wgmma")

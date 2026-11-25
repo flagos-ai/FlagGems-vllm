@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib
+import warnings
 
 import pytest
 import torch
@@ -122,7 +123,12 @@ class MegaMHCBenchmark(base.Benchmark):
         self.shape_desc = self.DEFAULT_SHAPE_DESC
 
     def get_input_iter(self, dtype):
+        from flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamhc.tle.prepared_launcher import (
+            UnsupportedPreparedRuntimeError,
+        )
+
         assert dtype is torch.bfloat16
+        admitted = False
         for (tokens,) in self.shapes:
             generator = torch.Generator(device=self.device).manual_seed(
                 20261111 + tokens
@@ -150,8 +156,21 @@ class MegaMHCBenchmark(base.Benchmark):
                 randn((24,), torch.float32).mul_(0.1),
                 randn((4096,), torch.float32).mul_(0.1).add_(1).bfloat16(),
             )
-            context = flaggems_vllm.create_mega_mhc_context(*values)
+            try:
+                context = flaggems_vllm.create_mega_mhc_context(*values)
+            except NotImplementedError as exc:
+                if not isinstance(exc.__cause__, UnsupportedPreparedRuntimeError):
+                    raise
+                warnings.warn(
+                    f"Skipping MegaMHC benchmark for T={tokens} because {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            admitted = True
             yield (*values, {"context": context})
+        if not admitted:
+            pytest.skip("No MegaMHC benchmark shape passed launch admission")
 
 
 @pytest.mark.megamhc

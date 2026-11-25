@@ -26,7 +26,6 @@ import triton.language as tl
 NUM_MHC_OUTPUTS = 24
 NUM_SQRSUM_PARTIALS = 1
 WORKSPACE_ROW_ELEMENTS = 32
-MAX_NUM_SPLITS = 132
 NUM_WARPS = 4
 CTA_THREADS = NUM_WARPS * 32
 FULL_TOKENS = 1
@@ -129,19 +128,6 @@ def _warp_sum_32(value):
         args=[value],
         dtype=tl.float32,
         is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _warp_sync_full_mask():
-    """Order one physical warp's shared stores before its scalar loads."""
-    return tl.inline_asm_elementwise(
-        asm="bar.warp.sync 0xffffffff; mov.u32 $0, 0;",
-        constraints="=r",
-        args=[],
-        dtype=tl.uint32,
-        is_pure=False,
         pack=1,
     )
 
@@ -883,14 +869,7 @@ def _tle_mhc_overlap_routing_tail(
     sinkhorn_eps,
 ):
     """One logical worker warp: publish Pre, then finish routing."""
-    lane = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, %laneid;",
-        constraints="=r",
-        args=[],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
+    lane = _physical_thread_id_x() % 32
     projection_mask = lane < JIT_FULL_PROJECTION_OUTPUTS
     tle.gpu.barrier_wait(mixes_ready)
     mixes = tl.load(

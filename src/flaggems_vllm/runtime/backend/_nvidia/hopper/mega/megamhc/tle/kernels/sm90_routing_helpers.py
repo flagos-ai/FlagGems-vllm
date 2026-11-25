@@ -1,10 +1,9 @@
-"""Shared routing/hidden helpers for the production eager P384 family.
+"""Shared routing helpers for production Hopper MegaMHC kernels.
 
-Formal callers are ``T in {12991, 13005, 13021, 16384}`` at
-``H=4096, R=4, P=24`` using the manual512, 12-producer/4-math P384 topology.
-The original bring-up kernel, plan, and workspace factory were not reachable
-from production dispatch and are omitted; only numerically validated leaf
-helpers remain under the compatibility import path.
+The warp-local Sinkhorn helper is shared by the CUDA Graph mid/large families
+and the eager P384 family.  All callers implement the same Normal-BF16
+``H=4096, R=4, P=24`` routing semantics.  The tensor validator is used by the
+P384 preparation path; this module has no independently dispatchable kernel.
 """
 
 from __future__ import annotations

@@ -14,6 +14,10 @@ synthetic topology:
 * T=416..448: seven M64 tiles, split-16, grid 112;
 * T=464..512: eight M64 tiles, split-16, grid 128.
 
+These grid sizes are shape-specific projection topologies, not assumed SM
+counts.  The public prepared launcher admits each cooperative grid against the
+compiled kernel's occupancy and the active device's actual SM count.
+
 Phase one assigns the default four-warp partition to WGMMA and four additional
 four-warp partitions to disjoint M16 producer stripes.  Eight K64 stages keep
 the BF16-rounded Post values and FP32 Fn slices below 100 KiB of shared memory.
@@ -42,6 +46,7 @@ import triton.language as tl
 
 from .. import fused_post_gemm_t64 as _t64
 from . import sm90_cp_async_helpers as _fn_cp
+from . import sm90_routing_helpers as _routing_helpers
 
 LOGICAL_TOKEN_BUCKETS = (
     272,
@@ -136,7 +141,6 @@ JIT_ROOT_THREADS = tl.constexpr(ROOT_WARPS * 32)
 JIT_MATH_WARPS = tl.constexpr(MATH_WARPS)
 JIT_MATH_REGS = tl.constexpr(MATH_REGS)
 JIT_NUM_ROLES = tl.constexpr(NUM_ROLES)
-JIT_SINKHORN_ITERS = tl.constexpr(SINKHORN_ITERS)
 JIT_ROLE_WARPS = tl.constexpr(ROLE_WARPS)
 JIT_ROLE_THREADS = tl.constexpr(ROLE_THREADS)
 JIT_TAIL_HIDDEN_CHUNK = tl.constexpr(TAIL_HIDDEN_CHUNK)
@@ -145,48 +149,6 @@ JIT_USE_COEFF_CACHE = tl.constexpr(USE_COEFF_CACHE)
 JIT_USE_NON_STRIPED_TAIL = tl.constexpr(USE_NON_STRIPED_TAIL)
 JIT_USE_EXACT_FULL_TILE = tl.constexpr(USE_EXACT_FULL_TILE)
 JIT_USE_TILE_LOCAL_BARRIER = tl.constexpr(USE_TILE_LOCAL_BARRIER)
-
-
-@triton.jit
-def _sinkhorn_nineteen_warp_iterations(value, epsilon):
-    """Run the repeated 4x4 Sinkhorn body as one warp-local PTX loop."""
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred again;
-          .reg .u32 iteration;
-          .reg .f32 x, t, total, inverse;
-          mov.f32 x, $1;
-          mov.u32 iteration, 19;
-        DG_TLE_MHC_LARGE_SINKHORN_LOOP:
-          mov.f32 total, x;
-          shfl.sync.bfly.b32 t, total, 2, 31, 0xffffffff;
-          add.rn.f32 total, total, t;
-          shfl.sync.bfly.b32 t, total, 1, 31, 0xffffffff;
-          add.rn.f32 total, total, t;
-          add.rn.f32 total, total, $2;
-          rcp.approx.ftz.f32 inverse, total;
-          mul.rn.f32 x, x, inverse;
-          mov.f32 total, x;
-          shfl.sync.bfly.b32 t, total, 4, 31, 0xffffffff;
-          add.rn.f32 total, total, t;
-          shfl.sync.bfly.b32 t, total, 24, 31, 0xffffffff;
-          add.rn.f32 total, total, t;
-          add.rn.f32 total, total, $2;
-          rcp.approx.ftz.f32 inverse, total;
-          mul.rn.f32 x, x, inverse;
-          add.u32 iteration, iteration, 0xffffffff;
-          setp.ne.u32 again, iteration, 0;
-          @again bra.uni DG_TLE_MHC_LARGE_SINKHORN_LOOP;
-          mov.f32 $0, x;
-        }
-        """,
-        constraints="=f,f,f",
-        args=[value, epsilon],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
@@ -250,18 +212,6 @@ def _issue_fn_cp_async_k64(
 def _cp_async_commit_group():
     return tl.inline_asm_elementwise(
         asm="{ cp.async.commit_group; mov.u32 $0, 0; }",
-        constraints="=r",
-        args=[],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _cp_async_wait_group_zero():
-    return tl.inline_asm_elementwise(
-        asm="{ cp.async.wait_group 0; mov.u32 $0, 0; }",
         constraints="=r",
         args=[],
         dtype=tl.uint32,
@@ -465,7 +415,9 @@ def _pipe_role4_routing_finalize(
     sinkhorn += sinkhorn_eps
     column_sum = _t64._warp_reduce4x4_column_sum(sinkhorn) + sinkhorn_eps
     sinkhorn *= _t64._fast_rcp_ftz_f32(column_sum)
-    sinkhorn = _sinkhorn_nineteen_warp_iterations(sinkhorn, sinkhorn_eps)
+    sinkhorn = _routing_helpers._sinkhorn_nineteen_warp_iterations(
+        sinkhorn, sinkhorn_eps
+    )
     comb_base = tl.cast(
         new_comb_res_mix_ptr + token * JIT_HC_MULT * JIT_HC_MULT,
         tl.uint64,
@@ -863,14 +815,7 @@ def _pipe8_math_and_routing(
     tle.gpu.barrier_wait(producer_ready)
     tle.gpu.barrier_wait(grid_acquire_ready)
     physical_thread = _t64._physical_thread_id_x()
-    lane = tl.inline_asm_elementwise(
-        asm="mov.u32 $0, %laneid;",
-        constraints="=r",
-        args=[],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
+    lane = physical_thread % 32
     role = (physical_thread - JIT_ROOT_THREADS) // 32
     if JIT_USE_NON_STRIPED_TAIL:
         token = tile * JIT_BLOCK_M + split * JIT_NUM_ROLES + role
@@ -941,7 +886,6 @@ def _sm90_large_graph_role4_k32_wgmma_kernel(
     tile = producer_pid // JIT_NUM_SPLITS
     split = producer_pid % JIT_NUM_SPLITS
     tl.static_assert(JIT_NUM_PIPE_STAGES == 8)
-    tl.static_assert(JIT_GRID_CTAS <= 132)
     tl.static_assert(JIT_PRODUCER_CTAS <= JIT_GRID_CTAS)
     tl.static_assert(JIT_PHYSICAL_THREADS == 640)
 

@@ -141,15 +141,11 @@ ADMITTED_PLAN_ADAPTERS: Mapping[str, PlanAdapter] = {
     ),
     # Tuple/workspace eager Plans.
     f"{_PREFIX}.kernels.sm90_eager_t1028_p256_manual512_cpasync.EagerT1028P256Manual512ProjectionPlan": PlanAdapter(
-        "eager",
+        "cooperative_eager",
         "_sm90_eager_t1028_p256_manual512_cpasync_kernel",
     ),
-    f"{_PREFIX}.kernels.sm90_eager_t2048_p256_manual512_cpasync.EagerT2048P256Manual512ProjectionPlan": PlanAdapter(
-        "eager",
-        "_sm90_eager_t2048_p256_manual512_cpasync_kernel",
-    ),
-    # T=3805/4100 alias this class after mutating the pinned fresh-process
-    # constants, so one exact adapter covers all three admitted buckets.
+    # T=2048/3805/4100 alias this class after mutating the pinned fresh-process
+    # constants, so one exact adapter covers all admitted P256 cluster buckets.
     (
         f"{_PREFIX}.kernels.sm90_eager_t3076_p256_cluster16_manual512_cpasync."
         "EagerT3076P256Cluster16Manual512ProjectionPlan"
@@ -447,9 +443,11 @@ def launch_spec_for_plan(plan: object) -> LaunchSpec:
             )
     elif adapter.kind == "cluster_eager":
         kwargs["maxnreg"] = int(plan.maxnreg)
-        if not module.USE_GLOBAL_TILE_BARRIER:
-            grid = (int(module.NUM_M_TILES),)
-            kwargs["cluster_dims"] = (int(module.CLUSTER_CTAS), 1, 1)
+        grid = (int(module.NUM_M_TILES),)
+        kwargs["cluster_dims"] = (int(module.CLUSTER_CTAS), 1, 1)
+    elif adapter.kind == "cooperative_eager":
+        kwargs["maxnreg"] = int(plan.maxnreg)
+        kwargs["launch_cooperative_grid"] = True
     else:
         raise PreparedLaunchContractError(
             f"unknown LaunchSpec adapter kind {adapter.kind!r}"

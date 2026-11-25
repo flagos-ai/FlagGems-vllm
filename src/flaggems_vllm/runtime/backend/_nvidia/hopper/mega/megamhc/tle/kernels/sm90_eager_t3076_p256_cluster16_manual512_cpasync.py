@@ -1,51 +1,45 @@
-"""Production SM90 eager MegaMHC base for ``T=3076, 3805, 4100``.
+"""Production SM90 eager MegaMHC base for four exact P256 token buckets.
 
 All admitted cases use the DeepSeek-V4-Flash Normal-BF16 profile
 ``H=4096, R=4, P=24``, sixteen physical warps (12 producer + 4 RS-WGMMA),
 the complete phase-3 x8 tail, a 128-element tail chunk, cp.async Fn staging,
-and ``maxnreg=64``.  The exact shape facades select one of two real launch
+and ``maxnreg=64``. The exact shape facades select one of three Hopper cluster
 topologies:
 
-* T=3076: cluster16 with H256 splits and a release/acquire cluster barrier;
+* T=2048: cluster16 with H256 splits;
+* T=3076: cluster8 with H512 splits and a release/acquire cluster barrier;
 * T=3805: cluster4 with H1024 splits and a cluster barrier; and
-* T=4100: four H1024 splits with a resident global tile barrier.
+* T=4100: cluster4 with H1024 splits and a cluster barrier.
 
 Projection, routing, and the BF16-boundary RMSNorm tail execute in one kernel.
-Only the topology selector remains import-time configurable because it changes
-the launch contract; historical tail, TMA, and register experiments are fixed
-to their admitted values.
+The prepared launcher checks every cluster size against the compiled kernel
+and active device before first launch. Cluster16 also requires the
+nonportable cluster opt-in.
+The T=1028 bucket has a distinct cooperative-grid implementation because its
+M4 tail uses a different split topology.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Mapping
 
-USE_GLOBAL_TILE_BARRIER = (
-    os.environ.get(
-        "DG_TLE_MHC_EAGER_T3076_P256_CLUSTER16_MANUAL512_GLOBAL_TILE_BARRIER",
-        "0",
-    )
-    == "1"
-)
+import torch
+import triton
+import triton.experimental.tle.language as tle
+import triton.language as tl
 
-import torch  # noqa: E402
-import triton  # noqa: E402
-import triton.experimental.tle.language as tle  # noqa: E402
-import triton.language as tl  # noqa: E402
-
-from .sm90_eager_p256_manual512_projection_split_ptx import (  # noqa: E402
+from .sm90_eager_p256_manual512_projection_split_ptx import (
     _manual512_p256_projection_split_ptx,
 )
-from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (  # noqa: E402
+from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (
     _token_shard_combine_exact1024_bf16x8_ptx as _token_shard_combine_bf16x8_ptx,
 )
-from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (  # noqa: E402
+from .sm90_eager_p256_manual512_token_tail_exact1024_ptx import (
     _token_shard_normalize_exact1024_bf16x8_ptx as _token_shard_normalize_bf16x8_ptx,
 )
-from .sm90_eager_p256_routing import _routing_finalize_no_barrier  # noqa: E402
-from .sm90_small_family import _physical_thread_id_x  # noqa: E402
+from .sm90_eager_p256_routing import _routing_finalize_no_barrier
+from .sm90_small_family import _physical_thread_id_x
 
 TOKENS = 3076
 HIDDEN = 4096
@@ -54,7 +48,7 @@ PROJECTION_OUTPUTS = 24
 BLOCK_M = 64
 BLOCK_N = 32
 NUM_M_TILES = (TOKENS + BLOCK_M - 1) // BLOCK_M
-CLUSTER_CTAS = 16
+CLUSTER_CTAS = 8
 NUM_SPLITS = CLUSTER_CTAS
 SPLIT_HIDDEN = HIDDEN // NUM_SPLITS
 MAX_SPLITS = NUM_SPLITS
@@ -81,7 +75,6 @@ JIT_HIDDEN_PHASE = tl.constexpr(HIDDEN_PHASE)
 JIT_TAIL_BATCHES = tl.constexpr(TAIL_BATCHES)
 JIT_X8_TAIL = tl.constexpr(True)
 JIT_TAIL_CHUNK = tl.constexpr(TAIL_CHUNK)
-JIT_USE_GLOBAL_TILE_BARRIER = tl.constexpr(USE_GLOBAL_TILE_BARRIER)
 
 
 @triton.jit
@@ -112,7 +105,7 @@ def _shared_address(pointer):
 
 @triton.jit
 def _cluster_split_barrier():
-    """Publish split partials across the sixteen-CTA Hopper cluster."""
+    """Publish split data across the shape-selected Hopper cluster."""
     physical_thread = _physical_thread_id_x()
     _ = tl.inline_asm_elementwise(
         asm=(
@@ -121,47 +114,6 @@ def _cluster_split_barrier():
         ),
         constraints="=r,r",
         args=[physical_thread],
-        dtype=tl.uint32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@triton.jit
-def _tile_split_barrier(tile_state_ptr, participant_last):
-    """Reusable resident-grid release/acquire barrier for one M64 tile."""
-    physical_thread = _physical_thread_id_x()
-    _ = tl.inline_asm_elementwise(
-        asm="""
-        {
-          .reg .pred leader, last, changed;
-          .reg .u32 old_phase, phase, prior;
-          .reg .u64 phase_address;
-          setp.eq.u32 leader, $2, 0;
-          @!leader bra.uni DG_TLE_MHC_CLUSTER4_TILE_CTA_SYNC;
-          add.u64 phase_address, $1, 4;
-          ld.acquire.gpu.global.u32 old_phase, [phase_address];
-          atom.acq_rel.gpu.global.inc.u32 prior, [$1], $3;
-          setp.eq.u32 last, prior, $3;
-          @last bra.uni DG_TLE_MHC_CLUSTER4_TILE_LAST;
-        DG_TLE_MHC_CLUSTER4_TILE_WAIT:
-          ld.acquire.gpu.global.u32 phase, [phase_address];
-          setp.ne.u32 changed, phase, old_phase;
-          @!changed bra.uni DG_TLE_MHC_CLUSTER4_TILE_WAIT;
-          bra.uni DG_TLE_MHC_CLUSTER4_TILE_CTA_SYNC;
-        DG_TLE_MHC_CLUSTER4_TILE_LAST:
-          atom.release.gpu.global.add.u32 phase, [phase_address], 1;
-        DG_TLE_MHC_CLUSTER4_TILE_CTA_SYNC:
-          bar.sync 0, 512;
-          mov.u32 $0, 0;
-        }
-        """,
-        constraints="=r,l,r,r",
-        args=[
-            tl.cast(tile_state_ptr, tl.uint64),
-            physical_thread,
-            participant_last,
-        ],
         dtype=tl.uint32,
         is_pure=False,
         pack=1,
@@ -224,7 +176,7 @@ def _run_extra_four_row_hidden_tail(
     rmsnorm_eps,
     rmsnorm_scale,
 ):
-    """Run one additional four-row H4096 tail batch for cluster4."""
+    """Run one additional four-row H4096 tail batch."""
     _token_shard_combine_bf16x8_ptx(
         owned_pre_base,
         residual_base,
@@ -382,9 +334,7 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
     new_post_mix_ptr,
     new_comb_res_mix_ptr,
     y_bf16_ptr,
-    debug_partials_ptr,
     partials_ptr,
-    tile_states_ptr,
     tail_squares_ptr,
     hc_norm_eps,
     hc_pre_eps,
@@ -393,7 +343,7 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
     rmsnorm_eps,
     rmsnorm_scale,
 ):
-    # FlagTree expands each logical tile into sixteen physical programs.
+    # FlagTree expands each logical tile into one physical program per split.
     pid = tl.program_id(0)
     tile = pid // JIT_NUM_SPLITS
     split = pid % JIT_NUM_SPLITS
@@ -440,7 +390,7 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
         nv_mma_shared_layout=False,
     )
     # The PTX body starts with a 512-thread rendezvous that publishes these
-    # coefficient caches before role split.  The last tile has four live rows.
+    # coefficient caches before role split. Masks handle any partial tile.
     local_m = tl.arange(0, JIT_BLOCK_M)
     m = tile * JIT_BLOCK_M + local_m
     token_mask = m < JIT_TOKENS
@@ -494,12 +444,9 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
 
     # The isolated projection PTX has already converged all sixteen warps
     # and written columns 0..24 directly into the compact split plane.
-    # The hardware cluster barrier publishes all sixteen split partials
+    # The hardware cluster barrier publishes every split partial
     # without requiring full-grid residency.
-    if JIT_USE_GLOBAL_TILE_BARRIER:
-        _tile_split_barrier(tile_states_ptr + tile * 2, num_splits - 1)
-    else:
-        _cluster_split_barrier()
+    _cluster_split_barrier()
     if JIT_X8_TAIL:
         physical_thread = _physical_thread_id_x()
         physical_warp = physical_thread // 32
@@ -508,8 +455,8 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
             partials_ptr + (tile * JIT_MAX_SPLITS * JIT_BLOCK_M) * JIT_BLOCK_N + 28
         )
         if JIT_TAIL_PHASE >= 2:
-            # Eight warp owners per split route disjoint rows.  The eight
-            # split CTAs therefore cover all 64 tokens concurrently.
+            # One warp per owned row. All split CTAs cover disjoint rows
+            # and reduce the projection partials across the entire tile.
             if physical_warp < rows_per_split:
                 route_row = split * rows_per_split + physical_warp
                 packed_route = 0.0
@@ -540,10 +487,9 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
             _manual512_cta_sync()
 
         if JIT_TAIL_PHASE >= 3:
-            # Each routing owner keeps at most four rows and processes all
-            # H4096 columns.  The retired 64KiB projection ring stores the
-            # complete BF16 boundary, so no second cross-CTA barrier or
-            # sixteen-way square reduction is needed.
+            # Each CTA processes the full H4096 in batches of up to four
+            # owned rows. The retired 64KiB projection ring stores the BF16
+            # boundary, eliminating a cross-CTA square reduction.
             owned_row_base = split * rows_per_split
             owned_rows = tl.maximum(
                 0, tl.minimum(rows_per_split, live_rows - owned_row_base)
@@ -699,9 +645,11 @@ def _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel(
                     8,
                     1,
                 )
-                if JIT_NUM_SPLITS == 4:
+                if JIT_NUM_SPLITS < 16:
                     _manual512_cta_sync()
-                    for extra_batch in tl.static_range(1, 4):
+                    for extra_batch in tl.static_range(
+                        1, JIT_BLOCK_M // JIT_NUM_SPLITS // 4
+                    ):
                         extra_row_base = owned_row_base + extra_batch * 4
                         extra_rows = tl.maximum(
                             0,
@@ -739,9 +687,7 @@ def _require_tensor(value, *, name, shape, dtype):
 @dataclass(frozen=True)
 class EagerT3076P256Cluster16Manual512ProjectionPlan:
     tensors: tuple[torch.Tensor, ...]
-    debug_partials: torch.Tensor
     partials: torch.Tensor
-    tile_states: torch.Tensor
     tail_squares: torch.Tensor
     scalars: tuple[float, ...]
     metadata: dict[str, object]
@@ -754,23 +700,12 @@ class EagerT3076P256Cluster16Manual512ProjectionPlan:
     def _kernel_args(self) -> tuple[object, ...]:
         return (
             *self.tensors,
-            self.debug_partials,
             self.partials,
-            self.tile_states,
             self.tail_squares,
             *self.scalars,
         )
 
     def compile(self):
-        if USE_GLOBAL_TILE_BARRIER:
-            return _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel.warmup(
-                *self._kernel_args(),
-                grid=(GRID_CTAS,),
-                num_warps=NUM_WARPS,
-                num_stages=1,
-                num_ctas=1,
-                maxnreg=self.maxnreg,
-            )
         return _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel.warmup(
             *self._kernel_args(),
             grid=(NUM_M_TILES,),
@@ -782,15 +717,6 @@ class EagerT3076P256Cluster16Manual512ProjectionPlan:
         )
 
     def run(self) -> None:
-        if USE_GLOBAL_TILE_BARRIER:
-            _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel[(GRID_CTAS,)](
-                *self._kernel_args(),
-                num_warps=NUM_WARPS,
-                num_stages=1,
-                num_ctas=1,
-                maxnreg=self.maxnreg,
-            )
-            return
         _sm90_eager_t3076_p256_cluster16_manual512_cpasync_kernel[(NUM_M_TILES,)](
             *self._kernel_args(),
             num_warps=NUM_WARPS,
@@ -881,13 +807,11 @@ def prepare_tle_sm90_projection(
 
     maxnreg = MAXNREG
     device = tensors[0].device
-    debug_partials = torch.empty((1,), dtype=torch.float32, device=device)
     partials = torch.empty(
         (NUM_M_TILES, MAX_SPLITS, BLOCK_M, BLOCK_N),
         dtype=torch.float32,
         device=device,
     )
-    tile_states = torch.zeros((NUM_M_TILES, 2), dtype=torch.uint32, device=device)
     tail_squares = torch.empty((GRID_CTAS, 4, 16), dtype=torch.float32, device=device)
     metadata: dict[str, object] = {
         "model": "DeepSeek-V4-Flash@60d8d707",
@@ -904,14 +828,15 @@ def prepare_tle_sm90_projection(
         "num_m_tiles": NUM_M_TILES,
         "logical_grid_tiles": NUM_M_TILES,
         "cluster_ctas": CLUSTER_CTAS,
-        "nonportable_cluster_size": not USE_GLOBAL_TILE_BARRIER,
-        "uses_cuda_cluster": not USE_GLOBAL_TILE_BARRIER,
-        "uses_global_tile_barrier": USE_GLOBAL_TILE_BARRIER,
-        "requires_full_grid_residency": USE_GLOBAL_TILE_BARRIER,
+        "nonportable_cluster_size": CLUSTER_CTAS > 8,
+        "requires_cluster_capability_admission": True,
+        "uses_cuda_cluster": True,
+        "uses_global_tile_barrier": False,
+        "requires_full_grid_residency": False,
         "num_splits": NUM_SPLITS,
         "split_hidden": SPLIT_HIDDEN,
         "active_k64_blocks": SPLIT_HIDDEN // 64,
-        "cta_mapping": "tile=pid//16, split=pid%16",
+        "cta_mapping": f"tile=pid//{NUM_SPLITS}, split=pid%{NUM_SPLITS}",
         "physical_cta_threads": 512,
         "producer_warps": 12,
         "math_warps": 4,
@@ -933,9 +858,7 @@ def prepare_tle_sm90_projection(
     }
     return EagerT3076P256Cluster16Manual512ProjectionPlan(
         tensors=tensors,
-        debug_partials=debug_partials,
         partials=partials,
-        tile_states=tile_states,
         tail_squares=tail_squares,
         scalars=(
             float(inputs["hc_norm_eps"]),
