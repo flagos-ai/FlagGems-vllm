@@ -347,7 +347,7 @@ def _rwkv_mm_sparsity_topsaten(k, v, out):
             return False
         _cast_dtype(gemm_out, out)
         return True
-    except Exception as exc:  # noqa: BLE001 - fallback boundary: any failure goes to the seed kernel
+    except Exception as exc:  # noqa: BLE001 - fall back to the seed kernel
         _warn_fallback_once(repr(exc))
         return False
 
