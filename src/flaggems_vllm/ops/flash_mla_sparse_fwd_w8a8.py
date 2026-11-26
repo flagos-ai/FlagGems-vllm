@@ -128,6 +128,40 @@ else:
             )
         return first_block, split_blocks
 
+    @triton.constexpr_function
+    def sparse_fp8_publish_output_asm(streaming: bool) -> str:
+        st_op = "st.global.cs.v2.b32" if streaming else "st.global.v2.b32"
+        lines = [
+            "{",
+            ".reg .b32 tid, row, col, offset, a, b, c, d;",
+            ".reg .b64 addr;",
+            "mov.u32 tid, %tid.x;",
+            "and.b32 tid, tid, 127;",
+            "shr.u32 row, tid, 5;",
+            "shl.b32 row, row, 4;",
+            "and.b32 col, tid, 31;",
+            "shr.u32 col, col, 2;",
+            "add.u32 row, row, col;",
+            "and.b32 col, tid, 3;",
+            "shl.b32 col, col, 3;",
+            "shl.b32 row, row, 10;",
+            "add.u32 offset, row, col;",
+            "cvt.u64.u32 addr, offset;",
+            "add.u64 addr, addr, $128;",
+        ]
+        for group in range(8):
+            k = 64 + group * 8
+            for j, reg in enumerate(("a", "b", "c", "d")):
+                lines.append(f"cvt.rn.bf16x2.f32 {reg}, ${k + 4 + j}, ${k + j};")
+            lines.append(f"{st_op} [addr+{group * 32}], {{a, b}};")
+            lines.append(f"{st_op} [addr+{8192 + group * 32}], {{c, d}};")
+        lines.extend(["mov.u32 $0, 0;", "}"])
+        return "\n".join(lines) + "\n"
+
+    SPARSE_FP8_PUBLISH_CONSTRAINTS = tl.constexpr(
+        ",".join(["=r"] * 64 + ["f"] * 64 + ["l"] * 64)
+    )
+
     @triton.jit
     def sparse_fp8_publish_output(
         acc,
@@ -150,106 +184,9 @@ else:
             return
             # Pair permuted accumulator columns into adjacent BF16 output elements.
         base_u64 = (Output + (batch * H + head_block * 64) * 512 + OFFSET).to(tl.uint64)
-        st_op: tl.constexpr = "st.global.cs.v2.b32" if STREAMING else "st.global.v2.b32"
         tl.inline_asm_elementwise(
-            asm=(
-                "{\n"
-                ".reg .b32 tid, row, col, offset, a, b, c, d;\n"
-                ".reg .b64 addr;\n"
-                "mov.u32 tid, %tid.x;\n"
-                "and.b32 tid, tid, 127;\n"
-                "shr.u32 row, tid, 5;\n"
-                "shl.b32 row, row, 4;\n"
-                "and.b32 col, tid, 31;\n"
-                "shr.u32 col, col, 2;\n"
-                "add.u32 row, row, col;\n"
-                "and.b32 col, tid, 3;\n"
-                "shl.b32 col, col, 3;\n"
-                "shl.b32 row, row, 10;\n"
-                "add.u32 offset, row, col;\n"
-                "cvt.u64.u32 addr, offset;\n"
-                "add.u64 addr, addr, $128;\n"
-                "cvt.rn.bf16x2.f32 a, $68, $64;\n"
-                "cvt.rn.bf16x2.f32 b, $69, $65;\n"
-                "cvt.rn.bf16x2.f32 c, $70, $66;\n"
-                "cvt.rn.bf16x2.f32 d, $71, $67;\n"
-                + st_op
-                + " [addr+0], {a, b};\n"
-                + st_op
-                + " [addr+8192], {c, d};\n"
-                "cvt.rn.bf16x2.f32 a, $76, $72;\n"
-                "cvt.rn.bf16x2.f32 b, $77, $73;\n"
-                "cvt.rn.bf16x2.f32 c, $78, $74;\n"
-                "cvt.rn.bf16x2.f32 d, $79, $75;\n"
-                + st_op
-                + " [addr+32], {a, b};\n"
-                + st_op
-                + " [addr+8224], {c, d};\n"
-                "cvt.rn.bf16x2.f32 a, $84, $80;\n"
-                "cvt.rn.bf16x2.f32 b, $85, $81;\n"
-                "cvt.rn.bf16x2.f32 c, $86, $82;\n"
-                "cvt.rn.bf16x2.f32 d, $87, $83;\n"
-                + st_op
-                + " [addr+64], {a, b};\n"
-                + st_op
-                + " [addr+8256], {c, d};\n"
-                "cvt.rn.bf16x2.f32 a, $92, $88;\n"
-                "cvt.rn.bf16x2.f32 b, $93, $89;\n"
-                "cvt.rn.bf16x2.f32 c, $94, $90;\n"
-                "cvt.rn.bf16x2.f32 d, $95, $91;\n"
-                + st_op
-                + " [addr+96], {a, b};\n"
-                + st_op
-                + " [addr+8288], {c, d};\n"
-                "cvt.rn.bf16x2.f32 a, $100, $96;\n"
-                "cvt.rn.bf16x2.f32 b, $101, $97;\n"
-                "cvt.rn.bf16x2.f32 c, $102, $98;\n"
-                "cvt.rn.bf16x2.f32 d, $103, $99;\n"
-                + st_op
-                + " [addr+128], {a, b};\n"
-                + st_op
-                + " [addr+8320], {c, d};\n"
-                "cvt.rn.bf16x2.f32 a, $108, $104;\n"
-                "cvt.rn.bf16x2.f32 b, $109, $105;\n"
-                "cvt.rn.bf16x2.f32 c, $110, $106;\n"
-                "cvt.rn.bf16x2.f32 d, $111, $107;\n"
-                + st_op
-                + " [addr+160], {a, b};\n"
-                + st_op
-                + " [addr+8352], {c, d};\n"
-                "cvt.rn.bf16x2.f32 a, $116, $112;\n"
-                "cvt.rn.bf16x2.f32 b, $117, $113;\n"
-                "cvt.rn.bf16x2.f32 c, $118, $114;\n"
-                "cvt.rn.bf16x2.f32 d, $119, $115;\n"
-                + st_op
-                + " [addr+192], {a, b};\n"
-                + st_op
-                + " [addr+8384], {c, d};\n"
-                "cvt.rn.bf16x2.f32 a, $124, $120;\n"
-                "cvt.rn.bf16x2.f32 b, $125, $121;\n"
-                "cvt.rn.bf16x2.f32 c, $126, $122;\n"
-                "cvt.rn.bf16x2.f32 d, $127, $123;\n"
-                + st_op
-                + " [addr+224], {a, b};\n"
-                + st_op
-                + " [addr+8416], {c, d};\n"
-                "mov.u32 $0, 0;\n"
-                "}\n"
-            ),
-            constraints=(
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-                "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-                "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-                "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-                "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
-                "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
-                "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,"
-                "l,l,l,l,l,l,l,l,l,l,l,l,l,l,l,l"
-            ),
+            asm=sparse_fp8_publish_output_asm(STREAMING),
+            constraints=SPARSE_FP8_PUBLISH_CONSTRAINTS,
             args=[acc * inverse[:, None], base_u64],
             dtype=tl.uint32,
             is_pure=False,
@@ -3989,7 +3926,7 @@ else:
         )
 
     @triton.jit
-    def repair(
+    def model1_repair(
         Q,
         QR,
         QS,
@@ -3999,21 +3936,42 @@ else:
         Idx,
         Output,
         L,
-        Flags,
-        RepairState,
+        Meta0,
+        Meta1,
+        Meta2,
         B,
         N,
         T: tl.constexpr,
         H: tl.constexpr,
         STRIDE: tl.constexpr,
         SCALE: tl.constexpr,
+        PACKED: tl.constexpr = False,
     ):
-        # The usual scale range needs no second attention pass.
-        if tl.load(RepairState) == 0:
+        if PACKED:
+            kmax = tl.load(Meta2).to(tl.float32, bitcast=True)
+            wide_cache = tl.load(Meta2 + 1)
+        elif tl.load(Meta1) == 0:
             return
-        grid = tl.num_programs(0)
-        for b in range(tl.program_id(0), B, grid):
-            if tl.load(Flags + b):
+        for b in range(tl.program_id(0), B, tl.num_programs(0)):
+            if PACKED:
+                qs = tl.load(Meta0 + b * (H // 16) + tl.arange(0, H // 16))
+                amplification = tl.max(tl.abs(qs), 0) * tl.abs(
+                    SCALE * 1.4426950408889634
+                )
+                unsafe = tl.min(qs, 0) < 0.0
+                if wide_cache != 0 or amplification * kmax > QK_RECOMPUTE_THRESHOLD:
+                    for step in range(tl.cdiv(T, 256)):
+                        pos = step * 256 + tl.arange(0, 256)
+                        idx = tl.load(Idx + b.to(tl.int64) * T + pos, pos < T, -1)
+                        valid = (idx >= 0) & (idx < N)
+                        ks = tl.load(Meta1 + tl.where(valid, idx, 0), valid, 0.0)
+                        unsafe |= (tl.min(ks, 0) < 0.0) | (
+                            amplification * tl.max(tl.abs(ks), 0)
+                            > QK_RECOMPUTE_THRESHOLD
+                        )
+            else:
+                unsafe = tl.load(Meta0 + b) != 0
+            if unsafe:
                 for group in range(H // 16):
                     repair_heads(
                         Q,
@@ -4033,40 +3991,6 @@ else:
                         STRIDE,
                         SCALE,
                     )
-            else:
-                pass
-
-    @triton.jit
-    def model1_merge_short(
-        Part, Stats, Out, Lse, H: tl.constexpr, S: tl.constexpr, D: tl.constexpr
-    ):
-        # Each CTA owns one full output row and accumulates its short list of splits.
-        b = tl.program_id(0)
-        h = tl.program_id(1)
-        row = b * S * H + h
-        col = tl.program_id(2) * D + tl.arange(0, D)
-        maximum = tl.full((), -float("inf"), tl.float32)
-        stats = ()
-        for split in tl.static_range(S):
-            z = tl.load(Stats + row + split * H)
-            stats += (z,)
-            maximum = tl.maximum(maximum, z)
-        safe = tl.where(maximum == -float("inf"), 0.0, maximum)
-        total = tl.full((), 0.0, tl.float32)
-        value = tl.full((D,), 0.0, tl.float32)
-        for split in tl.static_range(S):
-            w = tl.exp(stats[split] - safe)
-            v = tl.load(Part + (row + split * H) * 512 + col).to(tl.float32)
-            value = tl.fma(v, w, value)
-            total += w
-        outrow = b * H + h
-        tl.store(
-            Out + outrow * 512 + col, value * (1.0 / tl.where(total > 0.0, total, 1.0))
-        )
-        if tl.program_id(2) == 0:
-            tl.store(
-                Lse + outrow, tl.where(total > 0.0, safe + tl.log(total), float("inf"))
-            )
 
     @triton.jit
     def merge(
@@ -4194,63 +4118,6 @@ else:
                 Bounds + tl.program_id(0),
                 tl.where(tl.max(wide.to(tl.int32), 0) != 0, -maximum, maximum),
             )
-
-    @triton.jit
-    def model1_packed_repair(
-        Q,
-        QR,
-        QS,
-        K,
-        E,
-        KR,
-        Idx,
-        Out,
-        L,
-        QBounds,
-        KBounds,
-        Global,
-        B,
-        N,
-        T: tl.constexpr,
-        H: tl.constexpr,
-        STRIDE: tl.constexpr,
-        SCALE: tl.constexpr,
-    ):
-        kmax = tl.load(Global).to(tl.float32, bitcast=True)
-        wide_cache = tl.load(Global + 1)
-        for b in range(tl.program_id(0), B, tl.num_programs(0)):
-            qs = tl.load(QBounds + b * (H // 16) + tl.arange(0, H // 16))
-            amplification = tl.max(tl.abs(qs), 0) * tl.abs(SCALE * 1.4426950408889634)
-            unsafe = tl.min(qs, 0) < 0.0
-            if wide_cache != 0 or amplification * kmax > QK_RECOMPUTE_THRESHOLD:
-                for step in range(tl.cdiv(T, 256)):
-                    pos = step * 256 + tl.arange(0, 256)
-                    idx = tl.load(Idx + b.to(tl.int64) * T + pos, pos < T, -1)
-                    valid = (idx >= 0) & (idx < N)
-                    ks = tl.load(KBounds + tl.where(valid, idx, 0), valid, 0.0)
-                    unsafe |= (tl.min(ks, 0) < 0.0) | (
-                        amplification * tl.max(tl.abs(ks), 0) > QK_RECOMPUTE_THRESHOLD
-                    )
-            if unsafe:
-                for group in range(H // 16):
-                    repair_heads(
-                        Q,
-                        QR,
-                        QS,
-                        K,
-                        E,
-                        KR,
-                        Idx,
-                        Out,
-                        L,
-                        b,
-                        group,
-                        N,
-                        T,
-                        H,
-                        STRIDE,
-                        SCALE,
-                    )
 
     @tlc.builtin
     def model1_barrier_address(slot, _semantic=None):
@@ -4935,7 +4802,7 @@ else:
                 main = one_block[grid](*args, num_warps=8, num_stages=1)
                 reduce = None
                 if splits > 1:
-                    reduce = model1_merge_short[(batch, heads, 1)](
+                    reduce = merge[(batch, heads, 1)](
                         part, stats, out, lse, heads, splits, 512, num_warps=2
                     )[(batch, heads, 1)]
                 if len(model1_short_plans) >= 128:
@@ -4998,7 +4865,7 @@ else:
                 indices,
                 scale,
             )
-            model1_packed_repair[(min(batch, 256),)](
+            model1_repair[(min(batch, 256),)](
                 q,
                 q_rope,
                 q_scale,
@@ -5017,11 +4884,12 @@ else:
                 heads,
                 page_stride,
                 scale,
+                PACKED=True,
                 num_warps=8,
                 num_stages=1,
             )
             return out, lse
-        sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+        sm = get_num_sms(q.device)
         sm_limit = sm // work
         block = (
             128 if 128 < topk <= 640 and 1 < triton.cdiv(topk, 128) <= sm_limit else 64
@@ -5147,7 +5015,7 @@ else:
                 d,
                 num_warps=2,
             )
-        repair[(min(batch, 64),)](
+        model1_repair[(min(batch, 64),)](
             q,
             q_rope,
             q_scale,
@@ -5158,6 +5026,7 @@ else:
             out,
             lse,
             flags,
+            repair_state,
             repair_state,
             batch,
             tokens,
@@ -5450,35 +5319,41 @@ else:
             )
         else:
             partial, stats = output, lse
+        common_tensors = (
+            q_nope,
+            q_rope,
+            k_cache_lora,
+            k_cache_rope,
+            q_scale,
+            k_scale,
+            indices,
+            indices if topk_length is None else topk_length,
+            q_scale if attn_sink is None else attn_sink,
+        )
+        common_strides = (
+            q_nope.stride(0),
+            q_nope.stride(2),
+            q_rope.stride(0),
+            q_rope.stride(2),
+            k_cache_lora.stride(0),
+            k_cache_lora.stride(1),
+            k_cache_rope.stride(0),
+            k_cache_rope.stride(1),
+            q_scale.stride(0),
+            q_scale.stride(2),
+            k_scale.stride(0),
+            k_scale.stride(1),
+            indices.stride(0),
+            indices.stride(2),
+        )
         if use_tile:
             launch_sparse_entry(
                 sparse_fp8_tile,
                 lambda meta: (batch, heads // 64, splits * (512 // meta["BLOCK_D"])),
-                q_nope,
-                q_rope,
-                k_cache_lora,
-                k_cache_rope,
-                q_scale,
-                k_scale,
-                indices,
-                indices if topk_length is None else topk_length,
-                q_scale if attn_sink is None else attn_sink,
+                *common_tensors,
                 partial,
                 stats,
-                q_nope.stride(0),
-                q_nope.stride(2),
-                q_rope.stride(0),
-                q_rope.stride(2),
-                k_cache_lora.stride(0),
-                k_cache_lora.stride(1),
-                k_cache_rope.stride(0),
-                k_cache_rope.stride(1),
-                q_scale.stride(0),
-                q_scale.stride(2),
-                k_scale.stride(0),
-                k_scale.stride(1),
-                indices.stride(0),
-                indices.stride(2),
+                *common_strides,
                 batch,
                 heads,
                 pages * 64,
@@ -5494,32 +5369,11 @@ else:
             launch_sparse_entry(
                 sparse_fp8_compact,
                 (batch, heads // 64, splits),
-                q_nope,
-                q_rope,
-                k_cache_lora,
-                k_cache_rope,
-                q_scale,
-                k_scale,
-                indices,
-                indices if topk_length is None else topk_length,
-                q_scale if attn_sink is None else attn_sink,
+                *common_tensors,
                 partial,
                 stats,
                 repair_flags,
-                q_nope.stride(0),
-                q_nope.stride(2),
-                q_rope.stride(0),
-                q_rope.stride(2),
-                k_cache_lora.stride(0),
-                k_cache_lora.stride(1),
-                k_cache_rope.stride(0),
-                k_cache_rope.stride(1),
-                q_scale.stride(0),
-                q_scale.stride(2),
-                k_scale.stride(0),
-                k_scale.stride(1),
-                indices.stride(0),
-                indices.stride(2),
+                *common_strides,
                 batch,
                 heads,
                 pages * 64,
@@ -5536,31 +5390,10 @@ else:
             launch_sparse_entry(
                 sparse_fp8_warp_specialized,
                 (batch * (heads // 64), 1, splits),
-                q_nope,
-                q_rope,
-                k_cache_lora,
-                k_cache_rope,
-                q_scale,
-                k_scale,
-                indices,
-                indices if topk_length is None else topk_length,
-                q_scale if attn_sink is None else attn_sink,
+                *common_tensors,
                 partial,
                 stats,
-                q_nope.stride(0),
-                q_nope.stride(2),
-                q_rope.stride(0),
-                q_rope.stride(2),
-                k_cache_lora.stride(0),
-                k_cache_lora.stride(1),
-                k_cache_rope.stride(0),
-                k_cache_rope.stride(1),
-                q_scale.stride(0),
-                q_scale.stride(2),
-                k_scale.stride(0),
-                k_scale.stride(1),
-                indices.stride(0),
-                indices.stride(2),
+                *common_strides,
                 b_bucket,
                 heads,
                 pages * 64,
@@ -5606,20 +5439,9 @@ else:
                 lse,
                 partial,
                 stats,
-                q_nope.stride(0),
-                q_nope.stride(2),
-                q_rope.stride(0),
-                q_rope.stride(2),
-                k_cache_lora.stride(0),
-                k_cache_lora.stride(1),
-                k_cache_rope.stride(0),
-                k_cache_rope.stride(1),
-                indices.stride(0),
-                indices.stride(2),
-                q_scale.stride(0),
-                q_scale.stride(2),
-                k_scale.stride(0),
-                k_scale.stride(1),
+                *common_strides[:8],
+                *common_strides[12:],
+                *common_strides[8:12],
                 batch,
                 heads,
                 pages * 64,
@@ -5635,34 +5457,13 @@ else:
         else:
             head_tile = 2 if splits == 2 else 4
             sparse_fp8_fast_merge[(batch, heads // head_tile)](
-                q_nope,
-                q_rope,
-                k_cache_lora,
-                k_cache_rope,
-                q_scale,
-                k_scale,
-                indices,
-                indices if topk_length is None else topk_length,
-                q_scale if attn_sink is None else attn_sink,
+                *common_tensors,
                 stats if repair_flags is None else repair_flags,
                 partial,
                 stats,
                 output,
                 lse,
-                q_nope.stride(0),
-                q_nope.stride(2),
-                q_rope.stride(0),
-                q_rope.stride(2),
-                k_cache_lora.stride(0),
-                k_cache_lora.stride(1),
-                k_cache_rope.stride(0),
-                k_cache_rope.stride(1),
-                q_scale.stride(0),
-                q_scale.stride(2),
-                k_scale.stride(0),
-                k_scale.stride(1),
-                indices.stride(0),
-                indices.stride(2),
+                *common_strides,
                 heads,
                 pages * 64,
                 topk,
