@@ -75,6 +75,33 @@ def pytest_unconfigure(config):
     _cleanup_tle()
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--repro-ascend-report",
+        default=None,
+        help="JSON report for same-process Ascend TensorView/fallback reproduction",
+    )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    report_path = session.config.getoption("--repro-ascend-report")
+    if not report_path:
+        return
+    import json
+
+    path = Path(report_path)
+    existing = json.loads(path.read_text()) if path.exists() else {}
+    mode = os.environ.get("FLAGGEMS_ASCEND_REPRO_MODE", "ascend_execution")
+    tracer = session.config.pluginmanager.get_plugin("repro_ascend_trace")
+    recorder = session.config.pluginmanager.get_plugin("repro_ascend_recorder")
+    existing[mode] = {
+        "exit_status": int(exitstatus),
+        "nodes": recorder.nodes if recorder is not None else {},
+        "dispatch_events": tracer.events if tracer is not None else [],
+    }
+    path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
+
+
 @pytest.fixture(scope="session")
 def _gemm_rs_group():
     if int(os.environ.get("WORLD_SIZE", "1")) < 2:

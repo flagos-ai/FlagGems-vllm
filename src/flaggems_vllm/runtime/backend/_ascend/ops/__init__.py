@@ -24,6 +24,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.chunk_gated_delta_rule_fwd import
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.concat_and_cache_mla import (
+    concat_and_cache_mla,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
     build_compressor_metadata,
     compressor,
@@ -39,6 +42,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.deep_gemm_fp8_o_proj import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_combine_topk_swa_indices import (
     combine_topk_swa_indices,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_compute_global_topk_indices_and_lens import (
+    compute_global_topk_indices_and_lens,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
@@ -105,6 +111,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.matmul_persistent import (
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre_clamp_sinkhorn
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.paged_kv_block_gather import (
+    paged_kv_block_gather,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -116,6 +125,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_row
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer import (
     quant_lightning_indexer,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.rotary_embedding import (
+    apply_rotary_pos_emb,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.reshape_and_cache_flash import (
+    reshape_and_cache_flash,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
@@ -130,6 +145,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.silu_and_mul_with_clamp import (
     silu_and_mul_with_clamp,
     silu_and_mul_with_clamp_out,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.skip_layernorm import skip_layer_norm
 from flaggems_vllm.runtime.backend._ascend.ops.slot_mappings import (
     compute_slot_mappings,
 )
@@ -154,14 +170,17 @@ from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_trit
 
 __all__ = [
     "add_rms_norm",
+    "apply_rotary_pos_emb",
     "build_compressor_metadata",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule_fwd",
     "chunk_gated_delta_rule_w8a16_int8",
     "combine_topk_swa_indices",
+    "concat_and_cache_mla",
     "compressor",
     "compressor_prepared",
+    "compute_global_topk_indices_and_lens",
     "compute_slot_mappings",
     "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
@@ -194,6 +213,7 @@ __all__ = [
     "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
     "pack_seq_triton",
+    "paged_kv_block_gather",
     "paged_scatter_triton",
     "per_token_group_quant_fp8",
     "persistent_topk",
@@ -205,11 +225,13 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
+    "reshape_and_cache_flash",
     "scaled_int8_quant",
     "scatter_conv_state",
     "scatter_kda_state",
     "silu_and_mul_with_clamp",
     "silu_and_mul_with_clamp_out",
+    "skip_layer_norm",
     "sparse_attn_sharedkv",
     "sparse_flash_attention",
     "SUPPORTED_FP8_DTYPE",

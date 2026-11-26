@@ -179,6 +179,27 @@ def test_concat_and_cache_mla(
 
 
 @pytest.mark.concat_and_cache_mla
+@torch.inference_mode()
+def test_rope_cache_uses_feature_offset_after_latent():
+    rank, rope, num_tokens = 512, 64, 4
+    kv_c = torch.randn(num_tokens, rank, dtype=torch.bfloat16, device=device)
+    k_pe = torch.randn(num_tokens, rope, dtype=kv_c.dtype, device=device)
+    slots = torch.tensor([3, 7, -1, 10], dtype=torch.int64, device=device)
+    cache = torch.full((3, 4, rank + rope), -17, dtype=kv_c.dtype, device=device)
+    expected = cache.clone()
+    flat_expected = expected.view(-1, rank + rope)
+    for row, slot in enumerate(slots.tolist()):
+        if slot >= 0:
+            flat_expected[slot, :rank].copy_(kv_c[row])
+            flat_expected[slot, rank:].copy_(k_pe[row])
+
+    flaggems_vllm.concat_and_cache_mla(
+        kv_c, k_pe, cache, slots, "auto", torch.ones((), device=device)
+    )
+    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+
+
+@pytest.mark.concat_and_cache_mla
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float])
 @pytest.mark.parametrize("tokens", [0, 1, 4])
 @pytest.mark.parametrize("rope_stride", [(0, 0), (1536, 1), (9, 17)])

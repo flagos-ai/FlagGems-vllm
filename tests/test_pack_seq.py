@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
 import triton
@@ -396,3 +398,51 @@ def test_pack_seq_int8_out_of_range_padding_is_unvalidated():
         expected = x[b * 10 : b * 10 + 10]
         actual = result[b, :10]
         assert torch.equal(actual, expected)
+
+
+@pytest.mark.pack_seq_triton
+@pytest.mark.parametrize(
+    "lengths_list,pad_value",
+    [([3, 0, 5], -7.0), ([0, 4, 1], -float("inf"))],
+)
+def test_pack_seq_explicit_max_length_tensorview(lengths_list, pad_value, monkeypatch):
+    """Explicit host metadata enables TV; the default remains legacy Triton."""
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._ascend.ops.pack_seq"
+    )
+    tv = importlib.import_module("flaggems_vllm.runtime.backend._ascend.tensorview")
+    if flaggems_vllm.runtime.device.vendor_name != "ascend" or not tv.HAS_TENSORVIEW:
+        pytest.skip("requires Ascend TensorView")
+    if not torch.npu.is_available():
+        pytest.skip("requires an available NPU")
+    if not tv.tensorview_available():
+        pytest.skip("TensorView was disabled by an earlier compilation failure")
+
+    lengths = torch.tensor(lengths_list, dtype=torch.int32, device=flaggems_vllm.device)
+    x = (
+        torch.arange(sum(lengths_list) * 64, device=flaggems_vllm.device)
+        .reshape(-1, 64)
+        .float()
+    )
+    expected = _ref_pack_seq(x, lengths_list, pad_value=pad_value)
+    calls = []
+    original_tv = backend._pack_seq_tensorview
+
+    def record_tv(*args):
+        result = original_tv(*args)
+        calls.append(True)
+        return result
+
+    monkeypatch.setattr(backend, "_pack_seq_tensorview", record_tv)
+    result = backend.pack_seq_triton(
+        x, lengths, pad_value=pad_value, max_length=max(lengths_list)
+    )
+    if not tv.tensorview_available():
+        pytest.skip("this toolchain cannot compile the TensorView pack kernel")
+    assert calls, "explicit max_length did not select the TensorView pack kernel"
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    calls.clear()
+    default = backend.pack_seq_triton(x, lengths, pad_value=pad_value)
+    assert not calls, "the default path must retain the legacy Triton kernel"
+    torch.testing.assert_close(default, expected, rtol=0, atol=0)

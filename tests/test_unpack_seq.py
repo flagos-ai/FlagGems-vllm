@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
 import triton
@@ -271,3 +273,50 @@ def test_pack_unpack_int8_roundtrip(N, H, D, lengths_list):
     assert unpacked.shape == x.shape
     assert unpacked.dtype == torch.int8
     assert torch.equal(unpacked, x)
+
+
+@pytest.mark.unpack_seq_triton
+@pytest.mark.parametrize("lengths_list", ([3, 0, 5], [0, 4, 1]))
+def test_unpack_seq_explicit_total_tokens_tensorview(lengths_list, monkeypatch):
+    """Explicit host metadata enables TV; the default remains legacy Triton."""
+    backend = importlib.import_module(
+        "flaggems_vllm.runtime.backend._ascend.ops.unpack_seq"
+    )
+    tv = importlib.import_module("flaggems_vllm.runtime.backend._ascend.tensorview")
+    if flaggems_vllm.runtime.device.vendor_name != "ascend" or not tv.HAS_TENSORVIEW:
+        pytest.skip("requires Ascend TensorView")
+    if not torch.npu.is_available():
+        pytest.skip("requires an available NPU")
+    if not tv.tensorview_available():
+        pytest.skip("TensorView was disabled by an earlier compilation failure")
+
+    lengths = torch.tensor(lengths_list, dtype=torch.int32, device=flaggems_vllm.device)
+    total_tokens = sum(lengths_list)
+    packed = (
+        torch.arange(
+            len(lengths_list) * max(lengths_list) * 64,
+            device=flaggems_vllm.device,
+        )
+        .reshape(len(lengths_list), max(lengths_list), 64)
+        .float()
+    )
+    expected = _ref_unpack_seq(packed, lengths_list)
+    calls = []
+    original_tv = backend._unpack_seq_tensorview
+
+    def record_tv(*args):
+        result = original_tv(*args)
+        calls.append(True)
+        return result
+
+    monkeypatch.setattr(backend, "_unpack_seq_tensorview", record_tv)
+    result = backend.unpack_seq_triton(packed, lengths, total_tokens=total_tokens)
+    if not tv.tensorview_available():
+        pytest.skip("this toolchain cannot compile the TensorView unpack kernel")
+    assert calls, "explicit total_tokens did not select the TensorView unpack kernel"
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    calls.clear()
+    default = backend.unpack_seq_triton(packed, lengths)
+    assert not calls, "the default path must retain the legacy Triton kernel"
+    torch.testing.assert_close(default, expected, rtol=0, atol=0)

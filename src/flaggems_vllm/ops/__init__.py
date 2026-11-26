@@ -194,6 +194,7 @@ from flaggems_vllm.ops.mul import mul, mul_
 from flaggems_vllm.ops.mv import mv
 from flaggems_vllm.ops.outer import outer
 from flaggems_vllm.ops.pack_seq import pack_seq_triton
+from flaggems_vllm.ops.paged_kv_block_gather import paged_kv_block_gather
 from flaggems_vllm.ops.FLA import (
     parallel_nsa,
     parallel_nsa_compression,
@@ -430,6 +431,7 @@ __all__ = [
     "outer",
     "outplace_fused_experts",
     "pack_seq_triton",
+    "paged_kv_block_gather",
     "pad_attention_heads",
     "pad_indexer_heads",
     "pad_trailing_draft_slots",
