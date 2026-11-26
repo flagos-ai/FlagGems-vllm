@@ -139,7 +139,8 @@ def _scale_weight_codes(q, s, Q: tl.constexpr, DTYPE: tl.constexpr):
     if Q == 0:
         v = (q - 8).to(tl.float32)
     elif Q == 1:
-        v = (q - 128).to(tl.float32)
+        # Every uint8 code is exactly representable before subtracting the bias.
+        v = q.to(tl.uint8).to(tl.float32) - 128.0
     elif Q == 6:
         # The FP16 exponent bias is 14 larger than E2M1's.
         bits = ((q & 8) << 12) | ((q & 7) << 9)
@@ -148,6 +149,10 @@ def _scale_weight_codes(q, s, Q: tl.constexpr, DTYPE: tl.constexpr):
         bits = ((q & 127) << 20) | ((q & 128) << 24)
         v = bits.to(tl.float32, bitcast=True) * 1.329227995784916e36
         v = tl.where((q & 127) == 127, float("nan"), v)
+    if DTYPE == tl.bfloat16 and Q == 6:
+        # E2M1 times an E8M0 scale is exact in BF16, including subnormals.
+        bits = (v * s).to(tl.uint32, bitcast=True)
+        return (bits >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
     value = (v * s).to(DTYPE)
     if Q == 6 and DTYPE == tl.float16:
         # Preserve E2M1 negative zero through the FP16 conversion.
@@ -331,11 +336,18 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
     single_k = bf16 and named_args["SPLIT_K"] == 1
     mxfp4 = q == QUANT_TYPE_FP4_E2M1
     narrow = e >= 128 and (n <= 512 and k >= 2048 if first else k == 256 and n >= 2048)
+    early_paired = narrow and r >= max(256, e)
     wide = single_k and max(n, k) >= 8192
     wide_w8 = wide and w8 and bm >= 32
     wide_fp8 = wide_w8 and q == QUANT_TYPE_FP8_E4M3
     wide_mxfp4 = wide and mxfp4 and bm >= 64
-    short_down = single_k and not first and narrow and r >= 512 and bm == 16
+    short_down = (
+        single_k
+        and not first
+        and narrow
+        and (r >= 512 or (early_paired and q == QUANT_TYPE_UINT8B128))
+        and bm == 16
+    )
     dense_narrow = single_k and narrow and bm >= 128
 
     dot_layouts = {0}
@@ -343,7 +355,7 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
         single_k
         and first
         and bm == 16
-        and r >= max(512, 2 * e)
+        and (r >= max(512, 2 * e) or early_paired)
         and k >= 2048
         and n % 32 == 0
         and (q == QUANT_TYPE_UINT8B128 or (narrow and (w8 or mxfp4)))
@@ -369,6 +381,17 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
         for config in configs
         if config.kwargs.get("DOT_LAYOUT", 0) in dot_layouts
         and (multi_stage or config.num_stages == 1)
+        and (
+            (
+                config.kwargs.get("DOT_LAYOUT", 0),
+                config.kwargs["BN"],
+                config.kwargs["BK"],
+                config.num_warps,
+                config.num_stages,
+            )
+            != (2, 128, 64, 8, 2)
+            or (q == QUANT_TYPE_FP8_E4M3 and dense_narrow)
+        )
     ]
 
 
@@ -394,7 +417,8 @@ def _accumulate_gemm(
         return tl.dot(
             lhs.to(tl.float32), rhs.to(tl.float32), acc, input_precision="ieee"
         )
-    return tl.dot(lhs, rhs, acc)
+    else:
+        return tl.dot(lhs, rhs, acc)
 
 
 @libentry()
@@ -471,7 +495,8 @@ def _gemm(
     PAIRED: tl.constexpr = DOT_LAYOUT == 1
     STANDARD: tl.constexpr = DOT_LAYOUT == 2
     WEIGHT_KN: tl.constexpr = DOT_LAYOUT == 3
-    ROW_MAJOR_ACC: tl.constexpr = STANDARD or WEIGHT_KN
+    PAIRED_ROW_MAJOR: tl.constexpr = PAIRED and (Q == 2 or Q == 6)
+    ROW_MAJOR_ACC: tl.constexpr = STANDARD or WEIGHT_KN or PAIRED_ROW_MAJOR
     if PAIRED:
         weight_rows = tl.arange(0, 2 * BN)
         weight_n = tl.program_id(0) * BN + weight_rows % BN + (weight_rows // BN) * N
@@ -482,7 +507,7 @@ def _gemm(
         WEIGHT_N: tl.constexpr = N
         WEIGHT_BN: tl.constexpr = BN
     ACC_M: tl.constexpr = BM if ROW_MAJOR_ACC else WEIGHT_BN
-    ACC_N: tl.constexpr = BN if ROW_MAJOR_ACC else BM
+    ACC_N: tl.constexpr = WEIGHT_BN if ROW_MAJOR_ACC else BM
     acc_t = tl.zeros((ACC_M, ACC_N), tl.float32)
     if FIRST and not PAIRED:
         up_t = tl.zeros((ACC_M, ACC_N), tl.float32)
@@ -526,7 +551,7 @@ def _gemm(
             WEIGHT_KN,
         )
         acc_t = _accumulate_gemm(
-            a_t, w_t, acc_t, STANDARD, WEIGHT_KN, dtype == tl.float16
+            a_t, w_t, acc_t, ROW_MAJOR_ACC, WEIGHT_KN, dtype == tl.float16
         )
         if FIRST and not PAIRED:
             wu_t = _load_gemm_weight(
@@ -556,7 +581,10 @@ def _gemm(
             )
     if PAIRED:
         # Keep gate/up in the caller's two separate weight banks and share the dot.
-        acc, up = tl.split(tl.permute(tl.reshape(acc_t, (2, BN, BM)), (2, 1, 0)))
+        if PAIRED_ROW_MAJOR:
+            acc, up = tl.split(tl.permute(tl.reshape(acc_t, (BM, 2, BN)), (0, 2, 1)))
+        else:
+            acc, up = tl.split(tl.permute(tl.reshape(acc_t, (2, BN, BM)), (2, 1, 0)))
     else:
         acc = acc_t if ROW_MAJOR_ACC else tl.trans(acc_t)
         if FIRST:
@@ -834,6 +862,15 @@ def _batch_config(r, e, k, n, quant_type_id, dtype, apply_router_weight_on_input
     # Reuse expert weights when routes repeat; large banks make repeated
     # direct loads more expensive than the small route-alignment kernels.
     direct = r <= (2 if max(k, n) >= 4096 else 16)
+    small_quantized = (
+        dtype == torch.bfloat16
+        and quant_type_id in (QUANT_TYPE_FP8_E4M3, QUANT_TYPE_FP4_E2M1)
+        and e >= 128
+        and k >= 4096
+        and n == 256
+        and not apply_router_weight_on_input
+    )
+    direct = direct or (small_quantized and r <= 24)
     bm = 64 if r >= 32 * e else 32 if r >= 16 * e else 16
     # Dense BF16 batches can amortize each decoded weight tile over more routes.
     if dtype == torch.bfloat16 and r >= max(8192, 80 * e):
@@ -862,6 +899,9 @@ def _batch_config(r, e, k, n, quant_type_id, dtype, apply_router_weight_on_input
     )
     gate_split = split_k if k >= 4096 else 1
     down_split = split_k if n >= 4096 else 1
+    # More gate CTAs help hide the long K reduction in sparse quantized batches.
+    if small_quantized and r <= 192:
+        gate_split = 16 if quant_type_id == QUANT_TYPE_FP4_E2M1 and r <= 6 else 8
     # Sparse routes through a narrow gate tile leave too few CTAs to hide
     # the long INT8 weight load. Partition the gate reduction only.
     if (
