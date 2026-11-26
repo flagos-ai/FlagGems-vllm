@@ -1284,38 +1284,8 @@ sparse_fp8_repair:
     num_warps: 8
     num_stages: 1
 
-sparse_fp8_short:
-  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 128}
-    num_warps: 8
-    num_stages: 1
-  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 256}
-    num_warps: 4
-    num_stages: 1
-  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 256}
-    num_warps: 8
-    num_stages: 1
-  - META: {BLOCK_H: 16, BLOCK_K: 128, VALUE_DIM: 512}
-    num_warps: 8
-    num_stages: 1
-  - META: {BLOCK_H: 32, BLOCK_K: 128, VALUE_DIM: 256}
-    num_warps: 8
-    num_stages: 1
-
 sparse_fp8_warp_specialized:
   - META: {SMALL_REGS: 56, SMALL_WARPS: 4, LARGE_REGS: 32, LARGE_WARPS: 8}
-    num_warps: 4
-    num_stages: 1
-
-sparse_fp8_compact:
-  - META: {BLOCK_K: 64, FOLLOWER_REGS: 160}
-    num_warps: 4
-    num_stages: 1
-
-sparse_fp8_tile:
-  - META: {BLOCK_K: 64, BLOCK_D: 128}
-    num_warps: 4
-    num_stages: 1
-  - META: {BLOCK_K: 64, BLOCK_D: 256}
     num_warps: 4
     num_stages: 1
 
