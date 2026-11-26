@@ -55,7 +55,8 @@ MAX_INTERMEDIATE_SIZE = 14336
 # Per grouped batch, excluding caller inputs, the returned output and allocator reservations.
 GROUPED_WORKSPACE_BYTES = 2 << 30
 # Cross-call LRU byte limit for repacked (E, K//128, N, 128//pack) weights and scales.
-WEIGHT_CACHE_LIMIT = 4 << 30
+# 8 GiB holds a full DeepSeek-V3 TP=8 layer (w1 + w2 ~ 5.4 GiB) without thrashing.
+WEIGHT_CACHE_LIMIT = 8 << 30
 
 
 @contextmanager
