@@ -741,17 +741,14 @@ bmm_w8a8:
 flash_mla_sparse_fwd_w8a8:
   shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV, sink, topk_length, seed[, v4]"
   shapes:
-    # FlagOSTune Model1 and GLM-5.2 sparse prefill, sorted by merged call count.
-    - [16, 64, 512, 1114624, 1, 640, 512, false, false, 0, v4]
-    - [16, 64, 512, 98816, 1, 8320, 512, false, false, 1, v4]
+    # DeepSeek-V4-Flash prefill (Model1)
+    - [4, 64, 512, 1114624, 1, 640, 512, false, false, 4, v4]
+    - [1028, 64, 512, 98816, 1, 8320, 512, false, false, 12, v4]
+    - [4112, 64, 512, 66048, 1, 128, 512, false, false, 19, v4]
+    # GLM-5.2 prefill (V32)
     - [64, 64, 576, 361344, 1, 2048, 512, false, false, 0]
     - [449, 64, 576, 361344, 1, 2048, 512, false, false, 4]
-    - [4112, 64, 512, 1114624, 1, 640, 512, false, false, 2, v4]
-    - [4112, 64, 512, 98816, 1, 8320, 512, false, false, 3, v4]
-    - [4, 64, 512, 1114624, 1, 640, 512, false, false, 4, v4]
-    - [4, 64, 512, 98816, 1, 8320, 512, false, false, 5, v4]
-    - [193, 64, 576, 361344, 1, 2048, 512, false, false, 2]
-    - [512, 64, 576, 361344, 1, 2048, 512, false, false, 5]
+    - [16384, 64, 576, 361344, 1, 2048, 512, false, false, 39]
 qsa_sparse_paged_attention:
   shapes:
     # From Qwen3.8-Flash-Next-FP8 production captures.
