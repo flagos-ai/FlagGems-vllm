@@ -94,9 +94,10 @@ def test_ascend_matmul_tail_layout_and_out(dtype, layout, npu):
     assert actual is out
     assert_ascend_output(actual, expected, a)
     for guard in (storage[:16], storage[-16:]):
+        guard = utils.to_reference(guard)
         utils.gems_assert_equal(guard, torch.full_like(guard, -11))
     single = gems.matmul_persistent(a[0:1], b[0:1])
-    utils.gems_assert_equal(single, actual[0:1])
+    utils.gems_assert_equal(single, utils.to_reference(actual[0:1]))
 
 
 @pytest.mark.matmul_persistent
@@ -118,4 +119,5 @@ def test_ascend_matmul_contract(npu):
         x = torch.empty(left, device=npu, dtype=a.dtype)
         y = torch.empty(right, device=npu, dtype=a.dtype)
         result = entry(x, y)
-        utils.gems_assert_equal(result, torch.zeros(shape, device=npu, dtype=a.dtype))
+        expected = utils.to_reference(torch.zeros(shape, device=npu, dtype=a.dtype))
+        utils.gems_assert_equal(result, expected)
