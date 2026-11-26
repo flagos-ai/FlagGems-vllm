@@ -6,7 +6,6 @@ import logging
 import math
 import operator
 from contextlib import nullcontext
-from functools import lru_cache
 
 import torch
 import triton
@@ -17,47 +16,18 @@ from flaggems_vllm.utils import libentry, libtuner
 
 logger = logging.getLogger(__name__)
 
-_IS_ASCEND = runtime.device.vendor_name == "ascend"
 _STORAGE_TYPES = {1: tl.int8, 2: tl.int16, 4: tl.int32, 8: tl.int64}
 # Keep these values in the tuning key, without generating Ascend binaries for
 # incidental scalar divisibility/one-value specializations.
-_DYNAMIC_INDEX_DIMS = ["T", "H", "PAD"] if _IS_ASCEND else []
-
-
-@lru_cache(None)
-def _vector_cores(device_index):
-    return triton.runtime.driver.active.utils.get_device_properties(device_index)[
-        "num_vectorcore"
-    ]
-
-
-@libentry()
-@triton.jit(do_not_specialize=["N"])
-def _pad_indexer_heads_contiguous_kernel(
-    X, Y, N, ROW: tl.constexpr, BLOCK: tl.constexpr
-):
-    pid = tl.program_id(0).to(tl.int64)
-    lane = tl.arange(0, BLOCK)
-    for tile in range(pid, tl.cdiv(N.to(tl.int64), BLOCK), tl.num_programs(0)):
-        source = tile * BLOCK
-        if ROW:
-            # Each complete input tile supplies one copy and one zero tile.
-            # ROW is a multiple of BLOCK, so neither store crosses a token.
-            token = tile // (ROW // BLOCK)
-            dest = source + token * ROW
-            value = tl.load(X + source + lane)
-            tl.store(Y + dest + lane, value)
-            tl.store(Y + dest + ROW + lane, 0)
-        else:
-            valid = source + lane < N
-            value = tl.load(X + source + lane, mask=valid, other=0)
-            tl.store(Y + source + lane, value, mask=valid)
+_DYNAMIC_INDEX_DIMS = (
+    ["T", "H", "PAD"] if runtime.device.vendor_name == "ascend" else []
+)
 
 
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("pad_indexer_heads"),
-    key=["T", "H", "PAD", "TAIL", "ITEMSIZE", "CONTIGUOUS"],
+    key=["T", "H", "PAD", "TAIL", "ITEMSIZE", "CONTIGUOUS", "GRID_LIMIT"],
 )
 @triton.jit(do_not_specialize=_DYNAMIC_INDEX_DIMS)
 def _pad_indexer_heads_kernel(
@@ -70,6 +40,7 @@ def _pad_indexer_heads_kernel(
     ITEMSIZE: tl.constexpr,
     CONTIGUOUS: tl.constexpr,
     LAYOUT: tl.constexpr,
+    GRID_LIMIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     SHAPE: tl.constexpr = LAYOUT[0]
@@ -79,17 +50,16 @@ def _pad_indexer_heads_kernel(
     HAS_INPUT: tl.constexpr = LAYOUT[4]
     width = TAIL * UNITS
     pid = tl.program_id(0).to(tl.int64)
-    GRID_STRIDE: tl.constexpr = LAYOUT[5]
-    if GRID_STRIDE:
+    if GRID_LIMIT:
         heads = H.to(tl.int64) + PAD
         real_width = H.to(tl.int64) * width
         total = T.to(tl.int64) * heads * width
-        # The Ascend launch grid is bounded. Each program owns tiles separated
+        # The caller bounds the launch grid. Each program owns tiles separated
         # by that grid size, including the final partial tile.
         programs = tl.num_programs(0)
         steps = tl.cdiv(tl.cdiv(total, BLOCK) - pid, programs)
     else:
-        heads = STATIC_HEADS
+        heads = STATIC_HEADS if STATIC_HEADS else H + PAD
         real_width = H * width
         total = T * heads * width
         programs = 1
@@ -123,12 +93,8 @@ def _pad_indexer_heads_kernel(
         tl.store(Y + i, value, valid)
 
 
-def pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
-    """Append ``pad`` zero heads to ``[T,H,*tail]`` in fresh contiguous storage.
-
-    All strided layouts with nonnegative strides, including broadcast views,
-    are read directly. The inference API preserves storage bits, not autograd.
-    """
+def _prepare_pad_indexer_heads(x: torch.Tensor, pad: int):
+    """Validate the shared interface and allocate fresh output storage."""
     logger.debug("GEMS PAD_INDEXER_HEADS")
     pad = operator.index(pad)
     sizes = tuple(x.shape)
@@ -156,7 +122,20 @@ def pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
     if itemsize not in (1, 2, 4, 8, 16):
         raise NotImplementedError("pad_indexer_heads requires byte-addressable storage")
     shape = (sizes[0], sizes[1] + pad, *sizes[2:])
-    out = torch.empty(shape, dtype=x.dtype, device=device)
+    return torch.empty(shape, dtype=x.dtype, device=device), pad
+
+
+def _launch_pad_indexer_heads(x, out, pad, grid_limit=None):
+    """Launch the shared copy, optionally looping over a bounded grid."""
+    if grid_limit is not None:
+        grid_limit = operator.index(grid_limit)
+        if grid_limit <= 0:
+            raise ValueError("grid_limit must be positive")
+    sizes = tuple(x.shape)
+    strides = tuple(x.stride())
+    itemsize = x.element_size()
+    device = x.device
+    shape = tuple(out.shape)
     count = out.numel()
     if count == 0:
         return out
@@ -170,40 +149,40 @@ def pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
         else runtime.torch_device_fn.device(device)
     )
     with guard:
-        grid_limit = _vector_cores(device.index) if _IS_ASCEND else count * units
-        src = triton.reinterpret(x, storage_type)
-        dst = triton.reinterpret(out, storage_type)
-        tail = math.prod(sizes[2:])
-        if _IS_ASCEND and contiguous:
-            # Use up to 8 KiB per transfer. With equal real and padded spans,
-            # select a power-of-two tile that divides a whole input row.
-            block = 8192 // unit_size
-            row = sizes[1] * tail * units if pad else 0
-            if row:
-                block = math.gcd(row, block)
-            if pad == 0 or (pad == sizes[1] and block * unit_size >= 128):
-                n = x.numel() * units
-                grid = (min(grid_limit, triton.cdiv(n, block)),)
-                _pad_indexer_heads_contiguous_kernel[grid](src, dst, n, row, block)
-                return out
         _pad_indexer_heads_kernel[
-            lambda meta: (min(grid_limit, triton.cdiv(count * units, meta["BLOCK"])),)
+            lambda meta: (
+                (
+                    min(grid_limit, triton.cdiv(count * units, meta["BLOCK"]))
+                    if grid_limit is not None
+                    else triton.cdiv(count * units, meta["BLOCK"])
+                ),
+            )
         ](
-            src,
-            dst,
+            triton.reinterpret(x, storage_type),
+            triton.reinterpret(out, storage_type),
             sizes[0],
             sizes[1],
             pad,
-            tail,
+            math.prod(sizes[2:]),
             itemsize,
             contiguous,
             (
                 () if contiguous else sizes[2:],
                 () if contiguous else strides,
                 units,
-                0 if _IS_ASCEND else shape[1],
+                0 if runtime.device.vendor_name == "ascend" else shape[1],
                 sizes[1] != 0,
-                _IS_ASCEND,
             ),
+            grid_limit or 0,
         )
     return out
+
+
+def pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
+    """Append ``pad`` zero heads to ``[T,H,*tail]`` in fresh contiguous storage.
+
+    All strided layouts with nonnegative strides, including broadcast views,
+    are read directly. The inference API preserves storage bits, not autograd.
+    """
+    out, pad = _prepare_pad_indexer_heads(x, pad)
+    return _launch_pad_indexer_heads(x, out, pad)
