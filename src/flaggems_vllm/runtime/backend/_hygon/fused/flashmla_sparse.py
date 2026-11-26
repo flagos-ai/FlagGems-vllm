@@ -68,6 +68,14 @@ BLOCK_K_BY_DQK = {512: 32, 576: 64}
 # this only applies to the single-block case.
 BLOCK_K_SINGLE = 128
 BLOCK_D = 128
+# The KV tile is [BK, DV] of shared memory, so the single-block path above would
+# need 32 KiB of the 64 KiB and only two work groups would fit per CU. Gathering
+# that path in twice as many chunks halves the live tile, which buys a third and
+# fourth work group and 1.08-1.11x on the bandwidth-bound TOPK=128 rows. It only
+# helps where occupancy binds: the multi-block path pays for the extra chunks on
+# every iteration (up to 20%), and too few tokens to fill the CUs leaves the
+# extra work groups with nothing to do.
+BLOCK_D_SINGLE = 64
 _NUM_WARPS = 4
 # Occupancy target for the split decision below. The kernel is register-limited
 # to 3 work groups per CU (256 of the 768 VGPRs per SIMD), but splitting pays off
@@ -79,6 +87,12 @@ _MAX_SPLIT = 16
 # Below this many key blocks per token, the combine launch costs more host time
 # than the split saves on the device.
 _MIN_SPLIT_BLOCKS = 4
+# Splitting only fills the gap between the live work items and the occupancy
+# target, while its cost - a second launch plus a [HQ, DV] f32 partial per split
+# - does not shrink with that gap. Half-empty is where the two meet: at 64 of
+# the 128 work items splitting is still worth 1.13-1.59x, at 96 and 120 it
+# already costs 10-21%.
+_MIN_SPLIT_GAIN = 2
 
 
 @triton.jit
@@ -118,6 +132,7 @@ def _hcu_sparse_mla_fwd_kernel(
 ):
     """One work item: BH heads of one query token over `chunk` key blocks."""
     NHB: tl.constexpr = HQ // BH
+    NBD: tl.constexpr = DV // BD
     offs_h = tl.arange(0, BH)
     offs_d = tl.arange(0, BD)
     offs_t = tl.arange(0, BK)
@@ -130,10 +145,9 @@ def _hcu_sparse_mla_fwd_kernel(
     h0 = hb * BH
 
     q_ptr = q + tok * stride_qm + (h0 + offs_h)[:, None] * stride_qh
-    q0 = tl.load(q_ptr + offs_d[None, :])
-    q1 = tl.load(q_ptr + BD + offs_d[None, :])
-    q2 = tl.load(q_ptr + 2 * BD + offs_d[None, :])
-    q3 = tl.load(q_ptr + 3 * BD + offs_d[None, :])
+    qs = ()
+    for c in tl.static_range(NBD):
+        qs = qs + (tl.load(q_ptr + c * BD + offs_d[None, :]),)
     if DQK == 576:
         offs_td = tl.arange(0, 64)
         qt = tl.load(q_ptr + DV + offs_td[None, :])
@@ -148,10 +162,9 @@ def _hcu_sparse_mla_fwd_kernel(
     # online softmax in log2 units
     m_i = tl.full([BH], M_FLOOR, dtype=tl.float32)
     l_i = tl.zeros([BH], dtype=tl.float32)
-    acc0 = tl.zeros([BH, BD], dtype=tl.float32)
-    acc1 = tl.zeros([BH, BD], dtype=tl.float32)
-    acc2 = tl.zeros([BH, BD], dtype=tl.float32)
-    acc3 = tl.zeros([BH, BD], dtype=tl.float32)
+    accs = ()
+    for _c in tl.static_range(NBD):
+        accs = accs + (tl.zeros([BH, BD], dtype=tl.float32),)
     t_base = indices + tok * stride_tm
 
     for ck in range(lo, hi):
@@ -163,15 +176,13 @@ def _hcu_sparse_mla_fwd_kernel(
 
         # whole KV rows, one chunk per load: all NBD loads are issued before the
         # first dot, which is what gives the gather its memory-level parallelism
-        k0 = tl.load(kv_ptr + offs_d[None, :])
-        k1 = tl.load(kv_ptr + BD + offs_d[None, :])
-        k2 = tl.load(kv_ptr + 2 * BD + offs_d[None, :])
-        k3 = tl.load(kv_ptr + 3 * BD + offs_d[None, :])
+        ks = ()
+        for c in tl.static_range(NBD):
+            ks = ks + (tl.load(kv_ptr + c * BD + offs_d[None, :]),)
 
-        s = tl.dot(q0, tl.trans(k0))
-        s = tl.dot(q1, tl.trans(k1), s)
-        s = tl.dot(q2, tl.trans(k2), s)
-        s = tl.dot(q3, tl.trans(k3), s)
+        s = tl.dot(qs[0], tl.trans(ks[0]))
+        for c in tl.static_range(1, NBD):
+            s = tl.dot(qs[c], tl.trans(ks[c]), s)
         if DQK == 576:
             kt = tl.load(kv_ptr + DV + offs_td[None, :])
             s = tl.dot(qt, tl.trans(kt), s)
@@ -185,19 +196,19 @@ def _hcu_sparse_mla_fwd_kernel(
             m_new = tl.maximum(m_i, blk_max)
             alpha = tl.math.exp2(m_i - m_new)
             l_i = l_i * alpha
-            acc0 = acc0 * alpha[:, None]
-            acc1 = acc1 * alpha[:, None]
-            acc2 = acc2 * alpha[:, None]
-            acc3 = acc3 * alpha[:, None]
+            rescaled = ()
+            for c in tl.static_range(NBD):
+                rescaled = rescaled + (accs[c] * alpha[:, None],)
+            accs = rescaled
             m_i = m_new
 
         p = tl.math.exp2(s - m_i[:, None])
         l_i += tl.sum(p, axis=1)
         pb = p.to(tl.bfloat16)
-        acc0 = tl.dot(pb, k0, acc0)
-        acc1 = tl.dot(pb, k1, acc1)
-        acc2 = tl.dot(pb, k2, acc2)
-        acc3 = tl.dot(pb, k3, acc3)
+        updated = ()
+        for c in tl.static_range(NBD):
+            updated = updated + (tl.dot(pb, ks[c], accs[c]),)
+        accs = updated
 
     row_valid = l_i > 0
     inv_l = tl.where(row_valid, 1.0 / l_i, 0.0)
@@ -205,10 +216,8 @@ def _hcu_sparse_mla_fwd_kernel(
         # partial of (token, split): normalized O, (max, sum) in log2 units
         prow = (tok * nsplit + split) * HQ + h0 + offs_h
         op_ptr = o_part + prow[:, None] * DV
-        tl.store(op_ptr + offs_d[None, :], acc0 * inv_l[:, None])
-        tl.store(op_ptr + BD + offs_d[None, :], acc1 * inv_l[:, None])
-        tl.store(op_ptr + 2 * BD + offs_d[None, :], acc2 * inv_l[:, None])
-        tl.store(op_ptr + 3 * BD + offs_d[None, :], acc3 * inv_l[:, None])
+        for c in tl.static_range(NBD):
+            tl.store(op_ptr + c * BD + offs_d[None, :], accs[c] * inv_l[:, None])
         tl.store(ml_part + prow * 2, m_i)
         tl.store(ml_part + prow * 2 + 1, l_i)
     else:
@@ -229,14 +238,11 @@ def _hcu_sparse_mla_fwd_kernel(
             tl.where(row_valid, lse_i, float("inf")),
         )
         o_ptr = output + tok * stride_om + (h0 + offs_h)[:, None] * stride_oh
-        tl.store(o_ptr + offs_d[None, :], (acc0 * factor[:, None]).to(tl.bfloat16))
-        tl.store(o_ptr + BD + offs_d[None, :], (acc1 * factor[:, None]).to(tl.bfloat16))
-        tl.store(
-            o_ptr + 2 * BD + offs_d[None, :], (acc2 * factor[:, None]).to(tl.bfloat16)
-        )
-        tl.store(
-            o_ptr + 3 * BD + offs_d[None, :], (acc3 * factor[:, None]).to(tl.bfloat16)
-        )
+        for c in tl.static_range(NBD):
+            tl.store(
+                o_ptr + c * BD + offs_d[None, :],
+                (accs[c] * factor[:, None]).to(tl.bfloat16),
+            )
 
 
 @libentry()
@@ -305,18 +311,21 @@ _FWD_KERNEL = libentry()(_hcu_sparse_mla_fwd_kernel)
 
 
 @functools.lru_cache(maxsize=None)
-def _backend_launch_options(dqk: int, split: bool) -> dict:
+def _backend_launch_options(dqk: int, split: bool, single: bool) -> dict:
     """Backend-specific launch options, skipped on backends that lack them.
 
     ``kpack=2`` widens the per-lane K footprint of the MFMA operands, which pays
     off for the 512-wide rows (5-12%) but regresses the 576-wide ones, so it is
     selected per DQK.
 
-    ``sched_latency="mmac5-ds32"`` makes the scheduler assume a much longer LDS
-    latency, so it hoists the ds_reads of the PV operand away from the mmacs
-    that consume them. The inner loop otherwise spends 71 of its 762
-    instructions on a fully blocking ``s_waitcnt lgkmcnt(0)``, and with only 3
-    work groups per CU there is no other wave to cover that latency.
+    ``sched_latency`` makes the scheduler assume a longer LDS latency, so it
+    hoists the ds_reads of the PV operand away from the mmacs that consume
+    them; 23 of the inner loop's 44 ``s_waitcnt`` are otherwise a fully
+    blocking ``lgkmcnt(0)``, and with only 3 work groups per CU there is no
+    other wave to cover that latency. How far to go depends on how much loop
+    there is to hoist across: the multi-block loop wants ``ds80`` (1.05-1.09x
+    over ``ds32``), while the peeled single-block body has nothing to hide
+    behind and the same value costs it 2-4%.
 
     ``waves_per_eu_exact`` makes ``waves_per_eu`` actually pin the register
     budget, which this kernel needs: without it the allocator keeps sizing for
@@ -349,7 +358,7 @@ def _backend_launch_options(dqk: int, split: bool) -> dict:
         if dqk == 512 and "kpack" in fields:
             options["kpack"] = 2
         if not split and "sched_latency" in fields:
-            options["sched_latency"] = "mmac5-ds32"
+            options["sched_latency"] = "mmac5-ds32" if single else "mmac5-ds80"
         return options
     return {}
 
@@ -360,8 +369,8 @@ def _cu_count(device_index: int) -> int:
 
 
 @functools.lru_cache(maxsize=None)
-def _plan(sq: int, hq: int, topk: int, dqk: int, n_cu: int) -> Tuple[int, int, int]:
-    """(block_k, nsplit, chunk): a work item covers `chunk` key blocks of one token.
+def _plan(sq: int, hq: int, topk: int, dqk: int, n_cu: int) -> Tuple[int, int, int, int]:
+    """(block_k, block_d, nsplit, chunk): a work item covers `chunk` key blocks.
 
     TOPK is only split when BH-head items cannot fill the CUs, which is the
     regime the latency is dominated by idle CUs rather than by the gather.
@@ -372,11 +381,15 @@ def _plan(sq: int, hq: int, topk: int, dqk: int, n_cu: int) -> Tuple[int, int, i
     nblk = max(1, triton.cdiv(topk, block_k))
     items = sq * (hq // BLOCK_H)
     target = _CTAS_PER_CU * n_cu
-    if items >= target or nblk < _MIN_SPLIT_BLOCKS:
-        return block_k, 1, nblk
+    if items * _MIN_SPLIT_GAIN > target or nblk < _MIN_SPLIT_BLOCKS:
+        # The narrow value block only pays off where the loop runs once and the
+        # CUs are saturated, which is what makes occupancy the binding
+        # constraint; see BLOCK_D_SINGLE.
+        narrow = nblk == 1 and items >= target
+        return block_k, BLOCK_D_SINGLE if narrow else BLOCK_D, 1, nblk
     nsplit = min(nblk, _MAX_SPLIT, triton.cdiv(target, items))
     chunk = triton.cdiv(nblk, nsplit)
-    return block_k, triton.cdiv(nblk, chunk), chunk
+    return block_k, BLOCK_D, triton.cdiv(nblk, chunk), chunk
 
 
 def flash_mla_sparse_fwd(
@@ -427,7 +440,9 @@ def flash_mla_sparse_fwd(
     device_index = q.device.index
     if device_index is None:
         device_index = torch_device_fn.current_device()
-    block_k, nsplit, chunk = _plan(SQ, HQ, TOPK, DQK, _cu_count(device_index))
+    block_k, block_d, nsplit, chunk = _plan(
+        SQ, HQ, TOPK, DQK, _cu_count(device_index)
+    )
     if nsplit > 1:
         o_part = torch.empty(
             (SQ * nsplit * HQ, DV), device=q.device, dtype=torch.float32
@@ -470,14 +485,14 @@ def flash_mla_sparse_fwd(
             PARTIAL=nsplit > 1,
             BH=BLOCK_H,
             BK=block_k,
-            BD=BLOCK_D,
+            BD=block_d,
             DV=DV,
             num_warps=_NUM_WARPS,
             num_stages=1,  # staging the gather doubles LDS without hiding it
             waves_per_eu=1,  # one register budget to aim at; anything higher
             # caps the kernel below the 256 VGPRs it already needs and spills
             # hundreds of values (416 at 192 VGPRs)
-            **_backend_launch_options(DQK, nsplit > 1),
+            **_backend_launch_options(DQK, nsplit > 1, chunk == 1),
         )
         if nsplit > 1:
             _hcu_sparse_mla_combine_kernel[(SQ * HQ // 8,)](
