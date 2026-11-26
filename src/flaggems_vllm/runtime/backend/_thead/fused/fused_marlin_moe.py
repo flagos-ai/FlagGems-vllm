@@ -21,7 +21,7 @@ from typing import Callable, Dict, NamedTuple, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
-from flag_gems import zeros
+from flag_gems import zero_, zeros
 from torch.utils.weak import WeakTensorKeyDictionary
 
 from flaggems_vllm.ops.fused_marlin_moe import (
@@ -88,6 +88,7 @@ EXPERT_ID_MASK = tl.constexpr(0x3FFFFFFF)
 SHORT_TILE_FLAG = tl.constexpr(0x40000000)
 OVERLAP_BLOCK_ROWS = 64
 DENSE_WORKSPACE_HEADROOM_BYTES = 16 << 20
+DENSE_ROUTING_ALIGN_WORDS = 4
 _PPU_DENSE_MIN_TOKENS = 4096
 _TL_QUANT_TYPE_UINT4B8 = tl.constexpr(QUANT_TYPE_UINT4B8)
 _TL_QUANT_TYPE_UINT8B128 = tl.constexpr(QUANT_TYPE_UINT8B128)
@@ -1965,9 +1966,23 @@ def dense_align_count_histogram(
     tl.store(sorted_routes + o, NUM_ROUTES, o < EM)
 
 
-def dense_routing_sizes(routes: int, experts: int, block_m: int) -> Tuple[int, ...]:
+def dense_routing_sizes(
+    routes: int, experts: int, block_m: int
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     padded = routes + min(routes, experts) * (block_m - 1)
-    return padded, triton.cdiv(padded, block_m), 1, (experts + 1) * experts, experts + 1
+    sizes = (
+        padded,
+        triton.cdiv(padded, block_m),
+        1,
+        (experts + 1) * experts,
+        experts + 1,
+    )
+    # 16-byte slots keep full and tail chunks on the same pointer specialization.
+    slots = tuple(
+        triton.cdiv(size, DENSE_ROUTING_ALIGN_WORDS) * DENSE_ROUTING_ALIGN_WORDS
+        for size in sizes
+    )
+    return sizes, slots
 
 
 def align_dense_fp8_histogram(
@@ -2297,8 +2312,11 @@ def run_dense_wna16(
     intermediate = activations[: routes * n].view(routes, n)
     down = cache[: routes * down_tile].view(m, topk, down_tile)
     block_m = OVERLAP_BLOCK_ROWS if side is not None else configs[0]["BLOCK_SIZE_M"]
-    sizes = dense_routing_sizes(routes, e, block_m)
-    routing_buffers = route_storage[: sum(sizes)].split(sizes)
+    sizes, slots = dense_routing_sizes(routes, e, block_m)
+    routing_buffers = tuple(
+        slot[:size]
+        for slot, size in zip(route_storage[: sum(slots)].split(slots), sizes)
+    )
     if side is not None:
         return run_fp8_ordered_overlap(
             hidden_states,
@@ -2319,8 +2337,8 @@ def run_dense_wna16(
         )
     sorted_ids, experts, padded, counts, prefix = routing_buffers
     # The ordinary alignment accumulates into counts and reads prefix[0].
-    counts.zero_()
-    prefix[0].zero_()
+    zero_(counts)
+    zero_(prefix)
     _moe_align_block_size_triton_4stage(
         topk_ids, e, block_m, sorted_ids, experts, padded, workspace=(prefix, counts)
     )
@@ -2426,11 +2444,12 @@ def run_dense_batches(
 
     def workspace_words(batch: int) -> Tuple[int, int, int, int]:
         routes = batch * top_k
-        routing = sum(dense_routing_sizes(routes, experts, block_m))
+        routing = sum(dense_routing_sizes(routes, experts, block_m)[1])
         if can_overlap and batch >= MIN_OVERLAP_TOKENS:
             # The tail may use ordinary GEMMs with a different expert-block count.
             routing = max(
-                routing, sum(dense_routing_sizes(routes, experts, OVERLAP_BLOCK_ROWS))
+                routing,
+                sum(dense_routing_sizes(routes, experts, OVERLAP_BLOCK_ROWS)[1]),
             )
         # Each int32 word holds two BF16 elements; both projection widths are even.
         return (
