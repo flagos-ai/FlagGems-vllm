@@ -14,7 +14,6 @@
 
 import functools
 import logging
-import weakref
 from enum import Enum
 from typing import Any, Optional
 
@@ -190,24 +189,12 @@ def get_default_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
 ) -> dict[str, Any]:
-    """PPU-tuned per-M config (V6 sweep 2026-08-14; small-M re-sweep
-    2026-08-17).
-
-    Sweep-verified tiers (BM/BN/BK, w4/s4/GM8 fixed):
-      M > 1024: 64/256/32 (large-M workhorse)
-      512 < M <= 1024: 32/128/64
-      128 < M <= 512: 16/256/32
-      M <= 128: gemm1 16/256/64, gemm2 16/128/32 (2026-08-17 stage-split
-      sweep; BM must stay >=16 for the PPU m16n16k16 MMA. Split beats the
-      uniform 16/256/32 by ~3% on M<=128; a BM=8 gemm1 measured ~20%
-      faster but is incorrect (MMA m16 constraint), so it is not used.)
-    """
-    if M > 1024:
+    """PPU MoE GEMM tile selection (BM/BN/BK; w4/s4/GM8 fixed)."""
+    tokens_per_expert = M * topk / max(E, 1)
+    if M > 1024 or tokens_per_expert >= 48:
         bm, bn, bk = 64, 256, 32
-    elif M > 512:
+    elif tokens_per_expert >= 4:
         bm, bn, bk = 32, 128, 64
-    elif M > 128:
-        bm, bn, bk = 16, 256, 32
     elif gemm_stage == "gemm2":
         bm, bn, bk = 16, 128, 32
     else:
@@ -1664,56 +1651,29 @@ def dispatch_fused_moe_kernel(
         )
 
 
-_TRANSPOSE_CACHE: dict = {}
 _GEMV_CFG = None  # optional gemv tuning override: {"BLOCK_N":..,"BLOCK_K":..}
-_TRANSPOSE_CACHE_MAX = 4
-# Memory-pressure adaptive degradation: below LOW the transpose cache is
-# dropped and the path degrades to the untransposed layout; only above HIGH
-# is transposing re-enabled (hysteresis prevents flapping). Re-transposing on
-# every call under sustained pressure would cost ~21ms per call, far worse
-# than the ~1.8ms kernel win the transpose provides.
-_TRANSPOSE_MEM_LOW_BYTES = 10 * 1024**3
-_TRANSPOSE_MEM_HIGH_BYTES = 16 * 1024**3
-_TRANSPOSE_DISABLED = False
-_ENABLE_TRANSPOSE = True  # debug: set False to disable weight transposition
 
 
-def _transposed_view(w: torch.Tensor) -> torch.Tensor:
+def prepack_fused_moe_weights(
+    w1: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return N-contiguous (E, N, K) copies of the expert weights."""
+    from flaggems_vllm.ops.permute_copy import permute_copy
 
-    from flaggems_vllm.ops.permute_copy import permute_copy  # FlagGems kernel
+    def _pack(w):
+        E, N, K = w.shape
+        transposed = permute_copy(w, (0, 2, 1))
+        return transposed.as_strided((E, N, K), (K * N, 1, N))
 
-    key = (w.data_ptr(), w.shape, w.dtype)
-    entry = _TRANSPOSE_CACHE.get(key)
-    if entry is not None and entry[0]() is w:
-        return entry[1]
-    if len(_TRANSPOSE_CACHE) >= _TRANSPOSE_CACHE_MAX:
-        dead = [k for k, (r, _) in _TRANSPOSE_CACHE.items() if r() is None]
-        for k in dead:
-            del _TRANSPOSE_CACHE[k]
-        while len(_TRANSPOSE_CACHE) >= _TRANSPOSE_CACHE_MAX:
-            _TRANSPOSE_CACHE.pop(next(iter(_TRANSPOSE_CACHE)))
-    t = permute_copy(w, (0, 2, 1))  # (E, K, N) contiguous, FlagGems kernel
-    E, N, K = w.shape
-    view = t.as_strided((E, N, K), (K * N, 1, N))
-
-    # Transpose-copy lifetime is tied to the original weight: when the weight
-    # is garbage-collected the weakref callback drops the cache entry, so the
-    # (possibly huge) transposed copy is released immediately instead of
-    # lingering until the next LRU-triggered sweep.
-    def _cleanup(ref, _cache=_TRANSPOSE_CACHE, _key=key):
-        _cache.pop(_key, None)
-
-    _TRANSPOSE_CACHE[key] = (weakref.ref(w, _cleanup), view)
-    return view
+    return _pack(w1), _pack(w2)
 
 
-def fused_experts_impl(
+def _fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    inplace: bool = False,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
@@ -1761,33 +1721,13 @@ def fused_experts_impl(
 
     assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
+    assert w1.stride(-1) == 1 or w1.stride(1) == 1, "w1 layout"
+    assert w2.stride(-1) == 1 or w2.stride(1) == 1, "w2 layout"
 
-    # PPU: transposed weight view -> b-tile BN-contiguous reads (nopad layout
-    # win). Same shape, so N/K semantics are untouched. Quantized paths keep
-    # their original layout. Under memory pressure (free < LOW) the transpose
-    # cache is dropped and this path degrades to the untransposed layout;
-    # recovery (> HIGH) re-enables transposing. Hysteresis avoids flapping.
-    global _TRANSPOSE_DISABLED
-    try:
-        _free, _ = torch.cuda.mem_get_info()
-        if _free < _TRANSPOSE_MEM_LOW_BYTES:
-            if not _TRANSPOSE_DISABLED:
-                _TRANSPOSE_CACHE.clear()
-            _TRANSPOSE_DISABLED = True
-        elif _TRANSPOSE_DISABLED and _free > _TRANSPOSE_MEM_HIGH_BYTES:
-            _TRANSPOSE_DISABLED = False
-    except (AttributeError, RuntimeError):
-        _TRANSPOSE_DISABLED = False  # no CUDA-semantic mem query -> keep cache
-
-    if (
-        _ENABLE_TRANSPOSE
-        and not (use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-        and not (_TRANSPOSE_DISABLED)
-    ):
-        w1 = _transposed_view(w1)
-        w2 = _transposed_view(w2)
+    # GEMM and GEMV consume the caller's weight strides directly. An implicit
+    # transpose backed by a bounded cache thrashes across MoE layers and can
+    # record full-weight copies into every graph replay. Keep the original
+    # weights instead, without persistent copies or memory-pressure queries.
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
     num_tokens = hidden_states.size(0)
@@ -1853,7 +1793,7 @@ def fused_experts_impl(
     else:
         raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
-    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+    out_hidden_states = torch.empty_like(hidden_states)
 
     # Dequant INT8/INT4 weights (Triton can't do mixed-dtype dot)
     if use_int8_w8a16 or use_int4_w4a16:
@@ -2099,7 +2039,7 @@ def fused_experts_impl(
     return out_hidden_states
 
 
-def inplace_fused_experts(
+def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -2111,91 +2051,44 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
-) -> None:
-    """
-    In-place fused MoE: writes output directly into ``hidden_states``.
-
-    Same semantics as ``fused_experts_impl(..., inplace=True)``.
-    Returns None (the result is stored in ``hidden_states``).
-    """
-    fused_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        inplace=True,
-        activation=activation,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        global_num_experts=global_num_experts,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_shape=block_shape,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-    )
-
-
-def outplace_fused_experts(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    per_channel_quant: bool = False,
-    global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
+    expert_map: torch.Tensor | None = None,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_shape: list[int] | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Out-of-place fused MoE: allocates and returns a new output tensor.
+    """Fused MoE forward with the vLLM fused_experts_impl signature.
 
-    Same semantics as ``fused_experts_impl(..., inplace=False)``.
+    Always allocates and returns a new output tensor.
     """
-    return fused_experts_impl(
+    return _fused_experts_impl(
         hidden_states,
         w1,
         w2,
         topk_weights,
         topk_ids,
-        inplace=False,
         activation=activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        ocp_mx_scheme=ocp_mx_scheme,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
+        expert_map=expert_map,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
@@ -2204,7 +2097,6 @@ def outplace_fused_experts(
     )
 
 
-@functools.lru_cache(maxsize=16)
 def _supports_int8_moe(device_index: int) -> bool:
     props = torch.cuda.get_device_properties(device_index)
     supported = (
