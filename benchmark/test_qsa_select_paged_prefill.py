@@ -20,6 +20,7 @@ import flaggems_vllm
 from . import base
 
 try:
+    import vllm._custom_ops  # registers torch.ops._C on plugin platforms
     if flaggems_vllm.vendor_name == "metax":
         from vllm_metax.models.qwen4_exp.metax.ops.qsa_indexer_fallback import (
             qsa_select_paged_prefill as vendor_qsa,

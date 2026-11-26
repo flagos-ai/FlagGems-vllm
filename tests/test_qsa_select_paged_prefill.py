@@ -384,6 +384,7 @@ def vllm_reference():
         if flaggems_vllm.vendor_name == "metax"
         else "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer"
     )
+    import vllm._custom_ops  # noqa: F401 - registers torch.ops._C
     return pytest.importorskip(
         module,
         reason="vLLM QSA is required for the native cross-check",
@@ -715,7 +716,7 @@ DTYPES = [
         torch.float8_e4m3fn,
         id="fp8",
         marks=pytest.mark.skipif(
-            flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax"),
+            flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax", "thead"),
             reason="FP8 selection is currently validated on NVIDIA, MThreads, and MetaX",
         ),
     ),
@@ -751,7 +752,7 @@ def _case(settings, dtype, monkeypatch) -> QsaPrefillCase:
 @pytest.mark.parametrize("settings", CASES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_qsa_select_paged_prefill_matches_torch_reference(
-    accelerator, monkeypatch, settings, dtype
+    accelerator, monkeypatch, settings, dtype, _ppu_caps
 ) -> None:
     case = _case(settings, dtype, monkeypatch)
     _assert_matches(case.run_kernel(), case.run_reference(), case)
@@ -759,7 +760,7 @@ def test_qsa_select_paged_prefill_matches_torch_reference(
 
 @pytest.mark.qsa_select_paged_prefill
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax")
+    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax", "thead")
     or (
         flaggems_vllm.vendor_name == "nvidia"
         and (
@@ -772,7 +773,7 @@ def test_qsa_select_paged_prefill_matches_torch_reference(
 @pytest.mark.parametrize("settings", CASES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_qsa_select_paged_prefill_matches_vllm(
-    accelerator, monkeypatch, settings, dtype
+    accelerator, monkeypatch, settings, dtype, _ppu_caps
 ) -> None:
     reference = vllm_reference()
     case = _case(settings, dtype, monkeypatch)
@@ -810,7 +811,7 @@ def test_qsa_select_paged_prefill_matches_vllm(
 
 @pytest.mark.qsa_select_paged_prefill
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax"),
+    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax", "thead"),
     reason="NVIDIA/MThreads/MetaX wrapper error contract",
 )
 @pytest.mark.parametrize(
@@ -871,3 +872,28 @@ def test_qsa_select_paged_prefill_invalid_contract(accelerator, case) -> None:
         error = ValueError
     with pytest.raises(error):
         flaggems_vllm.qsa_select_paged_prefill(*inputs.launch_args())
+
+
+from unittest.mock import patch
+
+
+def _ppu_device_capability(cls, device_id=0):
+    from vllm.platforms.interface import DeviceCapability
+
+    major, minor = torch.cuda.get_device_capability(device_id)
+    return DeviceCapability(major=major, minor=minor)
+
+
+@pytest.fixture
+def _ppu_caps():
+    if flaggems_vllm.vendor_name != "thead":
+        yield
+        return
+    from vllm.platforms import current_platform
+
+    with patch.object(
+        type(current_platform),
+        "get_device_capability",
+        classmethod(_ppu_device_capability),
+    ):
+        yield
