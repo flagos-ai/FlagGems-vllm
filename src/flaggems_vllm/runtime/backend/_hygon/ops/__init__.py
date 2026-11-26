@@ -53,6 +53,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._hygon.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.runtime.backend._hygon.ops.megamoe import megamoe_int8
 from flaggems_vllm.runtime.backend._hygon.ops.mhc_pre_broadcast import (
     mhc_pre_broadcast,
@@ -94,6 +95,7 @@ __all__ = [
     "gemma_rms_norm",
     "inplace_fused_experts",
     "int8_einsum",
+    "mamba_mixer",
     "megamoe_int8",
     "mhc_pre_broadcast",
     "outplace_fused_experts",
