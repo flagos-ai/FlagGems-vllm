@@ -76,22 +76,11 @@ metax = [
 ]
 
 iluvatar = [
-    "vllm @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/vllm/0.32.0+flagos/vllm-0.32.0+flagos-py3-none-any.whl#sha256=ab55d53def642e67070b3645ca8f5928e9230f0ff013d35eba9fabc5d7628d12",
     "ixformer @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/ixformer/0.7.0+corex.4.5.0.20260804/ixformer-0.7.0+corex.4.5.0.20260804-cp312-cp312-linux_x86_64.whl#sha256=413fe629b4ee707df83fd99a19366dd35ae757a2f495acdc2cffa7a49be7a688",
-    # Flattened the deps of vllm into the direct deps since they should be
-    # resolved from specific repos, and there are no tools to resolve them.
-    "opencv-python-headless @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/opencv-python-headless/5.1.0.95+flagos/opencv_python_headless-5.1.0.95+flagos-cp37-abi3-manylinux_2_17_x86_64.whl#sha256=5a4424b67ccf9482198c6f881c10038029844df5ec16cf2066a4422089b4944d",
-    "compressed-tensors @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/compressed-tensors/0.17.0+flagos/compressed_tensors-0.17.0+flagos-py3-none-any.whl#sha256=42eb84cf77034f6bcb258681b93eebbb6037b6946198879f6a223dc5b2d15440",
-    "numpy<2",
 ]
 
 hygon = [
     "aiter-dtk",
-    "vllm @ https://resource.flagos.net/repository/flagos-pypi-hygon/packages/vllm/0.24.0+flagos/vllm-0.24.0+flagos-cp312-cp312-linux_x86_64.whl#sha256=00662bd456160fb9d610831cd7f04012e15a1feb57c3807b746f4e2c13ffd20d",
-    # Flattened the deps of vllm into the direct deps since they should be
-    # resolved from specific repos, and there are no tools to resolve them.
-    "opencv-python-headless @ https://resource.flagos.net/repository/flagos-pypi-hygon/packages/opencv-python-headless/5.0.0.93+flagos/opencv_python_headless-5.0.0.93+flagos-cp37-abi3-manylinux_2_28_x86_64.whl#sha256=33e9053e6a8d8e2fe98bc4f14ef0e5305d8dea47f328506e037051e6404a567b",
-    "compressed-tensors @ https://resource.flagos.net/repository/flagos-pypi-hygon/packages/compressed-tensors/0.17.0+flagos/compressed_tensors-0.17.0+flagos-py3-none-any.whl#sha256=42eb84cf77034f6bcb258681b93eebbb6037b6946198879f6a223dc5b2d15440",
     "scikit-learn>=1.4,<2.0",
     "xgboost==3.2.0; python_version < '3.12'",
     "xgboost==3.3.0; python_version >= '3.12'",
