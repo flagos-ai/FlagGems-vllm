@@ -57,8 +57,10 @@ from flaggems_vllm.ops.deep_gemm_fp8_o_proj import (
 )
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
-    _fused_inv_rope_fp8_quant_heads,
     fused_inv_rope_fp8_quant,
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
+    _quant_groups,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_bmm import (
     LLC_OPTIONS,
@@ -214,6 +216,84 @@ def _weight_supported(
     )
 
 
+@triton.jit
+def _o_proj_inv_rope_quant(
+    O,
+    Positions,
+    Cache,
+    Q,
+    S,
+    tokens,
+    heads,
+    heads_per_group: tl.constexpr,
+    o_token_stride,
+    o_head_stride,
+    cache_stride,
+    aligned_tokens,
+    eps,
+    HEADS: tl.constexpr,
+):
+    """Inverse interleaved RoPE + 128-group FP8 quantization for prefill.
+
+    One CTA quantizes ``HEADS`` heads of one token: rows are (head, 128-block)
+    pairs so each row is exactly one quantization group. Same math as the
+    shared kernel, with the RoPE partner taken from the loaded tile (the pair
+    swap over the last axis) instead of a second masked global load.
+    """
+    token = tl.program_id(0).to(tl.int64)
+    rows = tl.arange(0, HEADS * 4)
+    head = tl.program_id(1) * HEADS + rows // 4
+    chunk = rows % 4
+    group = head // heads_per_group
+    local_head = head % heads_per_group
+    valid_head = head < heads
+    scale_cols: tl.constexpr = heads_per_group * 4
+    scale_offsets = (
+        group.to(tl.int64) * scale_cols * aligned_tokens
+        + (local_head * 4 + chunk) * aligned_tokens
+        + token
+    )
+    if token >= tokens:
+        tl.store(S + scale_offsets, 0.0, valid_head)
+        return
+
+    cols = tl.arange(0, 128)
+    source = (
+        token * o_token_stride
+        + head.to(tl.int64)[:, None] * o_head_stride
+        + chunk[:, None] * 128
+        + cols[None, :]
+    )
+    x = tl.load(O + source, valid_head[:, None], other=0.0).to(tl.float32)
+    # partner[r, c] = x[r, c ^ 1]: swap the adjacent lanes in registers.
+    pairs = tl.reshape(x, (HEADS * 4, 64, 2))
+    even, odd = tl.split(pairs)
+    partner = tl.reshape(tl.join(odd, even), (HEADS * 4, 128))
+
+    # Every head of this token shares the same 32 cosine/sine entries.
+    position = tl.load(Positions + token)
+    cache_idx = tl.maximum((cols - 64) >> 1, 0)
+    cosine = tl.load(Cache + position * cache_stride + cache_idx, cols >= 64, other=1.0)
+    sine = tl.load(
+        Cache + position * cache_stride + 32 + cache_idx, cols >= 64, other=0.0
+    )
+    x_add = x * cosine[None, :] + partner * sine[None, :]
+    x_sub = x * cosine[None, :] - partner * sine[None, :]
+    rotated = tl.where((cols[None, :] & 1) == 0, x_add, x_sub)
+    is_rope = (chunk[:, None] == 3) & (cols[None, :] >= 64)
+    x = tl.where(is_rope, rotated, x)
+    quantized, scales = _quant_groups(x, eps, -448.0, 448.0, 1.0 / 448.0, False, False)
+    target = (
+        group.to(tl.int64)[:, None] * tokens * heads_per_group * 512
+        + token * heads_per_group * 512
+        + local_head[:, None] * 512
+        + chunk[:, None] * 128
+        + cols[None, :]
+    )
+    tl.store(Q + target, quantized.to(Q.dtype.element_ty), valid_head[:, None])
+    tl.store(S + scale_offsets, scales, valid_head)
+
+
 def _quant_heads(
     o, positions, cos_sin_cache, n_groups, heads_per_group, nope_dim, rope_dim
 ):
@@ -242,7 +322,7 @@ def _quant_heads(
         (n_groups, tokens, scale_cols),
         (scale_cols * aligned_tokens, 1, aligned_tokens),
     )
-    _fused_inv_rope_fp8_quant_heads[
+    _o_proj_inv_rope_quant[
         (aligned_tokens, triton.cdiv(heads, heads_per_program))
     ](
         o,
@@ -259,7 +339,6 @@ def _quant_heads(
         aligned_tokens,
         1e-10,
         HEADS=heads_per_program,
-        PACKED=0,
         num_warps=4,
         num_stages=1,
     )
