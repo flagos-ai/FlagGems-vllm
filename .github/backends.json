@@ -32,7 +32,7 @@
     "runner_label": "maca372",
     "label": "vendor/MetaX",
     "gpu_check": "tools/gpu_check_metax.sh",
-    "enabled": true
+    "enabled": false
   },
   {
     "backend": "nvidia-cuda128",

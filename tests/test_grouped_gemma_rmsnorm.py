@@ -24,6 +24,20 @@ SHAPES = [(0, 12, 4), (17, 4, 4)] + baseline.SHAPES
 ERRORS = (TypeError, ValueError, RuntimeError, NotImplementedError)
 
 
+@pytest.fixture(scope="module", autouse=flaggems_vllm.vendor_name == "thead")
+def _ppu_cpu_threads():
+    # The CPU oracle and output checks share the host with other PPU workers.
+    threads = torch.get_num_threads()
+    if threads == 1:
+        yield
+        return
+    try:
+        torch.set_num_threads(1)
+        yield
+    finally:
+        torch.set_num_threads(threads)
+
+
 def _reference(x, weight, eps, groups, compute_dtype=torch.float64):
     n, dim = x.shape
     group_dim = dim // groups
@@ -283,6 +297,12 @@ def test_grouped_gemma_rmsnorm_legacy_consistency(shape, x_dtype, w_dtype):
 
 @pytest.mark.grouped_gemma_rmsnorm
 def test_grouped_gemma_rmsnorm_public_dispatch():
-    assert (
-        flaggems_vllm.grouped_gemma_rmsnorm is flaggems_vllm.ops.grouped_gemma_rmsnorm
-    )
+    public_op = flaggems_vllm.grouped_gemma_rmsnorm
+    assert public_op is flaggems_vllm.ops.grouped_gemma_rmsnorm
+    assert public_op is flaggems_vllm.ops.qwen4.grouped_gemma_rmsnorm
+    if flaggems_vllm.vendor_name == "thead":
+        from flaggems_vllm.runtime.backend._thead.ops import (
+            grouped_gemma_rmsnorm as thead_op,
+        )
+
+        assert public_op is thead_op

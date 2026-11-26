@@ -103,7 +103,14 @@ _EAGER_BATCHED_SCFA_LAUNCH_PLAN_CACHE: dict[
 
 
 _EAGER_COMPILED_LAUNCHER_CACHE: dict[
-    tuple[int, int, tuple[int, ...], tuple[object, ...]], Callable[..., object] | object
+    tuple[
+        int,
+        int,
+        tuple[int, ...],
+        tuple[tuple[str, str], ...],
+        tuple[object, ...],
+    ],
+    Callable[..., object] | object,
 ] = {}
 
 
@@ -300,6 +307,63 @@ def _eager_pack_plan(
     return plan
 
 
+def _compile_options_key(
+    compile_options: dict[str, object],
+) -> tuple[tuple[str, str], ...]:
+    """Order-independent, hashable key of a launch's compile options.
+
+    Values are keyed by `repr`, the way `LibEntry._launch_options_key` does.
+    """
+    return tuple(sorted((name, repr(value)) for name, value in compile_options.items()))
+
+
+def _eager_launcher_cache_key(
+    device_index: int,
+    kernel_entry: object,
+    grid: tuple[int, ...],
+    compile_options: dict[str, object],
+    dispatch_key: tuple[object, ...],
+) -> tuple[object, ...]:
+    """Key `_EAGER_COMPILED_LAUNCHER_CACHE` for one kernel launch.
+
+    A cached launcher runs without re-entering LibEntry, so its key has to name
+    everything that selects the compiled kernel. That includes the compile
+    options: `multibuffer`, `unit_flag` and the like change the generated code and
+    the synchronization it emits. Every reader and writer of the cache builds its
+    key here, so they cannot drift apart.
+    """
+    return (
+        device_index,
+        id(kernel_entry),
+        grid,
+        _compile_options_key(compile_options),
+        dispatch_key,
+    )
+
+
+def _libentry_cache_key(
+    kernel_entry: object,
+    spec_args: list[object],
+    dns_args: list[object],
+    const_args: list[object],
+    launch_kwargs: dict[str, object],
+) -> tuple[object, ...]:
+    """Rebuild the key `LibEntry.run` stored the compiled kernel under.
+
+    flaggems_vllm's `LibEntry` appends the launch's compile options to the
+    argument key from `LibEntry.key`. FlagTree's `triton.runtime.libentry`, which
+    the kernels in this module use, keys on the arguments only and has no
+    `_launch_options_key`. Rebuild the key the way the entry stored it: asking
+    such an entry for the options would raise and disable the cached launcher for
+    that kernel for good.
+    """
+    entry_key = kernel_entry.key(spec_args, dns_args, const_args)
+    launch_options_key = getattr(kernel_entry, "_launch_options_key", None)
+    if launch_options_key is None:
+        return entry_key
+    return entry_key + launch_options_key(launch_kwargs)
+
+
 def _launch_cached_eager_kernel(
     kernel_entry: object,
     grid: tuple[int, ...],
@@ -319,7 +383,9 @@ def _launch_cached_eager_kernel(
     for the affected key.
     """
     device_index = torch.npu.current_device()
-    cache_key = (device_index, id(kernel_entry), grid, dispatch_key)
+    cache_key = _eager_launcher_cache_key(
+        device_index, kernel_entry, grid, compile_options, dispatch_key
+    )
     cached = _EAGER_COMPILED_LAUNCHER_CACHE.get(cache_key)
     if cached is not None and cached is not _EAGER_COMPILED_LAUNCHER_UNAVAILABLE:
         cached(*(runtime_args + constexpr_values))
@@ -349,7 +415,9 @@ def _launch_cached_eager_kernel(
             if index not in specialize_indices
             and index not in do_not_specialize_indices
         ]
-        entry_key = kernel_entry.key(spec_args, dns_args, const_args)
+        entry_key = _libentry_cache_key(
+            kernel_entry, spec_args, dns_args, const_args, launch_kwargs
+        )
         compiled_kernel = kernel_entry.kernel_cache[device_index][entry_key][0]
         grid3 = (grid + (1, 1))[:3]
         _EAGER_COMPILED_LAUNCHER_CACHE[cache_key] = compiled_kernel[grid3]
@@ -369,7 +437,9 @@ def _launch_q256_cached_eager_kernel(
 ) -> None:
     """Reuse the caller's current stream only for the screened q256 route."""
     if stream_key is not None:
-        cache_key = (stream_key[0], id(kernel_entry), grid, dispatch_key)
+        cache_key = _eager_launcher_cache_key(
+            stream_key[0], kernel_entry, grid, compile_options, dispatch_key
+        )
         cached = _EAGER_COMPILED_LAUNCHER_CACHE.get(cache_key)
         if cached is not None and cached is not _EAGER_COMPILED_LAUNCHER_UNAVAILABLE:
             cached(*(runtime_args + constexpr_values), stream=stream_key[1])
@@ -504,9 +574,9 @@ def _check_paged_kv(
         or int(table.shape[1]) <= 0
     ):
         raise ValueError(f"{table_name} must have shape [batch_size, max_num_blocks].")
-    page_ids = table.detach().cpu()
+    page_ids = table.detach().cpu().reshape(-1).tolist()
     page_count = int(kv.shape[0])
-    if bool(torch.any(page_ids < 0)) or bool(torch.any(page_ids >= page_count)):
+    if any(page < 0 or page >= page_count for page in page_ids):
         raise ValueError(
             f"{table_name} contains a physical page id outside [0, {page_count})."
         )
@@ -556,12 +626,12 @@ def _validate_sparse_attn_sharedkv_inputs(
         raise ValueError(
             "cu_seqlens_q must be a 1-D tensor describing at least one batch."
         )
-    cu_seqlens_cpu = cu_seqlens_q.detach().cpu()
+    cu_seqlens_cpu = cu_seqlens_q.detach().cpu().tolist()
     if int(cu_seqlens_cpu[0]) != 0:
         raise ValueError("cu_seqlens_q must start at 0.")
-    if bool(torch.any(cu_seqlens_cpu[1:] < cu_seqlens_cpu[:-1])):
+    if any(right < left for left, right in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])):
         raise ValueError("cu_seqlens_q must be monotonically non-decreasing.")
-    if bool(torch.any(cu_seqlens_cpu < 0)) or bool(torch.any(cu_seqlens_cpu > total_q)):
+    if any(length < 0 or length > total_q for length in cu_seqlens_cpu):
         raise ValueError(f"cu_seqlens_q values must be within [0, {total_q}].")
     if int(cu_seqlens_cpu[-1]) != total_q:
         raise ValueError(f"cu_seqlens_q[-1] must equal q.shape[0] ({total_q}).")
@@ -595,11 +665,11 @@ def _validate_sparse_attn_sharedkv_inputs(
         raise ValueError(
             f"seqused_kv must contain one length for each of the {batch_size} batches."
         )
-    seqused_kv_cpu = seqused_kv.detach().cpu()
-    if bool(torch.any(seqused_kv_cpu < 0)):
+    seqused_kv_cpu = seqused_kv.detach().cpu().tolist()
+    if any(length < 0 for length in seqused_kv_cpu):
         raise ValueError("seqused_kv values must be non-negative.")
     ori_capacity = int(ori_block_table.shape[1]) * int(ori_kv.shape[1])
-    if bool(torch.any(seqused_kv_cpu > ori_capacity)):
+    if any(length > ori_capacity for length in seqused_kv_cpu):
         raise ValueError(
             f"seqused_kv exceeds ori_block_table capacity ({ori_capacity})."
         )
@@ -622,8 +692,8 @@ def _validate_sparse_attn_sharedkv_inputs(
             dtype=q.dtype,
         )
         cmp_capacity = int(cmp_block_table.shape[1]) * int(cmp_kv.shape[1])
-        compressed_lengths = seqused_kv_cpu // int(cmp_ratio)
-        if bool(torch.any(compressed_lengths > cmp_capacity)):
+        compressed_lengths = [length // int(cmp_ratio) for length in seqused_kv_cpu]
+        if any(length > cmp_capacity for length in compressed_lengths):
             raise ValueError(
                 f"compressed KV length exceeds cmp_block_table capacity ({cmp_capacity})."
             )
@@ -7165,20 +7235,25 @@ def _launch_chunked_swa_sequence(
         entries = (
             (
                 _sparse_attn_sharedkv_chunk_pack_logical_k_and_fp16_v_kernel,
+                _EAGER_BATCHED_PACK_OPTIONS,
                 (ori_kv.dtype, *pack_values),
             ),
             (
                 _sparse_attn_sharedkv_prefill_swa_staged_qk_softmax_kernel,
+                _EAGER_CHUNK_QK_OPTIONS,
                 (q.dtype, logical_k.dtype, *qk_constexpr_values),
             ),
             (
                 _sparse_attn_sharedkv_prefill_swa_staged_pv_kernel,
+                _EAGER_BATCHED_PACK_OPTIONS,
                 (q.dtype, *pv_constexpr_values),
             ),
         )
         runners = tuple(
-            _EAGER_COMPILED_LAUNCHER_CACHE.get((stream_key[0], id(kernel), grid, key))
-            for kernel, key in entries
+            _EAGER_COMPILED_LAUNCHER_CACHE.get(
+                _eager_launcher_cache_key(stream_key[0], kernel, grid, options, key)
+            )
+            for kernel, options, key in entries
         )
         if all(callable(runner) for runner in runners):
             plan_cache[plan_key] = (
@@ -7464,6 +7539,7 @@ def _launch_chunked_cfa_sequence(
         entries = (
             (
                 _sparse_attn_sharedkv_q256_fused_ori_cmp_pack_kernel,
+                _EAGER_BATCHED_PACK_OPTIONS,
                 (
                     ori_kv.dtype,
                     cmp_kv.dtype,
@@ -7474,6 +7550,7 @@ def _launch_chunked_cfa_sequence(
             ),
             (
                 _sparse_attn_sharedkv_prefill_cfa_staged_qk_softmax_kernel,
+                _EAGER_BATCHED_PACK_OPTIONS,
                 (
                     q.dtype,
                     logical_ori_k.dtype,
@@ -7483,12 +7560,15 @@ def _launch_chunked_cfa_sequence(
             ),
             (
                 _sparse_attn_sharedkv_prefill_cfa_staged_pv_kernel,
+                _EAGER_CHUNK_PV_UNIT0_OPTIONS,
                 (q.dtype, *pv_constexpr_values),
             ),
         )
         runners = tuple(
-            _EAGER_COMPILED_LAUNCHER_CACHE.get((stream_key[0], id(kernel), grid, key))
-            for kernel, key in entries
+            _EAGER_COMPILED_LAUNCHER_CACHE.get(
+                _eager_launcher_cache_key(stream_key[0], kernel, grid, options, key)
+            )
+            for kernel, options, key in entries
         )
         if all(callable(runner) for runner in runners):
             plan_cache[plan_key] = (
@@ -7937,9 +8017,10 @@ def _launch_chunked_scfa_sequence(
             256,
             False,
         )
-        keys = (
+        entries = (
             (
                 _sparse_attn_sharedkv_q256_fused_ori_cmp_pack_kernel,
+                _EAGER_BATCHED_PACK_OPTIONS,
                 (
                     ori_kv.dtype,
                     cmp_kv.dtype,
@@ -7950,10 +8031,12 @@ def _launch_chunked_scfa_sequence(
             ),
             (
                 _sparse_attn_sharedkv_prefill_scfa_window_qk_partial_kernel,
+                stage_options,
                 (q.dtype, logical_ori_k.dtype, *ori_qk_constexpr_values),
             ),
             (
                 _sparse_attn_sharedkv_prefill_swa_staged_pv_kernel,
+                stage_options,
                 (
                     ori_acc.dtype,
                     ori_prob.dtype,
@@ -7963,6 +8046,7 @@ def _launch_chunked_scfa_sequence(
             ),
             (
                 _sparse_attn_sharedkv_prefill_scfa_static_slot_pipeline_kernel,
+                pipeline_options,
                 _scfa_static_slot_dispatch_key(
                     _single_scfa_static_dispatch_signature(pipeline_args),
                     pipeline_values,
@@ -7970,8 +8054,10 @@ def _launch_chunked_scfa_sequence(
             ),
         )
         runners = tuple(
-            _EAGER_COMPILED_LAUNCHER_CACHE.get((stream_key[0], id(kernel), grid, key))
-            for kernel, key in keys
+            _EAGER_COMPILED_LAUNCHER_CACHE.get(
+                _eager_launcher_cache_key(stream_key[0], kernel, grid, options, key)
+            )
+            for kernel, options, key in entries
         )
         if all(callable(runner) for runner in runners):
             # Retain slots to prevent identity reuse; no caller tensors are cached.
@@ -8013,7 +8099,9 @@ def _launch_q256_cached_scfa_score_guard_pipeline(
         raise ValueError("SCFA static-slot launcher argument count mismatch")
     if stream_key is not None:
         kernel_entry = _sparse_attn_sharedkv_prefill_scfa_static_slot_pipeline_kernel
-        cache_key = (stream_key[0], id(kernel_entry), grid, dispatch_key)
+        cache_key = _eager_launcher_cache_key(
+            stream_key[0], kernel_entry, grid, compile_options, dispatch_key
+        )
         cached = _EAGER_COMPILED_LAUNCHER_CACHE.get(cache_key)
         if cached is not None and cached is not _EAGER_COMPILED_LAUNCHER_UNAVAILABLE:
             cached(*(positional_args + trailing_values), stream=stream_key[1])
@@ -8044,7 +8132,9 @@ def _launch_cached_scfa_score_guard_pipeline(
     if len(trailing_values) != len(_SCFA_STATIC_SLOT_TRAILING_NAMES):
         raise ValueError("SCFA static-slot launcher argument count mismatch")
     device_index = torch.npu.current_device()
-    cache_key = (device_index, id(kernel_entry), grid, dispatch_key)
+    cache_key = _eager_launcher_cache_key(
+        device_index, kernel_entry, grid, compile_options, dispatch_key
+    )
     cached = _EAGER_COMPILED_LAUNCHER_CACHE.get(cache_key)
     ordered_args = positional_args + trailing_values
     if cached is not None and cached is not _EAGER_COMPILED_LAUNCHER_UNAVAILABLE:
@@ -8074,7 +8164,9 @@ def _launch_cached_scfa_score_guard_pipeline(
             if index not in specialize_indices
             and index not in do_not_specialize_indices
         ]
-        entry_key = kernel_entry.key(spec_args, dns_args, const_args)
+        entry_key = _libentry_cache_key(
+            kernel_entry, spec_args, dns_args, const_args, launch_kwargs
+        )
         compiled_kernel = kernel_entry.kernel_cache[device_index][entry_key][0]
         grid3 = (grid + (1, 1))[:3]
         _EAGER_COMPILED_LAUNCHER_CACHE[cache_key] = compiled_kernel[grid3]

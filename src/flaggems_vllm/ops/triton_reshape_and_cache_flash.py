@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _ORDINARY = {"auto", "float16", "bfloat16", "float32", "half", "float"}
 _FLOATS = (torch.float16, torch.bfloat16, torch.float32)
 _FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+_IS_ASCEND = runtime.device.vendor_name == "ascend"
 
 
 @triton.jit
@@ -109,15 +110,27 @@ if runtime.device.vendor_name == "mthreads":
     _scale_fp8 = _scale_fp8_musa  # noqa: F811 - intentional backend dependency
 
 
+def _prune_cache_flash_configs(configs, named_args, **kwargs):
+    if not _IS_ASCEND:
+        return configs
+    spec = named_args.get("SPEC", kwargs.get("SPEC"))
+    # Wide rows favor smaller tiles; token count does not change this choice.
+    # Compile one tile per storage/dtype specialization, retaining the full grid.
+    tile = 256 if spec[1] * spec[2] >= 512 else 512
+    selected = [config for config in configs if config.kwargs["TILE"] == tile]
+    return selected or configs
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("triton_reshape_and_cache_flash"),
+    prune_configs_by={"early_config_prune": _prune_cache_flash_configs},
     key=["SPEC"],
     # SQL tuning storage accepts scalar keys; repr preserves every tuple field.
     strategy=repr,
     restore_value=["KC", "VC"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_BLOCKS"])
 def _cache_flash(
     K,
     V,
@@ -127,11 +140,13 @@ def _cache_flash(
     KScale,
     VScale,
     SPEC: tl.constexpr,
+    NUM_BLOCKS,
     TILE: tl.constexpr,
 ):
     # One immutable metadata tuple keeps all layout/dtype/stride paths distinct
     # without paying LibEntry's Python per-parameter specialization overhead.
-    # SPEC[0] is the token-count tuning key; the launch grid already bounds it.
+    # Ascend shares kernels across token/cache counts. The grid bounds tokens,
+    # and the runtime cache count retains the same slot validity check.
     H: tl.constexpr = SPEC[1]
     D: tl.constexpr = SPEC[2]
     BS: tl.constexpr = SPEC[3]
@@ -153,7 +168,11 @@ def _cache_flash(
     token = tl.program_id(0).to(tl.int64)
     slot = tl.load(Slots + token).to(tl.int64)
     # Do not read source or scales for a negative slot.
-    if (slot >= 0) & (slot < B * BS):
+    if B == 0:
+        cache_bound = NUM_BLOCKS.to(tl.int64) * BS
+    else:
+        cache_bound = B * BS
+    if (slot >= 0) & (slot < cache_bound):
         feature = tl.program_id(1).to(tl.int64) * TILE + tl.arange(0, TILE)
         head, dim = feature // D, feature % D
         block, offset = slot // BS, slot % BS
@@ -330,11 +349,11 @@ def triton_reshape_and_cache_flash(
             k_scale,
             v_scale,
             (
-                slot_mapping.numel(),
+                0 if _IS_ASCEND else slot_mapping.numel(),
                 heads,
                 dim,
                 block_size,
-                blocks,
+                0 if _IS_ASCEND else blocks,
                 x,
                 head_major,
                 fmt,
@@ -350,5 +369,6 @@ def triton_reshape_and_cache_flash(
                 dim_v,
                 runtime.device.vendor_name == "mthreads",
             ),
+            blocks if _IS_ASCEND else 0,
         )
     return None
