@@ -150,10 +150,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
     "add_rms_norm",
+    "apply_trace_tokens",
     "build_compressor_metadata",
     "causal_conv1d_fn",
     "causal_conv1d_update",
