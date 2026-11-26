@@ -101,7 +101,7 @@ except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
     _tl = None
 
 
-_TritonExpertsBase = _fused_moe.TritonExperts if _fused_moe is not None else object
+_TritonExpertsBase = getattr(_fused_moe, "TritonExperts", object)
 
 
 def _require_runtime() -> None:

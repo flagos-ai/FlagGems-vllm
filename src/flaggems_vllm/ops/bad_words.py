@@ -25,7 +25,7 @@ from flaggems_vllm.utils import libentry, libtuner
 @libtuner(
     configs=runtime.get_tuned_config("apply_bad_words"),
     key=["NUM_TOKENS", "MAX_NUM_BAD_WORDS"],
-    use_cuda_graph=True,
+    use_cuda_graph=runtime.device.vendor_name == "nvidia",
     rep=20,
 )
 @triton.jit
