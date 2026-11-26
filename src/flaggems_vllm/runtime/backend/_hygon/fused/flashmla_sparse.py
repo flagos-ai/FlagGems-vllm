@@ -77,6 +77,35 @@ BLOCK_D = 128
 # extra work groups with nothing to do.
 BLOCK_D_SINGLE = 64
 _NUM_WARPS = 4
+# Stacked waves per SIMD. Above 4 the budget stops fitting the 256 VGPRs the
+# accumulator needs and the spills return (94 at 5, 506 at 8), so the useful
+# range is narrow. Three is worth 3.5% on the DQK=512 multi-block path and is
+# applied there only; see the launch site.
+_WAVES_PER_EU = 3
+_NUM_STAGES = 1
+# Key blocks between rescales. A rescale is only needed when the running max
+# grows, but detecting that costs a cross-wave max over [BH] - a reduction plus
+# an s_barrier every iteration. A fixed cadence turns it into a uniform branch
+# on the loop counter.
+#
+# `max_logits` is unaffected: m_i still tracks the exact running max and only
+# the max the accumulator is scaled against (m_ref) lags, which the epilogue
+# divides back out.
+RESCALE_PERIOD = 32
+# Read the KV tile twice - once already transposed for QK, once natural for PV -
+# rather than transposing it in registers.
+#
+# QK wants k^T [BD, BK] and PV wants k [BK, BD], so one of them has to be
+# turned. Doing it in registers costs an LDS round trip on the critical path
+# (120 ds_write + 120 ds_read per iteration against 128 mmac) and is what
+# presses the live tile into spilling. Reading the same bytes with the indices
+# swapped gives QK its operand straight from memory, and PV re-reads the tile
+# the first pass left in L1/L2.
+#
+# Only affordable where the gather is not the constraint, which is the case on
+# the DeepSeek-V4.1-Flash replay: the KV is 344 MiB there yet costs 107us of
+# wall time, so the kernel is compute-bound with bandwidth to spare.
+QK_TRANSPOSED = True
 # Occupancy target for the split decision below. The kernel is register-limited
 # to 3 work groups per CU (256 of the 768 VGPRs per SIMD), but splitting pays off
 # only well short of that: every extra split writes and re-reads a [HQ, DV] f32
@@ -129,6 +158,8 @@ def _hcu_sparse_mla_fwd_kernel(
     BK: tl.constexpr,
     BD: tl.constexpr,
     DV: tl.constexpr,
+    RESCALE_PERIOD: tl.constexpr,
+    QK_TRANSPOSED: tl.constexpr,
 ):
     """One work item: BH heads of one query token over `chunk` key blocks."""
     NHB: tl.constexpr = HQ // BH
@@ -161,6 +192,9 @@ def _hcu_sparse_mla_fwd_kernel(
 
     # online softmax in log2 units
     m_i = tl.full([BH], M_FLOOR, dtype=tl.float32)
+    # The max the accumulator and l_i are carried against; see the rescale
+    # comment in the loop body. Identical to m_i when the period is 0.
+    m_ref = tl.full([BH], M_FLOOR, dtype=tl.float32)
     l_i = tl.zeros([BH], dtype=tl.float32)
     accs = ()
     for _c in tl.static_range(NBD):
@@ -176,38 +210,82 @@ def _hcu_sparse_mla_fwd_kernel(
 
         # whole KV rows, one chunk per load: all NBD loads are issued before the
         # first dot, which is what gives the gather its memory-level parallelism
-        ks = ()
-        for c in tl.static_range(NBD):
-            ks = ks + (tl.load(kv_ptr + c * BD + offs_d[None, :]),)
+        if QK_TRANSPOSED:
+            # Each `t` is one KV row and each `d` a contiguous run along it, so
+            # swapping the indices yields [BD, BK] directly - the same bytes,
+            # just a different order - and the QK operand needs no transpose.
+            # PV still wants the natural [BK, BD] and reads it back below, from
+            # the L1/L2 lines this pass leaves behind.
+            i64 = ids.to(tl.int64) * stride_kvn
+            base_t = kv + i64[None, :]
+            ks = ()
+            for c in tl.static_range(NBD):
+                ks = ks + (tl.load(base_t + c * BD + offs_d[:, None]),)
+            s = tl.dot(qs[0], ks[0])
+            for c in tl.static_range(1, NBD):
+                s = tl.dot(qs[c], ks[c], s)
+            if DQK == 576:
+                kt = tl.load(kv_ptr + DV + offs_td[None, :])
+                s = tl.dot(qt, tl.trans(kt), s)
+        else:
+            ks = ()
+            for c in tl.static_range(NBD):
+                ks = ks + (tl.load(kv_ptr + c * BD + offs_d[None, :]),)
 
-        s = tl.dot(qs[0], tl.trans(ks[0]))
-        for c in tl.static_range(1, NBD):
-            s = tl.dot(qs[c], tl.trans(ks[c]), s)
-        if DQK == 576:
-            kt = tl.load(kv_ptr + DV + offs_td[None, :])
-            s = tl.dot(qt, tl.trans(kt), s)
+            s = tl.dot(qs[0], tl.trans(ks[0]))
+            for c in tl.static_range(1, NBD):
+                s = tl.dot(qs[c], tl.trans(ks[c]), s)
+            if DQK == 576:
+                kt = tl.load(kv_ptr + DV + offs_td[None, :])
+                s = tl.dot(qt, tl.trans(kt), s)
         s = tl.where(valid[None, :], s * sm_scale_log2, float("-inf"))
 
-        # Rescale only when the max grows: p = exp2(s - m_i) stays <= 1 whenever
-        # every head's block max is already covered by m_i, so this is the exact
-        # online softmax with the [BH, DV] multiply skipped.
+        # Rescale on a fixed cadence rather than on a data-dependent gate.
+        #
+        # m_i stays the exact running max (it is only ever raised), so it is
+        # what max_logits reports. The accumulator and l_i are carried against
+        # m_ref, which may trail it by up to RESCALE_PERIOD blocks: p is then a
+        # factor 2^(m_i - m_ref) larger than exact, which f32 absorbs and the
+        # epilogue divides back out.
         blk_max = tl.max(s, axis=1)
-        if tl.max(blk_max - m_i) > 0.0:
-            m_new = tl.maximum(m_i, blk_max)
-            alpha = tl.math.exp2(m_i - m_new)
-            l_i = l_i * alpha
-            rescaled = ()
-            for c in tl.static_range(NBD):
-                rescaled = rescaled + (accs[c] * alpha[:, None],)
-            accs = rescaled
-            m_i = m_new
+        if RESCALE_PERIOD == 0:
+            # Peeled single-block path: the loop runs once, so accs and l_i are
+            # still zero on entry and there is nothing to renormalise.
+            m_i = tl.maximum(m_i, blk_max)
+            m_ref = m_i
+        else:
+            m_i = tl.maximum(m_i, blk_max)
+            # Counted from the work item's first block: a split starting off a
+            # period boundary would otherwise run with m_ref at M_FLOOR and
+            # overflow. The last block always rescales, so that p is cast to
+            # bf16 against the exact max.
+            if ((ck - lo) % RESCALE_PERIOD == 0) | (ck == hi - 1):
+                alpha = tl.math.exp2(m_ref - m_i)
+                l_i = l_i * alpha
+                rescaled = ()
+                for c in tl.static_range(NBD):
+                    rescaled = rescaled + (accs[c] * alpha[:, None],)
+                accs = rescaled
+                m_ref = m_i
 
-        p = tl.math.exp2(s - m_i[:, None])
+        if RESCALE_PERIOD == 0:
+            # m_ref is m_i here; naming it would keep a second copy live.
+            p = tl.math.exp2(s - m_i[:, None])
+        else:
+            p = tl.math.exp2(s - m_ref[:, None])
         l_i += tl.sum(p, axis=1)
         pb = p.to(tl.bfloat16)
-        updated = ()
-        for c in tl.static_range(NBD):
-            updated = updated + (tl.dot(pb, ks[c], accs[c]),)
+        if QK_TRANSPOSED:
+            # PV wants the natural [BK, BD]; re-read it. The first pass left it
+            # in L1/L2, so this is a hit rather than a second trip to DRAM.
+            pvp = kv + i64[:, None] + offs_d[None, :]
+            updated = ()
+            for c in tl.static_range(NBD):
+                updated = updated + (tl.dot(pb, tl.load(pvp + c * BD), accs[c]),)
+        else:
+            updated = ()
+            for c in tl.static_range(NBD):
+                updated = updated + (tl.dot(pb, ks[c], accs[c]),)
         accs = updated
 
     row_valid = l_i > 0
@@ -218,7 +296,10 @@ def _hcu_sparse_mla_fwd_kernel(
         op_ptr = o_part + prow[:, None] * DV
         for c in tl.static_range(NBD):
             tl.store(op_ptr + c * BD + offs_d[None, :], accs[c] * inv_l[:, None])
-        tl.store(ml_part + prow * 2, m_i)
+        # The combiner assumes acc and the sum share one max, so hand it m_ref.
+        # With the period at 0 the two are the same tensor, and naming m_ref
+        # here would keep a second copy alive across the whole kernel.
+        tl.store(ml_part + prow * 2, m_ref if RESCALE_PERIOD > 0 else m_i)
         tl.store(ml_part + prow * 2 + 1, l_i)
     else:
         lse_i = (m_i + tl.math.log2(l_i)) * LN2
@@ -358,7 +439,19 @@ def _backend_launch_options(dqk: int, split: bool, single: bool) -> dict:
         if dqk == 512 and "kpack" in fields:
             options["kpack"] = 2
         if not split and "sched_latency" in fields:
-            options["sched_latency"] = "mmac5-ds32" if single else "mmac5-ds80"
+            # The latency tier interacts with the waves-per-SIMD hint - both are
+            # handed to the same instruction scheduler - so they are tuned as a
+            # pair. DQK=512 multi-block runs at three waves and wants ds40
+            # (1.146x, against 1.095x at ds64); the single-block path keeps its
+            # peeled tuning, and DQK=576 stays at one wave, where ds80 remains
+            # the best tier (1.031x vs 0.983x at ds40).
+            if single:
+                tier = 64
+            elif dqk == 512:
+                tier = 40
+            else:
+                tier = 80
+            options["sched_latency"] = f"mmac5-ds{tier}"
         return options
     return {}
 
@@ -369,7 +462,9 @@ def _cu_count(device_index: int) -> int:
 
 
 @functools.lru_cache(maxsize=None)
-def _plan(sq: int, hq: int, topk: int, dqk: int, n_cu: int) -> Tuple[int, int, int, int]:
+def _plan(
+    sq: int, hq: int, topk: int, dqk: int, n_cu: int
+) -> Tuple[int, int, int, int]:
     """(block_k, block_d, nsplit, chunk): a work item covers `chunk` key blocks.
 
     TOPK is only split when BH-head items cannot fill the CUs, which is the
@@ -440,9 +535,7 @@ def flash_mla_sparse_fwd(
     device_index = q.device.index
     if device_index is None:
         device_index = torch_device_fn.current_device()
-    block_k, block_d, nsplit, chunk = _plan(
-        SQ, HQ, TOPK, DQK, _cu_count(device_index)
-    )
+    block_k, block_d, nsplit, chunk = _plan(SQ, HQ, TOPK, DQK, _cu_count(device_index))
     if nsplit > 1:
         o_part = torch.empty(
             (SQ * nsplit * HQ, DV), device=q.device, dtype=torch.float32
@@ -487,11 +580,30 @@ def flash_mla_sparse_fwd(
             BK=block_k,
             BD=block_d,
             DV=DV,
+            RESCALE_PERIOD=RESCALE_PERIOD if chunk > 1 else 0,
+            # Only where the loop actually iterates. With one key block the
+            # tile is read once and never re-read from cache, so the second
+            # read is a second miss: measured 0.831x -> 0.735x on the TOPK=128
+            # band. Across the replay's TOPK=640 rows the same switch is worth
+            # 1.022x -> 1.067x.
+            #
+            # Not at DQK=576. The tail there is a [64, BK] read and turning it
+            # transposed is not the problem - leaving just the tail natural and
+            # transposing everything else still measures 0.65-0.68x across the
+            # whole TOPK=2048 band, so the combination of the deeper K extent
+            # with a second read of the tile is what loses. DQK=512 only.
+            QK_TRANSPOSED=QK_TRANSPOSED and DQK == DV and chunk > 1,
             num_warps=_NUM_WARPS,
-            num_stages=1,  # staging the gather doubles LDS without hiding it
-            waves_per_eu=1,  # one register budget to aim at; anything higher
-            # caps the kernel below the 256 VGPRs it already needs and spills
-            # hundreds of values (416 at 192 VGPRs)
+            num_stages=_NUM_STAGES,
+            # Three waves only pays on the DQK=512 multi-block path, which is the
+            # one the transposed read also serves: both are the same register
+            # budget landing in a better place. Measured there 1.057x -> 1.093x
+            # (1478 vs 1530us). It is flat on the peeled single-block path
+            # (0.832x either way) and costs 7% at DQK=576 (1.001x -> 0.934x), so
+            # it is scoped the same way QK_TRANSPOSED is.
+            waves_per_eu=(
+                _WAVES_PER_EU if QK_TRANSPOSED and DQK == DV and chunk > 1 else 1
+            ),
             **_backend_launch_options(DQK, nsplit > 1, chunk == 1),
         )
         if nsplit > 1:
