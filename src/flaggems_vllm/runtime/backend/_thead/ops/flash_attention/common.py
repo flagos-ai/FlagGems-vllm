@@ -49,17 +49,25 @@
 import torch
 import triton
 import triton.language as tl
-
-from flaggems_vllm.runtime.backend._thead.tle_utils import supports_tle_primitives
+from triton.compiler.compiler import make_backend
 
 try:
+    import triton.experimental.tle as tle_api
     from triton.experimental.tle.language import gpu
 except ImportError:
-    gpu = None
+    tle_api = gpu = None
 
 
 def supports_tle():
-    return gpu is not None and supports_tle_primitives(("gpu.alloc", "gpu.local_ptr"))
+    if tle_api is None:
+        return False
+    features = ("gpu.alloc", "gpu.local_ptr")
+    if hasattr(tle_api, "is_tle_supported"):
+        return tle_api.is_tle_supported(features)
+    target = triton.runtime.driver.active.get_current_target()
+    backend = type(make_backend(target)).__module__.split(".")[-2]
+    supported = tle_api.get_supported_primitives(backend)
+    return all(feature in supported for feature in features)
 
 
 def validate_inputs(q, k, v, cuq, cuk, usedk, table, out, alibi, maxq, maxk):

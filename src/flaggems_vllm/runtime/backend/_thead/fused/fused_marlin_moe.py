@@ -51,13 +51,13 @@ from flaggems_vllm.runtime.backend._thead.fused.marlin_fragments import (
     fold_fp8_scale_fragment,
     scale_int8_pair,
 )
-from flaggems_vllm.runtime.backend._thead.tle_utils import supports_tle_primitives
 from flaggems_vllm.utils import libentry
 
 try:
+    import triton.experimental.tle as tle_api
     from triton.experimental.tle import language as tle_async
 except ImportError:
-    tle_async = None
+    tle_api = tle_async = None
 
 _SCALE_CACHE = WeakTensorKeyDictionary()
 
@@ -5908,10 +5908,24 @@ _VLLM_QUANT_TYPE_FP8_E4M3 = 2814749767172868
 
 @lru_cache(maxsize=16)
 def supports_marlin_tle(device: torch.device) -> bool:
+    if tle_api is None or tle_async is None:
+        return False
+    features = ("load", "gpu.alloc", "gpu.local_ptr")
     with torch.cuda.device(device):
-        return tle_async is not None and supports_tle_primitives(
-            ("load", "gpu.alloc", "gpu.local_ptr")
-        )
+        try:
+            if hasattr(tle_api, "is_tle_supported"):
+                return tle_api.is_tle_supported(features)
+            if hasattr(tle_api, "get_supported_primitives"):
+                from triton.compiler.compiler import make_backend
+
+                target = triton.runtime.driver.active.get_current_target()
+                backend = type(make_backend(target)).__module__.split(".")[-2]
+                supported = tle_api.get_supported_primitives(backend)
+                return all(feature in supported for feature in features)
+        except ValueError:
+            # Older FlagTree versions can reject an unrecognized primitive name.
+            return False
+    return False
 
 
 def dispatch_marlin_call(call: MarlinCall) -> None:
