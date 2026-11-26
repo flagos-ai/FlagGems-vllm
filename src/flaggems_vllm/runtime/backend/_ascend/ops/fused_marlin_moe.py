@@ -10,7 +10,6 @@ GEMM accumulation and router-weighted reduction use FP32.
 import inspect
 import os
 import weakref
-from collections import OrderedDict
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Callable, Optional
@@ -19,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as al
+from torch.utils.weak import WeakTensorKeyDictionary
 
 try:
     import triton.experimental.tle as tle_api
@@ -54,9 +54,6 @@ MAX_HIDDEN_SIZE = 7168
 MAX_INTERMEDIATE_SIZE = 14336
 # Per grouped batch, excluding caller inputs, the returned output and allocator reservations.
 GROUPED_WORKSPACE_BYTES = 2 << 30
-# Cross-call LRU byte limit for repacked (E, K//128, N, 128//pack) weights and scales.
-# 8 GiB holds a full DeepSeek-V3 TP=8 layer (w1 + w2 ~ 5.4 GiB) without thrashing.
-WEIGHT_CACHE_LIMIT = 8 << 30
 
 
 @contextmanager
@@ -773,33 +770,23 @@ def prepare_packed_kernel(
         tl.store(T + (e * GROUPS + g) * N + ns, s, ns < N)
 
 
-WEIGHT_CACHE: OrderedDict = OrderedDict()
-WEIGHT_CACHE_BYTES = 0
-
-
-def _drop_weight_cache_entry(key, expected_ref=None):
-    global WEIGHT_CACHE_BYTES
-    entry = WEIGHT_CACHE.get(key)
-    if entry is None:
-        return
-    if (
-        expected_ref is not None
-        and entry[0] is not expected_ref
-        and entry[1] is not expected_ref
-    ):
-        return
-    WEIGHT_CACHE.pop(key, None)
-    WEIGHT_CACHE_BYTES -= entry[5]
+_WEIGHT_CACHE: WeakTensorKeyDictionary = WeakTensorKeyDictionary()
 
 
 def prepare_weights(weight: torch.Tensor, scale: torch.Tensor, bits: int = 4):
-    """Repack weights to (E, K//128, N, 128//pack) with bounded LRU + weakref caching."""
-    global WEIGHT_CACHE_BYTES
+    """Repack weights to (E, K//128, N, 128//pack) with WeakTensorKeyDictionary caching."""
+    try:
+        w_version = weight._version
+        s_version = scale._version
+    except RuntimeError:
+        # Inference tensors have no version counter: never cache them.
+        w_version = None
+        s_version = None
     stream_id = torch.npu.current_stream(weight.device).npu_stream
-    key = (id(weight), id(scale), bits)
-    version = (
-        weight._version,
-        scale._version,
+    meta = (
+        bits,
+        w_version,
+        s_version,
         weight.data_ptr(),
         scale.data_ptr(),
         tuple(weight.shape),
@@ -808,12 +795,10 @@ def prepare_weights(weight: torch.Tensor, scale: torch.Tensor, bits: int = 4):
         scale.dtype,
         stream_id,
     )
-    entry = WEIGHT_CACHE.get(key)
-    if entry is not None:
-        if entry[0]() is weight and entry[1]() is scale and entry[2] == version:
-            WEIGHT_CACHE.move_to_end(key)
-            return entry[3], entry[4]
-        _drop_weight_cache_entry(key)
+    if w_version is not None:
+        entry = _WEIGHT_CACHE.get(weight)
+        if entry is not None and entry[0]() is scale and entry[1] == meta:
+            return entry[2], entry[3]
 
     expert_count, output_features, packed_k = weight.shape
     hidden_size = packed_k * (8 // bits)
@@ -842,17 +827,8 @@ def prepare_weights(weight: torch.Tensor, scale: torch.Tensor, bits: int = 4):
         tasks,
         bits,
     )
-    nbytes = packed.numel() * packed.element_size() + (
-        grouped_scale.numel() * grouped_scale.element_size()
-    )
-    if nbytes <= WEIGHT_CACHE_LIMIT:
-        while WEIGHT_CACHE and WEIGHT_CACHE_BYTES + nbytes > WEIGHT_CACHE_LIMIT:
-            _, evicted = WEIGHT_CACHE.popitem(last=False)
-            WEIGHT_CACHE_BYTES -= evicted[5]
-        w_ref = weakref.ref(weight, lambda ref, k=key: _drop_weight_cache_entry(k, ref))
-        s_ref = weakref.ref(scale, lambda ref, k=key: _drop_weight_cache_entry(k, ref))
-        WEIGHT_CACHE[key] = (w_ref, s_ref, version, packed, grouped_scale, nbytes)
-        WEIGHT_CACHE_BYTES += nbytes
+    if w_version is not None:
+        _WEIGHT_CACHE[weight] = (weakref.ref(scale), meta, packed, grouped_scale)
     return packed, grouped_scale
 
 
