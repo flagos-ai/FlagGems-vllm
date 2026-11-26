@@ -2742,7 +2742,8 @@ def fused_marlin_moe(
         or group_size != GROUP_SIZE
     ):
         raise NotImplementedError(
-            "Only symmetric uint4b8 and uint8b128 with group_size=128 are supported"
+            f"Unsupported quant_type_id={quant_type_id} or group_size={group_size}. "
+            "Ascend requires symmetric uint4b8 or uint8b128 weights with group_size=128."
         )
     if (
         activation not in (None, "silu")
@@ -2777,6 +2778,12 @@ def fused_marlin_moe(
         clamp_limit,
     )
     if any(v is not None for v in options):
+        if any(v is not None for v in (g_idx1, g_idx2, sort_indices1, sort_indices2)):
+            raise NotImplementedError("Ascend Marlin MoE does not support act_order")
+        if input_dtype is not None:
+            raise NotImplementedError(
+                f"Ascend Marlin MoE does not support FP8 or other input_dtype overrides ({input_dtype})"
+            )
         raise NotImplementedError(
             "Bias, extra quantization metadata, callbacks and caller-owned workspaces are unsupported"
         )

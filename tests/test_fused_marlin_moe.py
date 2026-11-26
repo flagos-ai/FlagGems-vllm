@@ -1629,6 +1629,8 @@ def test_fused_marlin_moe_w8a16_fp8_ppu(
 def test_fused_marlin_moe_w8a16_inference_updates(
     precision, num_tokens, updated_tensor
 ):
+    if precision == "fp8" and flaggems_vllm.vendor_name == "ascend":
+        pytest.skip("Ascend does not support FP8 weights")
     with torch.inference_mode():
         if precision == "int8":
             args = _make_inputs_w8a16_int8(
