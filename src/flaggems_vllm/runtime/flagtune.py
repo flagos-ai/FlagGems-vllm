@@ -286,6 +286,12 @@ register_flagtune_op(
     description="W8A8 block FP8/INT8 matrix multiplication",
 )
 
+register_flagtune_op(
+    "silu_mul_per_token_group_quant_fp8_colmajor",
+    default=False,
+    description="Expanded SiLU/mul FP8 row/group schedules",
+)
+
 # DEFAULT_FLAGTUNE_INCLUDE and SUPPORTED_FLAGTUNE_OPS are provided by __getattr__.
 __all__ = [  # noqa: F822
     "DEFAULT_FLAGTUNE_INCLUDE",

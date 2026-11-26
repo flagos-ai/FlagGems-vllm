@@ -52,6 +52,9 @@ from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
 )
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
 from flaggems_vllm.runtime.backend._thead.ops.qsa_prepare import qsa_prepare
+from flaggems_vllm.runtime.backend._thead.ops.silu_mul_per_token_group_quant_fp8_colmajor import (
+    silu_mul_per_token_group_quant_fp8_colmajor,
+)
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -81,6 +84,7 @@ __all__ = [
     "qsa_prepare",
     "quantize_gdn_state_int8",
     "qwen4_hc_inject_combine",
+    "silu_mul_per_token_group_quant_fp8_colmajor",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_int8_bmm",

@@ -2020,3 +2020,62 @@ flash_mla_sparse_fwd:
   - META: {BK: 64, BH: 64}
     num_warps: 8
     num_stages: 4
+
+silu_mul_per_token_group_quant_fp8_colmajor:
+  - META: {BLOCK_M: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 8}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16}
+    num_warps: 8
+    num_stages: 1
+
+# Default schedules; the larger expand space requires explicit FlagTune opt-in.
+silu_mul_per_token_group_quant_fp8_tile_default:
+  - META: {BR: 1, BG: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BR: 4, BG: 1}
+    num_warps: 2
+    num_stages: 1
+  - META: {BR: 8, BG: 1}
+    num_warps: 2
+    num_stages: 1
+  - META: {BR: 8, BG: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BR: 16, BG: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BR: 32, BG: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {BR: 64, BG: 1}
+    num_warps: 8
+    num_stages: 1
+  - META: {BR: 4, BG: 2}
+    num_warps: 2
+    num_stages: 1
+  - META: {BR: 8, BG: 2}
+    num_warps: 2
+    num_stages: 1
+  - META: {BR: 8, BG: 2}
+    num_warps: 4
+    num_stages: 1
+  - META: {BR: 4, BG: 8}
+    num_warps: 4
+    num_stages: 1
+  - META: {BR: 8, BG: 8}
+    num_warps: 8
+    num_stages: 1
+  - META: {BR: 1, BG: 8}
+    num_warps: 1
+    num_stages: 1

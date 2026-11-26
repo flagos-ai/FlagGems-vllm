@@ -68,6 +68,9 @@ from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._hygon.ops.scaled_int8_quant import scaled_int8_quant
+from flaggems_vllm.runtime.backend._hygon.ops.silu_mul_per_token_group_quant_fp8_colmajor import (
+    silu_mul_per_token_group_quant_fp8_colmajor,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -107,6 +110,7 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
+    "silu_mul_per_token_group_quant_fp8_colmajor",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "triton_scaled_mm",

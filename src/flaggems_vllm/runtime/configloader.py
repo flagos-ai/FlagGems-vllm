@@ -101,6 +101,25 @@ class ConfigLoader(object):
         return triton.Config(single_config["META"], **kwargs)
 
     def _build_configs_by_op(self, op_name, ranges, pre_hook=None):
+        if op_name in (
+            "silu_mul_per_token_group_quant_fp8_tile",
+            "silu_mul_per_token_group_quant_fp8_tile_metax",
+            "silu_mul_per_token_group_quant_fp8_tile_thead",
+            "silu_mul_per_token_group_quant_fp8_tile_hygon",
+            "silu_mul_per_token_group_quant_fp8_tile_mthreads",
+        ):
+            return [
+                triton.Config(
+                    {"BR": br, "BG": bg},
+                    num_warps=w,
+                    num_stages=s,
+                    pre_hook=pre_hook,
+                )
+                for br in ranges["BR"]
+                for bg in ranges["BG"]
+                for w in ranges["w"]
+                for s in ranges["s"]
+            ]
         if op_name == "bmm":
             return [
                 triton.Config(
@@ -614,6 +633,39 @@ class ConfigLoader(object):
 
     def _build_expand_registry(self):
         return {
+            **{
+                f"silu_mul_per_token_group_quant_fp8_tile_{vendor}": {
+                    "yaml_op_name": f"silu_mul_per_token_group_quant_fp8_tile_{vendor}",
+                    "key": [
+                        "M",
+                        "N",
+                        "DTYPE",
+                        "UE",
+                        "HAS_CLAMP",
+                        "DEVICE_NAME",
+                        "INDEX64",
+                    ],
+                    "default_strategy": ["default"] * 7,
+                    "expand_yaml_path": os.path.join(
+                        os.path.dirname(__file__),
+                        "backend",
+                        f"_{vendor}",
+                        f"silu_mul_per_token_group_quant_fp8_tile_{vendor}_expand.yaml",
+                    ),
+                }
+                for vendor in ("metax", "thead", "hygon", "mthreads")
+            },
+            "silu_mul_per_token_group_quant_fp8_tile": {
+                "yaml_op_name": "silu_mul_per_token_group_quant_fp8_tile",
+                "key": ["M", "N", "DTYPE", "UE", "HAS_CLAMP", "DEVICE_NAME"],
+                "default_strategy": ["default"] * 6,
+                "expand_yaml_path": os.path.join(
+                    os.path.dirname(__file__),
+                    "backend",
+                    "_nvidia",
+                    "silu_mul_per_token_group_quant_fp8_tile_expand.yaml",
+                ),
+            },
             "addmm": self._build_single_expand_spec(
                 "addmm", expand_yaml_path=self._get_expand_config_path("addmm")
             ),

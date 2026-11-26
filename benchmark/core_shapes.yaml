@@ -628,6 +628,14 @@ ConcatAndCacheMLABenchmark:
     - [64, 8, 21, 8, 4]
     - [512, 64, 42, 16, 8]
     - [1024, 64, 84, 16, 8]
+silu_mul_per_token_group_quant_fp8_colmajor:
+  shapes:
+    - [128, 256]
+    - [128, 4096]
+    - [512, 4096]
+    - [1024, 1792]
+    - [8192, 4096]
+  shape_desc: "M, packed_gate_up_N"
 PerTokenGroupQuantFp8Benchmark:
   shapes:
     - [7, 512, 512]

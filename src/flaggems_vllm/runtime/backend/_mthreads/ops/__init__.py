@@ -69,6 +69,9 @@ from flaggems_vllm.runtime.backend._mthreads.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.silu_mul_per_token_group_quant_fp8_colmajor import (
+    silu_mul_per_token_group_quant_fp8_colmajor,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -109,6 +112,7 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
+    "silu_mul_per_token_group_quant_fp8_colmajor",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
     "w8a8_block_matmul",
