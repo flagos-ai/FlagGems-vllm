@@ -402,12 +402,21 @@ from flaggems_vllm.runtime.backend._hygon.mega.megamoe.api import (  # noqa: E40
 from flaggems_vllm.runtime.backend._hygon.mega.megamoe.kernel import (  # noqa: E402
     _local_epoch_barrier,
 )
-from flaggems_vllm.testing.megamoe_hygon_baseline import (  # noqa: E402
-    COMMUNICATION_BACKEND,
-    VLLM_REQUIRED_VERSION,
-    HcuNativeEpInt8Baseline,
-    NativeEpContract,
-    PrequantizedHcuTritonExperts,
+
+# The native EP baseline is written against the HCU vLLM build, so it is only
+# imported on Hygon. Other vLLM versions do not provide the classes it extends.
+if flaggems_vllm.vendor_name == "hygon":
+    from flaggems_vllm.testing.megamoe_hygon_baseline import (  # noqa: E402
+        COMMUNICATION_BACKEND,
+        VLLM_REQUIRED_VERSION,
+        HcuNativeEpInt8Baseline,
+        NativeEpContract,
+        PrequantizedHcuTritonExperts,
+    )
+
+_requires_hygon_baseline = pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "hygon",
+    reason="the native EP baseline is only available on Hygon",
 )
 
 
@@ -688,6 +697,7 @@ def test_prepacked_weight_descriptor_is_frozen():
 
 @pytest.mark.megamoe
 @pytest.mark.megamoe_int8
+@_requires_hygon_baseline
 def test_native_ep_baseline_contract_is_device_independent():
     """The paired benchmark contract must remain inspectable without HCU."""
 
@@ -714,6 +724,7 @@ def test_native_ep_baseline_contract_is_device_independent():
 
 @pytest.mark.megamoe
 @pytest.mark.megamoe_int8
+@_requires_hygon_baseline
 def test_native_ep_baseline_contract_rejects_unsupported_world_size():
     with pytest.raises(ValueError, match="world_size"):
         NativeEpContract(
