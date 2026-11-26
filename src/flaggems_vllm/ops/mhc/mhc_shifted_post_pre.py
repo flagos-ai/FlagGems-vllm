@@ -626,6 +626,40 @@ def mhc_shifted_post_pre(
             mix_size,
         )
 
+    # Ascend NPU hc=4 boundary: persistent TLE post, AB-swapped TLE
+    # projection, vectorised gate/Sinkhorn coefficients and a token-tiled
+    # collapse.  Without the TLE surface (stock Triton) the generic stages
+    # below stay in charge.
+    if hc == 4 and hidden_size > 0 and runtime.device.vendor_name == "ascend":
+        from flaggems_vllm.runtime.backend._ascend.ops.mhc_shifted_post_pre import (
+            HAS_ASCEND_TLE,
+            mhc_shifted_post_pre_ascend,
+        )
+
+        if HAS_ASCEND_TLE:
+            return mhc_shifted_post_pre_ascend(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                pre_mix,
+                norm_weight,
+                norm_eps,
+                capture_aux,
+                num_tokens,
+                hc,
+                hidden_size,
+                mix_size,
+            )
+
     # (1) post, with the coefficients the previous boundary produced.  The
     # comb layout is vLLM's, which is mhc_post's TRANSPOSED default.
     residual_cur = mhc_post(
