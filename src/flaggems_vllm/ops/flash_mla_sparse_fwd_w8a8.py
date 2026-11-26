@@ -1569,53 +1569,6 @@ else:
         tl.store(Norm + rows[:, None] * 448 + d[None, :], qnorm, d[None, :] < 448)
         tl.store(Magnitude + rows, tl.where(mx > 4.0 * mn, -mx, mx))
 
-    @triton.jit
-    def normalize_cache(
-        K,
-        E,
-        Normalized,
-        Scale,
-        PackedRope,
-        N,
-        STRIDE: tl.constexpr,
-    ):
-        # Each block processes consecutive physical slots, including a partial final page.
-        ids = tl.program_id(0) * 32 + tl.arange(0, 32)
-        page = (ids >> 6).to(tl.int64) * STRIDE
-        slot = ids & 63
-        g = tl.arange(0, 8)
-        word = tl.load(
-            E.to(tl.pointer_type(tl.uint64)) + page // 8 + 4608 + slot, ids < N, 0
-        )
-        exps = ((word[:, None] >> (g * 8)[None, :]) & 255).to(tl.int32)
-        hi = tl.max(tl.where(g[None, :] < 7, exps, 0), 1)
-        lo = tl.min(tl.where(g[None, :] < 7, exps, 255), 1)
-        d = tl.arange(0, 512)
-        content = tl.load(
-            K + (page + slot * 576)[:, None] + d[None, :],
-            (ids[:, None] < N) & (d[None, :] < 448),
-            0.0,
-        )
-        ratio = (tl.maximum(127 + tl.minimum(exps - hi[:, None], 0), 0) << 23).to(
-            tl.float32, bitcast=True
-        )
-        norm = scaled_bytes(content, ratio, 32)
-        tl.store(
-            Normalized + ids.to(tl.int64)[:, None] * 448 + d[None, :],
-            norm,
-            (ids[:, None] < N) & (d[None, :] < 448),
-        )
-        r = tl.arange(0, 64)
-        src = (page + slot * 576 + 448) // 2
-        rope = tl.load(
-            E.to(tl.pointer_type(tl.bfloat16)) + src[:, None] + r[None, :],
-            ids[:, None] < N,
-            0.0,
-        )
-        tl.store(PackedRope + ids[:, None] * 64 + r[None, :], rope, ids[:, None] < N)
-        scale = tl.where(hi == 0, 0x00400000, hi << 23).to(tl.float32, bitcast=True)
-        tl.store(Scale + ids, tl.where(hi - lo > 2, -scale, scale), ids < N)
-
     @triton.constexpr_function
     def rescale_fp8_registers(tmp="tmp"):
         return "".join(
@@ -1655,31 +1608,6 @@ else:
             f"shl.b32 {fac},{fac},10;\n"
             f"prmt.b32 {fac},{fac},{fac},0x1010;\n"
         )
-
-    @triton.constexpr_function
-    def ptx_fast_e4m3_range_check():
-        parts = [
-            "min.u32 fac,delta,14; shl.b32 fac,fac,3; mul.lo.u32 fac,fac,0x01010101;\n"
-            "add.u32 which,fac,0x08080808;\n"
-        ]
-        for idx, reg in enumerate(("a", "b", "c", "d")):
-            dst = "t" if idx == 0 else "u"
-            parts.append(f"or.b32 {dst},{reg},0x80808080; sub.u32 {dst},{dst},which;\n")
-            if idx > 0:
-                parts.append("and.b32 t,t,u;\n")
-        parts.append("and.b32 t,t,0x80808080;\n")
-        for idx, reg in enumerate(("a", "b", "c", "d")):
-            dst = "u" if idx == 0 else "which"
-            parts.append(
-                f"and.b32 {dst},{reg},0x7f7f7f7f; add.u32 {dst},{dst},0x01010101;\n"
-            )
-            if idx > 0:
-                parts.append("or.b32 u,u,which;\n")
-        parts.append(
-            "not.b32 u,u; and.b32 t,t,u; and.b32 t,t,0x80808080;\n"
-            "setp.eq.u32 fast,t,0x80808080; setp.lt.u32.and fast,delta,15,fast;\n"
-        )
-        return "".join(parts)
 
     @triton.constexpr_function
     def gather_topk128_asm(page_stride):
@@ -1923,156 +1851,6 @@ else:
     """
         )
 
-    @triton.constexpr_function
-    def warp_gather_asm(block, page_stride, panel_rows, warps):
-        # Each warp resolves its selected rows before issuing 16-byte copies.
-        # The 8 (or 16) metadata lanes broadcast one physical slot at a time.
-        asm = """
-    {
-    .reg .pred ok,active,first,rope,loop,real,fromlo,wide,rescale,row_diff,any_diff,fast;
-    .reg .b32 tid,lane,warp,row,pos,id,page,slot,e0,e1,ex,emin,emax,flag,sz;
-    .reg .b32 src0,src1,peer0,peer1,peer_sz,peer_hi,peer_e0,peer_e1,which;
-    .reg .b32 panel,off,sw,kdst,rdst,sdst,fac,a,b,c,d,t,u,delta,iter;
-    .reg .b16 xlo,xhi;
-    .reg .b64 address,pgaddr,src,peer,ptr;
-    mov.u32 tid,%tid.x;
-    and.b32 tid,tid,TIDMASK;
-    shr.u32 warp,tid,5;
-    and.b32 lane,tid,31;
-    and.b32 row,lane,ROWMASK;
-    mad.lo.u32 row,row,WARPS,warp;
-    add.u32 pos,$8,row;
-    setp.lt.u32 ok,pos,$9;
-    mul.wide.u32 address,pos,4;
-    add.u64 ptr,$3,address;
-    mov.b32 id,-1;
-    @ok ld.global.L1::evict_first.s32 id,[ptr];
-    setp.lt.u32 ok,id,$7;
-    @!ok mov.b32 id,0;
-    shr.u32 page,id,6;
-    and.b32 slot,id,63;
-    mul.wide.u32 address,page,PAGESTRIDE;
-    add.u64 pgaddr,$2,address;
-    mul.wide.u32 address,slot,8;
-    add.u64 ptr,pgaddr,address;
-    ld.global.v2.b32 {e0,e1},[ptr+36864];
-    mul.wide.u32 address,slot,576;
-    add.u64 src,pgaddr,address;
-    mov.b64 {src0,src1},src;
-    selp.u32 sz,16,0,ok;
-    shr.u32 panel,lane,3;
-    mul.lo.u32 panel,panel,PANEL;
-    setp.lt.u32 real,lane,28;
-    setp.lt.u32 rope,lane,8;
-    mov.u32 iter,0;
-    COPY:
-    shfl.sync.idx.b32 peer0,src0,iter,31,0xffffffff;
-    shfl.sync.idx.b32 peer1,src1,iter,31,0xffffffff;
-    shfl.sync.idx.b32 peer_sz,sz,iter,31,0xffffffff;
-    mov.b64 peer,{peer0,peer1};
-    mad.lo.u32 row,iter,WARPS,warp;
-    and.b32 sw,row,7;
-    shl.b32 sw,sw,4;
-    and.b32 off,lane,7;
-    shl.b32 off,off,4;
-    cvt.u64.u32 address,off;
-    add.u64 address,peer,address;
-    add.u64 address,address,448;
-    mad.lo.u32 off,row,128,off;
-    xor.b32 off,off,sw;
-    add.u32 rdst,$5,off;
-    @rope cp.async.cg.shared.global [rdst],[address],16,peer_sz;
-    add.u32 kdst,$4,off;
-    add.u32 kdst,kdst,panel;
-    shl.b32 t,lane,4;
-    cvt.u64.u32 address,t;
-    add.u64 address,peer,address;
-    @real cp.async.cg.shared.global [kdst],[address],16,peer_sz;
-    add.u32 iter,iter,1;
-    setp.le.u32 loop,iter,ROWMASK;
-    @loop bra COPY;
-    cp.async.commit_group;
-    """
-        asm += ptx_exponent_minmax("e0", "e1", "emin", "emax", "ex")
-        asm += """
-    sub.u32 delta,emax,emin;
-    setp.gt.u32 wide,delta,2;
-    and.pred wide,wide,ok;
-    selp.u32 flag,1,0,wide;
-    // One metadata lane owns the SMEM scale for this row.
-    """
-        asm += ptx_encode_e8m0_scale("emax", "ok", "t")
-        asm += """
-    and.b32 row,lane,ROWMASK;
-    mad.lo.u32 row,row,WARPS,warp;
-    mad.lo.u32 sdst,row,4,$6;
-    setp.le.u32 first,lane,ROWMASK;
-    @first st.shared.b32 [sdst],t;
-    cp.async.wait_group 0;
-    mov.u32 iter,0;
-    setp.ne.u32 row_diff,emax,emin;
-    and.pred row_diff,row_diff,first;
-    and.pred row_diff,row_diff,ok;
-    vote.sync.any.pred any_diff,row_diff,0xffffffff;
-    @!any_diff bra DONE_RESCALE;
-    RESCALE:
-    shfl.sync.idx.b32 peer_e0,e0,iter,31,0xffffffff;
-    shfl.sync.idx.b32 peer_e1,e1,iter,31,0xffffffff;
-    shfl.sync.idx.b32 peer_hi,emax,iter,31,0xffffffff;
-    setp.lt.u32 fromlo,lane,16;
-    selp.u32 ex,peer_e0,peer_e1,fromlo;
-    shr.u32 which,lane,2;
-    and.b32 which,which,3;
-    shl.b32 which,which,3;
-    bfe.u32 ex,ex,which,8;
-    setp.ne.u32 rescale,peer_hi,ex;
-    and.pred rescale,rescale,real;
-    @!rescale bra NEXT;
-    mad.lo.u32 row,iter,WARPS,warp;
-    and.b32 sw,row,7;
-    shl.b32 sw,sw,4;
-    and.b32 off,lane,7;
-    shl.b32 off,off,4;
-    mad.lo.u32 off,row,128,off;
-    xor.b32 off,off,sw;
-    add.u32 kdst,$4,off;
-    add.u32 kdst,kdst,panel;
-    ld.shared.v4.b32 {a,b,c,d},[kdst];
-    sub.s32 delta,peer_hi,ex;
-    // Subtracting from each exponent is exact while every merged_value stays normal.
-    // The half2 conversion below handles zeros, subnormals and wide spreads.
-    """
-        asm += ptx_fast_e4m3_range_check()
-        asm += """
-    @!fast bra SLOW_RESCALE;
-    sub.u32 a,a,fac;
-    sub.u32 b,b,fac;
-    sub.u32 c,c,fac;
-    sub.u32 d,d,fac;
-    bra WRITE_RESCALE;
-    SLOW_RESCALE:
-    """
-        asm += ptx_rescale_factor("delta", "fac", sub_op="sub.s32")
-        asm += rescale_fp8_registers("t")
-        asm += """
-    WRITE_RESCALE:
-    st.shared.v4.b32 [kdst],{a,b,c,d};
-    NEXT:
-    add.u32 iter,iter,1;
-    setp.le.u32 loop,iter,ROWMASK;
-    @loop bra RESCALE;
-    DONE_RESCALE:
-    mov.b32 $0,flag;
-    }
-    """
-        return (
-            asm.replace("PAGESTRIDE", str(page_stride))
-            .replace("PANEL", str(panel_rows * 128))
-            .replace("TIDMASK", str(warps * 32 - 1))
-            .replace("WARPS", str(warps))
-            .replace("ROWMASK", str(block // warps - 1))
-        )
-
     @triton.jit
     def gather_tile(
         K,
@@ -2091,11 +1869,7 @@ else:
         PREFETCHED: tl.constexpr,
     ):
         return tl.inline_asm_elementwise(
-            (
-                warp_gather_asm(BK, STRIDE, BK, 8)
-                if BK == 128
-                else gather_asm(BK, STRIDE, BK, 8, PREFETCHED)
-            ),
+            gather_asm(BK, STRIDE, BK, 8, PREFETCHED),
             "=r,r,l,l,r,r,r,r,r,r,r,r",
             [
                 tl.arange(0, 256),
@@ -2118,12 +1892,9 @@ else:
     @triton.jit
     def producer(
         K,
-        KR,
         Idx,
         Flags,
         RepairState,
-        Normalized,
-        Scale,
         sk,
         skr,
         ks,
@@ -2135,7 +1906,6 @@ else:
         S: tl.constexpr,
         BK: tl.constexpr,
         BUFS: tl.constexpr,
-        PREPACK: tl.constexpr,
         PREFIX: tl.constexpr,
         TAIL: tl.constexpr,
         TAIL_SPLITS: tl.constexpr,
@@ -2150,9 +1920,7 @@ else:
             TAIL_SPLITS,
         )
         # Resolve the two dependent global reads for all short-list tiles up front.
-        PREFETCHED: tl.constexpr = (
-            T > 128 and T <= 640 and BK == 64 and S == 1 and not PREPACK
-        )
+        PREFETCHED: tl.constexpr = T > 128 and T <= 640 and BK == 64 and S == 1
         if PREFETCHED:
             width: tl.constexpr = triton.next_power_of_2(T)
             saved_ids = tle.gpu.alloc(
@@ -2207,69 +1975,24 @@ else:
                     pass
             else:
                 tle.gpu.barrier_wait(kfree[buf], phaseIdx=cycle)
-            if PREPACK:
-                k = tl.arange(0, BK)
-                g = tl.arange(0, 8)
-                pos = (first + step) * BK + k
-                ids = tl.load(
-                    Idx + b.to(tl.int64) * T + pos,
-                    pos < T,
-                    -1,
-                    eviction_policy="evict_first",
-                )
-                valid = (ids >= 0) & (ids < N)
-                safe = tl.where(valid, ids, 0)
-                signed_scale = tl.load(Scale + safe)
-                repair |= tl.max((valid & (signed_scale < 0.0)).to(tl.int32), 0)
-                tl.store(
-                    tle.gpu.local_ptr(ks.slot(buf)),
-                    tl.where(valid, tl.abs(signed_scale), -1.0),
-                )
-                rows = tl.broadcast_to(k[:, None], (BK, 8))
-                cols = tl.broadcast_to((g * 8)[None, :], (BK, 8))
-                dst = tle.gpu.local_ptr(skr.slot(buf), (rows, cols))
-                src = KR + safe.to(tl.int64)[:, None] * 64 + cols
-                cp_async_cg_16(dst, src, tl.where(valid[:, None], 16, 0))
-                byte_cols = cols * 2
-                for tile in tl.static_range(4):
-                    dst_k = tle.gpu.local_ptr(
-                        tle_subslice(sk.slot(buf), [0, tile * 128], [BK, 128]),
-                        (rows, byte_cols),
-                    )
-                    src_k = (
-                        Normalized
-                        + safe.to(tl.int64)[:, None] * 448
-                        + tile * 128
-                        + byte_cols
-                    )
-                    cp_async_cg_16_pred(
-                        dst_k,
-                        src_k,
-                        tl.where(valid[:, None], 16, 0),
-                        ((tile < 3) | (byte_cols < 64)).to(tl.int32),
-                    )
-            else:
-                flag = gather_tile(
-                    K,
-                    Idx,
-                    sk.slot(buf),
-                    skr.slot(step % 4 if BUFS == 2 else 0),
-                    ks.slot(buf),
-                    b,
-                    (first + step) * BK,
-                    N,
-                    T,
-                    BK,
-                    STRIDE,
-                    id_address,
-                    exponent_address,
-                    PREFETCHED,
-                )
-                repair |= tl.max(flag, 0).to(tl.int32)
-            if PREPACK:
-                cp_async_wait_all(tl.arange(0, 256), FENCE=True)
-            else:
-                fence_proxy_async_shared(tl.arange(0, 256))
+            flag = gather_tile(
+                K,
+                Idx,
+                sk.slot(buf),
+                skr.slot(step % 4 if BUFS == 2 else 0),
+                ks.slot(buf),
+                b,
+                (first + step) * BK,
+                N,
+                T,
+                BK,
+                STRIDE,
+                id_address,
+                exponent_address,
+                PREFETCHED,
+            )
+            repair |= tl.max(flag, 0).to(tl.int32)
+            fence_proxy_async_shared(tl.arange(0, 256))
             tl.debug_barrier()
             if BUFS == 1:
                 tle.gpu.barrier_arrive(kfull[0])
@@ -2277,35 +2000,6 @@ else:
                 tle.gpu.barrier_arrive(kfull[buf], phaseIdx=cycle)
         tl.atomic_or(Flags + b, 1, mask=repair != 0, sem="relaxed")
         tl.atomic_or(RepairState, 1, mask=repair != 0, sem="relaxed")
-
-    @triton.jit
-    def merge_two(V, L, Output, Lout, H: tl.constexpr):
-        batch = tl.program_id(0).to(tl.int64)
-        dims = tl.arange(0, 512)
-        for off in tl.static_range(2):
-            h = tl.program_id(1) * 2 + off
-            row = batch * H + h
-            base = batch * (2 * H) + h
-            a = tl.load(L + base)
-            b = tl.load(L + base + H)
-            va = (a != -float("inf")) & (a != float("inf"))
-            vb = (b != -float("inf")) & (b != float("inf"))
-            if va & vb:
-                m = tl.maximum(a, b)
-                wa = tl.exp(a - m)
-                wb = tl.exp(b - m)
-                den = wa + wb
-                value = (
-                    wa * tl.load(V + base * 512 + dims).to(tl.float32)
-                    + wb * tl.load(V + (base + H) * 512 + dims).to(tl.float32)
-                ) / den
-                stat = m + tl.log(den)
-            else:
-                ix = tl.where(va, base, base + H)
-                value = tl.load(V + ix * 512 + dims, va | vb, 0.0).to(tl.float32)
-                stat = tl.where(va, a, tl.where(vb, b, float("inf")))
-            tl.store(Output + row * 512 + dims, value)
-            tl.store(Lout + row, stat)
 
     @triton.jit
     def leader(
@@ -2650,7 +2344,6 @@ else:
 
     @triton.jit
     def model1_fp8(
-        PackedRope,
         Q,
         QR,
         QS,
@@ -2660,8 +2353,6 @@ else:
         L,
         Flags,
         RepairState,
-        Normalized,
-        Scale,
         N,
         T: tl.constexpr,
         H: tl.constexpr,
@@ -2670,20 +2361,18 @@ else:
         S: tl.constexpr,
         BK: tl.constexpr,
         BUFS: tl.constexpr,
-        PREPACK: tl.constexpr,
         PREFIX: tl.constexpr,
         TAIL: tl.constexpr,
         TAIL_SPLITS: tl.constexpr,
     ):
         K = E.to(tl.pointer_type(tl.float8e4nv))
-        KR = PackedRope if PREPACK else E.to(tl.pointer_type(tl.bfloat16))
         sq = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
         sr = tle.gpu.alloc([64, 64], tl.bfloat16, scope=tle.gpu.smem)
         qs = tle.gpu.alloc(
             [64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
         )
         sk = tle.gpu.alloc([BUFS, BK, 512], tl.float8e4nv, scope=tle.gpu.smem)
-        RING: tl.constexpr = 4 if BUFS == 2 and not PREPACK else BUFS
+        RING: tl.constexpr = 4 if BUFS == 2 else BUFS
         skr = tle.gpu.alloc([RING, BK, 64], tl.bfloat16, scope=tle.gpu.smem)
         ks = tle.gpu.alloc(
             [BUFS, BK], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
@@ -2757,12 +2446,9 @@ else:
                     producer,
                     (
                         K,
-                        KR,
                         Idx,
                         Flags,
                         RepairState,
-                        Normalized,
-                        Scale,
                         sk,
                         skr,
                         ks,
@@ -2774,7 +2460,6 @@ else:
                         S,
                         BK,
                         BUFS,
-                        PREPACK,
                         PREFIX,
                         TAIL,
                         TAIL_SPLITS,
@@ -3816,9 +3501,7 @@ else:
             return out, lse
         sm = get_num_sms(q.device)
         sm_limit = sm // work
-        block = (
-            128 if 128 < topk <= 640 and 1 < triton.cdiv(topk, 128) <= sm_limit else 64
-        )
+        block = 64
         num_blocks = triton.cdiv(topk, block)
         target = max(1, sm_limit)
         if num_blocks >= 32 and sm < work < 4 * sm and 0 < work % sm <= sm // 4:
@@ -3859,7 +3542,6 @@ else:
         repair_flags = torch.zeros(batch + 1, dtype=torch.int32, device=q.device)
         flags, repair_state = repair_flags[1:], repair_flags[:1]
         exponent_bytes = exponent_words.view(torch.uint8)
-        prepack = topk > 128 and batch * topk >= 10 * tokens
         if splits > 1 and topk > 640:
             query = torch.empty_like(q)
             query_magnitude = q_scale.new_empty((batch, heads))
@@ -3868,24 +3550,7 @@ else:
             )
         else:
             query, query_magnitude = q, q_scale
-        if prepack:
-            normalized = q.new_empty((tokens, 448))
-            token_scale = q_scale.new_empty((tokens,))
-            rope_cache = q_rope.new_empty((tokens, 64))
-            normalize_cache[(triton.cdiv(tokens, 32),)](
-                fp8_keys,
-                exponent_bytes,
-                normalized,
-                token_scale,
-                rope_cache,
-                tokens,
-                page_stride,
-                num_warps=8,
-            )
-        else:
-            normalized, token_scale, rope_cache = fp8_keys, q_scale, bf16_keys
         model1_fp8[(grid_batch, heads // 64, splits)](
-            rope_cache,
             query,
             q_rope,
             query_magnitude,
@@ -3895,8 +3560,6 @@ else:
             stats,
             flags,
             repair_state,
-            normalized,
-            token_scale,
             tokens,
             topk,
             heads,
@@ -3904,8 +3567,7 @@ else:
             scale,
             splits,
             block,
-            128 // block,
-            prepack,
+            2,
             prefix,
             remainder,
             tail_splits,
@@ -3924,11 +3586,7 @@ else:
                 512,
                 num_warps=2,
             )
-        elif splits == 1:
-            pass  # The attention kernel wrote the final output directly.
-        elif splits == 2:
-            merge_two[(batch, heads // 2)](part, stats, out, lse, heads, num_warps=2)
-        else:
+        elif splits > 1:
             d = 128 if batch <= 4 else 512
             merge[(batch, heads, 512 // d)](
                 part,
