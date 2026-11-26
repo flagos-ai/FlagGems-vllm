@@ -65,13 +65,6 @@ on:
         required: false
         type: string
         default: ''
-      compiler:
-        description: >-
-          Compiler selector passed to tools/setup.sh (e.g. flagtree, triton,
-          keep). Empty keeps the setup.sh default.
-        required: false
-        type: string
-        default: ''
 
 permissions:
   contents: read
@@ -82,7 +75,6 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     env:
       UV_REFRESH: ${{ inputs.uv_refresh }}
-      COMPILER: ${{ inputs.compiler }}
     concurrency:
       group: >-
         backend-test-${{ inputs.backend }}-${{ github.event.pull_request.number || github.ref }}
