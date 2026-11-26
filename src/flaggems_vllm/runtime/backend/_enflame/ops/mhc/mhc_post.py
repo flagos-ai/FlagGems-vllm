@@ -39,9 +39,6 @@ import triton.language as tl
 
 from flaggems_vllm.ops.mhc.mhc_post import MixLayout
 from flaggems_vllm.ops.mhc.mhc_post import mhc_post as _general_mhc_post
-from flaggems_vllm.runtime.backend._enflame.ops._vllm_mhc_import_compat import (
-    install_vllm_mhc_import_compat,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -442,11 +439,6 @@ def _install():
     isinstance gates in the swapped-in implementation keep accepting the
     enum members callers built from the generic module.
 
-    The same import also makes the mhc test family reach this module during
-    `import flaggems_vllm`, so the vLLM mHC import guard (see
-    _vllm_mhc_import_compat) is installed here: tests and benchmarks probe
-    ``vllm.model_executor.layers.mhc`` only after `import flaggems_vllm`.
-
     The re-export chains matter as much as the direct import:
     ``flaggems_vllm.ops.mhc.__init__`` and ``flaggems_vllm.ops.__init__``
     bind ``mhc_post`` via ``from ... import mhc_post`` while `import
@@ -459,7 +451,6 @@ def _install():
     clobbers a vendor swap that already ran (e.g. SpecOpRegistrar on the
     top-level package).
     """
-    install_vllm_mhc_import_compat()
     if _use_general_for_ab():
         return
     import sys

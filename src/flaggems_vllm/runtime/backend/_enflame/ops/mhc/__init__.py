@@ -12,18 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# vLLM's mhc layer module crashes at import time on every non-CUDA-alike
-# platform (tilelang=None + module-level @tilelang.jit), which aborts pytest
-# collection of tests/test_mhc_ops.py, tests/test_mhc_pre_npu.py and
-# benchmark/test_mhc.py on GCU. install_vllm_mhc_import_guard() below converts
-# exactly that crash into a chained ImportError (the outcome the tests'
-# ``except ImportError`` probes already expect) and is a pure passthrough
-# otherwise. Nothing in this package imports the guarded module, so calling
-# it after the public imports is sufficient: the guard is active before any
-# external test or benchmark probes ``vllm...mhc``.
-from flaggems_vllm.runtime.backend._enflame.ops.mhc._vllm_mhc_import_compat import (
-    install_vllm_mhc_import_guard,
-)
 from flaggems_vllm.runtime.backend._enflame.ops.mhc.hc_head_fused_kernel import (
     hc_head_fused_kernel,
     hc_head_fused_kernel_ref,
@@ -39,8 +27,6 @@ from flaggems_vllm.runtime.backend._enflame.ops.mhc.mhc_bwd import (
 )
 from flaggems_vllm.runtime.backend._enflame.ops.mhc.mhc_post import MixLayout, mhc_post
 from flaggems_vllm.runtime.backend._enflame.ops.mhc.mhc_pre import mhc_pre
-
-install_vllm_mhc_import_guard()
 
 __all__ = [
     "hc_head_fused_kernel",
