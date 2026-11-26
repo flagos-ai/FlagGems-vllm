@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
@@ -84,7 +85,7 @@ def _dequantize_and_gather_k_cache_kernel(
         out_row = out_ptr + req_idx * out_stride0 + (offset + local_i) * out_stride1
 
         if nope_dim % quant_block == 0:
-            for qblock in tl.static_range(0, n_quant_blocks):
+            for qblock in tle.range(0, n_quant_blocks, loop_vectorize_factor=4):
                 qoffs = qblock * quant_block + tl.arange(0, quant_block)
                 x_u8 = tl.load(token_data + qoffs)
                 x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
@@ -93,7 +94,7 @@ def _dequantize_and_gather_k_cache_kernel(
                 x = x_fp8 * scale
                 tl.store(out_row + qoffs, x.to(tl.bfloat16))
         else:
-            for qblock in tl.static_range(0, n_quant_blocks - 1):
+            for qblock in tle.range(0, n_quant_blocks - 1, loop_vectorize_factor=4):
                 qoffs = qblock * quant_block + tl.arange(0, quant_block)
                 x_u8 = tl.load(token_data + qoffs)
                 x_fp8 = x_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)

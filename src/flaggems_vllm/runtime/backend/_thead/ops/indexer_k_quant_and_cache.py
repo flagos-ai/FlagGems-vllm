@@ -17,6 +17,7 @@
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
 
 
@@ -61,12 +62,6 @@ def _indexer_k_quant_and_cache_kernel(
 ):
     tid = tl.program_id(0)
     quant_block_id = tl.program_id(1) * 4
-    quant_block_offsets = tl.arange(0, 4)
-    head_offsets = tl.arange(0, QUANT_BLOCK_SIZE)
-    offsets = (
-        quant_block_id + quant_block_offsets[:, None]
-    ) * QUANT_BLOCK_SIZE + head_offsets[None, :]
-    mask = offsets < head_dim
 
     src_ptr = k_ptr + tid * head_dim
     slot_id = tl.load(slot_mapping_ptr + tid)
@@ -75,26 +70,34 @@ def _indexer_k_quant_and_cache_kernel(
 
     block_id = slot_id // block_size
     block_offset = slot_id % block_size
-
-    val = tl.load(src_ptr + offsets, mask=mask, other=0.0)
-    amax = tl.max(tl.abs(val).to(tl.float32), axis=1)
-    scale = tl.maximum(1e-4, amax) / 448.0
-
-    if USE_UE8M0:
-        scale = tl.exp2(tl.ceil(tl.log2(scale)))
-
-    fp8_val = _f32_to_fp8_e4m3fn(val.to(tl.float32) / scale[:, None])
     dst_ptr = kv_cache_ptr + block_id * kv_cache_value_stride + block_offset * head_dim
-    tl.store(dst_ptr + offsets, fp8_val, mask=mask)
-
     dst_scale_ptr = (
         kv_cache_scale_ptr
         + block_id * kv_cache_scale_stride
         + block_offset * num_quant_blocks
         + quant_block_id
     )
-    scale_mask = quant_block_id + quant_block_offsets < num_quant_blocks
-    tl.store(dst_scale_ptr + quant_block_offsets, scale, mask=scale_mask)
+
+    for quant_block_offset in tle.range(0, 4, loop_vectorize_factor=4):
+        quant_block_offsets = quant_block_offset + tl.arange(0, 1)
+        head_offsets = tl.arange(0, QUANT_BLOCK_SIZE)
+        offsets = (
+            quant_block_id + quant_block_offsets[:, None]
+        ) * QUANT_BLOCK_SIZE + head_offsets[None, :]
+        mask = offsets < head_dim
+
+        val = tl.load(src_ptr + offsets, mask=mask, other=0.0)
+        amax = tl.max(tl.abs(val).to(tl.float32), axis=1)
+        scale = tl.maximum(1e-4, amax) / 448.0
+
+        if USE_UE8M0:
+            scale = tl.exp2(tl.ceil(tl.log2(scale)))
+
+        fp8_val = _f32_to_fp8_e4m3fn(val.to(tl.float32) / scale[:, None])
+        tl.store(dst_ptr + offsets, fp8_val, mask=mask)
+
+        scale_mask = quant_block_id + quant_block_offsets < num_quant_blocks
+        tl.store(dst_scale_ptr + quant_block_offsets, scale, mask=scale_mask)
 
 
 def indexer_k_quant_and_cache(
