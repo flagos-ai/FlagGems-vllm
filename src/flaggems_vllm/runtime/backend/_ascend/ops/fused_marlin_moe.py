@@ -8,6 +8,8 @@ GEMM accumulation and router-weighted reduction use FP32.
 """
 
 import inspect
+import os
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Callable, Optional
 
@@ -50,6 +52,18 @@ MAX_HIDDEN_SIZE = 7168
 MAX_INTERMEDIATE_SIZE = 14336
 # Per grouped batch, excluding caller inputs, the returned output and allocator reservations.
 GROUPED_WORKSPACE_BYTES = 1 << 30
+
+
+@contextmanager
+def disable_all_blocks_parallel():
+    # FlagGems exports TRITON_ALL_BLOCKS_PARALLEL=1 on import, which forces
+    # AutoBlockify and degrades Ascend Cube/Vector multi-stage pipelines.
+    saved = os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
+    try:
+        yield
+    finally:
+        if saved is not None:
+            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved
 
 
 def check_tle_support(bits: int) -> None:
@@ -2159,6 +2173,7 @@ def fused_marlin_moe(
     check_tle_support(bits)
     if w1.ndim == 3 and global_num_experts not in (-1, w1.shape[0]):
         raise NotImplementedError("Expert parallel mappings are unsupported")
-    return run_quantized_moe(
-        hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, bits
-    )
+    with disable_all_blocks_parallel():
+        return run_quantized_moe(
+            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, bits
+        )
