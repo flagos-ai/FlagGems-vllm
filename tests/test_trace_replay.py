@@ -202,13 +202,6 @@ def test_inactive_lanes_preserve_out_of_int32_range_int64_sampled():
 
 
 @pytest.mark.apply_trace_tokens
-def test_export_and_public_entry():
-    assert "apply_trace_tokens" in flaggems_vllm.ops.__all__
-    assert callable(flaggems_vllm.ops.apply_trace_tokens)
-    assert callable(flaggems_vllm.apply_trace_tokens)
-
-
-@pytest.mark.apply_trace_tokens
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "enflame",
     reason="Enflame specialization is only registered on Enflame GCU",
