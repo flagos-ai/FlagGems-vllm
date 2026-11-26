@@ -204,59 +204,92 @@ def _load_gemm_weight(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EXACT: tl.constexpr,
+    WEIGHT_KN: tl.constexpr,
 ):
-    # Both operands use rows that are contiguous along K in the native layout.
-    expert = expert.to(tl.int64)
-    n = n.to(tl.int64)[:, None]
-    k = base + tl.arange(0, BK)
-    row = W + expert * WE + n * WN
-    if Q == 0 or Q == 6:
-        packed_k = (base // 2 + tl.arange(0, BK // 2)).to(tl.int64)
-        if EXACT:
-            packed = tl.load(row + packed_k[None, :] * WK)
-        else:
-            packed = tl.load(
-                row + packed_k[None, :] * WK,
-                (n < N) & (packed_k[None, :] < K // 2),
-                other=0x88 if Q == 0 else 0,
+    if WEIGHT_KN:
+        k = (base + tl.arange(0, BK))[:, None]
+        n = n[None, :]
+        if GROUP == -1 or BK <= GROUP:
+            group = 0 if GROUP == -1 else base // GROUP
+            scale = _group_scale(
+                S, expert, n, group, (n < N) & (base < K), SE, SN, SG, Q, EXACT
             )
-        packed = packed.to(tl.int32)
-        # Join on the innermost axis so every byte contributes even then odd K.
-        q = tl.reshape(tl.join(packed & 15, packed >> 4), (BN, BK))
-    else:
-        address = row + k[None, :].to(tl.int64) * WK
-        if EXACT:
-            q = tl.load(address).to(tl.int32)
-        else:
-            q = tl.load(
-                address, (n < N) & (k[None, :] < K), other=128 if Q == 1 else 0
-            ).to(tl.int32)
-
-    # A tile inside one scale group uses one scale per output column.
-    if GROUP == -1 or BK <= GROUP:
-        g = 0 if GROUP == -1 else base // GROUP
-        scale = _group_scale(
-            S, expert, n, g, (n < N) & (base < K), SE, SN, SG, Q, EXACT
-        )
-        return _scale_weight_codes(q, scale, Q, DTYPE)
-    else:
-        num_groups: tl.constexpr = BK // GROUP
-        groups = base // GROUP + tl.arange(0, num_groups)
-        scale = _group_scale(
+            return _decode_scaled(
+                W, scale, expert, n, k, N, K, WE, WN, WK, Q, DTYPE, EXACT
+            )
+        return _decode(
+            W,
             S,
             expert,
             n,
-            groups[None, :],
-            (n < N) & (groups[None, :] < K // GROUP),
+            k,
+            N,
+            K,
+            WE,
+            WN,
+            WK,
             SE,
             SN,
             SG,
             Q,
+            GROUP,
+            DTYPE,
             EXACT,
         )
-        grouped_codes = tl.reshape(q, (BN, num_groups, GROUP))
-        value = _scale_weight_codes(grouped_codes, scale[:, :, None], Q, DTYPE)
-        return tl.reshape(value, (BN, BK))
+
+    else:
+        # Both operands use rows that are contiguous along K in the native layout.
+        expert = expert.to(tl.int64)
+        n = n.to(tl.int64)[:, None]
+        k = base + tl.arange(0, BK)
+        row = W + expert * WE + n * WN
+        if Q == 0 or Q == 6:
+            packed_k = (base // 2 + tl.arange(0, BK // 2)).to(tl.int64)
+            if EXACT:
+                packed = tl.load(row + packed_k[None, :] * WK)
+            else:
+                packed = tl.load(
+                    row + packed_k[None, :] * WK,
+                    (n < N) & (packed_k[None, :] < K // 2),
+                    other=0x88 if Q == 0 else 0,
+                )
+            packed = packed.to(tl.int32)
+            # Join on the innermost axis so every byte contributes even then odd K.
+            q = tl.reshape(tl.join(packed & 15, packed >> 4), (BN, BK))
+        else:
+            address = row + k[None, :].to(tl.int64) * WK
+            if EXACT:
+                q = tl.load(address).to(tl.int32)
+            else:
+                q = tl.load(
+                    address, (n < N) & (k[None, :] < K), other=128 if Q == 1 else 0
+                ).to(tl.int32)
+
+        # A tile inside one scale group uses one scale per output column.
+        if GROUP == -1 or BK <= GROUP:
+            g = 0 if GROUP == -1 else base // GROUP
+            scale = _group_scale(
+                S, expert, n, g, (n < N) & (base < K), SE, SN, SG, Q, EXACT
+            )
+            return _scale_weight_codes(q, scale, Q, DTYPE)
+        else:
+            num_groups: tl.constexpr = BK // GROUP
+            groups = base // GROUP + tl.arange(0, num_groups)
+            scale = _group_scale(
+                S,
+                expert,
+                n,
+                groups[None, :],
+                (n < N) & (groups[None, :] < K // GROUP),
+                SE,
+                SN,
+                SG,
+                Q,
+                EXACT,
+            )
+            grouped_codes = tl.reshape(q, (BN, num_groups, GROUP))
+            value = _scale_weight_codes(grouped_codes, scale[:, :, None], Q, DTYPE)
+            return tl.reshape(value, (BN, BK))
 
 
 @triton.jit
@@ -289,10 +322,86 @@ def _prefix(Counts, Starts, E: tl.constexpr, B: tl.constexpr):
     tl.store(Starts + E, tl.sum(count))
 
 
+def _prune_gemm_configs(configs, named_args, **kwargs):
+    bm, q, first = named_args["BM"], named_args["Q"], named_args["FIRST"]
+    n, k, e, r = (named_args[key] for key in ("N", "K", "E", "R"))
+    w8 = q in (QUANT_TYPE_UINT8B128, QUANT_TYPE_FP8_E4M3)
+    packed_w4 = q in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP4_E2M1)
+    bf16 = named_args["A"].dtype == torch.bfloat16
+    single_k = bf16 and named_args["SPLIT_K"] == 1
+    mxfp4 = q == QUANT_TYPE_FP4_E2M1
+    narrow = e >= 128 and (n <= 512 and k >= 2048 if first else k == 256 and n >= 2048)
+    wide = single_k and max(n, k) >= 8192
+    wide_w8 = wide and w8 and bm >= 32
+    wide_fp8 = wide_w8 and q == QUANT_TYPE_FP8_E4M3
+    wide_mxfp4 = wide and mxfp4 and bm >= 64
+    short_down = single_k and not first and narrow and r >= 512 and bm == 16
+    dense_narrow = single_k and narrow and bm >= 128
+
+    dot_layouts = {0}
+    if (
+        single_k
+        and first
+        and bm == 16
+        and r >= max(512, 2 * e)
+        and k >= 2048
+        and n % 32 == 0
+        and (q == QUANT_TYPE_UINT8B128 or (narrow and (w8 or mxfp4)))
+    ):
+        dot_layouts.add(1)
+    if (
+        wide_fp8
+        or wide_mxfp4
+        or (single_k and q == QUANT_TYPE_FP8_E4M3 and first and bm == 128)
+        or (dense_narrow and w8)
+        or (mxfp4 and not first and (short_down or dense_narrow))
+    ):
+        dot_layouts.add(2)
+    if wide_w8 or (short_down and w8):
+        dot_layouts.add(3)
+    multi_stage = (
+        wide_fp8
+        or wide_mxfp4
+        or (bf16 and r >= 8192 and (bm >= 128 or (bm >= 64 and packed_w4)))
+    )
+    return [
+        config
+        for config in configs
+        if config.kwargs.get("DOT_LAYOUT", 0) in dot_layouts
+        and (multi_stage or config.num_stages == 1)
+    ]
+
+
+@triton.jit
+def _accumulate_gemm(
+    a,
+    w,
+    acc,
+    STANDARD: tl.constexpr,
+    WEIGHT_KN: tl.constexpr,
+    FP16: tl.constexpr,
+):
+    if WEIGHT_KN:
+        lhs = a
+        rhs = w
+    elif STANDARD:
+        lhs = a
+        rhs = tl.trans(w)
+    else:
+        lhs = w
+        rhs = a
+    if FP16:
+        return tl.dot(
+            lhs.to(tl.float32), rhs.to(tl.float32), acc, input_precision="ieee"
+        )
+    return tl.dot(lhs, rhs, acc)
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("hygon_marlin_gemm"),
     key=["N", "K", "R", "E", "Q", "FIRST", "DIRECT", "SHARED_ROUTING", "SPLIT_K", "BM"],
+    prune_configs_by={"early_config_prune": _prune_gemm_configs},
 )
 @triton.jit
 def _gemm(
@@ -326,6 +435,7 @@ def _gemm(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    DOT_LAYOUT: tl.constexpr = 0,
 ):
     block = tl.program_id(1)
     n = tl.program_id(0) * BN + tl.arange(0, BN)
@@ -358,13 +468,29 @@ def _gemm(
     route = route.to(tl.int64)
     valid = (route < R) & (expert >= 0) & (expert < E)
     dtype: tl.constexpr = A.dtype.element_ty
-    acc_t = tl.zeros((BN, BM), tl.float32)
-    if FIRST:
-        up_t = tl.zeros((BN, BM), tl.float32)
+    PAIRED: tl.constexpr = DOT_LAYOUT == 1
+    STANDARD: tl.constexpr = DOT_LAYOUT == 2
+    WEIGHT_KN: tl.constexpr = DOT_LAYOUT == 3
+    ROW_MAJOR_ACC: tl.constexpr = STANDARD or WEIGHT_KN
+    if PAIRED:
+        weight_rows = tl.arange(0, 2 * BN)
+        weight_n = tl.program_id(0) * BN + weight_rows % BN + (weight_rows // BN) * N
+        WEIGHT_N: tl.constexpr = 2 * N
+        WEIGHT_BN: tl.constexpr = 2 * BN
+    else:
+        weight_n = n
+        WEIGHT_N: tl.constexpr = N
+        WEIGHT_BN: tl.constexpr = BN
+    ACC_M: tl.constexpr = BM if ROW_MAJOR_ACC else WEIGHT_BN
+    ACC_N: tl.constexpr = BN if ROW_MAJOR_ACC else BM
+    acc_t = tl.zeros((ACC_M, ACC_N), tl.float32)
+    if FIRST and not PAIRED:
+        up_t = tl.zeros((ACC_M, ACC_N), tl.float32)
     split = tl.program_id(2)
     tiles = tl.cdiv(K, BK * SPLIT_K)
-    # Tiles that divide the problem exactly need no per-element bound test.
-    EXACT: tl.constexpr = BM <= 32 and N % BN == 0 and K % (BK * SPLIT_K) == 0
+    # Weight bounds depend on N and K, even when routing uses a wide M tile.
+    WEIGHT_EXACT: tl.constexpr = N % BN == 0 and K % (BK * SPLIT_K) == 0
+    EXACT: tl.constexpr = BM <= 32 and WEIGHT_EXACT
     arow = route // TOPK if FIRST else route
     for step in range(tiles):
         base = (split * tiles + step) * BK
@@ -374,16 +500,16 @@ def _gemm(
             valid[:, None] if EXACT else valid[:, None] & (k[None, :] < K),
             other=0,
         )
-        a_t = tl.trans(a)
+        a_t = a if ROW_MAJOR_ACC else tl.trans(a)
         if dtype == tl.float16:
             a_t = a_t.to(tl.float32)
         w_t = _load_gemm_weight(
             W,
             S,
             expert,
-            n,
+            weight_n,
             base,
-            N,
+            WEIGHT_N,
             K,
             WE,
             WN,
@@ -394,15 +520,15 @@ def _gemm(
             Q,
             GROUP,
             dtype,
-            BN,
+            WEIGHT_BN,
             BK,
-            EXACT,
+            EXACT if WEIGHT_KN else WEIGHT_EXACT,
+            WEIGHT_KN,
         )
-        if dtype == tl.float16:
-            acc_t = tl.dot(w_t.to(tl.float32), a_t, acc_t, input_precision="ieee")
-        else:
-            acc_t = tl.dot(w_t, a_t, acc_t)
-        if FIRST:
+        acc_t = _accumulate_gemm(
+            a_t, w_t, acc_t, STANDARD, WEIGHT_KN, dtype == tl.float16
+        )
+        if FIRST and not PAIRED:
             wu_t = _load_gemm_weight(
                 W,
                 S,
@@ -422,15 +548,19 @@ def _gemm(
                 dtype,
                 BN,
                 BK,
-                EXACT,
+                EXACT if WEIGHT_KN else WEIGHT_EXACT,
+                WEIGHT_KN,
             )
-            if dtype == tl.float16:
-                up_t = tl.dot(wu_t.to(tl.float32), a_t, up_t, input_precision="ieee")
-            else:
-                up_t = tl.dot(wu_t, a_t, up_t)
-    acc = tl.trans(acc_t)
-    if FIRST:
-        up = tl.trans(up_t)
+            up_t = _accumulate_gemm(
+                a_t, wu_t, up_t, STANDARD, WEIGHT_KN, dtype == tl.float16
+            )
+    if PAIRED:
+        # Keep gate/up in the caller's two separate weight banks and share the dot.
+        acc, up = tl.split(tl.permute(tl.reshape(acc_t, (2, BN, BM)), (2, 1, 0)))
+    else:
+        acc = acc_t if ROW_MAJOR_ACC else tl.trans(acc_t)
+        if FIRST:
+            up = up_t if ROW_MAJOR_ACC else tl.trans(up_t)
     if SPLIT_K > 1:
         stride = 2 * N if FIRST else N
         offsets = (split * R + route[:, None]) * stride + n[None, :]
@@ -639,7 +769,7 @@ def _fused_marlin_moe_impl(
             return 0
         r = tokens * topk
         direct, bm, shared, gate_split, down_split = _batch_config(
-            r, e, k, n, quant_type_id, apply_router_weight_on_input
+            r, e, k, n, quant_type_id, hidden_states.dtype, apply_router_weight_on_input
         )
         if direct:
             routing = 0
@@ -700,11 +830,22 @@ def _fused_marlin_moe_impl(
     return out
 
 
-def _batch_config(r, e, k, n, quant_type_id, apply_router_weight_on_input):
+def _batch_config(r, e, k, n, quant_type_id, dtype, apply_router_weight_on_input):
     # Reuse expert weights when routes repeat; large banks make repeated
     # direct loads more expensive than the small route-alignment kernels.
     direct = r <= (2 if max(k, n) >= 4096 else 16)
     bm = 64 if r >= 32 * e else 32 if r >= 16 * e else 16
+    # Dense BF16 batches can amortize each decoded weight tile over more routes.
+    if dtype == torch.bfloat16 and r >= max(8192, 80 * e):
+        bm = 128
+        if (
+            quant_type_id == QUANT_TYPE_FP4_E2M1
+            and n == 256
+            and k >= 2048
+            and e >= 128
+            and r >= 384 * e
+        ):
+            bm = 256
     # The shared aligner has four stages and a quadratic expert-count buffer.
     # Amortize that overhead on grouped batches with enough routes per expert.
     shared_routing = r >= max(
@@ -721,6 +862,18 @@ def _batch_config(r, e, k, n, quant_type_id, apply_router_weight_on_input):
     )
     gate_split = split_k if k >= 4096 else 1
     down_split = split_k if n >= 4096 else 1
+    # Sparse routes through a narrow gate tile leave too few CTAs to hide
+    # the long INT8 weight load. Partition the gate reduction only.
+    if (
+        dtype == torch.bfloat16
+        and quant_type_id == QUANT_TYPE_UINT8B128
+        and e >= 128
+        and k >= 4096
+        and n <= 512
+        and 32 < r <= 96
+        and not apply_router_weight_on_input
+    ):
+        gate_split = 8 if r <= 64 else 4
     return direct, bm, shared_routing, gate_split, down_split
 
 
@@ -745,7 +898,7 @@ def _run_moe_batch(
     topk = topk_ids.shape[1]
     r = m * topk
     direct, bm, shared_routing, gate_split, down_split = _batch_config(
-        r, e, k, n, quant_type_id, apply_router_weight_on_input
+        r, e, k, n, quant_type_id, hidden_states.dtype, apply_router_weight_on_input
     )
     cap = triton.cdiv(r, bm) * bm
     with torch.cuda.device(hidden_states.device):
@@ -856,7 +1009,10 @@ def _run_moe_batch(
                     num_warps=4,
                 )
                 del partial
-        _sum[(m, triton.cdiv(k, 256))](result, out, k, topk, 256, num_warps=4)
+        sum_block, sum_warps = (1024, 8) if m >= 2048 and k >= 1024 else (256, 4)
+        _sum[(m, triton.cdiv(k, sum_block))](
+            result, out, k, topk, sum_block, num_warps=sum_warps
+        )
 
 
 def _validate_inputs(
