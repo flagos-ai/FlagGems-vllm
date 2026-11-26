@@ -99,7 +99,7 @@ hygon = [
 ]
 
 mthreads = [
-    "mate @ https://dl.mthreads.com/repo/api/pypi/pypi/mate/0.2.4/mate-0.2.4-py3-none-any.whl#sha256=3221a86f96dd73e6e0c468cccd5ea962dbeaef2c1f3a21957ba09214fd8e5cce",
+    "mate @ https://dl.mthreads.com/repo/api/pypi/pypi/mate/0.2.8.post1/mate-0.2.8.post1-py3-none-any.whl#sha256=28384e15a00a46d8d05d0bebf15e633d2ce3c09c9c8e23e9cb7fdd1239e1ff51",
     "torchada>=0.1.76",
     # tvm_ffi imports ml_dtypes from its Cython init without declaring it, and
     # ml_dtypes 0.7 is built against the NumPy 2 C-API: 0.6 is the newest build
