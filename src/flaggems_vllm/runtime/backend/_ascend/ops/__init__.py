@@ -61,6 +61,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_q import fused_q
 from flaggems_vllm.runtime.backend._ascend.ops.gather_conv_state import (
     gather_conv_state,
 )
@@ -173,6 +174,7 @@ __all__ = [
     "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
     "fused_marlin_moe",
+    "fused_q",
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
     "gather_kda_state",

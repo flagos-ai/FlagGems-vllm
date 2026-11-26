@@ -62,6 +62,17 @@ except ImportError:
     HAS_VLLM = False
     _vllm_topk_softplus_sqrt = None
 
+# HAS_VLLM only says the Python wrapper imported successfully; it does not
+# guarantee the CUDA custom op it calls has been compiled into the current
+# vllm install. Probe for the op at runtime so the benchmark doesn't pick a
+# baseline that will blow up when actually invoked.
+HAS_VLLM_TOPK_KERNEL = False
+if HAS_VLLM:
+    try:
+        HAS_VLLM_TOPK_KERNEL = hasattr(torch.ops._moe_C, "topk_softplus_sqrt")
+    except Exception:
+        HAS_VLLM_TOPK_KERNEL = False
+
 
 # ---------------------------------------------------------------------------
 # Ascend baseline: vllm-ascend exposes the same sqrt-softplus gating math as a
@@ -207,7 +218,11 @@ def _torch_topk_softplus_sqrt_ref(
 _baseline_op = (
     _vllm_ascend_topk_softplus_sqrt_wrapper
     if HAS_ASCEND_GATING
-    else _vllm_topk_softplus_sqrt_wrapper if HAS_VLLM else _torch_topk_softplus_sqrt_ref
+    else (
+        _vllm_topk_softplus_sqrt_wrapper
+        if HAS_VLLM_TOPK_KERNEL
+        else _torch_topk_softplus_sqrt_ref
+    )
 )
 
 

@@ -623,6 +623,7 @@ def test_production_path_has_no_torch_compute():
         root
         / "src/flaggems_vllm/runtime/backend/_mthreads/ops/mhc_shifted_post_pre.py",
         root / "src/flaggems_vllm/runtime/backend/_hygon/ops/mhc_shifted_post_pre.py",
+        root / "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_shifted_post_pre.py",
     ]
     # The whole modules are production; the torch reference lives in this test.
     allowed = {
