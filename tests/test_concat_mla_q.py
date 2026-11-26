@@ -47,7 +47,12 @@ def test_concat_mla_q_matches_reference(dtype, shape, broadcast, strided):
     # Prefer vLLM's native concat_mla_q as the reference when available; the
     # op writes to a contiguous output, so only use it for the contiguous
     # (non-strided) case and fall back to torch.cat otherwise.
-    if _HAS_VLLM_CONCAT_MLA_Q and not strided:
+    if (
+        _HAS_VLLM_CONCAT_MLA_Q
+        and not strided
+        and dtype in (torch.float16, torch.bfloat16)
+        and (nope, rope) == (512, 64)
+    ):
         expected = torch.empty(tokens, heads, nope + rope, dtype=dtype, device="cuda")
         torch.ops._C_cache_ops.concat_mla_q(
             qn, qr.expand(tokens, heads, rope), expected
@@ -93,6 +98,36 @@ def test_empty_and_nonfinite_values():
     expected = torch.cat([qn, qr], dim=-1)
     torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
     assert torch.equal(torch.signbit(out), torch.signbit(expected))
+
+
+@gpu
+@pytest.mark.concat_mla_q
+@pytest.mark.parametrize("extra_heads", [1, 8])
+def test_padded_output_preserves_extra_heads(extra_heads):
+    qn = torch.randn(2, 8, 512, dtype=torch.bfloat16, device="cuda")
+    qr = torch.randn(2, 1, 64, dtype=qn.dtype, device=qn.device)
+    out = torch.full((2, 8 + extra_heads, 576), 77, dtype=qn.dtype, device=qn.device)
+    expected = out.clone()
+    expected[:, :8].copy_(torch.cat((qn, qr.expand(-1, 8, -1)), dim=-1))
+    if _HAS_VLLM_CONCAT_MLA_Q:
+        native = out.clone()
+        torch.ops._C_cache_ops.concat_mla_q(qn, qr.expand(-1, 8, -1), native)
+        torch.testing.assert_close(native, expected, rtol=0, atol=0)
+
+    flaggems_vllm.concat_mla_q(qn, qr, out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flaggems_vllm.concat_mla_q(qn, qr, out)
+    for sign in (-1, 1, -1):
+        qn.fill_(sign)
+        qr.fill_(2 * sign)
+        out.fill_(77)
+        graph.replay()
+        expected[:, :8, :512].fill_(sign)
+        expected[:, :8, 512:].fill_(2 * sign)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @gpu
