@@ -3,12 +3,16 @@
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
 """Context deduplication for speculative watermark sampling."""
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import has_triton_tle_attrs, libentry, libtuner
+
+logger = logging.getLogger(__name__)
 
 _HAS_LAYOUT = runtime.device.vendor_name == "nvidia" and has_triton_tle_attrs(
     ("gpu.set_layout", "gpu.BlockEncoding")
@@ -178,10 +182,21 @@ def draft_watermarking_mask(
 ) -> torch.Tensor:
     """Return active watermark rows and record each valid row's current context.
 
-    History tokens and request lengths are contiguous within rows. Context
-    buffers have unit column stride. Steps may be a stride-zero broadcast.
-    Each step is in ``[0, prior_contexts.shape[1])``.
+    All tensors share one accelerator device. For R draft rows, C context
+    tokens, and S draft slots, contexts has shape (R, C) with C > 0,
+    prior_contexts has shape (R, S, C) with unit column stride, and the
+    request, step, and enabled vectors each have R entries. Steps may use
+    a stride-zero broadcast. History has one token row per request with
+    unit column stride, and both request length vectors are contiguous.
+
+    Callers supply integer tokens, indices, and lengths, and a boolean
+    enabled vector. A negative request index skips the row. Otherwise the
+    request and step must be in range, and its lengths must satisfy
+    ``0 <= prompt_len <= total_len <= all_token_ids.shape[1]``. The writable
+    prior buffer must have non-overlapping slots and be disjoint from the
+    other inputs.
     """
+    logger.debug("GEMS DRAFT_WATERMARKING_MASK")
     if contexts.device.type == "cpu":
         raise NotImplementedError("draft_watermarking_mask requires an accelerator")
     if max_history is not None and max_history < 1:
@@ -193,6 +208,25 @@ def draft_watermarking_mask(
     enabled = enabled.contiguous()
     output = torch.empty(contexts.shape[0], device=contexts.device, dtype=torch.bool)
     if contexts.shape[0] == 0:
+        return output
+    if runtime.device.vendor_name == "ascend":
+        from flaggems_vllm.runtime.backend._ascend.ops.watermark import (
+            _launch_draft_watermarking_mask,
+        )
+
+        _launch_draft_watermarking_mask(
+            output,
+            all_token_ids,
+            req_indices,
+            prompt_lens,
+            total_lens,
+            prior_contexts,
+            contexts,
+            steps,
+            enabled,
+            max_history,
+            include_prompt,
+        )
         return output
     _repeated_context_mask_kernel[(contexts.shape[0],)](
         output,

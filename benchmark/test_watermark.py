@@ -7,7 +7,6 @@ import torch
 
 import flaggems_vllm
 from benchmark import base
-from benchmark.conftest import Config
 from flaggems_vllm import draft_watermarking_mask
 
 try:
@@ -129,27 +128,6 @@ class DraftWatermarkBenchmark(base.Benchmark):
                 assert actual.dtype == torch.bool
             inputs[4].copy_(prior)
             yield inputs
-
-    def run(self):
-        if vllm_reference is not None or Config.query:
-            return super().run()
-        self.init_user_config()
-        rows = []
-        for dtype in self.to_bench_dtypes:
-            for inputs in self.get_input_iter(dtype):
-                args, kwargs = self.unpack_to_args_kwargs(inputs)
-                latency_us = self.get_latency(self.gems_op, *args, **kwargs) * 1000
-                rows.append((self._case_shape, latency_us))
-        print(
-            "\nDraft watermark mask: FlagGems-vllm latency (vLLM reference unavailable)"
-        )
-        print("Requests  History  Width  Scenario                 FlagGems-vllm (us)")
-        print("-" * 72)
-        for shape, latency_us in rows:
-            print(
-                f"{shape[0]:>8}  {shape[1]:>7}  {shape[2]:>5}  "
-                f"{case_scenario(shape):<24} {latency_us:>18.3f}"
-            )
 
 
 @pytest.mark.draft_watermarking_mask
