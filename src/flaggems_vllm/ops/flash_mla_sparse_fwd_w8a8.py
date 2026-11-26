@@ -29,18 +29,6 @@ else:
     import triton.experimental.tle.language as tle
     import triton.language as tl
     import triton.language.core as tlc
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-    from triton.experimental.gluon.language import (
-        BlockedLayout,
-        NVMMADistributedLayout,
-        NVMMASharedLayout,
-        SliceLayout,
-    )
-    from triton.experimental.gluon.language import _core as glc
-    from triton.experimental.gluon.language.nvidia import hopper
-    from triton.experimental.gluon.language.nvidia.hopper import async_copy
-    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
     from flaggems_vllm import runtime
     from flaggems_vllm.ops.flash_mla import _get_num_sms as get_num_sms
@@ -2873,119 +2861,6 @@ else:
         return asm
 
     @triton.constexpr_function
-    def gather_topk128_asm(page_stride):
-        # Four lanes copy a 64-byte feature group. Each group of four lanes
-        # follows two indices, 64 tokens apart, and keeps both addresses live.
-        asm = """
-        {
-        .reg .b32 tid, lane, warp, row, chunk, offset, swizzle, base;
-        .reg .b32 id<2>, exp_lo<2>, exp_hi<2>, largest<2>, smallest<2>, size<2>;
-        .reg .b32 tmp, u, exponent, slot, delta, fac, kdst, rdst, flag, a, b, c, d;
-        .reg .b64 idx_ptr, src<2>, page<2>, meta, byte_offset;
-        .reg .b16 xlo, xhi;
-        .reg .pred valid<2>, first, skip, wide;
-        mov.u32 tid, %tid.x;
-        and.b32 tid, tid, 255;
-        and.b32 lane, tid, 31;
-        shr.u32 warp, tid, 5;
-        and.b32 chunk, lane, 3;
-        shr.u32 row, lane, 2;
-        mad.lo.u32 row, warp, 8, row;
-        mul.wide.u32 idx_ptr, row, 4;
-        add.u64 idx_ptr, idx_ptr, $3;
-        ld.global.L1::evict_first.s32 id0, [idx_ptr];
-        ld.global.L1::evict_first.s32 id1, [idx_ptr+256];
-        mov.u32 flag, 0;
-        and.b32 swizzle, row, 7;
-        shl.b32 swizzle, swizzle, 4;
-        shl.b32 offset, chunk, 4;
-        xor.b32 base, swizzle, offset;
-        mad.lo.u32 base, row, 128, base;
-        """
-        for half in range(2):
-            asm += f"""
-            setp.lt.u32 valid{half}, id{half}, $7;
-            @!valid{half} mov.u32 id{half}, 0;
-            selp.u32 size{half}, 16, 0, valid{half};
-            shr.u32 exponent, id{half}, 6;
-            mul.wide.u32 page{half}, exponent, {page_stride};
-            add.u64 page{half}, page{half}, $2;
-            and.b32 slot, id{half}, 63;
-            mad.wide.u32 meta, slot, 8, page{half};
-            ld.global.v2.b32 {{exp_lo{half},exp_hi{half}}}, [meta+36864];
-            mad.wide.u32 src{half}, slot, 576, page{half};
-            cvt.u64.u32 byte_offset, offset;
-            add.u64 src{half}, src{half}, byte_offset;
-            """
-        for half in range(2):
-            asm += f"and.b32 largest{half},exp_lo{half},255; mov.u32 smallest{half},largest{half};\n"
-            for group in range(1, 7):
-                word = "exp_lo" if group < 4 else "exp_hi"
-                asm += f"""
-                bfe.u32 exponent, {word}{half}, {(group % 4) * 8}, 8;
-                max.u32 largest{half}, largest{half}, exponent;
-                min.u32 smallest{half}, smallest{half}, exponent;
-                """
-            asm += f"""
-            sub.u32 delta, largest{half}, smallest{half};
-            setp.gt.and.u32 wide, delta, 2, valid{half};
-            @wide mov.u32 flag, 1;
-            shl.b32 exponent, largest{half}, 23;
-            setp.eq.u32 first, largest{half}, 0;
-            @first mov.u32 exponent, 0x00400000;
-            @!valid{half} mov.u32 exponent, 0xbf800000;
-            setp.eq.u32 first, chunk, 0;
-            mad.lo.u32 tmp, row, 4, $6;
-            @first st.shared.b32 [tmp+{half * 256}], exponent;
-            """
-        # A panel holds 64 rows by 128 FP8 channels per half. The last
-        # transfer also brings in the two 64-byte pieces of BF16 RoPE.
-        for panel in range(4):
-            for group in range(2 * panel, min(2 * panel + 2, 7)):
-                asm += f"xor.b32 exponent,base,{(group % 2) * 64}; add.u32 kdst,$4,exponent;\n"
-                for half in range(2):
-                    dest = half * 32768 + panel * 8192
-                    asm += f"cp.async.cg.shared.global [kdst+{dest}],[src{half}+{group * 64}],16,size{half};\n"
-            if panel == 3:
-                for piece in range(2):
-                    asm += f"xor.b32 exponent,base,{piece * 64}; add.u32 rdst,$5,exponent;\n"
-                    for half in range(2):
-                        asm += (
-                            f"cp.async.cg.shared.global [rdst+{half * 8192}],"
-                            f"[src{half}+{448 + piece * 64}],16,size{half};\n"
-                        )
-            asm += "cp.async.commit_group;\n"
-        for panel in range(4):
-            asm += f"cp.async.wait_group {3 - panel};\n"
-            for group in range(2 * panel, min(2 * panel + 2, 7)):
-                asm += f"xor.b32 exponent,base,{(group % 2) * 64}; add.u32 kdst,$4,exponent;\n"
-                word = "exp_lo" if group < 4 else "exp_hi"
-                for half in range(2):
-                    dest = half * 32768 + panel * 8192
-                    label = f"END_GROUP_{group}_{half}"
-                    asm += f"""
-                    bfe.u32 exponent, {word}{half}, {(group % 4) * 8}, 8;
-                    setp.eq.u32 skip, exponent, largest{half};
-                    @skip bra {label};
-                    sub.u32 delta, largest{half}, exponent;
-                    min.u32 delta, delta, 15;
-                    sub.u32 fac, 15, delta;
-                    shl.b32 fac, fac, 10;
-                    prmt.b32 fac, fac, fac, 0x1010;
-                    ld.shared.v4.b32 {{a,b,c,d}}, [kdst+{dest}];
-                    """
-                    asm += rescale_fp8_registers()
-                    asm += f"st.shared.v4.b32 [kdst+{dest}],{{a,b,c,d}}; {label}:\n"
-            # Each of the eight producer warps signals after its writes to both halves.
-            asm += f"""
-            bar.warp.sync 0xffffffff;
-            fence.proxy.async.shared::cta;
-            setp.eq.u32 first, lane, 0;
-            @first mbarrier.arrive.shared::cta.b64 _, [${8 + panel}];
-            """
-        return asm + "mov.b32 $0,flag; }"
-
-    @triton.constexpr_function
     def gather_asm(block, page_stride, panel_rows, warps, prefetched):
         # A subgroup of two or four lanes owns one selected row. Every lane keeps
         # that row's address and exponent word through both copying and rescaling.
@@ -3392,7 +3267,7 @@ else:
         TAIL_SPLITS: tl.constexpr,
     ):
         b, _, first, count = model1_block_info(
-            tl.program_id(0),
+            tl.program_id(0).to(tl.int64),
             tl.program_id(2),
             tl.cdiv(T, BK),
             S,
@@ -3556,70 +3431,7 @@ else:
         tl.atomic_or(Flags + b, 1, mask=repair != 0, sem="relaxed")
         tl.atomic_or(RepairState, 1, mask=repair != 0, sem="relaxed")
 
-    @gluon.jit
-    def publish(
-        Output,
-        row0,
-        acc,
-        scale,
-        OFFSET: gl.constexpr,
-        WIDTH: gl.constexpr,
-        STREAM: gl.constexpr,
-    ):
-        layout: gl.constexpr = acc.type.layout
-        row = row0 + gl.arange(0, 64, layout=gl.constexpr(SliceLayout(1, layout)))
-        col = OFFSET + gl.arange(0, WIDTH, layout=gl.constexpr(SliceLayout(0, layout)))
-        factor = gl.convert_layout(scale, gl.constexpr(SliceLayout(1, layout)))
-        gl.store(
-            Output + row[:, None] * 512 + col[None, :],
-            (acc * factor[:, None]).to(Output.dtype.element_ty),
-            cache_modifier=".cs" if STREAM else "",
-        )
-
-    @gluon.jit
-    def bf_band(
-        Q,
-        QS,
-        K,
-        q,
-        kv,
-        h,
-        offset,
-        valid,
-        scales,
-        layout: gl.constexpr,
-        policy: gl.constexpr,
-        start: gl.constexpr,
-        width: gl.constexpr,
-    ):
-        col = start + gl.arange(0, width, layout=gl.constexpr(SliceLayout(0, layout)))
-        qv = gl.load(
-            Q + (h * 448)[:, None] + col[None, :], eviction_policy="evict_first"
-        )
-        qs = gl.load(
-            QS + (h * 7)[:, None] + (col // 64)[None, :], eviction_policy="evict_first"
-        )
-        q.slice(start, width, 1).store((qv.to(gl.float32) * qs).to(gl.bfloat16))
-        quantized_values = gl.load(
-            K + offset[:, None] + col[None, :],
-            valid[:, None],
-            0.0,
-            eviction_policy=policy,
-        )
-        e = ((scales[:, None] >> ((col // 64) * 8)[None, :]) & 255).to(gl.uint16)
-        power = (e << 7).to(gl.bfloat16, bitcast=True)
-        kv.slice(start, width, 1).store(
-            gl.inline_asm_elementwise(
-                "mul.rn.bf16x2 $0,$1,$2;",
-                "=r,r,r",
-                [quantized_values.to(gl.bfloat16), power],
-                gl.bfloat16,
-                is_pure=True,
-                pack=2,
-            )
-        )
-
-    @gluon.jit
+    @triton.jit
     def one_block(
         Q,
         QR,
@@ -3631,85 +3443,84 @@ else:
         Output,
         L,
         scale,
-        N: gl.constexpr,
-        TOPK: gl.constexpr,
-        STRIDE: gl.constexpr,
-        H: gl.constexpr,
-        SPLITS: gl.constexpr,
-        BK: gl.constexpr,
+        N: tl.constexpr,
+        TOPK: tl.constexpr,
+        STRIDE: tl.constexpr,
+        H: tl.constexpr,
+        SPLITS: tl.constexpr,
+        BK: tl.constexpr,
     ):
-        K = K.to(gl.pointer_type(gl.float8e4nv))
-        KS = KS.to(gl.pointer_type(gl.int64))
-        KR = KR.to(gl.pointer_type(gl.bfloat16))
-        # All eight warps cooperate when a split is exactly one block. There
-        # is no running softmax state, inter-partition handoff or KV recycling.
-        layout: gl.constexpr = BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0])
-        qkl: gl.constexpr = NVMMADistributedLayout([3, 0], [4, 2], [16, BK // 2, 16])
-        pvl: gl.constexpr = NVMMADistributedLayout([3, 0], [4, 2], [16, 128, 16])
-        shared: gl.constexpr = NVMMASharedLayout(128, 16)
-        q = gl.allocate_shared_memory(gl.bfloat16, (64, 512), shared)
-        kv = gl.allocate_shared_memory(gl.bfloat16, (BK, 512), shared)
-        p = gl.allocate_shared_memory(gl.bfloat16, (64, BK), shared)
-        batch = gl.program_id(0).to(gl.int64)
-        head = gl.program_id(1) * 64
-        block = gl.program_id(2)
-        row0 = batch * H + head
-        row_out = (batch * SPLITS + block) * H + head
-        r = gl.arange(0, BK, layout=gl.constexpr(SliceLayout(1, layout)))
-        h = row0 + gl.arange(0, 64, layout=gl.constexpr(SliceLayout(1, layout)))
-        d = gl.arange(0, 64, layout=gl.constexpr(SliceLayout(0, layout)))
-        pos = block * BK + r
-        idx = gl.load(
-            Indices + batch * TOPK + pos, pos < TOPK, -1, eviction_policy="evict_first"
-        )
+        # A split fits in one key tile. Keep the dequantized KV tile in shared
+        # memory for both QK and PV, including the original BF16 RoPE channels.
+        batch = tl.program_id(0).to(tl.int64)
+        head = tl.program_id(1) * 64
+        split = tl.program_id(2)
+        h = batch * H + head + tl.arange(0, 64)
+        d = tl.arange(0, 512)
+        pos = split * BK + tl.arange(0, BK)
+        idx = tl.load(Indices + batch * TOPK + pos, pos < TOPK, -1)
         valid = (idx >= 0) & (idx < N)
-        idx = gl.where(valid, idx, 0)
-        page = (idx // 64).to(gl.int64) * STRIDE
+        idx = tl.where(valid, idx, 0)
+        page = (idx // 64).to(tl.int64) * STRIDE
         slot = idx % 64
         offset = page + slot * 576
-        policy: gl.constexpr = "evict_first" if N > 131072 else ""
-        scales = gl.load(KS + page // 8 + 4608 + slot, valid, 0, eviction_policy=policy)
-        async_copy.async_copy_global_to_shared(
-            kv.slice(448, 64, 1),
-            KR + (offset // 2 + 224)[:, None] + d[None, :],
-            valid[:, None],
-            cache_modifier=".cg",
+        K = K.to(tl.pointer_type(tl.float8e4nv))
+        KS = KS.to(tl.pointer_type(tl.uint64))
+        KR = KR.to(tl.pointer_type(tl.bfloat16))
+        exps = tl.load(KS + page // 8 + 4608 + slot, valid, 0)
+        sk = tle.gpu.alloc([BK, 512], tl.bfloat16, scope=tle.gpu.smem)
+        sp = tle.gpu.alloc([64, BK], tl.bfloat16, scope=tle.gpu.smem)
+        scores = tl.full((64, BK), 0, tl.float32)
+        for band in tl.static_range(4):
+            col = band * 128 + tl.arange(0, 128)
+            q = tl.load(Q + h[:, None] * 448 + col[None, :], col[None, :] < 448, 0.0)
+            qs = tl.load(
+                QS + h[:, None] * 7 + (col // 64)[None, :], col[None, :] < 448, 0.0
+            )
+            k = tl.load(
+                K + offset[:, None] + col[None, :],
+                valid[:, None] & (col[None, :] < 448),
+                0.0,
+            )
+            exp = ((exps[:, None] >> ((col // 64) * 8)[None, :]) & 255).to(tl.int32)
+            ks = tl.maximum(exp << 23, 0x00400000).to(tl.float32, bitcast=True)
+            qbf = (q.to(tl.float32) * qs).to(tl.bfloat16)
+            kbf = (k.to(tl.float32) * ks).to(tl.bfloat16)
+            if band == 3:
+                qr = tl.load(
+                    QR + h[:, None] * 64 + (col % 64)[None, :], col[None, :] >= 448, 0.0
+                )
+                kr = tl.load(
+                    KR + (offset // 2 + 224)[:, None] + (col % 64)[None, :],
+                    valid[:, None] & (col[None, :] >= 448),
+                    0.0,
+                )
+                qbf = tl.where(col[None, :] < 448, qbf, qr)
+                kbf = tl.where(col[None, :] < 448, kbf, kr)
+            tile = tle_subslice(sk, [0, band * 128], [BK, 128])
+            tl.store(tle.gpu.local_ptr(tile), kbf)
+            scores = tl.dot(qbf, tl.trans(kbf), scores)
+        scores *= scale * 1.4426950408889634
+        scores = tl.where(valid[None, :], scores, -float("inf"))
+        maximum = tl.max(scores, 1)
+        prob = tl.exp2(
+            scores - tl.where(maximum == -float("inf"), 0.0, maximum)[:, None]
         )
-        async_copy.async_copy_global_to_shared(
-            q.slice(448, 64, 1), QR + h[:, None] * 64 + d[None, :], cache_modifier=".cg"
+        denom = tl.sum(prob, 1)
+        safe = tl.where(denom > 0.0, denom, 1.0)
+        tl.store(tle.gpu.local_ptr(sp), prob.to(tl.bfloat16))
+        tl.debug_barrier()
+        rows = (batch * SPLITS + split) * H + head + tl.arange(0, 64)
+        output = tle.gpu.wgmma(sp, sk)
+        output = tle.gpu.wgmma_wait(0, output)
+        tl.store(
+            Output + rows[:, None] * 512 + d[None, :], output * (1.0 / safe)[:, None]
         )
-        async_copy.commit_group()
-        bf_band(Q, QS, K, q, kv, h, offset, valid, scales, layout, policy, 0, 256)
-        bf_band(Q, QS, K, q, kv, h, offset, valid, scales, layout, policy, 256, 128)
-        bf_band(Q, QS, K, q, kv, h, offset, valid, scales, layout, policy, 384, 64)
-        async_copy.wait_group(0)
-        hopper.fence_async_shared()
-        gl.thread_barrier()
-        zero_scores = gl.full((64, BK), 0, gl.float32, layout=gl.constexpr(qkl))
-        score = hopper.warpgroup_mma(
-            q, kv.permute((1, 0)), zero_scores, use_acc=False
-        ) * (scale * 1.4426950408889634)
-        score = gl.where(
-            gl.convert_layout(valid, gl.constexpr(SliceLayout(0, qkl)))[None, :],
-            score,
-            -float("inf"),
-        )
-        m = gl.max(score, 1)
-        prob = gl.exp2(score - gl.where(m == -float("inf"), 0.0, m)[:, None])
-        denom = gl.sum(prob, 1)
-        safe = gl.where(denom == 0.0, 1.0, denom)
-        p.store(prob.to(gl.bfloat16))
-        hopper.fence_async_shared()
-        gl.thread_barrier()
-        zo = gl.full((64, 512), 0, gl.float32, layout=gl.constexpr(pvl))
-        output = hopper.warpgroup_mma(p, kv, zo, use_acc=False)
-        publish(Output, row_out, output, 1.0 / safe, 0, 512, SPLITS == 1)
-        rows = row_out + gl.arange(0, 64, layout=gl.constexpr(SliceLayout(1, qkl)))
-        gl.store(
+        tl.store(
             L + rows,
-            gl.where(
+            tl.where(
                 denom > 0.0,
-                m * 0.6931471805599453 + gl.log(safe),
+                maximum * 0.6931471805599453 + tl.log(safe),
                 float("inf") if SPLITS == 1 else -float("inf"),
             ),
         )
@@ -3777,7 +3588,7 @@ else:
     ):
         hb = tl.program_id(1)
         b, output_row, _, count = model1_block_info(
-            tl.program_id(0),
+            tl.program_id(0).to(tl.int64),
             tl.program_id(2),
             tl.cdiv(T, BK),
             S,
@@ -3942,7 +3753,7 @@ else:
     ):
         hb = tl.program_id(1)
         b, output_row, _, count = model1_block_info(
-            tl.program_id(0),
+            tl.program_id(0).to(tl.int64),
             tl.program_id(2),
             tl.cdiv(T, BK),
             S,
@@ -4283,7 +4094,7 @@ else:
         STRIDE: tl.constexpr,
         SCALE: tl.constexpr,
     ):
-        rows = b * H + group * 16 + tl.arange(0, 16)
+        rows = b.to(tl.int64) * H + group * 16 + tl.arange(0, 16)
         d = tl.arange(0, 512)
         q = tl.load(Q + rows[:, None] * 448 + d[None, :], d[None, :] < 448, 0.0)
         qs = tl.load(QS + rows[:, None] * 7 + d[None, :] // 64, d[None, :] < 448, 0.0)
@@ -4425,50 +4236,41 @@ else:
                 Lse + outrow, tl.where(total > 0.0, safe + tl.log(total), float("inf"))
             )
 
-    @gluon.jit
+    @triton.jit
     def merge(
         o_part,
         lse_part,
         out,
         lse,
-        H: gl.constexpr,
-        SPLITS: gl.constexpr,
-        D: gl.constexpr,
+        H: tl.constexpr,
+        SPLITS: tl.constexpr,
+        D: tl.constexpr,
     ):
-        # A warp covers four splits and eight column vectors. Reductions use
-        # warp shuffles, including for padded and completely empty splits.
-        layout: gl.constexpr = BlockedLayout([1, 8], [4, 8], [1, 2], [1, 0])
-        ss = gl.arange(
-            0,
-            triton.next_power_of_2(SPLITS),
-            layout=gl.constexpr(SliceLayout(1, layout)),
-        )
-        d = gl.program_id(2) * D + gl.arange(
-            0, D, layout=gl.constexpr(SliceLayout(0, layout))
-        )
-        batch = gl.program_id(0).to(gl.int64)
-        h = gl.program_id(1)
+        ss = tl.arange(0, triton.next_power_of_2(SPLITS))
+        d = tl.program_id(2) * D + tl.arange(0, D)
+        batch = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1)
         rows = (batch * SPLITS + ss) * H + h
-        stats = gl.load(lse_part + rows, ss < SPLITS, -float("inf"))
-        stats = gl.where(stats == float("inf"), -float("inf"), stats)
-        m = gl.max(stats, 0)
+        stats = tl.load(lse_part + rows, ss < SPLITS, -float("inf"))
+        stats = tl.where(stats == float("inf"), -float("inf"), stats)
+        m = tl.max(stats, 0)
         empty = m == -float("inf")
-        w = gl.exp(stats - gl.where(empty, 0.0, m))
-        denom = gl.sum(w, 0)
-        v = gl.load(
+        w = tl.exp(stats - tl.where(empty, 0.0, m))
+        denom = tl.sum(w, 0)
+        v = tl.load(
             o_part + rows[:, None] * 512 + d[None, :],
             ss[:, None] < SPLITS,
             0.0,
             eviction_policy="evict_first",
         )
-        merged_value = gl.sum(v.to(gl.float32) * w[:, None], 0) / gl.where(
+        merged_value = tl.sum(v.to(tl.float32) * w[:, None], 0) / tl.where(
             empty, 1.0, denom
         )
-        gl.store(out + (batch * H + h) * 512 + d, merged_value.to(gl.bfloat16))
-        gl.store(
+        tl.store(out + (batch * H + h) * 512 + d, merged_value.to(tl.bfloat16))
+        tl.store(
             lse + batch * H + h,
-            gl.where(empty, float("inf"), m + gl.log(denom)),
-            mask=gl.program_id(2) == 0,
+            tl.where(empty, float("inf"), m + tl.log(denom)),
+            mask=tl.program_id(2) == 0,
         )
 
     @triton.jit
@@ -4620,745 +4422,6 @@ else:
                         SCALE,
                     )
 
-    @gluon.jit
-    def load_model1_short_group(
-        Q, QS, K, h, token_offsets, columns, exponents, valid, group: gl.constexpr
-    ):
-        query = gl.load(Q + (h * 448 + group * 64)[:, None] + columns[None, :])
-        key = gl.load(
-            K + (token_offsets + group * 64)[:, None] + columns[None, :],
-            valid[:, None],
-            0.0,
-        )
-        query_scale = gl.load(QS + h * 7 + group)
-        exponent = ((exponents >> (group * 8)) & 255).to(gl.int32)
-        key_scale = gl.maximum(exponent << 23, 0x00400000).to(gl.float32, bitcast=True)
-        return query, key, query_scale, key_scale
-
-    @gluon.jit
-    def model1_short_heads(
-        Q,
-        QR,
-        QS,
-        Cache,
-        Indices,
-        Out,
-        Lse,
-        H: gl.constexpr,
-        T: gl.constexpr,
-        N: gl.constexpr,
-        STRIDE: gl.constexpr,
-        SCALE: gl.constexpr,
-        DV: gl.constexpr,
-    ):
-        BH: gl.constexpr = 16
-        BK: gl.constexpr = 128
-        acc: gl.constexpr = NVMMADistributedLayout([2, 0], [1, 8], [16, 8])
-        ar: gl.constexpr = gl.DotOperandLayout(0, acc, 4)
-        br: gl.constexpr = gl.DotOperandLayout(1, acc, 4)
-        ah: gl.constexpr = gl.DotOperandLayout(0, acc, 2)
-        bh: gl.constexpr = gl.DotOperandLayout(1, acc, 2)
-        ld: gl.constexpr = BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0])
-        rv: gl.constexpr = SliceLayout(1, ld)
-        cv: gl.constexpr = SliceLayout(0, ld)
-        batch = gl.program_id(0)
-        h = (
-            batch * H
-            + gl.program_id(1) * BH
-            + gl.arange(0, BH, layout=gl.constexpr(rv))
-        )
-        col0 = gl.program_id(2) * DV
-        pos = gl.arange(0, BK, layout=gl.constexpr(rv))
-        idx = gl.load(Indices + batch * T + pos, pos < T, -1)
-        valid = (idx >= 0) & (idx < N)
-        idx = gl.where(valid, idx, 0)
-        page = (idx // 64).to(gl.int64) * STRIDE
-        off = page + idx % 64 * 576
-        d = gl.arange(0, 64, layout=gl.constexpr(cv))
-        e = gl.load(
-            Cache.to(gl.pointer_type(gl.uint64)) + page // 8 + 4608 + idx % 64, valid, 0
-        )
-        fp8 = Cache.to(gl.pointer_type(gl.float8e4nv))
-        rope = Cache.to(gl.pointer_type(gl.bfloat16))
-        qr = gl.load(QR + h[:, None] * 64 + d[None, :])
-        kr = gl.load(rope + (off // 2 + 224)[:, None] + d[None, :], valid[:, None], 0.0)
-        zero = gl.full((BH, BK), 0, gl.float32, layout=gl.constexpr(acc))
-        LOOKAHEAD: gl.constexpr = 3 if DV == 256 else 7
-        qk_tiles = ()
-        for g in gl.static_range(LOOKAHEAD):
-            qk_tiles += (load_model1_short_group(Q, QS, fp8, h, off, d, e, valid, g),)
-        score = hopper.mma_v2(
-            gl.convert_layout(qr, gl.constexpr(ah)),
-            gl.convert_layout(gl.permute(kr, (1, 0)), gl.constexpr(bh)),
-            zero,
-        )
-        for g in gl.static_range(7):
-            query, key, qs, ks = qk_tiles[g]
-            dot = hopper.mma_v2(
-                gl.convert_layout(query, gl.constexpr(ar)),
-                gl.convert_layout(gl.permute(key, (1, 0)), gl.constexpr(br)),
-                zero,
-            )
-            score += (
-                dot
-                * gl.convert_layout(qs, gl.constexpr(SliceLayout(1, acc)))[:, None]
-                * gl.convert_layout(ks, gl.constexpr(SliceLayout(0, acc)))[None, :]
-            )
-            if g + LOOKAHEAD < 7:
-                qk_tiles += (
-                    load_model1_short_group(
-                        Q, QS, fp8, h, off, d, e, valid, g + LOOKAHEAD
-                    ),
-                )
-        score = gl.where(
-            gl.convert_layout(valid, gl.constexpr(SliceLayout(0, acc)))[None, :],
-            score * (SCALE * 1.4426950408889634),
-            -float("inf"),
-        )
-        m = gl.max(score, 1)
-        p = gl.exp2(score - gl.where(m == -float("inf"), 0.0, m)[:, None])
-        den = gl.sum(p, 1)
-        oh = (
-            batch * H
-            + gl.program_id(1) * BH
-            + gl.arange(0, BH, layout=gl.constexpr(SliceLayout(1, acc)))
-        )
-        prob = gl.convert_layout(p.to(gl.bfloat16), gl.constexpr(ah))
-        inv = 1.0 / gl.where(den > 0.0, den, 1.0)
-        oc = gl.arange(0, 64, gl.constexpr(SliceLayout(0, acc)))
-        # Each CTA already has the selected keys and their scales from QK.
-        for tile in gl.static_range(512 // DV):
-            if gl.program_id(2) == tile:
-                for g in gl.static_range(tile * (DV // 64), (tile + 1) * (DV // 64)):
-                    if g == 7:
-                        value = kr
-                    else:
-                        value = (
-                            qk_tiles[g][1].to(gl.float32) * qk_tiles[g][3][:, None]
-                        ).to(gl.bfloat16)
-                    ans = hopper.mma_v2(
-                        prob,
-                        gl.convert_layout(value, gl.constexpr(bh)),
-                        gl.full((BH, 64), 0.0, gl.float32, layout=gl.constexpr(acc)),
-                    )
-                    gl.store(
-                        Out + oh[:, None] * 512 + g * 64 + oc[None, :],
-                        ans * inv[:, None],
-                    )
-        if col0 == 0:
-            gl.store(
-                Lse + oh,
-                gl.where(den > 0.0, m * 0.6931471805599453 + gl.log(den), float("inf")),
-            )
-
-    @glc.builtin
-    def model1_shared_ptr(buf, _semantic=None):
-        builder = _semantic.builder
-        ty = gl.pointer_type(buf.dtype, 3)
-        zero = _semantic.to_tensor(0).handle
-        op = builder.create_local_pointers(
-            ty.to_ir(builder), buf.handle, *([zero] * len(buf.shape))
-        )
-        return gl.tensor(op.get_result(0), ty)
-
-    @gluon.jit
-    def key_half_address(tile, half, offset: gl.constexpr = 0):
-        lo = model1_shared_ptr(tile.index(offset)).to(gl.uint64).to(gl.uint32)
-        hi = model1_shared_ptr(tile.index(offset + 1)).to(gl.uint64).to(gl.uint32)
-        return gl.where(half != 0, hi, lo)
-
-    @gluon.jit
-    def publish_model1_probabilities(tile, weights):
-        # stmatrix applies the token permutation used by sparse_fp8_transpose_asm.
-        gl.inline_asm_elementwise(
-            """
-            {
-            .reg .b16 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;
-            .reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;
-            .reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;
-            mov.u32 tid, %tid.x;
-            and.b32 warp_off, tid, 96;
-            shl.b32 warp_off, warp_off, 5;
-            and.b32 row_off, tid, 15;
-            shl.b32 row_off, row_off, 6;
-            or.b32 common, warp_off, row_off;
-            and.b32 tmp, tid, 16;
-            or.b32 common, common, tmp;
-            cvt.rn.satfinite.e4m3x2.f32 h0, $33, $32;
-            cvt.rn.satfinite.e4m3x2.f32 h1, $35, $34;
-            cvt.rn.satfinite.e4m3x2.f32 h2, $37, $36;
-            cvt.rn.satfinite.e4m3x2.f32 h3, $39, $38;
-            cvt.rn.satfinite.e4m3x2.f32 h4, $41, $40;
-            cvt.rn.satfinite.e4m3x2.f32 h5, $43, $42;
-            cvt.rn.satfinite.e4m3x2.f32 h6, $45, $44;
-            cvt.rn.satfinite.e4m3x2.f32 h7, $47, $46;
-            cvt.rn.satfinite.e4m3x2.f32 h8, $49, $48;
-            cvt.rn.satfinite.e4m3x2.f32 h9, $51, $50;
-            cvt.rn.satfinite.e4m3x2.f32 h10, $53, $52;
-            cvt.rn.satfinite.e4m3x2.f32 h11, $55, $54;
-            cvt.rn.satfinite.e4m3x2.f32 h12, $57, $56;
-            cvt.rn.satfinite.e4m3x2.f32 h13, $59, $58;
-            cvt.rn.satfinite.e4m3x2.f32 h14, $61, $60;
-            cvt.rn.satfinite.e4m3x2.f32 h15, $63, $62;
-            mov.b32 a0, {h0, h2};
-            mov.b32 a1, {h1, h3};
-            mov.b32 a2, {h4, h6};
-            mov.b32 a3, {h5, h7};
-            mov.b32 b0, {h8, h10};
-            mov.b32 b1, {h9, h11};
-            mov.b32 b2, {h12, h14};
-            mov.b32 b3, {h13, h15};
-            shr.u32 tmp, common, 7;
-            and.b32 tmp, tmp, 3;
-            shl.b32 tmp, tmp, 4;
-            xor.b32 phys0, common, tmp;
-            add.u32 common, common, 32;
-            shr.u32 tmp, common, 7;
-            and.b32 tmp, tmp, 3;
-            shl.b32 tmp, tmp, 4;
-            xor.b32 phys1, common, tmp;
-            add.u32 addr0, $64, phys0;
-            add.u32 addr1, $64, phys1;
-            stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};
-            stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};
-            fence.proxy.async.shared::cta;
-            mov.u32 $0, $64;
-            }
-            """,
-            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-            "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r",
-            [weights, model1_shared_ptr(tile).to(gl.uint64).to(gl.uint32)],
-            gl.uint32,
-            is_pure=False,
-            pack=32,
-        )
-
-    @gluon.jit
-    def model1_load_128_keys(
-        Cache,
-        Idx,
-        sk,
-        kr,
-        ks,
-        vt,
-        bars,
-        panel_ready,
-        Flags,
-        H: gl.constexpr,
-        N: gl.constexpr,
-        PAGE_STRIDE: gl.constexpr,
-    ):
-        lane_ids = gl.arange(0, 256, gl.constexpr(BlockedLayout([1], [32], [8], [0])))
-        b = gl.program_id(0)
-        half = gl.inline_asm_elementwise(
-            "{.reg .b32 t; mov.u32 t,%tid.x; shr.u32 t,t,7; and.b32 $0,t,1;}",
-            "=r,r",
-            [lane_ids],
-            gl.uint32,
-            is_pure=True,
-            pack=1,
-        )
-        keys_addr = key_half_address(sk, half, 0)
-        data = gl.inline_asm_elementwise(
-            gather_topk128_asm(PAGE_STRIDE),
-            "=r,r,l,l,r,r,r,r,r,r,r,r",
-            [
-                lane_ids,
-                Cache.to(gl.uint64),
-                (Idx + b.to(gl.int64) * 128).to(gl.uint64),
-                model1_shared_ptr(sk.index(0)).to(gl.uint64).to(gl.uint32),
-                model1_shared_ptr(kr.index(0)).to(gl.uint64).to(gl.uint32),
-                model1_shared_ptr(ks.index(0)).to(gl.uint64).to(gl.uint32),
-                N,
-                model1_shared_ptr(panel_ready.index(0)).to(gl.uint64).to(gl.uint32),
-                model1_shared_ptr(panel_ready.index(1)).to(gl.uint64).to(gl.uint32),
-                model1_shared_ptr(panel_ready.index(2)).to(gl.uint64).to(gl.uint32),
-                model1_shared_ptr(panel_ready.index(3)).to(gl.uint64).to(gl.uint32),
-            ],
-            gl.uint32,
-            is_pure=False,
-            pack=1,
-        )
-        risk = gl.max(data, 0).to(gl.int32)
-        values_addr = key_half_address(vt, half, 0)
-        gl.thread_barrier()
-        for g in gl.static_range(4):
-            for w in gl.static_range(1 if g == 3 else 2):
-                gl.inline_asm_elementwise(
-                    sparse_fp8_transpose_asm(),
-                    "=r,r,r,r,r",
-                    [lane_ids, keys_addr + g * 8192, values_addr + g * 8192, w * 4],
-                    gl.uint32,
-                    is_pure=False,
-                    pack=1,
-                )
-        gl.thread_barrier()
-        hopper.fence_async_shared()
-        hopper.mbarrier.arrive(bars.index(2))
-        gl.store(Flags + (b * (H // 64) + gl.program_id(1)) * 3, risk)
-
-    @gluon.jit
-    def store_model1_output_band(
-        result, tile, offset: gl.constexpr, width: gl.constexpr
-    ):
-        bands = gl.reshape(result, (64, width // 16, 2, 8))
-        natural = gl.reshape(gl.permute(bands, (0, 1, 3, 2)), (64, width))
-        tile.slice(offset, width, 1).store(natural)
-
-    @gluon.jit
-    def model1_compute_128(
-        Q,
-        QR,
-        QS,
-        Out,
-        L,
-        Flags,
-        sq,
-        qr,
-        qm,
-        sk,
-        kr,
-        ks,
-        vt,
-        sp,
-        pr,
-        maxima,
-        denominators,
-        bars,
-        panel_ready,
-        HALF: gl.constexpr,
-        H: gl.constexpr,
-        SCALE: gl.constexpr,
-        WIDE_OFFSETS: gl.constexpr,
-    ):
-        ld: gl.constexpr = BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
-        lr: gl.constexpr = SliceLayout(1, ld)
-        lc: gl.constexpr = SliceLayout(0, ld)
-        score_layout: gl.constexpr = NVMMADistributedLayout(
-            [3, 0], [4, 1], [16, 64, 32]
-        )
-        rope_layout: gl.constexpr = NVMMADistributedLayout([3, 0], [4, 1], [16, 64, 16])
-        value_layout: gl.constexpr = NVMMADistributedLayout(
-            [3, 0], [4, 1], [16, 128, 32]
-        )
-        b = gl.program_id(0)
-        hb = gl.program_id(1)
-        row = b.to(gl.int64) if WIDE_OFFSETS else b
-        h = row * H + hb * 64 + HALF * 32 + gl.arange(0, 32, gl.constexpr(lr))
-        d = gl.arange(0, 512, gl.constexpr(lc))
-        g = gl.arange(0, 8, gl.constexpr(lc))
-        q = gl.load(Q + h[:, None] * 448 + d[None, :], d[None, :] < 448, 0.0)
-        scales = gl.load(QS + h[:, None] * 7 + g[None, :], g[None, :] < 7, 0.0)
-        unit = gl.max(scales, 1)
-        # For normal positive scales, exponent deltas of zero, one and two
-        # are exact FP16 gains. Check all mantissa bits before using this path.
-        difference = unit[:, None].to(gl.uint32, bitcast=True) - scales.to(
-            gl.uint32, bitcast=True
-        )
-        incompatible = ((difference & 0x007FFFFF) != 0) | (difference > 0x01000000)
-        unsafe = gl.max(((g[None, :] < 7) & incompatible).to(gl.int32), 1)
-        unsafe |= (unit < 4.70197740328915e-38).to(gl.int32)
-        group_flag = Flags + (b * (H // 64) + hb) * 3 + 1 + HALF
-        gl.store(group_flag, gl.max(unsafe, 0))
-        delta = gl.minimum(difference >> 23, 2)
-        fp16_ratio = ((15 - delta) << 10).to(gl.uint16).to(gl.float16, bitcast=True)
-        tiled: gl.constexpr = BlockedLayout([1, 1, 8], [4, 1, 8], [4, 1, 1], [2, 1, 0])
-        ratios = gl.expand_dims(
-            gl.convert_layout(fp16_ratio, gl.constexpr(SliceLayout(2, tiled))), 2
-        )
-        fp16 = gl.convert_layout(
-            gl.reshape(q.to(gl.float16), (32, 8, 64)), gl.constexpr(tiled)
-        )
-        normalized = gl.reshape((fp16 * ratios).to(gl.float8e4nv), (32, 512))
-        sq.slice(HALF * 32, 32, 0).store(normalized)
-        qm.slice(HALF * 32, 32, 0).store(unit)
-        rd = gl.arange(0, 64, gl.constexpr(lc))
-        qr.slice(HALF * 32, 32, 0).store(gl.load(QR + h[:, None] * 64 + rd[None, :]))
-        hopper.fence_async_shared()
-        gl.thread_barrier()
-        hopper.mbarrier.arrive(bars.index(0))
-        hopper.mbarrier.wait(bars.index(0), phase=0)
-        key = sk.index(HALF)
-        hopper.mbarrier.wait(panel_ready.index(0), phase=0)
-        score = hopper.warpgroup_mma(
-            sq.slice(0, 128, 1),
-            key.slice(0, 128, 1).permute((1, 0)),
-            gl.full((64, 64), 0.0, gl.float32, layout=gl.constexpr(score_layout)),
-            use_acc=False,
-            is_async=True,
-        )
-        hopper.mbarrier.wait(panel_ready.index(1), phase=0)
-        score = hopper.warpgroup_mma(
-            sq.slice(128, 128, 1),
-            key.slice(128, 128, 1).permute((1, 0)),
-            score,
-            is_async=True,
-        )
-        hopper.mbarrier.wait(panel_ready.index(2), phase=0)
-        score = hopper.warpgroup_mma(
-            sq.slice(256, 128, 1),
-            key.slice(256, 128, 1).permute((1, 0)),
-            score,
-            is_async=True,
-        )
-        hopper.mbarrier.wait(panel_ready.index(3), phase=0)
-        score = hopper.warpgroup_mma(
-            sq.slice(384, 64, 1),
-            key.slice(384, 64, 1).permute((1, 0)),
-            score,
-            is_async=True,
-        )
-        rope = hopper.warpgroup_mma(
-            qr,
-            kr.index(HALF).permute((1, 0)),
-            gl.full((64, 64), 0.0, gl.float32, layout=gl.constexpr(rope_layout)),
-            use_acc=False,
-            is_async=True,
-        )
-        score, rope = hopper.warpgroup_mma_wait(0, deps=(score, rope))
-        kfactor = ks.index(HALF).load(gl.constexpr(SliceLayout(0, score_layout)))
-        logits = gl.where(
-            kfactor[None, :] >= 0.0,
-            (
-                score
-                * qm.load(gl.constexpr(SliceLayout(1, score_layout)))[:, None]
-                * kfactor[None, :]
-                + gl.convert_layout(rope, gl.constexpr(score_layout))
-            )
-            * (SCALE * 1.4426950408889634),
-            -float("inf"),
-        )
-        m = gl.max(logits, 1)
-        maxima.index(HALF).store(m)
-        gl.thread_barrier()
-        hopper.mbarrier.arrive(bars.index(1))
-        hopper.mbarrier.wait(bars.index(1), phase=0)
-        top = gl.maximum(
-            m, maxima.index(1 - HALF).load(gl.constexpr(SliceLayout(1, score_layout)))
-        )
-        p = gl.exp2(logits - gl.where(top == -float("inf"), 0.0, top)[:, None])
-        denominators.index(HALF).store(gl.sum(p, 1))
-        k0 = ks.index(0).load(gl.constexpr(SliceLayout(0, score_layout)))
-        k1 = ks.index(1).load(gl.constexpr(SliceLayout(0, score_layout)))
-        peak = gl.max(gl.maximum(k0, k1), 0)
-        floor = gl.min(
-            gl.minimum(
-                gl.where(k0 > 0.0, k0, float("inf")),
-                gl.where(k1 > 0.0, k1, float("inf")),
-            ),
-            0,
-        )
-        if HALF == 0:
-            gl.store(group_flag, 1, mask=peak > 4.0 * floor)
-        value_scale = peak * (1.0 / 448.0)
-        value_scale = gl.where(value_scale > 0.0, value_scale, 1.0)
-        weighted = p * (gl.maximum(kfactor, 0.0)[None, :] / value_scale)
-        publish_model1_probabilities(sp.index(HALF), weighted)
-        pr.index(HALF).store(p.to(gl.bfloat16))
-        gl.thread_barrier()
-        hopper.fence_async_shared()
-        hopper.mbarrier.arrive(bars.index(2))
-        hopper.mbarrier.wait(bars.index(2), phase=0)
-        den = denominators.index(0).load(
-            gl.constexpr(SliceLayout(1, value_layout))
-        ) + denominators.index(1).load(gl.constexpr(SliceLayout(1, value_layout)))
-        inv = 1.0 / gl.where(den > 0.0, den, 1.0)
-        first_head = b * H + hb * 64
-        # Both score products and the value transpose have finished using the key tile.
-        s_out = sk.index(HALF)._reinterpret(
-            gl.bfloat16, [64, 256], gl.constexpr(NVMMASharedLayout(128, 16))
-        )
-        for t in gl.static_range(2):
-            if HALF == 0 or t == 0:
-                value = hopper.warpgroup_mma(
-                    sp.index(0),
-                    vt.index(0).slice(HALF * 256 + t * 128, 128, 0).permute((1, 0)),
-                    gl.full(
-                        (64, 128), 0.0, gl.float32, layout=gl.constexpr(value_layout)
-                    ),
-                    use_acc=False,
-                    is_async=True,
-                )
-                value = hopper.warpgroup_mma(
-                    sp.index(1),
-                    vt.index(1).slice(HALF * 256 + t * 128, 128, 0).permute((1, 0)),
-                    value,
-                    is_async=True,
-                )
-                value = hopper.warpgroup_mma_wait(0, deps=(value,))
-                store_model1_output_band(
-                    (value * (inv * value_scale)[:, None]).to(gl.bfloat16),
-                    s_out,
-                    t * 128,
-                    128,
-                )
-                if t == 0:
-                    gl.thread_barrier()
-                    hopper.fence_async_shared()
-                    hopper.tma.async_copy_shared_to_global(
-                        Out, [first_head, HALF * 256], s_out.slice(0, 128, 1)
-                    )
-            else:
-                last = hopper.warpgroup_mma(
-                    sp.index(0),
-                    vt.index(0).slice(384, 64, 0).permute((1, 0)),
-                    gl.full(
-                        (64, 64), 0.0, gl.float32, layout=gl.constexpr(score_layout)
-                    ),
-                    use_acc=False,
-                    is_async=True,
-                )
-                last = hopper.warpgroup_mma(
-                    sp.index(1),
-                    vt.index(1).slice(384, 64, 0).permute((1, 0)),
-                    last,
-                    is_async=True,
-                )
-                last = hopper.warpgroup_mma_wait(0, deps=(last,))
-                store_model1_output_band(
-                    (
-                        last
-                        * gl.convert_layout(
-                            inv * value_scale,
-                            gl.constexpr(SliceLayout(1, score_layout)),
-                        )[:, None]
-                    ).to(gl.bfloat16),
-                    s_out,
-                    128,
-                    64,
-                )
-        if HALF == 1:
-            tail = hopper.warpgroup_mma(
-                pr.index(0),
-                kr.index(0),
-                gl.full((64, 64), 0.0, gl.float32, layout=gl.constexpr(rope_layout)),
-                use_acc=False,
-                is_async=True,
-            )
-            tail = hopper.warpgroup_mma(pr.index(1), kr.index(1), tail, is_async=True)
-            tail = hopper.warpgroup_mma_wait(0, deps=(tail,))
-            s_out.slice(192, 64, 1).store(
-                (
-                    tail
-                    * gl.convert_layout(inv, gl.constexpr(SliceLayout(1, rope_layout)))[
-                        :, None
-                    ]
-                ).to(gl.bfloat16)
-            )
-        else:
-            oh = first_head + gl.arange(
-                0, 64, gl.constexpr(SliceLayout(1, score_layout))
-            )
-            norm = gl.convert_layout(den, gl.constexpr(SliceLayout(1, score_layout)))
-            gl.store(
-                L + oh,
-                gl.where(
-                    norm > 0.0, top * 0.6931471805599453 + gl.log(norm), float("inf")
-                ),
-            )
-
-        gl.thread_barrier()
-        hopper.fence_async_shared()
-        hopper.tma.async_copy_shared_to_global(
-            Out, [first_head, HALF * 256 + 128], s_out.slice(128, 128, 1)
-        )
-        hopper.tma.store_wait(0)
-
-    @gluon.jit
-    def model1_topk128(
-        Q,
-        QR,
-        QS,
-        Cache,
-        Idx,
-        Out,
-        L,
-        Flags,
-        H: gl.constexpr,
-        N: gl.constexpr,
-        PAGE_STRIDE: gl.constexpr,
-        SCALE: gl.constexpr,
-        WIDE_OFFSETS: gl.constexpr,
-    ):
-        key_layout: gl.constexpr = NVMMASharedLayout(128, 8)
-        transposed_layout: gl.constexpr = NVMMASharedLayout(64, 8)
-        bf16_layout: gl.constexpr = NVMMASharedLayout(128, 16)
-        scalar_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
-        sq = gl.allocate_shared_memory(
-            gl.float8e4nv, (64, 512), gl.constexpr(key_layout)
-        )
-        qr = gl.allocate_shared_memory(gl.bfloat16, (64, 64), gl.constexpr(bf16_layout))
-        qm = gl.allocate_shared_memory(gl.float32, (64,), gl.constexpr(scalar_layout))
-        sk = gl.allocate_shared_memory(
-            gl.float8e4nv, (2, 64, 512), gl.constexpr(key_layout)
-        )
-        kr = gl.allocate_shared_memory(
-            gl.bfloat16, (2, 64, 64), gl.constexpr(bf16_layout)
-        )
-        ks = gl.allocate_shared_memory(gl.float32, (2, 64), gl.constexpr(scalar_layout))
-        vt = gl.allocate_shared_memory(
-            gl.float8e4nv, (2, 512, 64), gl.constexpr(transposed_layout)
-        )
-        sp = gl.allocate_shared_memory(
-            gl.float8e4nv, (2, 64, 64), gl.constexpr(transposed_layout)
-        )
-        pr = gl.allocate_shared_memory(
-            gl.bfloat16, (2, 64, 64), gl.constexpr(bf16_layout)
-        )
-        maxima = gl.allocate_shared_memory(
-            gl.float32, (2, 64), gl.constexpr(scalar_layout)
-        )
-        denominators = gl.allocate_shared_memory(
-            gl.float32, (2, 64), gl.constexpr(scalar_layout)
-        )
-        bars = gl.allocate_shared_memory(
-            gl.int64, (3, 1), gl.constexpr(hopper.mbarrier.MBarrierLayout())
-        )
-        for i in gl.static_range(3):
-            hopper.mbarrier.init(bars.index(i), count=3 if i == 2 else 2)
-        panel_ready = gl.allocate_shared_memory(
-            gl.int64, (4, 1), gl.constexpr(hopper.mbarrier.MBarrierLayout())
-        )
-        for z in gl.static_range(4):
-            hopper.mbarrier.init(panel_ready.index(z), count=8)
-        gl.warp_specialize(
-            [
-                (
-                    model1_compute_128,
-                    (
-                        Q,
-                        QR,
-                        QS,
-                        Out,
-                        L,
-                        Flags,
-                        sq,
-                        qr,
-                        qm,
-                        sk,
-                        kr,
-                        ks,
-                        vt,
-                        sp,
-                        pr,
-                        maxima,
-                        denominators,
-                        bars,
-                        panel_ready,
-                        0,
-                        H,
-                        SCALE,
-                        WIDE_OFFSETS,
-                    ),
-                ),
-                (
-                    model1_compute_128,
-                    (
-                        Q,
-                        QR,
-                        QS,
-                        Out,
-                        L,
-                        Flags,
-                        sq,
-                        qr,
-                        qm,
-                        sk,
-                        kr,
-                        ks,
-                        vt,
-                        sp,
-                        pr,
-                        maxima,
-                        denominators,
-                        bars,
-                        panel_ready,
-                        1,
-                        H,
-                        SCALE,
-                        WIDE_OFFSETS,
-                    ),
-                ),
-                (
-                    model1_load_128_keys,
-                    (
-                        Cache,
-                        Idx,
-                        sk,
-                        kr,
-                        ks,
-                        vt,
-                        bars,
-                        panel_ready,
-                        Flags,
-                        H,
-                        N,
-                        PAGE_STRIDE,
-                    ),
-                ),
-            ],
-            [4, 8],
-            [192, 64],
-        )
-
-    @triton.jit
-    def model1_topk128_repair(
-        Q,
-        QR,
-        QS,
-        K,
-        E,
-        KR,
-        Idx,
-        Out,
-        L,
-        Flags,
-        B,
-        N,
-        T: tl.constexpr,
-        H: tl.constexpr,
-        PAGE_STRIDE: tl.constexpr,
-        SCALE: tl.constexpr,
-    ):
-        slot = tl.program_id(0) * 16 + tl.arange(0, 16)
-        valid = slot < B * (H // 64)
-        bad = (
-            tl.load(Flags + slot * 3, valid, 0)
-            | tl.load(Flags + slot * 3 + 1, valid, 0)
-            | tl.load(Flags + slot * 3 + 2, valid, 0)
-        )
-        if tl.max(bad, 0) == 0:
-            return
-        for g in range(
-            tl.program_id(0) * 16,
-            tl.minimum((tl.program_id(0) + 1) * 16, B * (H // 64)),
-        ):
-            if (
-                tl.load(Flags + g * 3)
-                | tl.load(Flags + g * 3 + 1)
-                | tl.load(Flags + g * 3 + 2)
-            ):
-                for j in tl.static_range(4):
-                    repair_heads(
-                        Q,
-                        QR,
-                        QS,
-                        K,
-                        E,
-                        KR,
-                        Idx,
-                        Out,
-                        L,
-                        g // (H // 64),
-                        g % (H // 64) * 4 + j,
-                        N,
-                        T,
-                        H,
-                        PAGE_STRIDE,
-                        SCALE,
-                    )
-
     model1_short_plans = {}
 
     def model1_attention(
@@ -5420,59 +4483,8 @@ else:
         ):
             raise ValueError("Model1 tensors must share a CUDA device")
 
-        if topk == 128 and batch > 64:
-            out = q_rope.new_empty((batch, 1, heads, 512))
-            lse = q_scale.new_empty((batch, heads, 1))
-            flags = indices.new_empty((batch, heads // 64, 3))
-            desc = TensorDescriptor(
-                out,
-                [batch * heads, 512],
-                [512, 1],
-                [64, 128],
-                NVMMASharedLayout(128, 16),
-            )
-            model1_topk128[(batch, heads // 64)](
-                q,
-                q_rope,
-                q_scale,
-                packed_cache,
-                indices,
-                desc,
-                lse,
-                flags,
-                heads,
-                tokens,
-                packed_cache.stride(0),
-                scale,
-                q.numel() > 0x7FFFFFFF,
-                num_warps=4,
-                ptx_options="--register-usage-level=6",
-                num_stages=1,
-            )
-            keys, exponents, rope, stride, _, _ = cache_views(packed_cache)
-            model1_topk128_repair[(triton.cdiv(batch * (heads // 64), 16),)](
-                q,
-                q_rope,
-                q_scale,
-                keys,
-                exponents.view(torch.uint8),
-                rope,
-                indices,
-                out,
-                lse,
-                flags,
-                batch,
-                tokens,
-                128,
-                heads,
-                stride,
-                scale,
-                num_warps=4,
-                num_stages=1,
-            )
-            return out, lse
-
-        if batch <= 16 and topk <= 640:
+        work = batch * (heads // 64)
+        if (batch <= 16 and topk <= 640) or (work <= 64 and topk <= 128):
             bk = 64 if topk <= 64 else 128
             splits = triton.cdiv(topk, bk)
             grid = (batch, heads // 64, splits)
@@ -5502,27 +4514,6 @@ else:
                 splits,
                 bk,
             )
-            if topk == 128:
-                dv = 64 if batch <= 4 else 128 if batch <= 8 else 256
-                grid = (batch, heads // 16, 512 // dv)
-                args = (
-                    q,
-                    q_rope,
-                    q_scale,
-                    packed_cache,
-                    indices,
-                    out,
-                    lse,
-                    heads,
-                    topk,
-                    tokens,
-                    stride,
-                    scale,
-                    dv,
-                )
-                attention = model1_short_heads
-            else:
-                attention = one_block
             alignment = (
                 q.data_ptr() % 16,
                 q_rope.data_ptr() % 16,
@@ -5532,7 +4523,7 @@ else:
             key = (q.device, batch, heads, scale, tokens, topk, stride, alignment)
             runners = model1_short_plans.get(key)
             if runners is None:
-                main = attention[grid](*args, num_warps=8, num_stages=1)
+                main = one_block[grid](*args, num_warps=8, num_stages=1)
                 reduce = None
                 if splits > 1:
                     reduce = model1_merge_short[(batch, heads, 1)](
@@ -5626,18 +4617,13 @@ else:
             )
             return out, lse
         sm = torch.cuda.get_device_properties(q.device).multi_processor_count
-        work = batch * (heads // 64)
         sm_limit = sm // work
         block = (
             128 if 128 < topk <= 640 and 1 < triton.cdiv(topk, 128) <= sm_limit else 64
         )
         num_blocks = triton.cdiv(topk, block)
         target = max(1, sm_limit)
-        exact = topk <= 128 and work <= 64
-        if exact:
-            block = 64 if topk <= 64 else 128
-            splits = 1
-        elif num_blocks >= 32 and sm < work < 4 * sm and 0 < work % sm <= sm // 4:
+        if num_blocks >= 32 and sm < work < 4 * sm and 0 < work % sm <= sm // 4:
             splits = 2
         else:
             splits = (
@@ -5672,28 +4658,6 @@ else:
             lse = torch.empty((batch, heads), dtype=torch.float32, device=q.device)
             part = out if splits == 1 else out.new_empty((batch, splits, heads, 512))
             stats = lse if splits == 1 else lse.new_empty((batch, splits, heads))
-        if exact:
-            one_block[(batch, heads // 64, splits)](
-                q,
-                q_rope,
-                q_scale,
-                fp8_keys,
-                exponent_words,
-                bf16_keys,
-                indices,
-                part,
-                stats,
-                scale,
-                tokens,
-                topk,
-                page_stride,
-                heads,
-                splits,
-                block,
-                num_warps=8,
-                num_stages=1,
-            )
-            return out[:, None], lse[:, :, None]
         repair_flags = torch.zeros(batch + 1, dtype=torch.int32, device=q.device)
         flags, repair_state = repair_flags[1:], repair_flags[:1]
         exponent_bytes = exponent_words.view(torch.uint8)
