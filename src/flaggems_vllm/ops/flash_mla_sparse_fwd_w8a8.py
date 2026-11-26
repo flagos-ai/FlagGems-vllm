@@ -37,7 +37,14 @@ else:
     )
     from flaggems_vllm.ops.flash_mla_with_kvcache_model1 import tle_subslice
     from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
+        cp_async_cg_16,
+        cp_async_cg_16_pred,
+        cp_async_wait_all,
+        fence_proxy_async_shared,
+        publish_p_fp8_sw64_asm,
+        publish_p_fp8_sw64_constraints,
         publish_p_fp8_sw64_coupled_stmatrix,
+        vtranspose_fp8_64x128_coupled_asm,
         vtranspose_fp8_64x128_kperm,
     )
     from flaggems_vllm.utils import libentry, libtuner
@@ -76,70 +83,15 @@ else:
             pack=1,
         )
 
-    @triton.constexpr_function
-    def sparse_fp8_transpose_asm():
-        return (
-            "{\n"
-            ".reg .b32 tid, lane, warp, src_row, tmp, tmp2;\n"
-            ".reg .b32 src_log, src_phys, src_addr0, src_addr1;\n"
-            ".reg .b32 dst_row_r, dst_col, dst_log0, dst_log1;\n"
-            ".reg .b32 dst_phys0, dst_phys1, dst_addr0, dst_addr1;\n"
-            ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
-            ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
-            "mov.u32 tid, %tid.x;\n"
-            "and.b32 tid, tid, 127;\n"
-            "and.b32 lane, tid, 31;\n"
-            "shr.u32 warp, tid, 5;\n"
-            "add.u32 warp, warp, $4;\n"
-            # The coupled P permutation cancels the source-row bit permutation.
-            "mov.u32 src_row, lane;\n"
-            "shl.b32 src_log, src_row, 7;\n"
-            "shl.b32 tmp, warp, 4;\n"
-            "add.u32 src_log, src_log, tmp;\n"
-            "shr.u32 tmp, src_log, 7;\n"
-            "and.b32 tmp, tmp, 7;\n"
-            "shl.b32 tmp, tmp, 4;\n"
-            "xor.b32 src_phys, src_log, tmp;\n"
-            "add.u32 src_addr0, $2, src_phys;\n"
-            "add.u32 src_addr1, src_addr0, 4096;\n"
-            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-            "{a0, a1, a2, a3}, [src_addr0];\n"
-            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-            "{b0, b1, b2, b3}, [src_addr1];\n"
-            "prmt.b32 c0, a0, a1, 0x6420;\n"
-            "prmt.b32 c1, a0, a1, 0x7531;\n"
-            "prmt.b32 c2, a2, a3, 0x6420;\n"
-            "prmt.b32 c3, a2, a3, 0x7531;\n"
-            "prmt.b32 d0, b0, b1, 0x6420;\n"
-            "prmt.b32 d1, b0, b1, 0x7531;\n"
-            "prmt.b32 d2, b2, b3, 0x6420;\n"
-            "prmt.b32 d3, b2, b3, 0x7531;\n"
-            # Consecutive rows distribute each matrix store over all shared banks.
-            "and.b32 dst_row_r, lane, 15;\n"
-            "shl.b32 tmp, warp, 4;\n"
-            "add.u32 dst_row_r, dst_row_r, tmp;\n"
-            "shr.u32 dst_col, lane, 4;\n"
-            "and.b32 dst_col, dst_col, 1;\n"
-            "shl.b32 dst_col, dst_col, 4;\n"
-            "shl.b32 dst_log0, dst_row_r, 6;\n"
-            "add.u32 dst_log0, dst_log0, dst_col;\n"
-            "add.u32 dst_log1, dst_log0, 32;\n"
-            "shr.u32 tmp, dst_log0, 7;\n"
-            "and.b32 tmp, tmp, 3;\n"
-            "shl.b32 tmp, tmp, 4;\n"
-            "xor.b32 dst_phys0, dst_log0, tmp;\n"
-            "shr.u32 tmp2, dst_log1, 7;\n"
-            "and.b32 tmp2, tmp2, 3;\n"
-            "shl.b32 tmp2, tmp2, 4;\n"
-            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
-            "add.u32 dst_addr0, $3, dst_phys0;\n"
-            "add.u32 dst_addr1, $3, dst_phys1;\n"
-            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
-            "[dst_addr0], {c0, c1, c2, c3};\n"
-            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
-            "[dst_addr1], {d0, d1, d2, d3};\n"
-            "mov.u32 $0, $1;\n"
-            "}"
+    @triton.jit
+    def sparse_fp8_sub(lhs, rhs):
+        return tl.inline_asm_elementwise(
+            "sub.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            [lhs, rhs],
+            dtype=tl.float32,
+            is_pure=False,
+            pack=1,
         )
 
     @triton.jit
@@ -154,7 +106,7 @@ else:
         src_base = tle.gpu.local_ptr(s_src, (0, 0))
         dst_base = tle.gpu.local_ptr(s_dst, (dst_row, 0))
         return tl.inline_asm_elementwise(
-            asm=sparse_fp8_transpose_asm(),
+            asm=vtranspose_fp8_64x128_coupled_asm(),
             constraints="=r,r,r,r,r",
             args=[carrier, src_base, dst_base, tl.full((), warp_offset, tl.uint32)],
             dtype=tl.uint32,
@@ -326,129 +278,10 @@ else:
         base_u32 = tl.inline_asm_elementwise(
             "mov.u32 $0, $1;", "=r,r", [base], dtype=tl.uint32, is_pure=True, pack=1
         )
-        if PREQUANTIZED:
-            declaration: tl.constexpr = ""
-            conversion: tl.constexpr = (
-                "prmt.b32 a0, $32, $33, 0x5410;\n"
-                "prmt.b32 a1, $32, $33, 0x7632;\n"
-                "prmt.b32 a2, $34, $35, 0x5410;\n"
-                "prmt.b32 a3, $34, $35, 0x7632;\n"
-                "prmt.b32 b0, $36, $37, 0x5410;\n"
-                "prmt.b32 b1, $36, $37, 0x7632;\n"
-                "prmt.b32 b2, $38, $39, 0x5410;\n"
-                "prmt.b32 b3, $38, $39, 0x7632;\n"
-            )
-            publication: tl.constexpr = (
-                "shr.u32 tmp, common, 7;\n"
-                "and.b32 tmp, tmp, 3;\n"
-                "shl.b32 tmp, tmp, 4;\n"
-                "xor.b32 phys0, common, tmp;\n"
-                "add.u32 common, common, 32;\n"
-                "shr.u32 tmp, common, 7;\n"
-                "and.b32 tmp, tmp, 3;\n"
-                "shl.b32 tmp, tmp, 4;\n"
-                "xor.b32 phys1, common, tmp;\n"
-                "add.u32 addr0, $40, phys0;\n"
-                "add.u32 addr1, $40, phys1;\n"
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};\n"
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};\n"
-                "fence.proxy.async.shared::cta;\n"
-                "mov.u32 $0, $40;\n"
-                "}"
-            )
-        else:
-            declaration: tl.constexpr = (
-                ".reg .b16 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;\n"
-            )
-            conversion: tl.constexpr = (
-                "cvt.rn.satfinite.e4m3x2.f32 h0, $33, $32;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h1, $35, $34;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h2, $37, $36;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h3, $39, $38;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h4, $41, $40;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h5, $43, $42;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h6, $45, $44;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h7, $47, $46;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h8, $49, $48;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h9, $51, $50;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h10, $53, $52;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h11, $55, $54;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h12, $57, $56;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h13, $59, $58;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h14, $61, $60;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h15, $63, $62;\n"
-                "mov.b32 a0, {h0, h2};\n"
-                "mov.b32 a1, {h1, h3};\n"
-                "mov.b32 a2, {h4, h6};\n"
-                "mov.b32 a3, {h5, h7};\n"
-                "mov.b32 b0, {h8, h10};\n"
-                "mov.b32 b1, {h9, h11};\n"
-                "mov.b32 b2, {h12, h14};\n"
-                "mov.b32 b3, {h13, h15};\n"
-            )
-            publication: tl.constexpr = (
-                "shr.u32 tmp, common, 7;\n"
-                "and.b32 tmp, tmp, 3;\n"
-                "shl.b32 tmp, tmp, 4;\n"
-                "xor.b32 phys0, common, tmp;\n"
-                "add.u32 common, common, 32;\n"
-                "shr.u32 tmp, common, 7;\n"
-                "and.b32 tmp, tmp, 3;\n"
-                "shl.b32 tmp, tmp, 4;\n"
-                "xor.b32 phys1, common, tmp;\n"
-                "add.u32 addr0, $64, phys0;\n"
-                "add.u32 addr1, $64, phys1;\n"
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};\n"
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};\n"
-                "fence.proxy.async.shared::cta;\n"
-                "mov.u32 $0, $64;\n"
-                "}"
-            )
-        asm: tl.constexpr = (
-            "{\n"
-            + declaration
-            + (
-                (
-                    ".reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;\n"
-                    ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
-                    "mov.u32 tid, %tid.x;\n"
-                    "and.b32 warp_off, tid, 96;\n"
-                    "shl.b32 warp_off, warp_off, 5;\n"
-                    "and.b32 row_off, tid, 15;\n"
-                    "shl.b32 row_off, row_off, 6;\n"
-                    "or.b32 common, warp_off, row_off;\n"
-                    "and.b32 tmp, tid, 16;\n"
-                    "or.b32 common, common, tmp;\n"
-                )
-            )
-            + conversion
-            + publication
-        )
         base1 = tle.gpu.local_ptr(s_p1, (0, 0))
-        if PREQUANTIZED:
-            constraints128: tl.constexpr = (
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
-            )
-        else:
-            constraints128: tl.constexpr = (
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-                "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
-            )
         return tl.inline_asm_elementwise(
-            p128_publication_asm(asm, PREQUANTIZED),
-            constraints128,
+            p128_publication_asm(publish_p_fp8_sw64_asm(PREQUANTIZED), PREQUANTIZED),
+            publish_p_fp8_sw64_constraints(2, PREQUANTIZED),
             [p, base_u32, base1.to(tl.uint64).to(tl.uint32)],
             dtype=tl.uint32,
             is_pure=False,
@@ -504,14 +337,7 @@ else:
                 KV + (ids // 64) * kp + (ids % 64) * kt + feature, valid, 0.0
             ).to(tl.float32)
             product = query[:, None] * key[None, :]
-            scores = tl.inline_asm_elementwise(
-                "add.rn.f32 $0, $1, $2;",
-                "=f,f,f",
-                [scores, product],
-                dtype=tl.float32,
-                is_pure=False,
-                pack=1,
-            )
+            scores = sparse_fp8_accumulate(scores, product)
         return scores
 
     @triton.jit
@@ -819,14 +645,7 @@ else:
                                 vtranspose_fp8_64x128_kperm(
                                     source, sv1, (tile - 2) * 128
                                 )
-                    tl.inline_asm_elementwise(
-                        "{ fence.proxy.async.shared::cta; mov.b32 $0, $1; }",
-                        "=r,r",
-                        [tl.arange(0, 128)],
-                        dtype=tl.int32,
-                        is_pure=False,
-                        pack=1,
-                    )
+                    fence_proxy_async_shared(tl.arange(0, 128))
                     tl.debug_barrier()
                     correction = (correction * previous_scale) / probability_scale
                     tl.store(tle.gpu.local_ptr(alpha), correction)
@@ -1277,14 +1096,7 @@ else:
                         vtranspose_fp8_64x128_kperm(source, sv, tile * 128)
                 else:
                     pass
-            tl.inline_asm_elementwise(
-                "{ fence.proxy.async.shared::cta; mov.b32 $0, $1; }",
-                "=r,r",
-                [tl.arange(0, 128)],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
+            fence_proxy_async_shared(tl.arange(0, 128))
             tl.debug_barrier()
             value = tle.gpu.wgmma(sp, sv, out_dtype=tl.float32, trans_b=True)
             value = tle.gpu.wgmma_wait(0, value)
@@ -1453,20 +1265,11 @@ else:
                             + copy_columns
                         )
                         # Keep the first K64 copies pending across the second free wait.
-                        tl.inline_asm_elementwise(
-                            "{ .reg .pred active; setp.ne.u32 active, $4, 0; "
-                            "@active cp.async.cg.shared.global [$1], [$2], 16, $3; "
-                            "mov.u32 $0, 0; }",
-                            constraints="=r,r,l,r,r",
-                            args=[
-                                dst.to(tl.uint64).to(tl.uint32),
-                                src.to(tl.uint64),
-                                tl.where(valid[:, None], 16, 0),
-                                ((copy_rows // 64) == key_half).to(tl.uint32),
-                            ],
-                            dtype=tl.uint32,
-                            is_pure=False,
-                            pack=1,
+                        cp_async_cg_16_pred(
+                            dst,
+                            src,
+                            tl.where(valid[:, None], 16, 0),
+                            ((copy_rows // 64) == key_half).to(tl.uint32),
                         )
                     # Consumer 0 releases all RoPE rows with kfree[0].
                     if key_half == 0 and ASYNC_KR:
@@ -1482,18 +1285,10 @@ else:
                             + slots[:, None] * krt
                             + rope_columns
                         )
-                        tl.inline_asm_elementwise(
-                            "{ cp.async.cg.shared.global [$1], [$2], 16, $3; "
-                            "mov.u32 $0, 0; }",
-                            constraints="=r,r,l,r",
-                            args=[
-                                dst_r.to(tl.uint64).to(tl.uint32),
-                                src_r.to(tl.uint64),
-                                tl.where(valid[:, None], 16, 0).to(tl.uint32),
-                            ],
-                            dtype=tl.uint32,
-                            is_pure=False,
-                            pack=1,
+                        cp_async_cg_16(
+                            dst_r,
+                            src_r,
+                            tl.where(valid[:, None], 16, 0).to(tl.uint32),
                         )
                     else:
                         pass
@@ -1539,26 +1334,12 @@ else:
             else:
                 pass
             if CAN_ASYNC_NOPE:
-                tl.inline_asm_elementwise(
-                    "{ cp.async.commit_group; cp.async.wait_group 0; mov.u32 $0, $1; }",
-                    constraints="=r,r",
-                    args=[tl.arange(0, PRODUCER_WARPS * 32)],
-                    dtype=tl.uint32,
-                    is_pure=False,
-                    pack=1,
-                )
+                cp_async_wait_all(tl.arange(0, PRODUCER_WARPS * 32).to(tl.uint32))
             else:
                 pass
             # Matrix transpose avoids byte stores and their shared-memory bank conflicts.
             tl.debug_barrier()
-            tl.inline_asm_elementwise(
-                "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
-                constraints="=r,r",
-                args=[tl.arange(0, 128)],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
+            fence_proxy_async_shared(tl.arange(0, 128))
             tle.gpu.barrier_arrive(kfull[0])
             tle.gpu.barrier_arrive(kfull[1])
 
@@ -1806,14 +1587,7 @@ else:
                                         (group - 1) * 128,
                                         warp_half * 4,
                                     )
-                    tl.inline_asm_elementwise(
-                        "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }",
-                        constraints="=r,r",
-                        args=[tl.arange(0, 128)],
-                        dtype=tl.int32,
-                        is_pure=False,
-                        pack=1,
-                    )
+                    fence_proxy_async_shared(tl.arange(0, 128))
                     if inner == 0:
                         tle.gpu.barrier_arrive(vfull[outer])
                     else:
@@ -2494,22 +2268,8 @@ else:
                             * (SCALE * 1.4426950408889634)
                         )
                         new_maximum = tl.maximum(maximum, score)
-                        old_delta = tl.inline_asm_elementwise(
-                            "sub.rn.f32 $0, $1, $2;",
-                            "=f,f,f",
-                            [maximum, new_maximum],
-                            dtype=tl.float32,
-                            is_pure=False,
-                            pack=1,
-                        )
-                        score_delta = tl.inline_asm_elementwise(
-                            "sub.rn.f32 $0, $1, $2;",
-                            "=f,f,f",
-                            [score, new_maximum],
-                            dtype=tl.float32,
-                            is_pure=False,
-                            pack=1,
-                        )
+                        old_delta = sparse_fp8_sub(maximum, new_maximum)
+                        score_delta = sparse_fp8_sub(score, new_maximum)
                         correction = tl.exp2(old_delta)
                         probability = tl.exp2(score_delta)
                         denominator = denominator * correction + probability
@@ -2845,20 +2605,69 @@ else:
         tl.store(Scale + ids, tl.where(hi - lo > 2, -scale, scale), ids < N)
 
     @triton.constexpr_function
-    def rescale_fp8_registers():
-        asm = ""
-        for reg in ("a", "b", "c", "d"):
-            asm += f"""
-            mov.b32 {{xlo,xhi}},{reg};
-            cvt.rn.f16x2.e4m3x2 tmp,xlo;
-            cvt.rn.f16x2.e4m3x2 u,xhi;
-            mul.f16x2 tmp,tmp,fac;
-            mul.f16x2 u,u,fac;
-            cvt.rn.satfinite.e4m3x2.f16x2 xlo,tmp;
-            cvt.rn.satfinite.e4m3x2.f16x2 xhi,u;
-            mov.b32 {reg},{{xlo,xhi}};
-            """
-        return asm
+    def rescale_fp8_registers(tmp="tmp"):
+        return "".join(
+            f"mov.b32 {{xlo,xhi}},{reg}; "
+            f"cvt.rn.f16x2.e4m3x2 {tmp},xlo; cvt.rn.f16x2.e4m3x2 u,xhi; "
+            f"mul.f16x2 {tmp},{tmp},fac; mul.f16x2 u,u,fac; "
+            f"cvt.rn.satfinite.e4m3x2.f16x2 xlo,{tmp}; cvt.rn.satfinite.e4m3x2.f16x2 xhi,u; "
+            f"mov.b32 {reg},{{xlo,xhi}};\n"
+            for reg in ("a", "b", "c", "d")
+        )
+
+    @triton.constexpr_function
+    def ptx_exponent_minmax(e0, e1, lo, hi, ex):
+        lines = [f"and.b32 {hi},{e0},255; mov.u32 {lo},{hi};"]
+        for g in range(1, 7):
+            word = e0 if g < 4 else e1
+            lines.append(
+                f"bfe.u32 {ex},{word},{(g % 4) * 8},8; "
+                f"min.u32 {lo},{lo},{ex}; max.u32 {hi},{hi},{ex};"
+            )
+        return "\n".join(lines) + "\n"
+
+    @triton.constexpr_function
+    def ptx_encode_e8m0_scale(hi, ok_pred, out_reg, first_pred="first"):
+        return (
+            f"shl.b32 {out_reg},{hi},23;\n"
+            f"setp.eq.u32 {first_pred},{hi},0;\n"
+            f"@{first_pred} mov.u32 {out_reg},0x00400000;\n"
+            f"@!{ok_pred} mov.u32 {out_reg},0xbf800000;\n"
+        )
+
+    @triton.constexpr_function
+    def ptx_rescale_factor(delta, fac, sub_op="sub.u32"):
+        return (
+            f"min.u32 {delta},{delta},15;\n"
+            f"{sub_op} {fac},15,{delta};\n"
+            f"shl.b32 {fac},{fac},10;\n"
+            f"prmt.b32 {fac},{fac},{fac},0x1010;\n"
+        )
+
+    @triton.constexpr_function
+    def ptx_fast_e4m3_range_check():
+        parts = [
+            "min.u32 fac,delta,14; shl.b32 fac,fac,3; mul.lo.u32 fac,fac,0x01010101;\n"
+            "add.u32 which,fac,0x08080808;\n"
+        ]
+        for idx, reg in enumerate(("a", "b", "c", "d")):
+            dst = "t" if idx == 0 else "u"
+            parts.append(f"or.b32 {dst},{reg},0x80808080; sub.u32 {dst},{dst},which;\n")
+            if idx > 0:
+                parts.append("and.b32 t,t,u;\n")
+        parts.append("and.b32 t,t,0x80808080;\n")
+        for idx, reg in enumerate(("a", "b", "c", "d")):
+            dst = "u" if idx == 0 else "which"
+            parts.append(
+                f"and.b32 {dst},{reg},0x7f7f7f7f; add.u32 {dst},{dst},0x01010101;\n"
+            )
+            if idx > 0:
+                parts.append("or.b32 u,u,which;\n")
+        parts.append(
+            "not.b32 u,u; and.b32 t,t,u; and.b32 t,t,0x80808080;\n"
+            "setp.eq.u32 fast,t,0x80808080; setp.lt.u32.and fast,delta,15,fast;\n"
+        )
+        return "".join(parts)
 
     @triton.constexpr_function
     def gather_topk128_asm(page_stride):
@@ -2906,22 +2715,20 @@ else:
             add.u64 src{half}, src{half}, byte_offset;
             """
         for half in range(2):
-            asm += f"and.b32 largest{half},exp_lo{half},255; mov.u32 smallest{half},largest{half};\n"
-            for group in range(1, 7):
-                word = "exp_lo" if group < 4 else "exp_hi"
-                asm += f"""
-                bfe.u32 exponent, {word}{half}, {(group % 4) * 8}, 8;
-                max.u32 largest{half}, largest{half}, exponent;
-                min.u32 smallest{half}, smallest{half}, exponent;
-                """
+            asm += ptx_exponent_minmax(
+                f"exp_lo{half}",
+                f"exp_hi{half}",
+                f"smallest{half}",
+                f"largest{half}",
+                "exponent",
+            )
             asm += f"""
             sub.u32 delta, largest{half}, smallest{half};
             setp.gt.and.u32 wide, delta, 2, valid{half};
             @wide mov.u32 flag, 1;
-            shl.b32 exponent, largest{half}, 23;
-            setp.eq.u32 first, largest{half}, 0;
-            @first mov.u32 exponent, 0x00400000;
-            @!valid{half} mov.u32 exponent, 0xbf800000;
+            """
+            asm += ptx_encode_e8m0_scale(f"largest{half}", f"valid{half}", "exponent")
+            asm += f"""
             setp.eq.u32 first, chunk, 0;
             mad.lo.u32 tmp, row, 4, $6;
             @first st.shared.b32 [tmp+{half * 256}], exponent;
@@ -2956,12 +2763,9 @@ else:
                     setp.eq.u32 skip, exponent, largest{half};
                     @skip bra {label};
                     sub.u32 delta, largest{half}, exponent;
-                    min.u32 delta, delta, 15;
-                    sub.u32 fac, 15, delta;
-                    shl.b32 fac, fac, 10;
-                    prmt.b32 fac, fac, fac, 0x1010;
-                    ld.shared.v4.b32 {{a,b,c,d}}, [kdst+{dest}];
                     """
+                    asm += ptx_rescale_factor("delta", "fac")
+                    asm += f"ld.shared.v4.b32 {{a,b,c,d}}, [kdst+{dest}];\n"
                     asm += rescale_fp8_registers()
                     asm += f"st.shared.v4.b32 [kdst+{dest}],{{a,b,c,d}}; {label}:\n"
             # Each of the eight producer warps signals after its writes to both halves.
@@ -3049,14 +2853,9 @@ else:
         if prefetched:
             metadata += "shr.u32 hi,e1,24;\n"
         else:
-            metadata += "and.b32 hi,e0,255; mov.b32 lo,hi;\n"
-            for g in range(1, 7):
-                metadata += f"bfe.u32 ex,{'e0' if g<4 else 'e1'},{(g%4)*8},8; min.u32 lo,lo,ex; max.u32 hi,hi,ex;\n"
+            metadata += ptx_exponent_minmax("e0", "e1", "lo", "hi", "ex")
+        metadata += ptx_encode_e8m0_scale("hi", "ok", "tmp")
         metadata += """
-    shl.b32 tmp,hi,23;
-    setp.eq.u32 first,hi,0;
-    @first mov.b32 tmp,0x00400000;
-    @!ok mov.b32 tmp,0xbf800000;
     setp.eq.u32 first,chunk,0;
     mad.lo.u32 sdst,row,4,$6;
     @first st.shared.b32 [sdst],tmp;
@@ -3086,10 +2885,9 @@ else:
     setp.eq.u32 skip,hi,ex;
     @skip bra NEXT;
     sub.u32 delta,hi,ex;
-    min.u32 delta,delta,15;
-    sub.u32 fac,15,delta;
-    shl.b32 fac,fac,10;
-    prmt.b32 fac,fac,fac,0x1010;
+    """
+        asm += ptx_rescale_factor("delta", "fac")
+        asm += """
     and.b32 tmp,group,1;
     shl.b32 tmp,tmp,6;
     xor.b32 kdst,kbase,tmp;
@@ -3182,22 +2980,17 @@ else:
     setp.le.u32 loop,iter,ROWMASK;
     @loop bra COPY;
     cp.async.commit_group;
-    and.b32 emin,e0,255;
-    mov.b32 emax,emin;
     """
-        for group in range(1, 7):
-            asm += f"bfe.u32 ex,{'e0' if group < 4 else 'e1'},{(group % 4) * 8},8; "
-            asm += "min.u32 emin,emin,ex; max.u32 emax,emax,ex; "
+        asm += ptx_exponent_minmax("e0", "e1", "emin", "emax", "ex")
         asm += """
     sub.u32 delta,emax,emin;
     setp.gt.u32 wide,delta,2;
     and.pred wide,wide,ok;
     selp.u32 flag,1,0,wide;
     // One metadata lane owns the SMEM scale for this row.
-    shl.b32 t,emax,23;
-    setp.eq.u32 first,emax,0;
-    @first mov.b32 t,0x00400000;
-    @!ok mov.b32 t,0xbf800000;
+    """
+        asm += ptx_encode_e8m0_scale("emax", "ok", "t")
+        asm += """
     and.b32 row,lane,ROWMASK;
     mad.lo.u32 row,row,WARPS,warp;
     mad.lo.u32 sdst,row,4,$6;
@@ -3236,38 +3029,9 @@ else:
     sub.s32 delta,peer_hi,ex;
     // Subtracting from each exponent is exact while every merged_value stays normal.
     // The half2 conversion below handles zeros, subnormals and wide spreads.
-    min.u32 fac,delta,14;
-    shl.b32 fac,fac,3;
-    mul.lo.u32 fac,fac,0x01010101;
-    add.u32 which,fac,0x08080808;
-    or.b32 t,a,0x80808080;
-    sub.u32 t,t,which;
-    or.b32 u,b,0x80808080;
-    sub.u32 u,u,which;
-    and.b32 t,t,u;
-    or.b32 u,c,0x80808080;
-    sub.u32 u,u,which;
-    and.b32 t,t,u;
-    or.b32 u,d,0x80808080;
-    sub.u32 u,u,which;
-    and.b32 t,t,u;
-    and.b32 t,t,0x80808080;
-    and.b32 u,a,0x7f7f7f7f;
-    add.u32 u,u,0x01010101;
-    and.b32 which,b,0x7f7f7f7f;
-    add.u32 which,which,0x01010101;
-    or.b32 u,u,which;
-    and.b32 which,c,0x7f7f7f7f;
-    add.u32 which,which,0x01010101;
-    or.b32 u,u,which;
-    and.b32 which,d,0x7f7f7f7f;
-    add.u32 which,which,0x01010101;
-    or.b32 u,u,which;
-    not.b32 u,u;
-    and.b32 t,t,u;
-    and.b32 t,t,0x80808080;
-    setp.eq.u32 fast,t,0x80808080;
-    setp.lt.u32.and fast,delta,15,fast;
+    """
+        asm += ptx_fast_e4m3_range_check()
+        asm += """
     @!fast bra SLOW_RESCALE;
     sub.u32 a,a,fac;
     sub.u32 b,b,fac;
@@ -3275,24 +3039,9 @@ else:
     sub.u32 d,d,fac;
     bra WRITE_RESCALE;
     SLOW_RESCALE:
-    min.u32 delta,delta,15;
-    sub.s32 fac,15,delta;
-    shl.b32 fac,fac,10;
-    prmt.b32 fac,fac,fac,0x1010;
     """
-        for reg in ("a", "b", "c", "d"):
-            asm += """
-        mov.b32 {xlo,xhi},WORD;
-        cvt.rn.f16x2.e4m3x2 t,xlo;
-        cvt.rn.f16x2.e4m3x2 u,xhi;
-        mul.f16x2 t,t,fac;
-        mul.f16x2 u,u,fac;
-        cvt.rn.satfinite.e4m3x2.f16x2 xlo,t;
-        cvt.rn.satfinite.e4m3x2.f16x2 xhi,u;
-        mov.b32 WORD,{xlo,xhi};
-        """.replace(
-                "WORD", reg
-            )
+        asm += ptx_rescale_factor("delta", "fac", sub_op="sub.s32")
+        asm += rescale_fp8_registers("t")
         asm += """
     WRITE_RESCALE:
     st.shared.v4.b32 [kdst],{a,b,c,d};
@@ -3468,18 +3217,7 @@ else:
                 cols = tl.broadcast_to((g * 8)[None, :], (BK, 8))
                 dst = tle.gpu.local_ptr(skr.slot(buf), (rows, cols))
                 src = KR + safe.to(tl.int64)[:, None] * 64 + cols
-                tl.inline_asm_elementwise(
-                    "{ cp.async.cg.shared.global [$1], [$2], 16, $3; mov.u32 $0, 0; }",
-                    "=r,r,l,r",
-                    [
-                        dst.to(tl.uint64).to(tl.uint32),
-                        src.to(tl.uint64),
-                        tl.where(valid[:, None], 16, 0),
-                    ],
-                    dtype=tl.uint32,
-                    is_pure=False,
-                    pack=1,
-                )
+                cp_async_cg_16(dst, src, tl.where(valid[:, None], 16, 0))
                 byte_cols = cols * 2
                 for tile in tl.static_range(4):
                     dst_k = tle.gpu.local_ptr(
@@ -3492,19 +3230,11 @@ else:
                         + tile * 128
                         + byte_cols
                     )
-                    tl.inline_asm_elementwise(
-                        "{ .reg .pred p; setp.ne.b32 p,$4,0; "
-                        "@p cp.async.cg.shared.global [$1], [$2], 16, $3; mov.u32 $0, 0; }",
-                        "=r,r,l,r,r",
-                        [
-                            dst_k.to(tl.uint64).to(tl.uint32),
-                            src_k.to(tl.uint64),
-                            tl.where(valid[:, None], 16, 0),
-                            ((tile < 3) | (byte_cols < 64)).to(tl.int32),
-                        ],
-                        dtype=tl.uint32,
-                        is_pure=False,
-                        pack=1,
+                    cp_async_cg_16_pred(
+                        dst_k,
+                        src_k,
+                        tl.where(valid[:, None], 16, 0),
+                        ((tile < 3) | (byte_cols < 64)).to(tl.int32),
                     )
             else:
                 flag = gather_tile(
@@ -3524,18 +3254,10 @@ else:
                     PREFETCHED,
                 )
                 repair |= tl.max(flag, 0).to(tl.int32)
-            tl.inline_asm_elementwise(
-                (
-                    "{ cp.async.commit_group; cp.async.wait_group 0; fence.proxy.async.shared::cta; mov.u32 $0, $1; }"
-                    if PREPACK
-                    else "{ fence.proxy.async.shared::cta; mov.u32 $0, $1; }"
-                ),
-                "=r,r",
-                [tl.arange(0, 256)],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
+            if PREPACK:
+                cp_async_wait_all(tl.arange(0, 256), FENCE=True)
+            else:
+                fence_proxy_async_shared(tl.arange(0, 256))
             tl.debug_barrier()
             if BUFS == 1:
                 tle.gpu.barrier_arrive(kfull[0])
@@ -3964,14 +3686,7 @@ else:
                             group * 128 if group < 2 else 0,
                             warp_half * 4,
                         )
-            tl.inline_asm_elementwise(
-                "{ fence.proxy.async.shared::cta; mov.b32 $0, $1; }",
-                "=r,r",
-                [tl.arange(0, 128)],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
+            fence_proxy_async_shared(tl.arange(0, 128))
             tle.gpu.barrier_arrive(vfull[0])
             if BUFS == 1:
                 tle.gpu.barrier_arrive(kfree[0])
@@ -4588,14 +4303,7 @@ else:
             is_pure=False,
             pack=1,
         )
-        tl.inline_asm_elementwise(
-            "{ fence.proxy.async.shared::cta; mov.u32 $0,$1; }",
-            "=r,r",
-            [key_flags],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
+        fence_proxy_async_shared(key_flags)
         tl.debug_barrier()
         half = tl.inline_asm_elementwise(
             "{.reg .u32 t; mov.u32 t,%tid.x; shr.u32 t,t,7; and.b32 $0,t,1;}",
@@ -4620,7 +4328,7 @@ else:
             if OUTPUT_TILES == 1 or tl.program_id(2) == group:
                 for warp_half in tl.static_range(1 if group == 3 else 2):
                     tl.inline_asm_elementwise(
-                        sparse_fp8_transpose_asm(),
+                        vtranspose_fp8_64x128_coupled_asm(),
                         "=r,r,r,r,r",
                         [
                             lane,
@@ -4632,14 +4340,7 @@ else:
                         is_pure=False,
                         pack=1,
                     )
-        tl.inline_asm_elementwise(
-            "{ fence.proxy.async.shared::cta; mov.u32 $0,$1; }",
-            "=r,r",
-            [lane],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
+        fence_proxy_async_shared(lane)
         tl.store(tle.gpu.local_ptr(repair_flags, (0,)), tl.max(key_flags, 0))
         tle.gpu.barrier_arrive(values_ready[0])
 
