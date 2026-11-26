@@ -47,14 +47,23 @@ sync_source() {
   git -C "${CACHE_DIR}" submodule update --init --recursive --quiet
 }
 main() {
-  check_headers
   local adaptor cuda_path
   adaptor="$(detect_adaptor)"
+  if [ "${adaptor}" = "metax" ]; then
+    log "MetaX build: using MACA headers; skip gflags/glog preflight"
+  else
+    check_headers
+  fi
   cuda_path="$(detect_cuda_path)"
   sync_source
   mkdir -p "${OUTPUT_DIR}"
   export FLAGCX_ADAPTOR="${adaptor}"
   export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+  if [ "${adaptor}" = "metax" ]; then
+    export DEVICE_HOME="${DEVICE_HOME:-/opt/maca}"
+    export CCL_HOME="${CCL_HOME:-/opt/maca}"
+    export USE_METAX=1
+  fi
   if [ -n "${cuda_path}" ]; then
     export CUDA_PATH="${cuda_path}"
     export CUDA_HOME="${cuda_path}"
