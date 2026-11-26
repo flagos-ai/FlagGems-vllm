@@ -55,6 +55,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_weight_scale import
 from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import (
     fused_inv_rope_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_kda_gate import fused_kda_gate
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -171,6 +172,7 @@ __all__ = [
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
+    "fused_kda_gate",
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
     "gather_kda_state",
