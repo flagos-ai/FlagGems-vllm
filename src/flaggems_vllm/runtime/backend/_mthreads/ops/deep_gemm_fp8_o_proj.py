@@ -22,17 +22,22 @@ backend ships a working inverse-RoPE + FP8 quant kernel
 (``_mthreads/ops/fused_inv_rope_fp8_quant.py``) and the S5000 has native FP8
 tensor cores, so this module wires those together:
 
-1. The activation quant is the MThreads kernel (one head per CTA for decode,
-   eight-head tiles for prefill, both tuned there), producing the same
-   block-wise FP8 payload and scales the shared ``fp8_einsum`` would consume.
-2. The GEMM is a dedicated block-scaled batched kernel instead of the shared
-   TLE ``w8a8_block_fp8_bmm``. That kernel searches tiles for the generic bmm
-   shapes; with this operator's ``N = 1024``, ``B = n_groups`` and short ``K`` it
-   resolves to one CTA per weight tile at ``M <= 128`` (0.29 ms for 34 MB of
-   weights at ``M = 16``) and faults with ``misaligned address`` once
-   ``M >= 512``, so it cannot back this operator. The kernel below walks K in
-   128-wide blocks, applies both block scales after each ``tl.dot`` and keeps a
-   fixed tile per shape, so no autotune is paid at benchmark time.
+1. The activation quant is the MThreads kernel, owned by this module so the
+   tile width follows the S5000 sweeps: one head per CTA for decode, four-head
+   tiles for prefill. It produces the same block-wise FP8 payload and scales
+   the shared ``fp8_einsum`` would consume.
+2. The GEMM is either a dedicated block-scaled batched kernel or, from 512
+   tokens up, the TLE warp-specialized one. The shared TLE
+   ``w8a8_block_fp8_bmm`` cannot back this operator on its own: it searches
+   tiles for the generic bmm shapes, and with this operator's ``N = 1024``,
+   ``B = n_groups`` and short ``K`` it resolves to one CTA per weight tile at
+   ``M <= 128`` (0.29 ms for 34 MB of weights at ``M = 16``) and faults with
+   ``misaligned address`` once ``M >= 512``. The dedicated kernel below walks K
+   in 128-wide blocks, applies both block scales after each ``tl.dot`` and
+   keeps a fixed tile per shape, so no autotune is paid at benchmark time.
+3. Both kernels are relaunched through their compiled-kernel handles: FlagTree's
+   dispatch costs ~115-220 us per launch, and up to 256 tokens this operator is
+   entirely host bound.
 
 The numerics are the operator's own: FP8 x FP8 products with FP32 accumulation
 scaled by ``x_scale[row, k_block] * y_scale[n_block, k_block]`` per 128x128
@@ -49,6 +54,7 @@ from typing import Callable, Optional, Sequence, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+from triton import knobs
 
 from flaggems_vllm.ops.deep_gemm_fp8_o_proj import (
     _SUPPORTED_RECIPE,
@@ -56,9 +62,6 @@ from flaggems_vllm.ops.deep_gemm_fp8_o_proj import (
     _weight_and_scale,
 )
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
-    fused_inv_rope_fp8_quant,
-)
 from flaggems_vllm.runtime.backend._mthreads.ops.per_token_group_quant_fp8 import (
     _quant_groups,
 )
@@ -77,12 +80,102 @@ except ImportError:  # pragma: no cover - older FlagTree builds
 logger = logging.getLogger(__name__)
 
 _QUANT_BLOCK = 128
-# Tensor-metadata signatures whose support verdict has already been computed.
+# Tensor-metadata signatures whose support verdict has already been computed;
+# the value holds that signature's cached kernel launchers.
 _SUPPORT_CHECKED = {}
 # TLE path: the weight TMA descriptor and the extern-libs handle are cached
 # (rebuilding the latter costs ~19 us per call).
 _TLE_WEIGHT_DESCS = {}
 _EXTERN_LIBS = None
+# Set when a direct launch fails, so every later call takes the regular path.
+_LAUNCH_DISABLED = False
+
+
+def _current_stream():
+    """Current MUSA stream handle, as the Triton launcher wants it."""
+    stream = torch.musa.current_stream()
+    return getattr(stream, "musa_stream", getattr(stream, "cuda_stream", stream))
+
+
+class _CachedLaunch:
+    """A compiled Triton kernel relaunched through its C launcher.
+
+    FlagTree's ``JITFunction.run`` re-binds the arguments, re-derives the
+    specialization of every scalar and pointer, rebuilds the cache key and only
+    then expands the descriptor arguments. On the S5000 that costs ~115 us for
+    a plain kernel and ~220 us for the 41-parameter TLE one, against ~20 us
+    (~75 us with three TMA descriptors) for the launcher itself, and at 256
+    tokens and below this operator is entirely host bound. This class keeps the
+    compiled kernel and the constant argument tail so later calls go straight
+    to the launcher. It is only built for signatures whose arguments the caller
+    already validated, and every failure drops back to the regular dispatch.
+    """
+
+    __slots__ = ("kernel", "grid", "tail")
+
+    def __init__(self, kernel, arg_names, grid, num_args, kwargs):
+        self.kernel = kernel
+        size = len(grid)
+        self.grid = (
+            grid[0],
+            grid[1] if size > 1 else 1,
+            grid[2] if size > 2 else 1,
+        )
+        self.tail = [kwargs[name] for name in arg_names[num_args:]]
+
+    def __call__(self, args):
+        kernel = self.kernel
+        kernel.run(
+            self.grid[0],
+            self.grid[1],
+            self.grid[2],
+            _current_stream(),
+            kernel.function,
+            kernel.packed_metadata,
+            None,
+            None,
+            None,
+            *args,
+            *self.tail,
+        )
+
+
+def _launch_hooks_absent() -> bool:
+    """Whether Triton has no launch hooks installed (profiler/debugger attach)."""
+    for name in ("launch_enter_hook", "launch_exit_hook"):
+        hook = getattr(knobs.runtime, name, None)
+        if hook is None:
+            continue
+        calls = getattr(hook, "calls", None)
+        if calls is None or calls:
+            return False
+    return True
+
+
+def _dispatch(jit_fn, grid, args, kwargs, record, slot):
+    """Launch ``jit_fn``, reusing its compiled kernel after the first call."""
+    global _LAUNCH_DISABLED
+    launcher = record.get(slot)
+    if launcher is not None:
+        try:
+            launcher(args)
+            return
+        except Exception:  # pragma: no cover - defensive, layout changes
+            logger.warning("direct launch failed; using the regular dispatch")
+            record.pop(slot, None)
+            _LAUNCH_DISABLED = True
+    kernel = jit_fn.run(*args, grid=grid, warmup=False, **kwargs)
+    # The launcher bypasses Triton's launch hooks, so only use it when none is
+    # installed. Building it can only fail on a signature we cannot mirror (a
+    # parameter the caller passes positionally and as a keyword), which just
+    # means this shape keeps the regular dispatch.
+    if not _LAUNCH_DISABLED and _launch_hooks_absent():
+        try:
+            record[slot] = _CachedLaunch(
+                kernel, jit_fn.arg_names, grid, len(args), kwargs
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("cannot cache the launch of %s", jit_fn.arg_names[0])
 
 
 @triton.jit
@@ -295,9 +388,9 @@ def _o_proj_inv_rope_quant(
 
 
 def _quant_heads(
-    o, positions, cos_sin_cache, n_groups, heads_per_group, nope_dim, rope_dim
+    o, positions, cos_sin_cache, n_groups, heads_per_group, nope_dim, rope_dim, record
 ):
-    """Inverse RoPE + group FP8 quant, with the prefill tile width retuned.
+    """Inverse RoPE + group FP8 quant for every batch size.
 
     Same kernel and math as ``fused_inv_rope_fp8_quant``; only the tile width
     and warp count differ. That wrapper tiles eight heads per CTA from 128
@@ -305,10 +398,13 @@ def _quant_heads(
     every prefill point (4096/8: 490 -> 430 us, 4096/16: 922 -> 806 us,
     8192/8: 929 -> 830 us, 2048/16: 486 -> 434 us), because the eight-head tile
     halves the CTA count while each CTA is already only a few KB of traffic.
+    Decode keeps the wrapper's one-head tile, which it picked for the same
+    reason in reverse (from 64 tokens down the batch has more CTAs than the
+    chip has lanes, so a narrow tile is what keeps them short).
     """
     heads = o.shape[1]
     tokens = o.shape[0]
-    heads_per_program = 4
+    heads_per_program = 1 if tokens < 128 else 4
     aligned_tokens = triton.cdiv(tokens, 4) * 4
     scale_cols = heads_per_group * 4
     output = torch.empty(
@@ -322,25 +418,31 @@ def _quant_heads(
         (n_groups, tokens, scale_cols),
         (scale_cols * aligned_tokens, 1, aligned_tokens),
     )
-    _o_proj_inv_rope_quant[
-        (aligned_tokens, triton.cdiv(heads, heads_per_program))
-    ](
-        o,
-        positions,
-        cos_sin_cache,
-        output,
-        scales,
-        tokens,
-        heads,
-        heads_per_group,
-        o.stride(0),
-        o.stride(1),
-        cos_sin_cache.stride(0),
-        aligned_tokens,
-        1e-10,
-        HEADS=heads_per_program,
-        num_warps=4,
-        num_stages=1,
+    _dispatch(
+        _o_proj_inv_rope_quant,
+        (aligned_tokens, triton.cdiv(heads, heads_per_program)),
+        (
+            o,
+            positions,
+            cos_sin_cache,
+            output,
+            scales,
+            tokens,
+            heads,
+            heads_per_group,
+            o.stride(0),
+            o.stride(1),
+            cos_sin_cache.stride(0),
+            aligned_tokens,
+            1e-10,
+        ),
+        {
+            "HEADS": heads_per_program,
+            "num_warps": 1 if heads_per_program == 1 else 4,
+            "num_stages": 1,
+        },
+        record,
+        "quant",
     )
     return output.transpose(0, 1), scales.transpose(0, 1)
 
@@ -370,7 +472,7 @@ def _use_tle(num_tokens: int, n_groups: int) -> bool:
 _TLE_TILE = (128, 128, 16, 1, 0)
 
 
-def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups):
+def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups, record):
     """Block-scaled FP8 batched GEMM through the TLE warp-specialized kernel.
 
     ``act``/``act_scale`` are token-major ``[tokens, groups, k]``; the kernel
@@ -419,51 +521,59 @@ def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups):
         weight, n_groups * n, k, block_n // (2 if block_m == 256 else 1)
     )
     jit_fn = getattr(ws_gemm_fp8.fn, "fn", ws_gemm_fp8.fn)
-    jit_fn[(derived["NUM_CTAS"],)](
-        x_desc,
-        y_desc,
-        scale_desc,
-        scale_g,
-        weight_scale,
-        out_g,
-        out_g,
-        num_tokens,
-        n,
-        k_blocks,
-        scale_g.stride(1),
-        scale_g.stride(0),
-        scale_g.stride(2),
-        weight_scale.stride(0),
-        weight_scale.stride(1),
-        weight_scale.stride(2),
-        out_g.stride(1),
-        out_g.stride(0),
-        out_g.stride(2),
-        derived["num_units"],
-        derived["num_m_tiles"],
-        derived["partial_plane"],
-        BATCH=n_groups,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        CONSUMER_WARPS=warps,
-        SPLIT_K=split_k,
-        PROMOTE=promote,
-        NUM_N_TILES=derived["NUM_N_TILES"],
-        UNIT_K_BLOCKS=derived["UNIT_K_BLOCKS"],
-        GROUP_M=derived["GROUP_M"],
-        NUM_CTAS=derived["NUM_CTAS"],
-        STAGES=derived["STAGES"],
-        MMA_LAYOUT=derived["MMA_LAYOUT"],
-        ROW_LAYOUT=derived["ROW_LAYOUT"],
-        N_SLICES=derived["N_SLICES"],
-        STAGE_ROW_SCALES=derived["STAGE_ROW_SCALES"],
-        ROW_SCALE_PAD=derived["ROW_SCALE_PAD"],
-        Z_STRIDE_M=derived["Z_STRIDE_M"],
-        Z_STRIDE_B=derived["Z_STRIDE_B"],
-        X_BATCH_MAJOR=1,
-        llc_options=LLC_OPTIONS,
-        extern_libs=_extern_libs(),
-        num_warps=warps,
+    _dispatch(
+        jit_fn,
+        (derived["NUM_CTAS"],),
+        (
+            x_desc,
+            y_desc,
+            scale_desc,
+            scale_g,
+            weight_scale,
+            out_g,
+            out_g,
+            num_tokens,
+            n,
+            k_blocks,
+            scale_g.stride(1),
+            scale_g.stride(0),
+            scale_g.stride(2),
+            weight_scale.stride(0),
+            weight_scale.stride(1),
+            weight_scale.stride(2),
+            out_g.stride(1),
+            out_g.stride(0),
+            out_g.stride(2),
+            derived["num_units"],
+            derived["num_m_tiles"],
+            derived["partial_plane"],
+        ),
+        {
+            "BATCH": n_groups,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "CONSUMER_WARPS": warps,
+            "SPLIT_K": split_k,
+            "PROMOTE": promote,
+            "NUM_N_TILES": derived["NUM_N_TILES"],
+            "UNIT_K_BLOCKS": derived["UNIT_K_BLOCKS"],
+            "GROUP_M": derived["GROUP_M"],
+            "NUM_CTAS": derived["NUM_CTAS"],
+            "STAGES": derived["STAGES"],
+            "MMA_LAYOUT": derived["MMA_LAYOUT"],
+            "ROW_LAYOUT": derived["ROW_LAYOUT"],
+            "N_SLICES": derived["N_SLICES"],
+            "STAGE_ROW_SCALES": derived["STAGE_ROW_SCALES"],
+            "ROW_SCALE_PAD": derived["ROW_SCALE_PAD"],
+            "Z_STRIDE_M": derived["Z_STRIDE_M"],
+            "Z_STRIDE_B": derived["Z_STRIDE_B"],
+            "X_BATCH_MAJOR": 1,
+            "llc_options": LLC_OPTIONS,
+            "extern_libs": _extern_libs(),
+            "num_warps": warps,
+        },
+        record,
+        "tle",
     )
 
 
@@ -526,12 +636,21 @@ def deep_gemm_fp8_o_proj(
         act, act_scale = o, None
         num_tokens, device = o.shape[0], o.device
 
+    # Entering the device context costs a set/restore pair per call (~10 us on
+    # MUSA), and the benchmark's interval starts before this call, so it shows
+    # up whole in the measured latency. Skip it when the device already matches.
+    current = torch.musa.current_device()
+    target = device.index if device.index is not None else current
+
     # The support check walks shapes/strides/dtypes (~6 us). It only depends on
     # the tensor metadata, so keep the verdict for the shapes this model repeats
     # every step; the benchmark interval starts before this call, so the check
-    # lands in the measured latency.
+    # lands in the measured latency. The verdict's slot also holds this
+    # signature's cached kernel launchers, which is why the device is part of
+    # the key: a compiled kernel belongs to one device.
     check_key = (
         prequantized,
+        target,
         act.shape,
         act.dtype,
         act.stride(),
@@ -542,6 +661,7 @@ def deep_gemm_fp8_o_proj(
         weight_scale.dtype,
         getattr(positions, "shape", None),
         getattr(positions, "dtype", None),
+        getattr(positions, "stride", lambda: None)(),
         getattr(cos_sin_cache, "shape", None),
         getattr(cos_sin_cache, "dtype", None),
         getattr(cos_sin_cache, "stride", lambda: None)(),
@@ -578,6 +698,7 @@ def deep_gemm_fp8_o_proj(
                 and cos_sin_cache.dtype == torch.float32
                 and cos_sin_cache.stride(-1) == 1
                 and positions.dtype == torch.int64
+                and positions.stride(0) == 1
             )
 
         if not (
@@ -592,13 +713,10 @@ def deep_gemm_fp8_o_proj(
                 "BF16 attention output with head_dim 512 = 448 + 64), 128x128 block "
                 "scales and an FP8 wo_a"
             )
-        _SUPPORT_CHECKED[check_key] = True
+        _SUPPORT_CHECKED[check_key] = record = {}
+    else:
+        record = _SUPPORT_CHECKED[check_key]
 
-    # Entering the device context costs a set/restore pair per call (~10 us on
-    # MUSA), and the benchmark's interval starts before this call, so it shows
-    # up whole in the measured latency. Skip it when the device already matches.
-    current = torch.musa.current_device()
-    target = device.index if device.index is not None else current
     if target == current:
         ctx = contextlib.nullcontext()
     else:
@@ -641,31 +759,21 @@ def deep_gemm_fp8_o_proj(
         }
 
         if not prequantized:
-            if num_tokens >= 1024:
-                act, act_scale = _quant_heads(
-                    o,
-                    positions,
-                    cos_sin_cache,
-                    n_groups,
-                    heads_per_group,
-                    nope_dim,
-                    rope_dim,
-                )
-            else:
-                act, act_scale = fused_inv_rope_fp8_quant(
-                    o,
-                    positions,
-                    cos_sin_cache,
-                    n_groups,
-                    heads_per_group,
-                    nope_dim=nope_dim,
-                    rope_dim=rope_dim,
-                    quant_group_size=_QUANT_BLOCK,
-                    tma_aligned_scales=False,
-                )
+            act, act_scale = _quant_heads(
+                o,
+                positions,
+                cos_sin_cache,
+                n_groups,
+                heads_per_group,
+                nope_dim,
+                rope_dim,
+                record,
+            )
 
         if use_tle:
-            _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups)
+            _tle_bmm(
+                act, act_scale, weight, weight_scale, out, num_tokens, n_groups, record
+            )
         else:
             # Both producers hand back token-major tensors; the kernel walks them
             # group-major, which is the same storage with the leading strides
@@ -674,31 +782,38 @@ def deep_gemm_fp8_o_proj(
             act_scale_g = act_scale.transpose(0, 1)
             act_strides = act_g.stride()
             act_scale_strides = act_scale_g.stride()
-            _o_proj_bmm_kernel[grid](
-                act_g,
-                act_scale_g,
-                weight,
-                weight_scale,
-                out_g,
-                num_tokens,
-                act_strides[0],
-                act_strides[1],
-                act_strides[2],
-                act_scale_strides[0],
-                act_scale_strides[1],
-                act_scale_strides[2],
-                weight_strides[0],
-                weight_strides[1],
-                weight_strides[2],
-                weight_scale_strides[0],
-                weight_scale_strides[1],
-                weight_scale_strides[2],
-                out_strides[0],
-                out_strides[1],
-                out_strides[2],
-                **gemm_kwargs,
+            _dispatch(
+                _o_proj_bmm_kernel,
+                grid,
+                (
+                    act_g,
+                    act_scale_g,
+                    weight,
+                    weight_scale,
+                    out_g,
+                    num_tokens,
+                    act_strides[0],
+                    act_strides[1],
+                    act_strides[2],
+                    act_scale_strides[0],
+                    act_scale_strides[1],
+                    act_scale_strides[2],
+                    weight_strides[0],
+                    weight_strides[1],
+                    weight_strides[2],
+                    weight_scale_strides[0],
+                    weight_scale_strides[1],
+                    weight_scale_strides[2],
+                    out_strides[0],
+                    out_strides[1],
+                    out_strides[2],
+                ),
+                gemm_kwargs,
+                record,
+                "gemm",
             )
 
     assert callable(wo_b), "`wo_b` must be a callable linear layer"
     return wo_b(out.flatten(1))
+
 
