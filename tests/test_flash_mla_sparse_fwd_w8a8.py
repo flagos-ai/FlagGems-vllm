@@ -31,6 +31,87 @@ from tests.test_flash_mla_with_kvcache_w8a8 import quantize_dense_fp8
 
 from .accuracy_utils import gems_assert_close, gems_assert_equal, to_cpu, to_reference
 
+PAGE_TOKENS = 64
+NOPE = 448
+ROPE = 64
+GROUP = 64
+SCALE_BYTES = 8
+DATA_BYTES = NOPE + ROPE * 2
+TOKEN_BYTES = DATA_BYTES + SCALE_BYTES
+PAGE_PAYLOAD = PAGE_TOKENS * TOKEN_BYTES
+PAGE_STRIDE = ((PAGE_PAYLOAD + DATA_BYTES - 1) // DATA_BYTES) * DATA_BYTES
+
+
+def pack_v4_cache(kv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return native packed pages and the corresponding BF16 reference KV."""
+    tokens = kv.shape[0]
+    assert tokens > 0 and kv.shape == (tokens, 1, NOPE + ROPE)
+    assert kv.dtype == torch.bfloat16
+
+    pages = (tokens + PAGE_TOKENS - 1) // PAGE_TOKENS
+    padded = torch.zeros(
+        (pages * PAGE_TOKENS, NOPE + ROPE), dtype=kv.dtype, device=kv.device
+    )
+    padded[:tokens].copy_(kv[:, 0])
+    padded = padded.view(pages, PAGE_TOKENS, NOPE + ROPE)
+    groups = (
+        padded[..., :NOPE].float().reshape(pages, PAGE_TOKENS, NOPE // GROUP, GROUP)
+    )
+    exponent = (groups.abs().amax(-1) / 448.0).clamp_min(1.0e-4).log2().ceil()
+    scales = torch.exp2(exponent)
+    fp8 = (groups / scales[..., None]).to(torch.float8_e4m3fn)
+
+    page_bytes = torch.zeros((pages, PAGE_STRIDE), dtype=torch.uint8, device=kv.device)
+    data_end = PAGE_TOKENS * DATA_BYTES
+    payload = page_bytes[:, :data_end].view(pages, PAGE_TOKENS, DATA_BYTES)
+    payload[..., :NOPE] = fp8.view(torch.uint8).reshape(pages, PAGE_TOKENS, NOPE)
+    payload[..., NOPE:] = padded[..., NOPE:].contiguous().view(torch.uint8)
+    scale = page_bytes[:, data_end:PAGE_PAYLOAD].view(pages, PAGE_TOKENS, SCALE_BYTES)
+    scale[..., : NOPE // GROUP] = (exponent + 127).to(torch.uint8)
+
+    reference = padded.clone()
+    reference[..., :NOPE] = (fp8.float() * scales[..., None]).reshape(
+        pages, PAGE_TOKENS, NOPE
+    )
+    packed = page_bytes[:, :PAGE_PAYLOAD].view(pages, PAGE_TOKENS, 1, TOKEN_BYTES)
+    return packed, reference.view(-1, 1, NOPE + ROPE)[:tokens]
+
+
+def quantize_v4_query(q: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Prepare the native V4 448 FP8 Q and 64 BF16 RoPE."""
+    batch, heads, width = q.shape
+    assert width == NOPE + ROPE and q.dtype == torch.bfloat16
+    blocks = q[..., :NOPE].float().reshape(batch, heads, NOPE // GROUP, GROUP)
+    exponent = (blocks.abs().amax(-1) / 448.0).clamp_min(1.0e-4).log2().ceil()
+    scales = torch.exp2(exponent)
+    fp8 = (blocks / scales[..., None]).to(torch.float8_e4m3fn)
+    rope = q[..., NOPE:].contiguous()
+    reference = q.clone()
+    reference[..., :NOPE] = (fp8.float() * scales[..., None]).reshape(
+        batch, heads, NOPE
+    )
+    return fp8.reshape(batch, heads, NOPE), rope, scales, reference
+
+
+def native_v4_inputs(inputs):
+    query, kv, indices, scale, value_dim, sink, length = inputs
+    if sink is not None or length is not None:
+        raise ValueError("Native V4 benchmark requires fixed top-k without sinks")
+    fp8, rope, scales, query_reference = quantize_v4_query(query)
+    cache, kv_reference = pack_v4_cache(kv)
+    baseline = query_reference, kv_reference, indices, scale, value_dim, sink, length
+    packed = (
+        fp8[:, None],
+        rope[:, None],
+        cache,
+        None,
+        scales[:, None],
+        None,
+        indices,
+        scale,
+    )
+    return baseline, packed
+
 
 @lru_cache(maxsize=1)
 def flashmla_reference() -> ModuleType:
@@ -195,3 +276,30 @@ def test_flash_mla_sparse_flashmla(shape):
         *quantize_sparse_fp8_fixture(*inputs)
     )
     assert_sparse_fixture_close(output[:, 0], lse[:, :, 0], reference, reference_lse)
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4, 64, 512, 256, 1, 128, 512, False, False, 10),
+        (64, 64, 512, 512, 1, 128, 512, False, False, 11),
+        (16, 64, 512, 1024, 1, 640, 512, False, False, 12),
+        (64, 64, 512, 1024, 1, 640, 512, False, False, 13),
+        (4, 64, 512, 9216, 1, 8320, 512, False, False, 14),
+    ],
+)
+def test_flash_mla_sparse_native_v4(shape):
+    inputs = make_sparse_inputs(shape)
+    inputs[2][0].fill_(-1)
+    baseline, packed = native_v4_inputs(inputs)
+    reference, _, reference_lse = flashmla_reference().flash_mla_sparse_fwd(*baseline)
+    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed)
+    for columns in (slice(None), slice(NOPE, None)):
+        assert_sparse_fixture_close(
+            output[:, 0, :, columns],
+            lse[:, :, 0],
+            reference[..., columns],
+            reference_lse,
+        )
