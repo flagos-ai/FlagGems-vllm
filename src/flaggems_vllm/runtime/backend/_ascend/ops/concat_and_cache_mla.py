@@ -18,9 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.concat_and_cache_mla import (
-    concat_and_cache_mla as _generic,
-)
+from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla as _generic
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._ascend.tensorview import (
     HAS_TENSORVIEW,

@@ -18,9 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.ops.paged_kv_block_gather import (
-    paged_kv_block_gather as _generic,
-)
+from flaggems_vllm.ops.paged_kv_block_gather import paged_kv_block_gather as _generic
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._ascend.tensorview import (
     HAS_TENSORVIEW,

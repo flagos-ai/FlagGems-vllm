@@ -21,6 +21,7 @@ class Collector:
 
 class DispatchTrace:
     """Trace dispatch decisions by wrapping private eligibility and launch gates."""
+
     def __init__(self, force_fallback=False):
         self.events = []
         self.originals = []
@@ -32,6 +33,7 @@ class DispatchTrace:
 
     def pytest_collection_finish(self, session):
         import sys
+
         for name, module in tuple(sys.modules.items()):
             if not name.startswith("flaggems_vllm.runtime.backend._ascend.ops."):
                 continue
@@ -39,35 +41,87 @@ class DispatchTrace:
                 eligible = getattr(module, eligible_name, None)
                 if not callable(eligible):
                     continue
+
                 def make_eligible(fn, module_name, attr_name):
                     def wrapped(*args, **kwargs):
                         result = fn(*args, **kwargs)
-                        self._record({"op_module": module_name, "route": "tensorview_eligible" if result else "generic_ineligible", "eligibility": attr_name})
+                        self._record(
+                            {
+                                "op_module": module_name,
+                                "route": (
+                                    "tensorview_eligible"
+                                    if result
+                                    else "generic_ineligible"
+                                ),
+                                "eligibility": attr_name,
+                            }
+                        )
                         return result
+
                     return wrapped
+
                 self.originals.append((module, eligible_name, eligible))
-                setattr(module, eligible_name, make_eligible(eligible, name, eligible_name))
+                setattr(
+                    module, eligible_name, make_eligible(eligible, name, eligible_name)
+                )
             gate = getattr(module, "tensorview_call", None)
             if callable(gate):
+
                 def make_gate(fn, module_name):
                     def wrapped(op_name, fast_fn, generic_fn, *args, **kwargs):
                         if self.force_fallback:
-                            self._record({"op_module": module_name, "op": op_name, "route": "forced_generic_fallback"})
+                            self._record(
+                                {
+                                    "op_module": module_name,
+                                    "op": op_name,
+                                    "route": "forced_generic_fallback",
+                                }
+                            )
                             return generic_fn(*args, **kwargs)
+
                         def traced_fast(*a, **k):
-                            self._record({"op_module": module_name, "op": op_name, "route": "tensorview_fast_attempt"})
+                            self._record(
+                                {
+                                    "op_module": module_name,
+                                    "op": op_name,
+                                    "route": "tensorview_fast_attempt",
+                                }
+                            )
                             try:
                                 value = fast_fn(*a, **k)
                             except Exception as exc:
-                                self._record({"op_module": module_name, "op": op_name, "route": "tensorview_fast_error", "error": repr(exc)})
+                                self._record(
+                                    {
+                                        "op_module": module_name,
+                                        "op": op_name,
+                                        "route": "tensorview_fast_error",
+                                        "error": repr(exc),
+                                    }
+                                )
                                 raise
-                            self._record({"op_module": module_name, "op": op_name, "route": "tensorview_fast_success"})
+                            self._record(
+                                {
+                                    "op_module": module_name,
+                                    "op": op_name,
+                                    "route": "tensorview_fast_success",
+                                }
+                            )
                             return value
+
                         def traced_generic(*a, **k):
-                            self._record({"op_module": module_name, "op": op_name, "route": "generic_fallback"})
+                            self._record(
+                                {
+                                    "op_module": module_name,
+                                    "op": op_name,
+                                    "route": "generic_fallback",
+                                }
+                            )
                             return generic_fn(*a, **k)
+
                         return fn(op_name, traced_fast, traced_generic, *args, **kwargs)
+
                     return wrapped
+
                 self.originals.append((module, "tensorview_call", gate))
                 setattr(module, "tensorview_call", make_gate(gate, name))
 
@@ -117,14 +171,20 @@ class Recorder:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("targets", nargs="+", help="pytest target paths")
-    parser.add_argument("--output-dir", type=Path, default=Path("ascend-dispatch-repro"))
-    parser.add_argument("--execute", action="store_true", help="execute on configured hardware")
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("ascend-dispatch-repro")
+    )
+    parser.add_argument(
+        "--execute", action="store_true", help="execute on configured hardware"
+    )
     parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
-    os.environ["PYTHONPATH"] = str(root / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = (
+        str(root / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
     targets = [str(root / t) if not Path(t).is_absolute() else t for t in args.targets]
     collector = Collector()
     status = pytest.main(["-q", "--collect-only", *targets], plugins=[collector])
@@ -133,27 +193,48 @@ def main() -> int:
         encoding="utf-8",
     )
     if int(status) != 0 or not collector.nodes:
-        print(f"Collection failed or returned zero nodes; see {out / 'collection.log'}", file=sys.stderr)
+        print(
+            f"Collection failed or returned zero nodes; see {out / 'collection.log'}",
+            file=sys.stderr,
+        )
         return 2
-    (out / "nodeids.txt").write_text("\n".join(collector.nodes) + "\n", encoding="utf-8")
+    (out / "nodeids.txt").write_text(
+        "\n".join(collector.nodes) + "\n", encoding="utf-8"
+    )
     print(f"Collected {len(collector.nodes)} nodes: {out / 'nodeids.txt'}")
     if not args.execute:
-        print("Collection only. --execute runs tests on hardware and captures TensorView routes.")
+        print(
+            "Collection only. --execute runs tests on hardware and captures TensorView routes."
+        )
         return 0
-    if os.environ.get("FLAGGEMS_VENDOR", os.environ.get("DNN_VENDOR", "")).lower() != "ascend":
-        print("Refusing execution: set FLAGGEMS_VENDOR=ascend on an Ascend host.", file=sys.stderr)
+    if (
+        os.environ.get("FLAGGEMS_VENDOR", os.environ.get("DNN_VENDOR", "")).lower()
+        != "ascend"
+    ):
+        print(
+            "Refusing execution: set FLAGGEMS_VENDOR=ascend on an Ascend host.",
+            file=sys.stderr,
+        )
         return 2
     base = (["--quick"] if args.quick else []) + collector.nodes
     results = []
-    for mode, force_fallback in (("ascend_native_dispatch", False), ("ascend_forced_generic_fallback", True)):
+    for mode, force_fallback in (
+        ("ascend_native_dispatch", False),
+        ("ascend_forced_generic_fallback", True),
+    ):
         os.environ["FLAGGEMS_ASCEND_REPRO_MODE"] = mode
         tracer = DispatchTrace(force_fallback=force_fallback)
         recorder = Recorder(out / "results.json", mode, tracer)
         tracer.__pytest_plugin_name__ = "repro_ascend_trace"
         recorder.__pytest_plugin_name__ = "repro_ascend_recorder"
-        results.append(int(pytest.main([
-            "-q", "--repro-ascend-report", str(out / "results.json"), *base
-        ], plugins=[tracer, recorder])))
+        results.append(
+            int(
+                pytest.main(
+                    ["-q", "--repro-ascend-report", str(out / "results.json"), *base],
+                    plugins=[tracer, recorder],
+                )
+            )
+        )
     return int(any(results))
 
 

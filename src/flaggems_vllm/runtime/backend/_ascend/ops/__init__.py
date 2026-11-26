@@ -24,14 +24,14 @@ from flaggems_vllm.runtime.backend._ascend.ops.chunk_gated_delta_rule_fwd import
 from flaggems_vllm.runtime.backend._ascend.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.concat_and_cache_mla import (
-    concat_and_cache_mla,
-)
 from flaggems_vllm.runtime.backend._ascend.ops.compressor import (
     build_compressor_metadata,
     compressor,
     compressor_prepared,
     prepare_compressor_workspace,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.concat_and_cache_mla import (
+    concat_and_cache_mla,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._ascend.ops.cp_gather_indexer_k_quant_cache import (
@@ -126,11 +126,11 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer import (
     quant_lightning_indexer,
 )
-from flaggems_vllm.runtime.backend._ascend.ops.rotary_embedding import (
-    apply_rotary_pos_emb,
-)
 from flaggems_vllm.runtime.backend._ascend.ops.reshape_and_cache_flash import (
     reshape_and_cache_flash,
+)
+from flaggems_vllm.runtime.backend._ascend.ops.rotary_embedding import (
+    apply_rotary_pos_emb,
 )
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
