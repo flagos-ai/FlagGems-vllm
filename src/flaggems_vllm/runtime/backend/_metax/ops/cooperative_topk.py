@@ -24,7 +24,11 @@ from flaggems_vllm.utils import libentry, libtuner
 try:
     from triton.experimental.tle.language import gpu
 except ImportError:
-    gpu = None
+    # The vendor Triton in MACA 3.9 exposes the same operations under mctle.
+    try:
+        from triton.language.extra.maca.mctle import gpu
+    except ImportError:
+        gpu = None
 
 _HAS_SMEM = all(hasattr(gpu, name) for name in ("alloc", "local_ptr", "smem"))
 
