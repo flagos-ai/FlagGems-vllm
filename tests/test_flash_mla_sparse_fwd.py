@@ -479,6 +479,38 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
 
 
 @pytest.mark.flash_mla_sparse_fwd
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="requires MetaX C550")
+@pytest.mark.parametrize("num_queries", [1, 128])
+def test_flash_mla_sparse_fwd_metax_c550(num_queries):
+    op = flaggems_vllm.flash_mla_sparse_fwd
+    assert op.supports_metax_c550()
+    device = flaggems_vllm.device
+    generator = torch.Generator(device=device).manual_seed(42)
+    q = torch.randn(
+        (num_queries, 64, 576), dtype=torch.bfloat16, device=device, generator=generator
+    )
+    kv = torch.randn(
+        (512, 1, 576), dtype=torch.bfloat16, device=device, generator=generator
+    )
+    indices = torch.full((num_queries, 1, 2048), -1, dtype=torch.int32, device=device)
+    indices[..., :128] = torch.arange(128, device=device)
+    lengths = torch.full((num_queries,), 65, dtype=torch.int32, device=device)
+    if num_queries > 1:
+        lengths[-1] = 0
+    sinks = torch.linspace(-2, 2, 64, dtype=torch.float32, device=device)
+    scale = 576**-0.5
+    actual = op(q, kv, indices, scale, attn_sink=sinks, topk_length=lengths)
+    expected = FlashmlaSparseTestKit.torch_flash_mla_sparse_fwd(
+        num_queries, 512, 64, 1, 576, 2048, q, kv, indices, scale, 512, sinks, lengths
+    )
+    flaggems_vllm.testing.assert_close(
+        actual[0], expected[0], torch.bfloat16, atol=1e-2
+    )
+    for result, reference in zip(actual[1:], expected[1:]):
+        flaggems_vllm.testing.assert_close(result, reference, torch.float32, atol=1e-4)
+
+
+@pytest.mark.flash_mla_sparse_fwd
 def test_flash_mla_sparse_vendor_export_and_abi():
     from flaggems_vllm.ops import flashmla_sparse as generic
 

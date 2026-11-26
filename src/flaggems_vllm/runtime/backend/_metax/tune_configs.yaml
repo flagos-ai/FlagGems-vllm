@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Sparse MLA's NVIDIA tiles exceed C550's 64 KiB shared-memory limit.
+flash_mla_sparse_fwd:
+  - META: {BK: 16, BH: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BK: 16, BH: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BK: 16, BH: 16}
+    num_warps: 4
+    num_stages: 2
+  - META: {BK: 16, BH: 16}
+    num_warps: 4
+    num_stages: 1
+
 expand_pools_and_append_tail:
   - META:
       BLOCK_COLS: 128

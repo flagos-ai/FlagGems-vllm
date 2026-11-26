@@ -24,7 +24,7 @@ from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.tle_capabilities import supports_sparse_mla_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
-if has_triton_tle(3, 6, 0):
+if runtime.device.vendor_name != "metax" and has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 
@@ -41,6 +41,17 @@ TLE_FLASHMLA_PREFILL_BK = 64
 TLE_FLASHMLA_PREFILL_BH = 64
 TLE_FLASHMLA_PREFILL_PAIR_BLOCKS = 2
 TLE_FLASHMLA_PREFILL_WORKER_NUM_WARPS = 4
+
+
+def _supports_metax_c550() -> bool:
+    """Check the device contract for the C550 BF16 sparse MLA provider."""
+    if runtime.device.vendor_name != "metax" or not torch.cuda.is_available():
+        return False
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return (
+        "c550" in properties.name.lower()
+        and getattr(properties, "shared_memory_per_block", 0) >= 64 * 1024
+    )
 
 
 # SQ and SKV are deliberately absent from the autotune key: the winning config
@@ -1210,3 +1221,6 @@ def flash_mla_sparse_fwd(
         topk_length is not None,
     )
     return output, max_logits, lse
+
+
+flash_mla_sparse_fwd.supports_metax_c550 = _supports_metax_c550
