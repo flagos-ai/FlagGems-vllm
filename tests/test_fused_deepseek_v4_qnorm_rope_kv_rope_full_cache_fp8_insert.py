@@ -23,8 +23,10 @@ from flaggems_vllm.utils.device_info import get_device_capability
 OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert"
 VENDOR = flaggems_vllm.vendor_name
 DEVICE = flaggems_vllm.device
-SUPPORTED_VENDORS = frozenset({"nvidia", "mthreads", "hygon", "metax", "thead"})
-UINT8_CONTAINER_VENDORS = frozenset({"hygon", "metax", "thead"})
+SUPPORTED_VENDORS = frozenset(
+    {"nvidia", "mthreads", "hygon", "metax", "thead", "ascend"}
+)
+UINT8_CONTAINER_VENDORS = frozenset({"hygon", "metax", "thead", "ascend"})
 FP8_STORE_DTYPE = getattr(torch, "float8_e4m3fn", None)
 HEAD_DIM = 512
 ROPE_DIM = 64

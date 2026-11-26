@@ -1086,6 +1086,39 @@ def test_fused_marlin_moe_w8a16_library_tuning():
         assert all(config.maxnreg is None for config in kernel.fn.configs)
 
 
+def test_fused_marlin_moe_w8a16_fp8_down_prune():
+    """Few tokens and a short K loop drop the deeper pipelines; others keep all."""
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    down = module._fused_moe_kernel_w8a16_down_fp8.fn
+    prune = module._prune_w8a16_fp8_down_configs
+    configs = list(down.configs)
+    assert any(config.num_stages > 1 for config in configs)
+
+    def kept(num_tokens, intermediate):
+        return prune(configs, {"T": num_tokens, "I": intermediate})
+
+    # I=256 gives at most four K iterations: only one-stage candidates stay.
+    assert kept(16, 256)
+    assert {config.num_stages for config in kept(16, 256)} == {1}
+    # More tokens, or a longer K loop, keep every candidate.
+    assert kept(17, 256) == configs
+    assert kept(16, 768) == configs
+
+
+def test_fused_marlin_moe_w8a16_fp8_down_cache_version():
+    """The down kernel's pruning rule only runs on a cache miss.
+
+    A table written before the rule existed keeps serving its three-stage
+    results unless the kernel names a new table. The mechanism itself is
+    covered in test_libentry.py; this pins the kernel that depends on it.
+    """
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    down = module._fused_moe_kernel_w8a16_down_fp8.fn
+
+    assert down.early_config_prune is module._prune_w8a16_fp8_down_configs
+    assert down.cache_version is not None
+
+
 @pytest.mark.parametrize("blocks", [(64, 128), (128, 64)])
 def test_fused_marlin_moe_w8a16_tuning_cache(tmp_path, blocks):
     from flaggems_vllm.utils.models.sql import SQLPersistantModel
