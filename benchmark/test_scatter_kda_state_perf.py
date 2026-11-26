@@ -78,11 +78,11 @@ def _gems_scatter(cache, idx, vals):
     return out
 
 
-@pytest.mark.kda_state_scatter
+@pytest.mark.scatter_kda_state
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="targets Ascend")
-def test_kda_state_scatter_perf():
+def test_scatter_kda_state_perf():
     KdaStateScatterBenchmark(
-        op_name="kda_state_scatter",
+        op_name="scatter_kda_state",
         torch_op=_torch_scatter,
         gems_op=_gems_scatter,
         dtypes=[torch.bfloat16],

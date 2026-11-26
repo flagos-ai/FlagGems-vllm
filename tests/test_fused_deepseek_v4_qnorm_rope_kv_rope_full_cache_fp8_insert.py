@@ -23,8 +23,10 @@ from flaggems_vllm.utils.device_info import get_device_capability
 OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert"
 VENDOR = flaggems_vllm.vendor_name
 DEVICE = flaggems_vllm.device
-SUPPORTED_VENDORS = frozenset({"nvidia", "mthreads", "hygon", "metax", "thead"})
-UINT8_CONTAINER_VENDORS = frozenset({"hygon", "metax", "thead"})
+SUPPORTED_VENDORS = frozenset(
+    {"nvidia", "mthreads", "hygon", "metax", "thead", "ascend"}
+)
+UINT8_CONTAINER_VENDORS = frozenset({"hygon", "metax", "thead", "ascend"})
 FP8_STORE_DTYPE = getattr(torch, "float8_e4m3fn", None)
 HEAD_DIM = 512
 ROPE_DIM = 64
@@ -74,6 +76,14 @@ def fp8_ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.where(u >= 0x80, 0xFF - u, u + 0x80)
 
     return (key(a) - key(b)).abs()
+
+
+def _max_fp8_ulp(a: torch.Tensor, b: torch.Tensor) -> int:
+    """Maximum E4M3 ULP distance without MUSA's unsupported int16 reduce."""
+    distance = fp8_ulp_distance(a, b)
+    if distance.device.type == "musa":
+        distance = distance.cpu()
+    return int(distance.max().item())
 
 
 def _to_e4m3_uint8(x: torch.Tensor) -> torch.Tensor:
@@ -282,11 +292,7 @@ def _run_and_compare(
     )
 
     if n_heads > 0:
-        q_max_ulp = int(
-            fp8_ulp_distance(q_fused.view(torch.uint8), q_ref.view(torch.uint8))
-            .max()
-            .item()
-        )
+        q_max_ulp = _max_fp8_ulp(q_fused.view(torch.uint8), q_ref.view(torch.uint8))
         assert q_max_ulp <= 1, f"Q FP8 differs by {q_max_ulp} ULP (>1)"
 
     cache_fused_u8 = cache_fused.view(torch.uint8)
@@ -299,10 +305,8 @@ def _run_and_compare(
         rtol=0,
         atol=0,
     )
-    k_max_ulp = int(
-        fp8_ulp_distance(cache_fused_u8[..., NOPE_DIM:], cache_ref_u8[..., NOPE_DIM:])
-        .max()
-        .item()
+    k_max_ulp = _max_fp8_ulp(
+        cache_fused_u8[..., NOPE_DIM:], cache_ref_u8[..., NOPE_DIM:]
     )
     assert k_max_ulp <= 1, f"K-cache RoPE FP8 differs by {k_max_ulp} ULP (>1)"
 

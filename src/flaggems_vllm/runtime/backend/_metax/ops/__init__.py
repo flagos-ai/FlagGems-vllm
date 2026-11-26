@@ -22,6 +22,9 @@ from flaggems_vllm.runtime.backend._metax.ops.cooperative_topk import cooperativ
 from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
+from flaggems_vllm.runtime.backend._metax.ops.deep_gemm_fp8_o_proj import (
+    deep_gemm_fp8_o_proj,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,
 )
@@ -53,6 +56,7 @@ from flaggems_vllm.runtime.backend._metax.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
+from flaggems_vllm.runtime.backend._metax.ops.w8a8_block_matmul import w8a8_block_matmul
 from flaggems_vllm.utils import triton_version_utils
 
 # A missing optional TLE extension must not disable the independent INT8 ops.
@@ -64,6 +68,7 @@ else:
 __all__ = [
     "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
+    "deep_gemm_fp8_o_proj",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
@@ -86,4 +91,5 @@ __all__ = [
     "SUPPORTED_FP8_DTYPE",
     "top_k_top_p",
     "w8a8_block_int8_bmm",
+    "w8a8_block_matmul",
 ]
