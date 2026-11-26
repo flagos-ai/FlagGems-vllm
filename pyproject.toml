@@ -76,6 +76,7 @@ metax = [
     "xgboost==3.3.0; python_version >= '3.12'",
 ]
 
+
 iluvatar = [
     "ixformer @ https://resource.flagos.net/repository/flagos-pypi-iluvatar/packages/ixformer/0.7.0+corex.4.5.0.20260804/ixformer-0.7.0+corex.4.5.0.20260804-cp312-cp312-linux_x86_64.whl#sha256=413fe629b4ee707df83fd99a19366dd35ae757a2f495acdc2cffa7a49be7a688",
 ]
