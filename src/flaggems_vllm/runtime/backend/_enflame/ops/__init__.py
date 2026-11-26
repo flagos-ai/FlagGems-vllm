@@ -25,52 +25,11 @@ generic ``flaggems_vllm.ops`` package; rewire them when adapting an
 operator locally.
 """
 
-# Keep vllm.third_party.deep_gemm importable on hosts whose torch build lacks
-# the CUDA shared libraries its vendored _C extension needs (test/benchmark
-# modules import deep_gemm.utils.math at module level). See the module
-# docstring of _vllm_deep_gemm_import_compat for the exact mechanism.
 import sys
 
 import torch
 
 from flaggems_vllm.runtime import device as _runtime_device
-from flaggems_vllm.runtime.backend._enflame.ops._vllm_deep_gemm_import_compat import (
-    install_vllm_deep_gemm_import_compat,
-)
-
-install_vllm_deep_gemm_import_compat()  # Library-compat shim (not GCUIR); keep
-
-# vLLM accuracy tests call get_paged_mqa_logits_metadata with torch's
-# multi_processor_count, which the GCU deep_gemm C++ API rejects by
-# hard-exiting the process (killing the whole pytest session before the
-# op under test runs); its topsaten path likewise rejects the standard
-# vLLM 2D tensor ranks. See the module docstring of
-# _vllm_paged_mqa_logits_compat for the exact mechanism.
-from flaggems_vllm.runtime.backend._enflame.ops._vllm_paged_mqa_logits_compat import (
-    install_vllm_paged_mqa_logits_compat,
-)
-
-install_vllm_paged_mqa_logits_compat()  # Library-compat shim (not GCUIR); keep
-
-# Make vLLM's own fused_experts_impl reference runnable on GCU (tests compare
-# FlagGems fused_moe against it): fall back to a GCU device name when vLLM
-# cannot detect a platform, and provide the missing _C/_moe_C ops through
-# FlagGems Triton implementations. No-op wherever vLLM works natively.
-from flaggems_vllm.runtime.backend._enflame.ops._vllm_moe_ref_compat import (
-    install_vllm_moe_ref_compat,
-)
-
-install_vllm_moe_ref_compat()  # Library-compat shim (not GCUIR); keep
-
-# flaggems_vllm LibEntry (unlike LibTuner) does not expose cache_key, which upstream tests require
-# (tests/test_tle_capabilities.py asserts that @libentry() kernels expose this attribute); additive
-# class-attribute patch that applies only when the attribute is missing and delegates to the
-# jit_function already resolved by LibEntry.
-from flaggems_vllm.runtime.backend._enflame.ops._flaggems_libentry_compat import (
-    install_flaggems_libentry_compat,
-)
-
-install_flaggems_libentry_compat()  # Library-compat shim (not GCUIR); keep
 
 # isort: off
 from flaggems_vllm.runtime.backend._enflame.ops.act_quant import act_quant_triton
@@ -180,17 +139,6 @@ from flaggems_vllm.runtime.backend._enflame.ops.fused_deepseek_v4_qnorm_rope_kv_
 from flaggems_vllm.runtime.backend._enflame.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
-
-# Make vLLM's own fused_inv_rope_fp8_quant reference runnable on GCU
-# (benchmarks time it as the baseline): its kernel's int64 positions scalar
-# load aborts the device (triton_i64_narrow_load); the shim re-exposes
-# positions as compact int32 words (zero-copy) before delegating. No-op
-# wherever vLLM works natively.
-from flaggems_vllm.runtime.backend._enflame.ops._vllm_inv_rope_ref_compat import (
-    install_vllm_inv_rope_ref_compat,
-)
-
-install_vllm_inv_rope_ref_compat()  # Library-compat shim (not GCUIR); keep
 
 from flaggems_vllm.runtime.backend._enflame.ops.fused_indexer_q_rope_quant import (
     fused_indexer_q_rope_quant,
@@ -399,17 +347,6 @@ if (
         and getattr(_flaggems_pkg, "SUPPORTED_FP8_DTYPE", None) is torch.float32
     ):
         _flaggems_pkg.SUPPORTED_FP8_DTYPE = torch.float8_e4m3fn
-
-# tests/test_tle_capabilities.py re-executes the top-K module files from
-# their sys.modules entry, so the SpecOpRegistrar function swap cannot keep
-# the generic non-TLE radix kernels (GCU-banned) out of that path.  Redirect
-# the module identities to the GCU compat file; see
-# _vllm_topk_module_compat.install_vllm_topk_module_compat.
-from flaggems_vllm.runtime.backend._enflame.ops._vllm_topk_module_compat import (
-    install_vllm_topk_module_compat,
-)
-
-install_vllm_topk_module_compat()  # Library-compat shim (not GCUIR); keep
 
 __all__ = [
     "act_quant_triton",

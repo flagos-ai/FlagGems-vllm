@@ -22,10 +22,6 @@ import triton.language as tl
 from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn as _general_hc_split_sinkhorn,
 )
-from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
-    mhc_split_sinkhorn_torch_ref as _general_mhc_split_sinkhorn_torch_ref,
-)
-
 LOG2E = tl.constexpr(1.4426950408889634)
 
 
@@ -604,11 +600,9 @@ def _install():
     the already-imported generic module (loaded during ``import
     flaggems_vllm``), following the mhc_post/mhc_pre precedent.
 
-    ``mhc_split_sinkhorn_torch_ref`` is swapped in as well: the generic
-    reference uses ``Tensor.max(dim=-1)`` whose int64 index output is rejected
-    by topsatenMax on GCU (TOPSATEN_STATUS_NOT_SUPPORT abort), so the GCU copy
-    computes the row max with ``torch.amax`` instead — a bit-identical
-    reduction (verified with torch.equal against CPU max().values).
+    The torch reference is kept in ``tests/test_mhc_ops.py`` and uses
+    ``torch.amax`` for the row max; ``Tensor.max(dim=-1)`` emits an int64 index
+    output that topsatenMax rejects on GCU. No test-only ref is swapped here.
     """
     if _use_general_for_ab():
         return
@@ -623,11 +617,6 @@ def _install():
             continue
         if getattr(mod, "hc_split_sinkhorn", None) is _general_hc_split_sinkhorn:
             mod.hc_split_sinkhorn = hc_split_sinkhorn
-        if (
-            getattr(mod, "mhc_split_sinkhorn_torch_ref", None)
-            is _general_mhc_split_sinkhorn_torch_ref
-        ):
-            mod.mhc_split_sinkhorn_torch_ref = mhc_split_sinkhorn_torch_ref
 
 
 _install()

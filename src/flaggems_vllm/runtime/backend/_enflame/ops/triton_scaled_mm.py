@@ -320,8 +320,8 @@ def _fits_int32(
 # helper to compute the identical math on CPU copies — exactly the result
 # to_reference() wrapping would have produced. Default --ref device runs,
 # benchmarks and production paths are untouched (test module / conftest
-# absent from sys.modules, TO_CPU False). Same scoped-compat pattern as
-# _vllm_moe_ref_compat.py.
+# absent from sys.modules, TO_CPU False). Same test-local ref pattern as
+# tests/test_fused_experts_impl.py.
 # ---------------------------------------------------------------------------
 
 _TEST_MODULE_NAME = "tests.test_triton_scaled_mm"

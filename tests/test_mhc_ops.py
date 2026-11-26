@@ -271,7 +271,7 @@ def mhc_split_sinkhorn_torch_ref(
         2
     ] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
 
-    row_max = comb.max(dim=-1, keepdim=True).values
+    row_max = torch.amax(comb, dim=-1, keepdim=True)
     comb = (comb - row_max).exp()
     comb = comb / comb.sum(dim=-1, keepdim=True) + eps
     comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
