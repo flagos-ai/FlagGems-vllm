@@ -123,13 +123,13 @@ class _CachedLaunch:
         )
         self.tail = [kwargs[name] for name in arg_names[num_args:]]
 
-    def __call__(self, args):
+    def __call__(self, args, stream):
         kernel = self.kernel
         kernel.run(
             self.grid[0],
             self.grid[1],
             self.grid[2],
-            _current_stream(),
+            stream,
             kernel.function,
             kernel.packed_metadata,
             None,
@@ -152,13 +152,13 @@ def _launch_hooks_absent() -> bool:
     return True
 
 
-def _dispatch(jit_fn, grid, args, kwargs, record, slot):
+def _dispatch(jit_fn, grid, args, kwargs, record, slot, stream):
     """Launch ``jit_fn``, reusing its compiled kernel after the first call."""
     global _LAUNCH_DISABLED
     launcher = record.get(slot)
     if launcher is not None:
         try:
-            launcher(args)
+            launcher(args, stream)
             return
         except Exception:  # pragma: no cover - defensive, layout changes
             logger.warning("direct launch failed; using the regular dispatch")
@@ -325,6 +325,7 @@ def _o_proj_inv_rope_quant(
     aligned_tokens,
     eps,
     HEADS: tl.constexpr,
+    SCALE_DENSE: tl.constexpr,
 ):
     """Inverse interleaved RoPE + 128-group FP8 quantization for prefill.
 
@@ -332,6 +333,12 @@ def _o_proj_inv_rope_quant(
     pairs so each row is exactly one quantization group. Same math as the
     shared kernel, with the RoPE partner taken from the loaded tile (the pair
     swap over the last axis) instead of a second masked global load.
+
+    ``SCALE_DENSE`` picks the scale layout: dense ``[group, token, column]``
+    writes this CTA's ``HEADS * 4`` scales as one contiguous run (the TLE GEMM
+    wants exactly that tile), while the token-major layout the plain GEMM's row
+    load wants scatters them one per 64 KB-strided address. Measured at 4096
+    tokens: 368 vs 310 us for the same kernel without the scale store.
     """
     token = tl.program_id(0).to(tl.int64)
     rows = tl.arange(0, HEADS * 4)
@@ -341,11 +348,19 @@ def _o_proj_inv_rope_quant(
     local_head = head % heads_per_group
     valid_head = head < heads
     scale_cols: tl.constexpr = heads_per_group * 4
-    scale_offsets = (
-        group.to(tl.int64) * scale_cols * aligned_tokens
-        + (local_head * 4 + chunk) * aligned_tokens
-        + token
-    )
+    if SCALE_DENSE:
+        scale_offsets = (
+            group.to(tl.int64) * scale_cols * tokens
+            + token * scale_cols
+            + local_head * 4
+            + chunk
+        )
+    else:
+        scale_offsets = (
+            group.to(tl.int64) * scale_cols * aligned_tokens
+            + (local_head * 4 + chunk) * aligned_tokens
+            + token
+        )
     if token >= tokens:
         tl.store(S + scale_offsets, 0.0, valid_head)
         return
@@ -388,7 +403,16 @@ def _o_proj_inv_rope_quant(
 
 
 def _quant_heads(
-    o, positions, cos_sin_cache, n_groups, heads_per_group, nope_dim, rope_dim, record
+    o,
+    positions,
+    cos_sin_cache,
+    n_groups,
+    heads_per_group,
+    nope_dim,
+    rope_dim,
+    record,
+    stream,
+    dense_scales,
 ):
     """Inverse RoPE + group FP8 quant for every batch size.
 
@@ -401,26 +425,56 @@ def _quant_heads(
     Decode keeps the wrapper's one-head tile, which it picked for the same
     reason in reverse (from 64 tokens down the batch has more CTAs than the
     chip has lanes, so a narrow tile is what keeps them short).
+
+    ``dense_scales`` emits the scale block the TLE GEMM consumes directly
+    (``[groups, tokens, columns]``); the token-major layout the plain GEMM's
+    row load wants is then only built for the shapes that use it.
+
+    The output and scale buffers never escape this operator, so they are kept
+    in the signature's slot and reused. They are keyed by stream as well, so a
+    second stream cannot overtake a buffer that the first one still reads.
     """
     heads = o.shape[1]
     tokens = o.shape[0]
     heads_per_program = 1 if tokens < 128 else 4
     aligned_tokens = triton.cdiv(tokens, 4) * 4
     scale_cols = heads_per_group * 4
-    output = torch.empty(
-        (n_groups, tokens, heads_per_group * (nope_dim + rope_dim)),
-        device=o.device,
-        dtype=torch.float8_e4m3fn,
-    )
-    scales = torch.empty(
-        n_groups * scale_cols * aligned_tokens, device=o.device, dtype=torch.float32
-    ).as_strided(
-        (n_groups, tokens, scale_cols),
-        (scale_cols * aligned_tokens, 1, aligned_tokens),
-    )
+    key = (stream, tokens, heads, n_groups, heads_per_group, dense_scales)
+    workspace = record.get("ws")
+    if workspace is None or workspace[0] != key:
+        output = torch.empty(
+            (n_groups, tokens, heads_per_group * (nope_dim + rope_dim)),
+            device=o.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        if dense_scales:
+            scales = torch.empty(
+                (n_groups, tokens, scale_cols), device=o.device, dtype=torch.float32
+            )
+            tokens_axis = tokens
+        else:
+            scales = torch.empty(
+                n_groups * scale_cols * aligned_tokens,
+                device=o.device,
+                dtype=torch.float32,
+            ).as_strided(
+                (n_groups, tokens, scale_cols),
+                (scale_cols * aligned_tokens, 1, aligned_tokens),
+            )
+            tokens_axis = aligned_tokens
+        workspace = (
+            key,
+            output,
+            scales,
+            output.transpose(0, 1),
+            scales.transpose(0, 1),
+            tokens_axis,
+        )
+        record["ws"] = workspace
+    _, output, scales, output_t, scales_t, tokens_axis = workspace
     _dispatch(
         _o_proj_inv_rope_quant,
-        (aligned_tokens, triton.cdiv(heads, heads_per_program)),
+        (tokens_axis, triton.cdiv(heads, heads_per_program)),
         (
             o,
             positions,
@@ -438,13 +492,15 @@ def _quant_heads(
         ),
         {
             "HEADS": heads_per_program,
+            "SCALE_DENSE": dense_scales,
             "num_warps": 1 if heads_per_program == 1 else 4,
             "num_stages": 1,
         },
         record,
         "quant",
+        stream,
     )
-    return output.transpose(0, 1), scales.transpose(0, 1)
+    return output_t, scales_t
 
 
 def _use_tle(num_tokens: int, n_groups: int) -> bool:
@@ -472,7 +528,9 @@ def _use_tle(num_tokens: int, n_groups: int) -> bool:
 _TLE_TILE = (128, 128, 16, 1, 0)
 
 
-def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups, record):
+def _tle_bmm(
+    act, act_scale, weight, weight_scale, out, num_tokens, n_groups, record, stream
+):
     """Block-scaled FP8 batched GEMM through the TLE warp-specialized kernel.
 
     ``act``/``act_scale`` are token-major ``[tokens, groups, k]``; the kernel
@@ -574,6 +632,7 @@ def _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups, re
         },
         record,
         "tle",
+        stream,
     )
 
 
@@ -727,6 +786,7 @@ def deep_gemm_fp8_o_proj(
                 (0, n_groups * o_lora_rank), dtype=torch.bfloat16, device=device
             )
             return wo_b(empty)
+        stream = _current_stream()
 
         # Everything the GEMM needs that does not depend on the quant result is
         # prepared before the quant launch: the two kernels are only ~6 us and
@@ -768,11 +828,21 @@ def deep_gemm_fp8_o_proj(
                 nope_dim,
                 rope_dim,
                 record,
+                stream,
+                use_tle,
             )
 
         if use_tle:
             _tle_bmm(
-                act, act_scale, weight, weight_scale, out, num_tokens, n_groups, record
+                act,
+                act_scale,
+                weight,
+                weight_scale,
+                out,
+                num_tokens,
+                n_groups,
+                record,
+                stream,
             )
         else:
             # Both producers hand back token-major tensors; the kernel walks them
@@ -811,6 +881,7 @@ def deep_gemm_fp8_o_proj(
                 gemm_kwargs,
                 record,
                 "gemm",
+                stream,
             )
 
     assert callable(wo_b), "`wo_b` must be a callable linear layer"
