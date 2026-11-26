@@ -27,7 +27,7 @@ _DYNAMIC_INDEX_DIMS = (
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("pad_indexer_heads"),
-    key=["T", "H", "PAD", "TAIL", "ITEMSIZE", "CONTIGUOUS"],
+    key=["T", "H", "PAD", "TAIL", "ITEMSIZE", "CONTIGUOUS", "GRID_LIMIT"],
 )
 @triton.jit(do_not_specialize=_DYNAMIC_INDEX_DIMS)
 def _pad_indexer_heads_kernel(
@@ -40,6 +40,7 @@ def _pad_indexer_heads_kernel(
     ITEMSIZE: tl.constexpr,
     CONTIGUOUS: tl.constexpr,
     LAYOUT: tl.constexpr,
+    GRID_LIMIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     SHAPE: tl.constexpr = LAYOUT[0]
@@ -47,34 +48,49 @@ def _pad_indexer_heads_kernel(
     UNITS: tl.constexpr = LAYOUT[2]
     STATIC_HEADS: tl.constexpr = LAYOUT[3]
     HAS_INPUT: tl.constexpr = LAYOUT[4]
-    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     width = TAIL * UNITS
-    heads = STATIC_HEADS if STATIC_HEADS else H + PAD
-    head = i // width % heads
-    token = i // (width * heads)
-    tail = i % width
-    if CONTIGUOUS:
-        source = (token * H + head) * width + tail
+    pid = tl.program_id(0).to(tl.int64)
+    if GRID_LIMIT:
+        heads = H.to(tl.int64) + PAD
+        real_width = H.to(tl.int64) * width
+        total = T.to(tl.int64) * heads * width
+        # The caller bounds the launch grid. Each program owns tiles separated
+        # by that grid size, including the final partial tile.
+        programs = tl.num_programs(0)
+        steps = tl.cdiv(tl.cdiv(total, BLOCK) - pid, programs)
     else:
-        source = (token * STRIDES[0] + head * STRIDES[1]) * UNITS
-        source += tail % UNITS
-        remaining = tail // UNITS
-        for axis in tl.static_range(len(SHAPE) - 1, -1, -1):
-            source += remaining % SHAPE[axis] * STRIDES[axis + 2] * UNITS
-            remaining //= SHAPE[axis]
-    valid = i < T * heads * width
-    # X/Y have integer pointer types: no FP8 conversion or float canonicalization.
-    # Bound the flattened source-head span, rather than the head coordinate.
-    # FlagTree AABS otherwise mistakes H for the flat tile's extent and shrinks
-    # a 1024-element copy tile to 16 elements for the real GLM5Next workload.
-    if HAS_INPUT:
-        real_head = i % (heads * width) < H * width
-        value = tl.load(X + source, valid & real_head, other=0)
-    else:
-        # CANN can validate even a fully masked null input address. Eliminate
-        # the load at compile time for zero-head inputs with nonempty padding.
-        value = tl.full((BLOCK,), 0, tl.int32)
-    tl.store(Y + i, value, valid)
+        heads = STATIC_HEADS if STATIC_HEADS else H + PAD
+        real_width = H * width
+        total = T * heads * width
+        programs = 1
+        steps = 1
+    for step in range(steps):
+        i = (pid + step * programs) * BLOCK + tl.arange(0, BLOCK)
+        head = i // width % heads
+        token = i // (width * heads)
+        tail = i % width
+        if CONTIGUOUS:
+            source = (token * H + head) * width + tail
+        else:
+            source = (token * STRIDES[0] + head * STRIDES[1]) * UNITS
+            source += tail % UNITS
+            remaining = tail // UNITS
+            for axis in tl.static_range(len(SHAPE) - 1, -1, -1):
+                source += remaining % SHAPE[axis] * STRIDES[axis + 2] * UNITS
+                remaining //= SHAPE[axis]
+        valid = i < total
+        # X/Y have integer pointer types: no FP8 conversion or float canonicalization.
+        # Bound the flattened source-head span, rather than the head coordinate.
+        # FlagTree AABS otherwise mistakes H for the flat tile's extent and shrinks
+        # a 1024-element copy tile to 16 elements for the real GLM5Next workload.
+        if HAS_INPUT:
+            real_head = i % (heads * width) < real_width
+            value = tl.load(X + source, valid & real_head, other=0)
+        else:
+            # CANN can validate even a fully masked null input address. Eliminate
+            # the load at compile time for zero-head inputs with nonempty padding.
+            value = tl.full((BLOCK,), 0, tl.int32)
+        tl.store(Y + i, value, valid)
 
 
 def _prepare_pad_indexer_heads(x: torch.Tensor, pad: int):
@@ -109,8 +125,12 @@ def _prepare_pad_indexer_heads(x: torch.Tensor, pad: int):
     return torch.empty(shape, dtype=x.dtype, device=device), pad
 
 
-def _launch_pad_indexer_heads(x, out, pad):
-    """Launch the generic copy into an already validated output."""
+def _launch_pad_indexer_heads(x, out, pad, grid_limit=None):
+    """Launch the shared copy, optionally looping over a bounded grid."""
+    if grid_limit is not None:
+        grid_limit = operator.index(grid_limit)
+        if grid_limit <= 0:
+            raise ValueError("grid_limit must be positive")
     sizes = tuple(x.shape)
     strides = tuple(x.stride())
     itemsize = x.element_size()
@@ -130,7 +150,13 @@ def _launch_pad_indexer_heads(x, out, pad):
     )
     with guard:
         _pad_indexer_heads_kernel[
-            lambda meta: (triton.cdiv(count * units, meta["BLOCK"]),)
+            lambda meta: (
+                (
+                    min(grid_limit, triton.cdiv(count * units, meta["BLOCK"]))
+                    if grid_limit is not None
+                    else triton.cdiv(count * units, meta["BLOCK"])
+                ),
+            )
         ](
             triton.reinterpret(x, storage_type),
             triton.reinterpret(out, storage_type),
@@ -147,6 +173,7 @@ def _launch_pad_indexer_heads(x, out, pad):
                 0 if runtime.device.vendor_name == "ascend" else shape[1],
                 sizes[1] != 0,
             ),
+            grid_limit or 0,
         )
     return out
 
