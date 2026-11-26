@@ -35,7 +35,6 @@ from flaggems_vllm.runtime.backend._metax.ops.persistent_topk import persistent_
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.libentry import LibEntry
 
-
 _METAX_TILE_CONFIGS = (
     (4, 64, 1, 4),
     (8, 64, 4, 4),
@@ -472,6 +471,8 @@ def _qsa_prefill_score_kernel(
             & (dims[:, None] < HEAD_DIM),
             other=0.0,
         )
+        if IS_FP8:
+            query = query.to(tl.bfloat16)
     if GROUP_HEADS:
         query_high = tl.load(
             q_ptr
@@ -504,6 +505,8 @@ def _qsa_prefill_score_kernel(
             mask=live[:, None] & (dims[None, :] < HEAD_DIM),
             other=0.0,
         )
+        if IS_FP8:
+            keys = keys.to(tl.bfloat16)
         if ELEMENTWISE:
             keys_fp32 = keys.to(tl.float32)
             for row_offset in tl.range(0, BLOCK_R):
@@ -915,10 +918,7 @@ def _prefill_logits(
     # the rectangular grid leaves substantial capacity unused.
     compact = _compact_eligible(
         q.shape[0], layout[0], max_query_len, num_queries
-    ) and not (
-        runtime.device.vendor_name == "metax"
-        and q.dtype == torch.float8_e4m3fn
-    )
+    ) and not (runtime.device.vendor_name == "metax" and q.dtype == torch.float8_e4m3fn)
     if compact:
         kernel = _qsa_prefill_compact_score_kernel
         grid = lambda meta: (
@@ -937,12 +937,14 @@ def _prefill_logits(
             triton.cdiv(min(num_queries, max_query_len), meta["TILE_R"]),
             triton.cdiv(logits_width, meta["BLOCK_N"] * meta["K_TILES"]),
         )
+        '''
         if kernel is _qsa_prefill_score_kernel:
             constants = dict(constants)
             constants["ELEMENTWISE"] = (
                 runtime.device.vendor_name == "metax"
                 and q.dtype == torch.float8_e4m3fn
             )
+        '''
     kernel[grid](
         q,
         k_cache,
