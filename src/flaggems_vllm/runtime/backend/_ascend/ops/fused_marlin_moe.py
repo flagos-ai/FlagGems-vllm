@@ -1187,93 +1187,26 @@ def expert_panel_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     GRID: tl.constexpr,
+    STAGES: tl.constexpr = 1,
+    EXPERT_OUTER: tl.constexpr = False,
 ):
-    STAGES: tl.constexpr = 1
     pid = tl.program_id(0)
+    COLS: tl.constexpr = N // BN
     with tle.scope(core_mode="cube"):
         cube_iteration = 0
-        for cube_task in range(pid, E * (N // BN), GRID):
-            cube_expert = cube_task // (N // BN)
-            cube_col = cube_task % (N // BN) * BN
-            cube_count = tl.load(Counts + cube_expert)
-            if cube_count > 0:
-                cube_begin = tl.load(Offsets + cube_expert)
-                cube_stage = (pid * STAGES + cube_iteration % STAGES) * BN * K
-                cube_tile_pair(
-                    A,
-                    Work + cube_stage,
-                    Output,
-                    cube_begin,
-                    cube_col,
-                    pid,
-                    pid * 0,
-                    K,
-                    N,
-                    BM,
-                    BN,
-                    None,
-                    BN,
-                    True,
-                )
-                for cube_start in range(BM, cube_count, BM):
-                    remaining = cube_count - cube_start
-                    if remaining <= 16:
+        if EXPERT_OUTER:
+            for cube_expert in range(pid, E, GRID):
+                cube_count = tl.load(Counts + cube_expert)
+                if cube_count > 0:
+                    cube_begin = tl.load(Offsets + cube_expert)
+                    for col_idx in range(COLS):
+                        cube_col = col_idx * BN
+                        cube_stage = (pid * STAGES + cube_iteration % STAGES) * BN * K
                         cube_tile_pair(
                             A,
                             Work + cube_stage,
                             Output,
-                            cube_begin + cube_start,
-                            cube_col,
-                            pid,
-                            pid * 0,
-                            K,
-                            N,
-                            16,
-                            BN,
-                            None,
-                            BN,
-                            False,
-                        )
-                    elif remaining <= 32:
-                        cube_tile_pair(
-                            A,
-                            Work + cube_stage,
-                            Output,
-                            cube_begin + cube_start,
-                            cube_col,
-                            pid,
-                            pid * 0,
-                            K,
-                            N,
-                            32,
-                            BN,
-                            None,
-                            BN,
-                            False,
-                        )
-                    elif remaining <= 64:
-                        cube_tile_pair(
-                            A,
-                            Work + cube_stage,
-                            Output,
-                            cube_begin + cube_start,
-                            cube_col,
-                            pid,
-                            pid * 0,
-                            K,
-                            N,
-                            64,
-                            BN,
-                            None,
-                            BN,
-                            False,
-                        )
-                    else:
-                        cube_tile_pair(
-                            A,
-                            Work + cube_stage,
-                            Output,
-                            cube_begin + cube_start,
+                            cube_begin,
                             cube_col,
                             pid,
                             pid * 0,
@@ -1283,50 +1216,237 @@ def expert_panel_kernel(
                             BN,
                             None,
                             BN,
-                            False,
+                            True,
                         )
-                sync_ring_set("cube", "vector", 3)
-                cube_iteration += 1
+                        for cube_start in range(BM, cube_count, BM):
+                            remaining = cube_count - cube_start
+                            if remaining <= 32:
+                                cube_tile_pair(
+                                    A,
+                                    Work + cube_stage,
+                                    Output,
+                                    cube_begin + cube_start,
+                                    cube_col,
+                                    pid,
+                                    pid * 0,
+                                    K,
+                                    N,
+                                    32,
+                                    BN,
+                                    None,
+                                    BN,
+                                    False,
+                                )
+                            elif remaining <= 64:
+                                cube_tile_pair(
+                                    A,
+                                    Work + cube_stage,
+                                    Output,
+                                    cube_begin + cube_start,
+                                    cube_col,
+                                    pid,
+                                    pid * 0,
+                                    K,
+                                    N,
+                                    64,
+                                    BN,
+                                    None,
+                                    BN,
+                                    False,
+                                )
+                            else:
+                                cube_tile_pair(
+                                    A,
+                                    Work + cube_stage,
+                                    Output,
+                                    cube_begin + cube_start,
+                                    cube_col,
+                                    pid,
+                                    pid * 0,
+                                    K,
+                                    N,
+                                    BM,
+                                    BN,
+                                    None,
+                                    BN,
+                                    False,
+                                )
+                        sync_ring_set("cube", "vector", 3)
+                        cube_iteration += 1
+        else:
+            for cube_task in range(pid, E * COLS, GRID):
+                cube_expert = cube_task // COLS
+                cube_col = cube_task % COLS * BN
+                cube_count = tl.load(Counts + cube_expert)
+                if cube_count > 0:
+                    cube_begin = tl.load(Offsets + cube_expert)
+                    cube_stage = (pid * STAGES + cube_iteration % STAGES) * BN * K
+                    cube_tile_pair(
+                        A,
+                        Work + cube_stage,
+                        Output,
+                        cube_begin,
+                        cube_col,
+                        pid,
+                        pid * 0,
+                        K,
+                        N,
+                        BM,
+                        BN,
+                        None,
+                        BN,
+                        True,
+                    )
+                    for cube_start in range(BM, cube_count, BM):
+                        remaining = cube_count - cube_start
+                        if remaining <= 16:
+                            cube_tile_pair(
+                                A,
+                                Work + cube_stage,
+                                Output,
+                                cube_begin + cube_start,
+                                cube_col,
+                                pid,
+                                pid * 0,
+                                K,
+                                N,
+                                16,
+                                BN,
+                                None,
+                                BN,
+                                False,
+                            )
+                        elif remaining <= 32:
+                            cube_tile_pair(
+                                A,
+                                Work + cube_stage,
+                                Output,
+                                cube_begin + cube_start,
+                                cube_col,
+                                pid,
+                                pid * 0,
+                                K,
+                                N,
+                                32,
+                                BN,
+                                None,
+                                BN,
+                                False,
+                            )
+                        elif remaining <= 64:
+                            cube_tile_pair(
+                                A,
+                                Work + cube_stage,
+                                Output,
+                                cube_begin + cube_start,
+                                cube_col,
+                                pid,
+                                pid * 0,
+                                K,
+                                N,
+                                64,
+                                BN,
+                                None,
+                                BN,
+                                False,
+                            )
+                        else:
+                            cube_tile_pair(
+                                A,
+                                Work + cube_stage,
+                                Output,
+                                cube_begin + cube_start,
+                                cube_col,
+                                pid,
+                                pid * 0,
+                                K,
+                                N,
+                                BM,
+                                BN,
+                                None,
+                                BN,
+                                False,
+                            )
+                    sync_ring_set("cube", "vector", 3)
+                    cube_iteration += 1
     with tle.scope(core_mode="vector"):
         sub = tle.dsa.ascend.sub_vec_id()
         VBN: tl.constexpr = BN // 2
         ns = tl.arange(0, VBN)
         ks = tl.arange(0, 128)
         vector_iteration = 0
-        for vector_task in range(pid, E * (N // BN), GRID):
-            vector_expert = vector_task // (N // BN)
-            vector_col = vector_task % (N // BN) * BN + sub * VBN
-            vector_count = tl.load(Counts + vector_expert)
-            if vector_count > 0:
-                if vector_iteration >= STAGES:
-                    sync_ring_wait("cube", "vector", 3)
-                vector_stage = (pid * STAGES + vector_iteration % STAGES) * BN * K
-                for kb in range(K // 128):
-                    decoded = load_weight_tile(
-                        Q,
-                        S,
-                        vector_expert,
-                        vector_col,
-                        kb,
-                        N,
-                        K,
-                        VBN,
-                        8,
-                    )
-                    if kb >= 2:
+        if EXPERT_OUTER:
+            for vector_expert in range(pid, E, GRID):
+                vector_count = tl.load(Counts + vector_expert)
+                if vector_count > 0:
+                    for col_idx in range(COLS):
+                        vector_col = col_idx * BN + sub * VBN
+                        if vector_iteration >= STAGES:
+                            sync_ring_wait("cube", "vector", 3)
+                        vector_stage = (
+                            (pid * STAGES + vector_iteration % STAGES) * BN * K
+                        )
+                        for kb in range(K // 128):
+                            decoded = load_weight_tile(
+                                Q,
+                                S,
+                                vector_expert,
+                                vector_col,
+                                kb,
+                                N,
+                                K,
+                                VBN,
+                                8,
+                            )
+                            if kb >= 2:
+                                sync_ring_wait("cube", "vector", 4)
+                            tl.store(
+                                Work
+                                + vector_stage
+                                + kb * BN * 128
+                                + (sub * VBN + ns[:, None]) * 128
+                                + ks[None, :],
+                                decoded,
+                            )
+                            sync_ring_set("vector", "cube", 2)
+                        for _ in range(tl.minimum(K // 128, 2)):
+                            sync_ring_wait("cube", "vector", 4)
+                        vector_iteration += 1
+        else:
+            for vector_task in range(pid, E * COLS, GRID):
+                vector_expert = vector_task // COLS
+                vector_col = vector_task % COLS * BN + sub * VBN
+                vector_count = tl.load(Counts + vector_expert)
+                if vector_count > 0:
+                    if vector_iteration >= STAGES:
+                        sync_ring_wait("cube", "vector", 3)
+                    vector_stage = (pid * STAGES + vector_iteration % STAGES) * BN * K
+                    for kb in range(K // 128):
+                        decoded = load_weight_tile(
+                            Q,
+                            S,
+                            vector_expert,
+                            vector_col,
+                            kb,
+                            N,
+                            K,
+                            VBN,
+                            8,
+                        )
+                        if kb >= 2:
+                            sync_ring_wait("cube", "vector", 4)
+                        tl.store(
+                            Work
+                            + vector_stage
+                            + kb * BN * 128
+                            + (sub * VBN + ns[:, None]) * 128
+                            + ks[None, :],
+                            decoded,
+                        )
+                        sync_ring_set("vector", "cube", 2)
+                    for _ in range(tl.minimum(K // 128, 2)):
                         sync_ring_wait("cube", "vector", 4)
-                    tl.store(
-                        Work
-                        + vector_stage
-                        + kb * BN * 128
-                        + (sub * VBN + ns[:, None]) * 128
-                        + ks[None, :],
-                        decoded,
-                    )
-                    sync_ring_set("vector", "cube", 2)
-                for _ in range(tl.minimum(K // 128, 2)):
-                    sync_ring_wait("cube", "vector", 4)
-                vector_iteration += 1
+                    vector_iteration += 1
         drain_weight_ring(vector_iteration, STAGES)
 
 
@@ -1351,9 +1471,13 @@ def grouped_quantized_gemm(
     ]
     if expert_panel:
         panel_bn = 256
-        panel_grid = min(w.shape[0] * (n // panel_bn), cores)
+        expert_outer = k <= 512
+        panel_stages = 2 if expert_outer else 1
+        panel_grid = min(
+            w.shape[0] if expert_outer else w.shape[0] * (n // panel_bn), cores
+        )
         panel_work = torch.empty(
-            panel_grid * 1 * panel_bn * k, device=a.device, dtype=a.dtype
+            panel_grid * panel_stages * panel_bn * k, device=a.device, dtype=a.dtype
         )
         expert_panel_kernel[(panel_grid,)](
             a,
@@ -1369,6 +1493,8 @@ def grouped_quantized_gemm(
             bm,
             panel_bn,
             panel_grid,
+            panel_stages,
+            expert_outer,
             disable_auto_inject_block_sync=True,
             num_warps=1,
             enable_fp_fusion=False,
@@ -2111,7 +2237,15 @@ def grouped_route_geometry(m, t, e, k, n, bits, dtype):
     r = m * t
     bm = (
         128
-        if m >= 8192 or (n > 4096 and r >= e * 64)
+        if m >= 8192
+        or (
+            bits == 8
+            and dtype == torch.float16
+            and k == 4096
+            and n == 256
+            and r >= e * 72
+        )
+        or (n > 4096 and r >= e * 64)
         else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
     )
     use_small_m = (
@@ -2207,7 +2341,18 @@ def grouped_route_moe(
         if packed_x is not None
         else torch.empty((padded, k), device=x.device, dtype=x.dtype)
     )
-    grouped_quantized_gemm(a, w2, s2, experts, z, bm, bits, offsets=offsets)
+    grouped_quantized_gemm(
+        a,
+        w2,
+        s2,
+        experts,
+        z,
+        bm,
+        bits,
+        counts=counts if panel else None,
+        offsets=offsets,
+        expert_panel=panel,
+    )
     del a
     combine_expert_outputs(z, topk_weights, out, inv)
 
