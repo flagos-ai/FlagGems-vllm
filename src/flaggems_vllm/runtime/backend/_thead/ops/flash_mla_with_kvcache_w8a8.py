@@ -12,867 +12,1554 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
+from __future__ import annotations
+
 import math
-from dataclasses import fields
 from typing import Optional
 
 import torch
 import triton
+import triton.experimental.tle.language as tle
 import triton.language as tl
-from triton.backends.ppu.compiler import HGGCOptions
 from triton.language import core
 
-from flaggems_vllm import runtime
-from flaggems_vllm.runtime.backend._thead.fused.attention import (
-    _flash_int8_merge_splits,
-)
-from flaggems_vllm.utils import libentry, libtuner
+HEAD_DIM_NOPE = 512
+HEAD_DIM_ROPE = 64
+HEAD_DIM_TOTAL = HEAD_DIM_NOPE + HEAD_DIM_ROPE
+PAGE_BLOCK_SIZE = 64
+LOG2_E = tl.constexpr(1.4426950408889634)
+LN_2 = tl.constexpr(0.6931471805599453)
+# Leave headroom below 127.0 so round-to-nearest cannot overflow signed int8.
+P7_INV_MAX_QUANT = tl.constexpr(1.0 / 126.99)
+MIN_PROBABILITY_SCALE = tl.constexpr(1.0e-30)
+MAX_GPU_SORT_BATCH = 2048
 
 
 @core.extern
-def native_mla_probability_reciprocal(probability_scale, _semantic=None):
+def native_rcpf(x, _semantic=None):
     return core.extern_elementwise(
         "",
         "",
-        [probability_scale],
+        [x],
         {(core.float32,): ("__builtin_ppu_rcpf", core.float32)},
         is_pure=True,
         _semantic=_semantic,
     )
 
 
-@triton.jit
-def quantize_mla_probabilities(normalized_probabilities):
-    # Direct conversion preserves round-half-up without a float floor round trip.
-    coarse, residual = tl.inline_asm_elementwise(
-        """{
-        .reg .s32 coarse, residual;
-        .reg .f32 rounded, coarse_fp, error;
-        ppu.add.f32 rounded, $2, 0f3F000000;
-        ppu.cvt.rmi.s32.f32 coarse, rounded;
-        ppu.cvt.rn.f32.s32 coarse_fp, coarse;
-        ppu.sub.f32 error, $2, coarse_fp;
-        ppu.fma.rn.f32 rounded, error, 0f42FE0000, 0f3F000000;
-        ppu.cvt.rmi.s32.f32 residual, rounded;
-        ppu.mov.b32 $0, coarse;
-        ppu.mov.b32 $1, residual;
-        }""",
-        "=r,=r,f",
-        [normalized_probabilities],
-        dtype=(tl.int32, tl.int32),
-        is_pure=True,
-        pack=1,
-    )
-    return coarse.to(tl.int8), residual.to(tl.int8)
-
-
-P14_PACKED_ASM = tl.constexpr(
+# PPU inline assembly rounds 4 FP32 probabilities in [0, 127] to signed int8
+# and packs them into one i32 via ppu.prmt.b32 without scalar extraction loops.
+P7_NORMALIZED_PACKED_ASM = tl.constexpr(
     """{
-.reg .s32 coarse<4>, residual<4>;
-.reg .f32 rounded<4>, coarse_fp<4>, error<4>;
-.reg .b32 packed0, packed1;
-ppu.add.f32 rounded0, $2, 0f3F000000;
-ppu.cvt.rmi.s32.f32 coarse0, rounded0;
-ppu.cvt.rn.f32.s32 coarse_fp0, coarse0;
-ppu.sub.f32 error0, $2, coarse_fp0;
-ppu.fma.rn.f32 rounded0, error0, 0f42FE0000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 residual0, rounded0;
-ppu.add.f32 rounded1, $3, 0f3F000000;
-ppu.cvt.rmi.s32.f32 coarse1, rounded1;
-ppu.cvt.rn.f32.s32 coarse_fp1, coarse1;
-ppu.sub.f32 error1, $3, coarse_fp1;
-ppu.fma.rn.f32 rounded1, error1, 0f42FE0000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 residual1, rounded1;
-ppu.add.f32 rounded2, $4, 0f3F000000;
-ppu.cvt.rmi.s32.f32 coarse2, rounded2;
-ppu.cvt.rn.f32.s32 coarse_fp2, coarse2;
-ppu.sub.f32 error2, $4, coarse_fp2;
-ppu.fma.rn.f32 rounded2, error2, 0f42FE0000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 residual2, rounded2;
-ppu.add.f32 rounded3, $5, 0f3F000000;
-ppu.cvt.rmi.s32.f32 coarse3, rounded3;
-ppu.cvt.rn.f32.s32 coarse_fp3, coarse3;
-ppu.sub.f32 error3, $5, coarse_fp3;
-ppu.fma.rn.f32 rounded3, error3, 0f42FE0000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 residual3, rounded3;
-ppu.prmt.b32 packed0, coarse0, coarse1, 0x0040;
-ppu.prmt.b32 packed1, coarse2, coarse3, 0x0040;
-ppu.prmt.b32 $0, packed0, packed1, 0x5410;
-ppu.prmt.b32 packed0, residual0, residual1, 0x0040;
-ppu.prmt.b32 packed1, residual2, residual3, 0x0040;
-ppu.prmt.b32 $1, packed0, packed1, 0x5410;
-}"""
-)
-
-P14_NORMALIZED_PACKED_ASM = tl.constexpr(
-    """{
-.reg .s32 coarse<4>, residual<4>;
-.reg .f32 rounded<4>, coarse_fp<4>, error<4>;
-.reg .b32 packed0, packed1;
-ppu.add.f32 rounded0, $2, 0f3F000000;
-ppu.cvt.rmi.f32.f32 coarse_fp0, rounded0;
-ppu.cvt.rzi.s32.f32 coarse0, coarse_fp0;
-ppu.sub.f32 error0, $2, coarse_fp0;
-ppu.fma.rn.f32 rounded0, error0, 0f42FE0000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 residual0, rounded0;
-ppu.add.f32 rounded1, $3, 0f3F000000;
-ppu.cvt.rmi.f32.f32 coarse_fp1, rounded1;
-ppu.cvt.rzi.s32.f32 coarse1, coarse_fp1;
-ppu.sub.f32 error1, $3, coarse_fp1;
-ppu.fma.rn.f32 rounded1, error1, 0f42FE0000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 residual1, rounded1;
-ppu.add.f32 rounded2, $4, 0f3F000000;
-ppu.cvt.rmi.f32.f32 coarse_fp2, rounded2;
-ppu.cvt.rzi.s32.f32 coarse2, coarse_fp2;
-ppu.sub.f32 error2, $4, coarse_fp2;
-ppu.fma.rn.f32 rounded2, error2, 0f42FE0000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 residual2, rounded2;
-ppu.add.f32 rounded3, $5, 0f3F000000;
-ppu.cvt.rmi.f32.f32 coarse_fp3, rounded3;
-ppu.cvt.rzi.s32.f32 coarse3, coarse_fp3;
-ppu.sub.f32 error3, $5, coarse_fp3;
-ppu.fma.rn.f32 rounded3, error3, 0f42FE0000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 residual3, rounded3;
-ppu.prmt.b32 packed0, coarse0, coarse1, 0x0040;
-ppu.prmt.b32 packed1, coarse2, coarse3, 0x0040;
-ppu.prmt.b32 $0, packed0, packed1, 0x5410;
-ppu.prmt.b32 packed0, residual0, residual1, 0x0040;
-ppu.prmt.b32 packed1, residual2, residual3, 0x0040;
-ppu.prmt.b32 $1, packed0, packed1, 0x5410;
-}"""
-)
-
-
-P15_NORMALIZED_PACKED_ASM = tl.constexpr(
-    """{
-.reg .s32 quantized<4>;
-.reg .f32 rounded<4>;
+.reg .s32 q<4>;
+.reg .f32 r<4>;
 .reg .b32 pair0, pair1;
-ppu.fma.rn.f32 rounded0, $2, 0f43800000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 quantized0, rounded0;
-ppu.fma.rn.f32 rounded1, $3, 0f43800000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 quantized1, rounded1;
-ppu.fma.rn.f32 rounded2, $4, 0f43800000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 quantized2, rounded2;
-ppu.fma.rn.f32 rounded3, $5, 0f43800000, 0f3F000000;
-ppu.cvt.rmi.s32.f32 quantized3, rounded3;
-ppu.prmt.b32 pair0, quantized0, quantized1, 0x5410;
-ppu.prmt.b32 pair1, quantized2, quantized3, 0x5410;
-ppu.prmt.b32 $1, pair0, pair1, 0x6420;
-ppu.add.u32 pair0, pair0, 0x00800080;
-ppu.add.u32 pair1, pair1, 0x00800080;
-ppu.prmt.b32 $0, pair0, pair1, 0x7531;
+ppu.add.rn.f32 r0, $1, 0f3F000000;
+ppu.cvt.rmi.s32.f32 q0, r0;
+ppu.add.rn.f32 r1, $2, 0f3F000000;
+ppu.cvt.rmi.s32.f32 q1, r1;
+ppu.add.rn.f32 r2, $3, 0f3F000000;
+ppu.cvt.rmi.s32.f32 q2, r2;
+ppu.add.rn.f32 r3, $4, 0f3F000000;
+ppu.cvt.rmi.s32.f32 q3, r3;
+ppu.prmt.b32 pair0, q0, q1, 0x5410;
+ppu.prmt.b32 pair1, q2, q3, 0x5410;
+ppu.prmt.b32 $0, pair0, pair1, 0x6420;
 }"""
 )
 
 
 @triton.jit
-def quantize_mla_probabilities_packed(
-    normalized_probabilities,
-    NORMALIZED: tl.constexpr = False,
-    RADIX: tl.constexpr = 127,
-):
-    tl.static_assert(RADIX == 127 or RADIX == 256)
-    if RADIX == 256:
-        tl.static_assert(NORMALIZED)
-        # MLA normalization bounds finite inputs by 127 plus FP32 roundoff.
-        assembly: tl.constexpr = P15_NORMALIZED_PACKED_ASM
-    else:
-        assembly: tl.constexpr = (
-            P14_NORMALIZED_PACKED_ASM if NORMALIZED else P14_PACKED_ASM
-        )
+def quantize_mla_probabilities_p7(normalized_probabilities):
     return tl.inline_asm_elementwise(
-        assembly,
-        "=r,=r,f,f,f,f",
+        P7_NORMALIZED_PACKED_ASM,
+        "=r,f,f,f,f",
         [normalized_probabilities],
-        dtype=(tl.int8, tl.int8),
+        dtype=tl.int8,
         is_pure=True,
         pack=4,
     )
 
 
 @triton.jit
-def _split_mla_features(values, rows: tl.constexpr, half_width: tl.constexpr):
-    return tl.split(tl.permute(tl.reshape(values, (rows, 2, half_width)), (0, 2, 1)))
-
-
-@triton.jit
-def _sum_and_max(sum_left, max_left, sum_right, max_right):
+def sum_and_max(sum_left, max_left, sum_right, max_right):
     return sum_left + sum_right, tl.maximum(max_left, max_right)
 
 
+@triton.constexpr_function
+def swizzled_2d(vec, max_phase):
+    return tle.gpu.swizzled_shared_layout(
+        vec, 1, max_phase, [1, 0], [1, 1], [1, 1], [1, 1], [1, 0]
+    )
+
+
 @triton.jit
-def _sorted_mla_request(request_ids, request_lengths, batch, B: tl.constexpr):
-    slots: tl.constexpr = request_ids.shape[0]
-    max_priority: tl.constexpr = 0x7FFFFFFF // slots
-    # Bound only scheduling priority; every request keeps its actual KV length.
-    priority = tl.minimum(tl.maximum(request_lengths, 0), max_priority)
-    keys = priority * slots + (B - 1 - request_ids)
-    keys = tl.where(request_ids < B, keys, -1)
-    sorted_keys = tl.sort(keys, descending=True)
-    reverse_ids = sorted_keys & (slots - 1)
-    selected = tl.sum(tl.where(request_ids == batch, reverse_ids, 0), 0)
-    return B - 1 - selected
+def sort_requests_kernel(Lengths, Order, batch_size, N: tl.constexpr):
+    offs = tl.arange(0, N)
+    mask = offs < batch_size
+    lens = tl.load(Lengths + offs, mask=mask, other=-1)
+    first = tl.load(Lengths)
+    # Uniform batches skip bitonic sort to avoid unnecessary register traffic.
+    all_eq = tl.sum(tl.where(mask & (lens != first), 1, 0)) == 0
+    if all_eq:
+        tl.store(Order + offs, offs.to(tl.int32), mask=mask)
+    else:
+        keys = (lens.to(tl.int64) << 32) | (N - 1 - offs).to(tl.int64)
+        sorted_keys = tl.sort(keys, descending=True)
+        order = (N - 1 - (sorted_keys & 0xFFFFFFFF)).to(tl.int32)
+        tl.store(Order + offs, order, mask=mask)
 
 
-def dense_mla_configs() -> list[triton.Config]:
-    configs = runtime.get_tuned_config("dense_int8_mla_kernel")
-    defaults = {
-        "ppu_fold_global_load_offsets": False,
-        "ppu_vectorize_i8_shared_store": False,
-        "ppu_hoist_readonly_shared_matrices": 0,
-        "ppu_publish_shared_float_scales_early": False,
-        "ppu_reuse_mla_kv": False,
-        "ppu_async_mla_kv": False,
-        "ppu_prefetch_mla_nope": False,
-        "ppu_scalarize_mla_pv": False,
-    }
-    required = set(defaults)
-    available = {field.name for field in fields(HGGCOptions)}
-    if not required.issubset(available):
-        return [config for config in configs if required.isdisjoint(config.kwargs)]
-    if "ppu_scalarize_mla_p15" in available:
-        defaults["ppu_scalarize_mla_p15"] = False
-        defaults["PROBABILITY_RADIX"] = 127
-    if "ppu_pipeline_mla_kv" in available:
-        defaults["ppu_pipeline_mla_kv"] = False
-    if "ppu_pipeline_mla_kv_pages" in available:
-        defaults["ppu_pipeline_mla_kv_pages"] = False
-    if "ppu_mla_h64_k128" in available:
-        defaults["ppu_mla_h64_k128"] = False
-    if "ppu_mla_h32_k128" in available:
-        defaults["ppu_mla_h32_k128"] = False
-    if "ppu_gather_mla_row_reductions" in available:
-        defaults["ppu_gather_mla_row_reductions"] = False
-    if "ppu_unique_mla_scale_writers" in available:
-        defaults["ppu_unique_mla_scale_writers"] = False
-    if "ppu_reuse_mla_split_kv" in available:
-        defaults["ppu_reuse_mla_split_kv"] = False
-    if "ppu_mla_kr_joint_copy" in available:
-        defaults["ppu_mla_kr_joint_copy"] = False
-    defaults["FOLD_LOGIT_SCALE"] = False
-    if "ppu_mla_h16_kv_pipeline" in available:
-        defaults["ppu_mla_h16_kv_pipeline"] = False
-    if "ppu_mla_h16_kr_copy" in available:
-        defaults["ppu_mla_h16_kr_copy"] = False
-    if "ppu_mla_row_subgroups" in available:
-        defaults["ppu_mla_row_subgroups"] = False
-    if "ppu_mla_score_guard" in available:
-        defaults["ppu_mla_score_guard"] = 0
-        defaults["INTERIOR_SCORE_HINT"] = False
-    if "ppu_mla_uniform_request_sort" in available:
-        defaults["SORT_SKIP_EQUAL"] = False
-        defaults["ppu_mla_uniform_request_sort"] = False
-    normalized = []
-    for config in configs:
-        if "ppu_mla_h32_k128" in config.kwargs and "ppu_mla_h32_k128" not in available:
-            continue
-        if "ppu_mla_h64_k128" in config.kwargs and "ppu_mla_h64_k128" not in available:
-            continue
-        if (
-            "ppu_scalarize_mla_p15" in config.kwargs
-            and "ppu_scalarize_mla_p15" not in available
-        ):
-            continue
-        if (
-            "ppu_pipeline_mla_kv" in config.kwargs
-            and "ppu_pipeline_mla_kv" not in available
-        ):
-            continue
-        if (
-            "ppu_pipeline_mla_kv_pages" in config.kwargs
-            and "ppu_pipeline_mla_kv_pages" not in available
-        ):
-            continue
-        candidate = copy.copy(config)
-        candidate.kwargs = {**defaults, **config.kwargs}
-        normalized.append(candidate)
-    if "ppu_gather_mla_row_reductions" in available:
-        enabled = []
-        for config in normalized:
-            if config.kwargs["ppu_mla_h32_k128"]:
-                candidate = copy.copy(config)
-                candidate.kwargs = {
-                    **config.kwargs,
-                    "ppu_gather_mla_row_reductions": True,
-                }
-                enabled.append(candidate)
-        normalized.extend(enabled)
-    if "ppu_unique_mla_scale_writers" in available:
-        enabled = []
-        for config in normalized:
-            if config.kwargs["ppu_mla_h32_k128"]:
-                candidate = copy.copy(config)
-                candidate.kwargs = {
-                    **config.kwargs,
-                    "ppu_unique_mla_scale_writers": True,
-                }
-                enabled.append(candidate)
-        normalized.extend(enabled)
-    if "ppu_reuse_mla_split_kv" in available:
-        for config in normalized:
-            kwargs = config.kwargs
-            if (
-                config.num_warps == 8
-                and config.num_stages == 1
-                and kwargs["BH"] == 16
-                and kwargs["BK"] == 128
-                and kwargs["QK_SPLITS"] == 4
-                and kwargs["FUSED_PV"]
-                and not kwargs["PAIR_PV"]
-                and not kwargs["COLUMN_SOFTMAX"]
-                and kwargs["SORT_REQUESTS"]
-                and kwargs["PROBABILITY_RADIX"] == 127
-            ):
-                candidate = copy.copy(config)
-                candidate.kwargs = {
-                    **kwargs,
-                    "ppu_reuse_mla_split_kv": True,
-                    "ppu_async_mla_kv": True,
-                }
-                normalized.append(candidate)
-                break
-    if "ppu_mla_kr_joint_copy" in available:
-        enabled = []
-        for config in normalized:
-            kwargs = config.kwargs
-            if (
-                kwargs["ppu_mla_h32_k128"]
-                and kwargs["SORT_REQUESTS"]
-                and kwargs["ppu_gather_mla_row_reductions"]
-                and kwargs["ppu_unique_mla_scale_writers"]
-            ):
-                candidate = copy.copy(config)
-                candidate.kwargs = {**kwargs, "ppu_mla_kr_joint_copy": True}
-                enabled.append(candidate)
-        normalized.extend(enabled)
-    if "ppu_mla_kr_joint_copy" in available:
-        for config in normalized:
-            kwargs = config.kwargs
-            if kwargs["ppu_mla_kr_joint_copy"]:
-                candidate = copy.copy(config)
-                candidate.kwargs = {**kwargs, "FOLD_LOGIT_SCALE": True}
-                normalized.append(candidate)
-                break
-    if "ppu_mla_h16_kv_pipeline" in available:
-        enabled = []
-        for config in normalized:
-            if config.kwargs.get("ppu_reuse_mla_split_kv"):
-                for reuse_pages in (False, True):
-                    candidate = copy.copy(config)
-                    candidate.kwargs = {
-                        **config.kwargs,
-                        "ppu_pipeline_mla_kv": True,
-                        "ppu_pipeline_mla_kv_pages": reuse_pages,
-                        "ppu_mla_h16_kv_pipeline": True,
-                    }
-                    enabled.append(candidate)
-        normalized.extend(enabled)
-    if "ppu_mla_h16_kr_copy" in available:
-        enabled = []
-        for config in normalized:
-            if config.kwargs.get("ppu_mla_h16_kv_pipeline"):
-                candidate = copy.copy(config)
-                candidate.kwargs = {**config.kwargs, "ppu_mla_h16_kr_copy": True}
-                enabled.append(candidate)
-        normalized.extend(enabled)
-    if "ppu_mla_uniform_request_sort" in available:
-        enabled = []
-        for config in normalized:
-            kwargs = config.kwargs
-            if kwargs["SORT_REQUESTS"] and (
-                kwargs.get("ppu_reuse_mla_split_kv") or kwargs.get("FOLD_LOGIT_SCALE")
-            ):
-                candidate = copy.copy(config)
-                candidate.kwargs = {
-                    **kwargs,
-                    "SORT_SKIP_EQUAL": True,
-                    "ppu_mla_uniform_request_sort": True,
-                }
-                enabled.append(candidate)
-        normalized.extend(enabled)
-    if "ppu_mla_row_subgroups" in available:
-        enabled = []
-        for config in normalized:
-            if config.kwargs.get("ppu_gather_mla_row_reductions"):
-                candidate = copy.copy(config)
-                candidate.kwargs = {**config.kwargs, "ppu_mla_row_subgroups": True}
-                enabled.append(candidate)
-        normalized.extend(enabled)
-    if "ppu_mla_score_guard" in available:
-        enabled = []
-        for config in normalized:
-            if config.kwargs.get("ppu_mla_row_subgroups") and config.kwargs.get(
-                "ppu_mla_kr_joint_copy"
-            ):
-                modes = (3,)
-            elif config.kwargs.get("ppu_mla_h16_kr_copy"):
-                modes = (3,)
-            else:
-                continue
-            for mode in modes:
-                candidate = copy.copy(config)
-                candidate.kwargs = {
-                    **config.kwargs,
-                    "ppu_mla_score_guard": mode,
-                    "INTERIOR_SCORE_HINT": mode == 3,
-                }
-                enabled.append(candidate)
-        normalized.extend(enabled)
-    return normalized
-
-
-@libentry()
-@libtuner(
-    configs=dense_mla_configs(),
-    key=["B", "H", "HEADS_PER_QUERY", "SPLITS", "TABLE_STRIDE", "CAUSAL"],
-    warmup=30,
-    rep=80,
-    use_cuda_graph=False,
-)
 @triton.jit
-def dense_int8_mla_kernel(
+def prep_flat_q2_kernel(
+    Lengths,
+    FlatOrder,
+    EffLengths,
+    batch_size,
+    CAUSAL: tl.constexpr,
+    SORT_REQUESTS: tl.constexpr,
+    N: tl.constexpr,
+):
+    offs = tl.arange(0, N)
+    mask = offs < batch_size
+    lens = tl.load(Lengths + offs, mask=mask, other=-1)
+    if SORT_REQUESTS:
+        first = tl.load(Lengths)
+        all_eq = tl.sum(tl.where(mask & (lens != first), 1, 0)) == 0
+        if all_eq:
+            order = offs.to(tl.int32)
+        else:
+            keys = (lens.to(tl.int64) << 32) | (N - 1 - offs).to(tl.int64)
+            sorted_keys = tl.sort(keys, descending=True)
+            order = (N - 1 - (sorted_keys & 0xFFFFFFFF)).to(tl.int32)
+    else:
+        order = offs.to(tl.int32)
+    # Place q=1 and q=0 of the same request adjacently so their KV pages reuse L2.
+    tl.store(FlatOrder + offs * 2, order * 2 + 1, mask=mask)
+    tl.store(FlatOrder + offs * 2 + 1, order * 2, mask=mask)
+    len_q0 = tl.maximum(lens - 1, 0) if CAUSAL else lens
+    tl.store(EffLengths + offs * 2, len_q0, mask=mask)
+    tl.store(EffLengths + offs * 2 + 1, lens, mask=mask)
+
+
+@triton.jit
+def dense_int8_mla_tle_kernel(
     Q,
     QR,
     KV,
     KR,
-    QS,
     KS,
+    QS,
     Table,
     Lengths,
-    Partial,
-    Stats,
-    Offsets,
-    Output,
-    LSE,
-    Q_STRIDES: tl.constexpr,
-    QR_STRIDES: tl.constexpr,
-    KV_STRIDES: tl.constexpr,
-    KR_STRIDES: tl.constexpr,
-    QS_STRIDES: tl.constexpr,
-    KS_STRIDES: tl.constexpr,
+    BatchOrder,
+    Out,
+    Lse,
+    Q_STRIDE0: tl.constexpr,
+    Q_STRIDE1: tl.constexpr,
+    Q_STRIDE2: tl.constexpr,
+    QR_STRIDE0: tl.constexpr,
+    QR_STRIDE1: tl.constexpr,
+    QR_STRIDE2: tl.constexpr,
+    KV_STRIDE0: tl.constexpr,
+    KV_STRIDE1: tl.constexpr,
+    KR_STRIDE0: tl.constexpr,
+    KR_STRIDE1: tl.constexpr,
+    QS_STRIDE0: tl.constexpr,
+    QS_STRIDE1: tl.constexpr,
+    QS_STRIDE2: tl.constexpr,
+    KS_STRIDE0: tl.constexpr,
+    KS_STRIDE1: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
-    LENGTH_STRIDE: tl.constexpr,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    HEADS_PER_QUERY: tl.constexpr,
-    SPLITS: tl.constexpr,
-    SCALE: tl.constexpr,
+    batch_size,
+    total_heads,
+    heads_per_query,
+    softmax_scale,
+    NUM_SPLITS: tl.constexpr,
+    USE_BATCH_ORDER: tl.constexpr,
     CAUSAL: tl.constexpr,
-    BH: tl.constexpr,
-    BK: tl.constexpr,
-    FUSED_PV: tl.constexpr,
-    COLUMN_SOFTMAX: tl.constexpr,
-    QK_SPLITS: tl.constexpr,
-    PAIR_PV: tl.constexpr,
-    SORT_REQUESTS: tl.constexpr = False,
-    PROBABILITY_RADIX: tl.constexpr = 127,
-    SORT_SKIP_EQUAL: tl.constexpr = False,
-    INTERIOR_SCORE_HINT: tl.constexpr = False,
-    FOLD_LOGIT_SCALE: tl.constexpr = False,
+    SINGLE_QUERY: tl.constexpr,
+    HEADS_ALIGNED: tl.constexpr,
+    FLAT_Q2: tl.constexpr,
+    CONTIG_Q2_H16: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
-    tl.static_assert(
-        PROBABILITY_RADIX == 127
-        or (
-            PROBABILITY_RADIX == 256
-            and ((BH == 32 and (BK == 128 or BK == 256)) or (BH == 64 and BK == 128))
-        )
+    BH: tl.constexpr = 32
+    # Grid = (head_blocks, num_splits, batch) schedules longest requests first
+    # while keeping head tiles of the same (split, batch) co-resident for L2 reuse.
+    head_block = tl.program_id(0)
+    split_idx = tl.program_id(1)
+    raw_batch = tl.program_id(2)
+    batch = (
+        tl.load(BatchOrder + raw_batch).to(tl.int32) if USE_BATCH_ORDER else raw_batch
     )
-    h32_k128: tl.constexpr = BH == 32 and BK == 128 and PROBABILITY_RADIX == 256
-    head_tile, batch, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    sort_requests: tl.constexpr = SORT_REQUESTS and B * triton.cdiv(H, BH) > 64
-    reuse_length: tl.constexpr = sort_requests and SORT_SKIP_EQUAL and BH == 16
-    if sort_requests:
-        # Process longer requests first while preserving every original output row.
-        request_ids = tl.arange(0, triton.next_power_of_2(B))
-        request_lengths = tl.load(
-            Lengths + request_ids * LENGTH_STRIDE, request_ids < B, 0
-        )
-        if SORT_SKIP_EQUAL:
-            first_length = tl.load(Lengths)
-            different = tl.sum(
-                ((request_ids < B) & (request_lengths != first_length)).to(tl.int32), 0
+    tbl_batch = (batch >> 1) if FLAT_Q2 else batch
+    head_base = head_block * BH
+
+    length = tl.load(Lengths + batch)
+    total_pages = (length + 63) // 64
+    if NUM_SPLITS > 1:
+        total_tiles = (total_pages + 1) // 2
+        tiles_per_split = (total_tiles + NUM_SPLITS - 1) // NUM_SPLITS
+        start_page = split_idx * tiles_per_split * 2
+        end_page = tl.minimum(start_page + tiles_per_split * 2, total_pages)
+    else:
+        start_page = 0
+        end_page = total_pages
+
+    # 104 KiB SMEM keeps 2 eight-warp CTAs resident per SM; maxPhase=32 matches
+    # the 512-byte row stride of Q and KV to avoid TSM bank conflicts.
+    q_buf = tle.gpu.alloc(
+        [BH, 512], dtype=tl.int8, scope=tle.gpu.smem, layout=swizzled_2d(16, 32)
+    )
+    q_pe_buf = tle.gpu.alloc(
+        [BH, 64], dtype=OUT_DTYPE, scope=tle.gpu.smem, layout=swizzled_2d(8, 8)
+    )
+    kv_buf = tle.gpu.alloc(
+        [128, 512], dtype=tl.int8, scope=tle.gpu.smem, layout=swizzled_2d(16, 32)
+    )
+    kr_buf = tle.gpu.alloc(
+        [128, 64], dtype=OUT_DTYPE, scope=tle.gpu.smem, layout=swizzled_2d(8, 8)
+    )
+    p_buf = tle.gpu.alloc(
+        [BH, 128], dtype=tl.int8, scope=tle.gpu.smem, layout=swizzled_2d(16, 8)
+    )
+    rescale_buf = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem, layout=None)
+    cscale_buf = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem, layout=None)
+
+    flat_h_1d = head_base + tl.arange(0, BH)
+    if HEADS_ALIGNED:
+        safe_flat_1d = flat_h_1d
+    else:
+        head_mask_1d = flat_h_1d < total_heads
+        safe_flat_1d = tl.where(head_mask_1d, flat_h_1d, 0)
+    if SINGLE_QUERY or CONTIG_Q2_H16:
+        q_idx_1d = 0
+        h_idx_1d = safe_flat_1d
+        if HEADS_ALIGNED:
+            qs = tl.load(QS + batch * QS_STRIDE0 + h_idx_1d * QS_STRIDE2)
+        else:
+            qs = tl.load(
+                QS + batch * QS_STRIDE0 + h_idx_1d * QS_STRIDE2,
+                mask=head_mask_1d,
+                other=0.0,
             )
-            if different != 0:
-                batch = _sorted_mla_request(request_ids, request_lengths, batch, B)
-                if reuse_length:
-                    length = tl.load(Lengths + batch * LENGTH_STRIDE)
-            else:
-                if reuse_length:
-                    length = first_length
+    else:
+        q_idx_1d = safe_flat_1d // heads_per_query
+        h_idx_1d = safe_flat_1d % heads_per_query
+        if HEADS_ALIGNED:
+            qs = tl.load(
+                QS + batch * QS_STRIDE0 + q_idx_1d * QS_STRIDE1 + h_idx_1d * QS_STRIDE2
+            )
         else:
-            batch = _sorted_mla_request(request_ids, request_lengths, batch, B)
-    heads = head_tile * BH + tl.arange(0, BH)
-    # The launch grid covers ceil_div(H, BH) head tiles.
-    valid_heads = (
-        tl.full((BH,), True, tl.int1)
-        if H % BH == 0 and HEADS_PER_QUERY >= 32
-        else heads < H
-    )
-    query_index = heads // HEADS_PER_QUERY
-    query_head = heads % HEADS_PER_QUERY
-    dims = tl.arange(0, 512)
-    rope_dims = tl.arange(0, 64)
-    tokens = tl.arange(0, BK)
-    reduction_axis: tl.constexpr = 0 if COLUMN_SOFTMAX else 1
-    late_rope: tl.constexpr = (
-        (BH == 32 and BK == 256) or (BH == 64 and BK == 128) or h32_k128
-    )
-    q = tl.load(
-        Q
-        + batch * Q_STRIDES[0]
-        + query_index[:, None] * Q_STRIDES[1]
-        + query_head[:, None] * Q_STRIDES[2]
-        + dims[None, :],
-        valid_heads[:, None],
-        0,
-    )
-    if QK_SPLITS == 4:
-        q_left, q_right = _split_mla_features(q, BH, 256)
-        q0, q1 = _split_mla_features(q_left, BH, 128)
-        q2, q3 = _split_mla_features(q_right, BH, 128)
-    qr = tl.load(
-        QR
-        + batch * QR_STRIDES[0]
-        + query_index[:, None] * QR_STRIDES[1]
-        + query_head[:, None] * QR_STRIDES[2]
-        + rope_dims[None, :],
-        valid_heads[:, None],
-        0,
-    )
-    qs = tl.load(
-        QS
-        + batch * QS_STRIDES[0]
-        + query_index * QS_STRIDES[1]
-        + query_head * QS_STRIDES[2],
-        valid_heads,
-        0,
-    )
-    if not reuse_length:
-        length = tl.load(Lengths + batch * LENGTH_STRIDE)
-    query_limit = (
-        tl.maximum(length - H // HEADS_PER_QUERY + query_index + 1, 0)
-        if CAUSAL
-        else tl.full((BH,), 0, tl.int32) + length
-    )
-    maximum = tl.full((BH,), -float("inf"), tl.float32)
-    denominator = tl.zeros((BH,), tl.float32)
-    accumulator = tl.zeros((BH, 512), tl.float32)
-    valid_pages = tl.cdiv(length, 64)
-    first_page = valid_pages * split // SPLITS
-    end_page = valid_pages * (split + 1) // SPLITS
-    for page_idx in range(first_page, end_page, BK // 64):
-        page_offsets = page_idx + tokens // 64
-        if BK == 64:
-            page = tl.load(Table + batch * TABLE_STRIDE + page_idx).to(tl.int64)[None]
+            qs = tl.load(
+                QS + batch * QS_STRIDE0 + q_idx_1d * QS_STRIDE1 + h_idx_1d * QS_STRIDE2,
+                mask=head_mask_1d,
+                other=0.0,
+            )
+        q_len = total_heads // heads_per_query
+        query_limit = (
+            (length - (q_len - 1 - q_idx_1d))
+            if CAUSAL
+            else tl.full([BH], 0, dtype=tl.int32) + length
+        )
+    qs_log2 = qs * (softmax_scale * LOG2_E)
+
+    flat_h = head_base + tl.arange(0, BH)[:, None]
+    d512 = tl.arange(0, 512)[None, :]
+    d256_l = tl.arange(0, 256)[None, :]
+    d256_r = tl.arange(256, 512)[None, :]
+    d64 = tl.arange(0, 64)[None, :]
+    if HEADS_ALIGNED:
+        if SINGLE_QUERY or CONTIG_Q2_H16:
+            q_row = Q + batch * Q_STRIDE0 + flat_h * Q_STRIDE2
+            qr_row = QR + batch * QR_STRIDE0 + flat_h * QR_STRIDE2
         else:
-            page = tl.load(
-                Table + batch * TABLE_STRIDE + page_offsets,
-                page_offsets < end_page,
-                0,
+            q_idx = flat_h // heads_per_query
+            h_idx = flat_h % heads_per_query
+            q_row = Q + batch * Q_STRIDE0 + q_idx * Q_STRIDE1 + h_idx * Q_STRIDE2
+            qr_row = QR + batch * QR_STRIDE0 + q_idx * QR_STRIDE1 + h_idx * QR_STRIDE2
+        tle.gpu.copy(q_row + d512, q_buf, [BH, 512], is_async=True)
+        tle.gpu.copy(qr_row + d64, q_pe_buf, [BH, 64], is_async=True)
+    else:
+        head_valid = flat_h < total_heads
+        safe_flat = tl.where(head_valid, flat_h, 0)
+        if SINGLE_QUERY:
+            q_row = Q + batch * Q_STRIDE0 + safe_flat * Q_STRIDE2
+            qr_row = QR + batch * QR_STRIDE0 + safe_flat * QR_STRIDE2
+        else:
+            q_idx = safe_flat // heads_per_query
+            h_idx = safe_flat % heads_per_query
+            q_row = Q + batch * Q_STRIDE0 + q_idx * Q_STRIDE1 + h_idx * Q_STRIDE2
+            qr_row = QR + batch * QR_STRIDE0 + q_idx * QR_STRIDE1 + h_idx * QR_STRIDE2
+        tle.gpu.copy(
+            q_row + d512, q_buf, [BH, 512], mask=head_valid, other=0, is_async=True
+        )
+        tle.gpu.copy(
+            qr_row + d64, q_pe_buf, [BH, 64], mask=head_valid, other=0, is_async=True
+        )
+    tle.gpu.async_commit_group()
+
+    rows128 = tl.arange(0, 128)[:, None]
+    is_p0_128 = rows128 < 64
+    tok64_128 = rows128 & 63
+    tokens = tl.arange(0, 128)
+    is_p0_1d = tokens < 64
+    tok64_1d = tokens & 63
+
+    # Clamp to 0 so empty splits and zero-length requests skip the loop safely.
+    n_tiles = tl.maximum((end_page - start_page + 1) // 2, 0)
+    end_tok = tl.minimum(length, end_page * 64)
+    maximum = tl.full([BH], -float("inf"), dtype=tl.float32)
+    denominator = tl.zeros([BH], dtype=tl.float32)
+    acc_l = tl.zeros([BH, 256], dtype=tl.float32)
+    acc_r = tl.zeros([BH, 256], dtype=tl.float32)
+
+    p0 = tl.load(
+        Table + tbl_batch * TABLE_STRIDE + start_page,
+        mask=start_page < end_page,
+        other=0,
+    ).to(tl.int64)
+    p1 = tl.load(
+        Table + tbl_batch * TABLE_STRIDE + start_page + 1,
+        mask=(start_page + 1) < end_page,
+        other=0,
+    ).to(tl.int64)
+    if n_tiles > 0:
+        kv_base0 = (
+            tl.where(is_p0_128, KV + p0 * KV_STRIDE0, KV + p1 * KV_STRIDE0)
+            + tok64_128 * KV_STRIDE1
+            + d512
+        )
+        v0 = (start_page * 64 + rows128) < end_tok
+        tle.gpu.copy(kv_base0, kv_buf, [128, 512], mask=v0, other=0, is_async=True)
+        tle.gpu.async_commit_group()
+
+    if SINGLE_QUERY or CONTIG_Q2_H16:
+        # Peel at most one partially valid trailing tile so the hot loop runs
+        # without KR/KS masks or softmax tail branches while staying NaN-safe.
+        eff_end_tok = (
+            end_tok
+            if (SINGLE_QUERY or (not CAUSAL))
+            else tl.minimum(length - 1, end_page * 64)
+        )
+        n_full = tl.maximum((eff_end_tok - start_page * 64) // 128, 0)
+
+        for t in range(n_full):
+            page_idx = start_page + t * 2
+            nxt_page = page_idx + 2
+            rem_nxt = end_tok - nxt_page * 64
+
+            tle.gpu.async_wait_group(0)
+            kr_ptrs = (
+                tl.where(is_p0_128, KR + p0 * KR_STRIDE0, KR + p1 * KR_STRIDE0)
+                + tok64_128 * KR_STRIDE1
+                + d64
+            )
+            ks_ptrs = (
+                tl.where(is_p0_1d, KS + p0 * KS_STRIDE0, KS + p1 * KS_STRIDE0)
+                + tok64_1d * KS_STRIDE1
+            )
+            tle.gpu.copy(kr_ptrs, kr_buf, [128, 64], is_async=True)
+            tle.gpu.async_commit_group()
+            ks_cur = tl.load(ks_ptrs)
+
+            np0 = tl.load(
+                Table + tbl_batch * TABLE_STRIDE + nxt_page,
+                mask=nxt_page < end_page,
+                other=0,
             ).to(tl.int64)
-        valid_tokens = (page_idx * 64 + tokens < length) & (page_offsets < end_page)
-        kv = tl.load(
-            KV
-            + page[:, None] * KV_STRIDES[0]
-            + (tokens % 64)[:, None] * KV_STRIDES[1]
-            + dims[None, :],
-            valid_tokens[:, None],
-            0,
-            cache_modifier=".cg",
-        )
-        if not late_rope:
-            kr = tl.load(
-                KR
-                + page[:, None] * KR_STRIDES[0]
-                + (tokens % 64)[:, None] * KR_STRIDES[1]
-                + rope_dims[None, :],
-                valid_tokens[:, None],
-                0,
-            )
-            ks = tl.load(
-                KS + page * KS_STRIDES[0] + (tokens % 64) * KS_STRIDES[1],
-                valid_tokens,
-                0,
-            )
-        if QK_SPLITS == 4:
-            kv_left, kv_right = _split_mla_features(kv, BK, 256)
-            kv0, kv1 = _split_mla_features(kv_left, BK, 128)
-            kv2, kv3 = _split_mla_features(kv_right, BK, 128)
-            # INT32 partial sums are exact: 512 * 128 * 128 fits in INT32.
-            content_scores = (
-                tl.dot(q0, tl.trans(kv0), out_dtype=tl.int32)
-                + tl.dot(q1, tl.trans(kv1), out_dtype=tl.int32)
-                + tl.dot(q2, tl.trans(kv2), out_dtype=tl.int32)
-                + tl.dot(q3, tl.trans(kv3), out_dtype=tl.int32)
+            np1 = tl.load(
+                Table + tbl_batch * TABLE_STRIDE + nxt_page + 1,
+                mask=(nxt_page + 1) < end_page,
+                other=0,
+            ).to(tl.int64)
+
+            content_scores = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kv_buf))),
+                out_dtype=tl.int32,
             ).to(tl.float32)
-        else:
-            content_scores = tl.dot(q, tl.trans(kv), out_dtype=tl.int32).to(tl.float32)
-        if late_rope:
-            # Delay KR and KS to avoid spills across the content dot.
-            kr = tl.load(
-                KR
-                + page[:, None] * KR_STRIDES[0]
-                + (tokens % 64)[:, None] * KR_STRIDES[1]
-                + rope_dims[None, :],
-                valid_tokens[:, None],
-                0,
+
+            tle.gpu.async_wait_group(0)
+            qk = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_pe_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kr_buf))),
+                content_scores,
+                out_dtype=tl.float32,
             )
-            ks = tl.load(
-                KS + page * KS_STRIDES[0] + (tokens % 64) * KS_STRIDES[1],
-                valid_tokens,
-                0,
-            )
-        rope_scores = tl.dot(qr, tl.trans(kr), out_dtype=tl.float32)
-        # Separating the dot chains avoids replicated QK warps on older compilers.
-        qk = content_scores + rope_scores
-        qk = tl.trans(qk) if COLUMN_SOFTMAX else qk
-        if FOLD_LOGIT_SCALE and h32_k128 and SCALE == 576**-0.5:
-            scaled_ks = ks * (SCALE * 1.4426950408889634)
-            scores = (
-                qk
-                * tl.expand_dims(qs, reduction_axis)
-                * tl.expand_dims(scaled_ks, 1 - reduction_axis)
-            )
-        else:
-            scores = (
-                qk
-                * tl.expand_dims(qs, reduction_axis)
-                * tl.expand_dims(ks, 1 - reduction_axis)
-                * (SCALE * 1.4426950408889634)
-            )
-        visible = (
-            page_idx * 64 + tl.expand_dims(tokens, 1 - reduction_axis)
-            < tl.expand_dims(query_limit, reduction_axis)
-        ) & tl.expand_dims(page_offsets < end_page, 1 - reduction_axis)
-        if INTERIOR_SCORE_HINT:
-            # A later page in this split contains at least one remaining token.
-            # Both draft queries can therefore see every token of the current tile.
-            visible = (page_idx + BK // 64 < end_page) | visible
-        scores = tl.where(visible, scores, -float("inf"))
-        new_maximum = tl.maximum(maximum, tl.max(scores, reduction_axis))
-        safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
-        probabilities = tl.exp2(scores - tl.expand_dims(safe_maximum, reduction_axis))
-        rescale = tl.exp2(maximum - safe_maximum)
-        if BH == 16 and BK == 128:
-            # Retain the original reduction schedule for this tile geometry.
-            denominator = denominator * rescale + tl.sum(probabilities, reduction_axis)
-            scaled_probabilities = probabilities * tl.expand_dims(
-                ks, 1 - reduction_axis
-            )
-            probability_scale = tl.maximum(
-                tl.max(scaled_probabilities, reduction_axis) / 127.0, 1.0e-30
-            )
-        else:
-            # Fold KV scales into P and share synchronization for both statistics.
-            scaled_probabilities = probabilities * tl.expand_dims(
-                ks, 1 - reduction_axis
-            )
+
+            scores = tl.trans(qk) * qs_log2[None, :] * ks_cur[:, None]
+            new_maximum = tl.maximum(maximum, tl.max(scores, axis=0))
+            probabilities = tl.exp2(scores - new_maximum[None, :])
+            rescale = tl.exp2(maximum - new_maximum)
+            scaled_probabilities = probabilities * ks_cur[:, None]
             probability_sum, scaled_probability_max = tl.reduce(
-                (probabilities, scaled_probabilities), reduction_axis, _sum_and_max
+                (probabilities, scaled_probabilities), 0, sum_and_max
             )
             denominator = denominator * rescale + probability_sum
-            probability_scale = tl.maximum(scaled_probability_max / 127.0, 1.0e-30)
-        if (BH == 32 and BK == 256) or (BH == 64 and BK == 128) or h32_k128:
-            # The original MLA scale bounds make both full-div scaling branches false.
-            normalized_probabilities = scaled_probabilities * tl.expand_dims(
-                native_mla_probability_reciprocal(probability_scale), reduction_axis
+            probability_scale = tl.maximum(
+                scaled_probability_max * P7_INV_MAX_QUANT, MIN_PROBABILITY_SCALE
             )
-            quantized_probabilities, quantized_residual = (
-                quantize_mla_probabilities_packed(
-                    normalized_probabilities, NORMALIZED=True, RADIX=PROBABILITY_RADIX
-                )
+            norm_p = tl.trans(
+                scaled_probabilities * native_rcpf(probability_scale)[None, :]
             )
-        else:
-            if BH == 16 and BK == 128:
-                normalized_probabilities = scaled_probabilities * tl.expand_dims(
-                    native_mla_probability_reciprocal(probability_scale),
-                    reduction_axis,
+            p_q = quantize_mla_probabilities_p7(norm_p)
+            tl.store(tle.gpu.local_ptr(p_buf), p_q)
+            tl.store(tle.gpu.local_ptr(rescale_buf), rescale)
+            tl.store(tle.gpu.local_ptr(cscale_buf), probability_scale)
+
+            kvl = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows128, d256_l), shape=(128, 256))
+            )
+            pq_l = tl.load(tle.gpu.local_ptr(p_buf))
+            rs_pv = tl.load(tle.gpu.local_ptr(rescale_buf))
+            cs_pv = tl.load(tle.gpu.local_ptr(cscale_buf))
+            hl = tl.dot(pq_l, kvl, out_dtype=tl.int32)
+            acc_l = acc_l * rs_pv[:, None] + hl.to(tl.float32) * cs_pv[:, None]
+
+            # Complete all kvl reads before launching the next async KV overwrite.
+            tl.debug_barrier()
+
+            kvr = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows128, d256_r), shape=(128, 256))
+            )
+            if nxt_page < end_page:
+                nkv_ptrs = (
+                    tl.where(is_p0_128, KV + np0 * KV_STRIDE0, KV + np1 * KV_STRIDE0)
+                    + tok64_128 * KV_STRIDE1
+                    + d512
                 )
+                tle.gpu.copy(
+                    nkv_ptrs,
+                    kv_buf,
+                    [128, 512],
+                    mask=rows128 < rem_nxt,
+                    other=0,
+                    is_async=True,
+                )
+                tle.gpu.async_commit_group()
+
+            hr = tl.dot(pq_l, kvr, out_dtype=tl.int32)
+            acc_r = acc_r * rs_pv[:, None] + hr.to(tl.float32) * cs_pv[:, None]
+
+            maximum = new_maximum
+            p0, p1 = np0, np1
+
+        if n_full < n_tiles:
+            tail_page = start_page + n_full * 2
+            rem_cur = end_tok - tail_page * 64
+
+            tle.gpu.async_wait_group(0)
+            kr_ptrs = (
+                tl.where(is_p0_128, KR + p0 * KR_STRIDE0, KR + p1 * KR_STRIDE0)
+                + tok64_128 * KR_STRIDE1
+                + d64
+            )
+            ks_ptrs = (
+                tl.where(is_p0_1d, KS + p0 * KS_STRIDE0, KS + p1 * KS_STRIDE0)
+                + tok64_1d * KS_STRIDE1
+            )
+            tle.gpu.copy(
+                kr_ptrs,
+                kr_buf,
+                [128, 64],
+                mask=rows128 < rem_cur,
+                other=0,
+                is_async=True,
+            )
+            tle.gpu.async_commit_group()
+            ks_cur = tl.load(ks_ptrs, mask=tokens < rem_cur, other=0.0)
+
+            content_scores = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kv_buf))),
+                out_dtype=tl.int32,
+            ).to(tl.float32)
+
+            tle.gpu.async_wait_group(0)
+            qk = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_pe_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kr_buf))),
+                content_scores,
+                out_dtype=tl.float32,
+            )
+
+            scores = tl.trans(qk) * qs_log2[None, :] * ks_cur[:, None]
+            if SINGLE_QUERY or (not CAUSAL):
+                visible = tokens[:, None] < rem_cur
             else:
-                normalized_probabilities = scaled_probabilities / tl.expand_dims(
-                    probability_scale, reduction_axis
+                q_rem = (
+                    tl.minimum(length - (flat_h_1d < 16).to(tl.int32), end_page * 64)
+                    - tail_page * 64
                 )
-            quantized_probabilities, quantized_residual = quantize_mla_probabilities(
-                normalized_probabilities
+                visible = tokens[:, None] < q_rem[None, :]
+            scores = tl.where(visible, scores, -float("inf"))
+            new_maximum = tl.maximum(maximum, tl.max(scores, axis=0))
+            safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
+            probabilities = tl.exp2(scores - safe_maximum[None, :])
+            rescale = tl.exp2(maximum - safe_maximum)
+            scaled_probabilities = probabilities * ks_cur[:, None]
+            probability_sum, scaled_probability_max = tl.reduce(
+                (probabilities, scaled_probabilities), 0, sum_and_max
             )
-        quantized_probabilities = (
-            tl.trans(quantized_probabilities)
-            if COLUMN_SOFTMAX
-            else quantized_probabilities
-        )
-        quantized_residual = (
-            tl.trans(quantized_residual) if COLUMN_SOFTMAX else quantized_residual
-        )
-        if PAIR_PV and FUSED_PV:
-            paired_probabilities = tl.reshape(
-                tl.permute(
-                    tl.join(quantized_probabilities, quantized_residual), (2, 0, 1)
-                ),
-                (2 * BH, BK),
+            denominator = denominator * rescale + probability_sum
+            probability_scale = tl.maximum(
+                scaled_probability_max * P7_INV_MAX_QUANT, MIN_PROBABILITY_SCALE
             )
-            # Keep JoinOp from requesting 64-bit packed dot operands.
-            paired_probabilities = tl.inline_asm_elementwise(
-                "ppu.mov.b32 $0, $1;",
-                "=r,r",
-                [paired_probabilities.to(tl.int32)],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            ).to(tl.int8)
-            paired_products = tl.dot(paired_probabilities, kv, out_dtype=tl.int32)
-            high, low = tl.split(
-                tl.permute(tl.reshape(paired_products, (2, BH, 512)), (1, 2, 0))
+            norm_p = tl.trans(
+                scaled_probabilities * native_rcpf(probability_scale)[None, :]
             )
-            contribution = (high * PROBABILITY_RADIX + low).to(tl.float32)
-            contribution_scale = probability_scale * (1.0 / PROBABILITY_RADIX)
-        else:
-            if FUSED_PV:
-                # Both supported radices keep the 256-token sum within INT32.
-                high = tl.dot(quantized_probabilities, kv, out_dtype=tl.int32)
-                contribution = tl.dot(
-                    quantized_residual, kv, high * PROBABILITY_RADIX, out_dtype=tl.int32
-                ).to(tl.float32)
-                contribution_scale = probability_scale * (1.0 / PROBABILITY_RADIX)
-            else:
-                contribution = tl.dot(
-                    quantized_probabilities, kv, out_dtype=tl.int32
-                ).to(tl.float32)
-                correction = tl.dot(quantized_residual, kv, out_dtype=tl.int32).to(
-                    tl.float32
-                )
-                contribution += correction * (1.0 / PROBABILITY_RADIX)
-                contribution_scale = probability_scale
-        accumulator = (
-            accumulator * rescale[:, None] + contribution * contribution_scale[:, None]
-        )
-        maximum = new_maximum
-    if SPLITS == 1:
-        inv_denominator = 1.0 / tl.where(denominator > 0, denominator, 1.0)
-        normalized = accumulator * inv_denominator[:, None]
-        tl.store(
-            Output + (batch * H + heads[:, None]) * 512 + dims[None, :],
-            normalized,
-            valid_heads[:, None],
-        )
-        logsum = tl.where(
-            denominator > 0,
-            maximum * 0.6931471805599453 + tl.log(denominator),
-            float("inf"),
-        )
-        tl.store(LSE + heads * B + batch, logsum, valid_heads)
+            p_q = quantize_mla_probabilities_p7(norm_p)
+            tl.store(tle.gpu.local_ptr(p_buf), p_q)
+            tl.store(tle.gpu.local_ptr(rescale_buf), rescale)
+            tl.store(tle.gpu.local_ptr(cscale_buf), probability_scale)
+
+            kvl = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows128, d256_l), shape=(128, 256))
+            )
+            pq_l = tl.load(tle.gpu.local_ptr(p_buf))
+            rs_pv = tl.load(tle.gpu.local_ptr(rescale_buf))
+            cs_pv = tl.load(tle.gpu.local_ptr(cscale_buf))
+            hl = tl.dot(pq_l, kvl, out_dtype=tl.int32)
+            acc_l = acc_l * rs_pv[:, None] + hl.to(tl.float32) * cs_pv[:, None]
+
+            tl.debug_barrier()
+
+            kvr = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows128, d256_r), shape=(128, 256))
+            )
+            hr = tl.dot(pq_l, kvr, out_dtype=tl.int32)
+            acc_r = acc_r * rs_pv[:, None] + hr.to(tl.float32) * cs_pv[:, None]
+
+            maximum = new_maximum
     else:
-        tl.store(
-            Partial + ((split * B + batch) * H + heads[:, None]) * 512 + dims[None, :],
-            accumulator,
-            valid_heads[:, None],
+        for t in range(n_tiles):
+            page_idx = start_page + t * 2
+            nxt_page = page_idx + 2
+            rem_cur = end_tok - page_idx * 64
+
+            tle.gpu.async_wait_group(0)
+            kr_ptrs = (
+                tl.where(is_p0_128, KR + p0 * KR_STRIDE0, KR + p1 * KR_STRIDE0)
+                + tok64_128 * KR_STRIDE1
+                + d64
+            )
+            ks_ptrs = (
+                tl.where(is_p0_1d, KS + p0 * KS_STRIDE0, KS + p1 * KS_STRIDE0)
+                + tok64_1d * KS_STRIDE1
+            )
+            tle.gpu.copy(
+                kr_ptrs,
+                kr_buf,
+                [128, 64],
+                mask=rows128 < rem_cur,
+                other=0,
+                is_async=True,
+            )
+            tle.gpu.async_commit_group()
+            ks_cur = tl.load(ks_ptrs, mask=tokens < rem_cur, other=0.0)
+
+            np0 = tl.load(
+                Table + tbl_batch * TABLE_STRIDE + nxt_page,
+                mask=nxt_page < end_page,
+                other=0,
+            ).to(tl.int64)
+            np1 = tl.load(
+                Table + tbl_batch * TABLE_STRIDE + nxt_page + 1,
+                mask=(nxt_page + 1) < end_page,
+                other=0,
+            ).to(tl.int64)
+
+            content_scores = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kv_buf))),
+                out_dtype=tl.int32,
+            ).to(tl.float32)
+
+            tle.gpu.async_wait_group(0)
+            qk = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_pe_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kr_buf))),
+                content_scores,
+                out_dtype=tl.float32,
+            )
+
+            scores = tl.trans(qk) * qs_log2[None, :] * ks_cur[:, None]
+            if page_idx + 2 >= end_page - 1:
+                page_offsets = page_idx + tokens // 64
+                visible = (page_idx * 64 + tokens[:, None] < query_limit[None, :]) & (
+                    page_offsets[:, None] < end_page
+                )
+                scores = tl.where(visible, scores, -float("inf"))
+            new_maximum = tl.maximum(maximum, tl.max(scores, axis=0))
+            safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
+            probabilities = tl.exp2(scores - safe_maximum[None, :])
+            rescale = tl.exp2(maximum - safe_maximum)
+            scaled_probabilities = probabilities * ks_cur[:, None]
+            probability_sum, scaled_probability_max = tl.reduce(
+                (probabilities, scaled_probabilities), 0, sum_and_max
+            )
+            denominator = denominator * rescale + probability_sum
+            probability_scale = tl.maximum(
+                scaled_probability_max * P7_INV_MAX_QUANT, MIN_PROBABILITY_SCALE
+            )
+            norm_p = tl.trans(
+                scaled_probabilities * native_rcpf(probability_scale)[None, :]
+            )
+            p_q = quantize_mla_probabilities_p7(norm_p)
+            tl.store(tle.gpu.local_ptr(p_buf), p_q)
+            tl.store(tle.gpu.local_ptr(rescale_buf), rescale)
+            tl.store(tle.gpu.local_ptr(cscale_buf), probability_scale)
+
+            kvl = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows128, d256_l), shape=(128, 256))
+            )
+            pq_l = tl.load(tle.gpu.local_ptr(p_buf))
+            rs_pv = tl.load(tle.gpu.local_ptr(rescale_buf))
+            cs_pv = tl.load(tle.gpu.local_ptr(cscale_buf))
+            hl = tl.dot(pq_l, kvl, out_dtype=tl.int32)
+            acc_l = acc_l * rs_pv[:, None] + hl.to(tl.float32) * cs_pv[:, None]
+
+            tl.debug_barrier()
+
+            kvr = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows128, d256_r), shape=(128, 256))
+            )
+            if nxt_page < end_page:
+                nkv_ptrs = (
+                    tl.where(is_p0_128, KV + np0 * KV_STRIDE0, KV + np1 * KV_STRIDE0)
+                    + tok64_128 * KV_STRIDE1
+                    + d512
+                )
+                tle.gpu.copy(
+                    nkv_ptrs,
+                    kv_buf,
+                    [128, 512],
+                    mask=rows128 < (rem_cur - 128),
+                    other=0,
+                    is_async=True,
+                )
+                tle.gpu.async_commit_group()
+
+            hr = tl.dot(pq_l, kvr, out_dtype=tl.int32)
+            acc_r = acc_r * rs_pv[:, None] + hr.to(tl.float32) * cs_pv[:, None]
+
+            maximum = new_maximum
+            p0, p1 = np0, np1
+
+    # Zero-visible rows have acc == 0, so replacing denom == 0 with 1.0 yields 0.0.
+    valid_row = (
+        (denominator > 0.0) if HEADS_ALIGNED else ((denominator > 0.0) & head_mask_1d)
+    )
+    safe_d = tl.where(valid_row, denominator, 1.0)
+    inv_d = 1.0 / safe_d
+    if NUM_SPLITS > 1:
+        # -inf marks empty splits so merge_splits_kernel skips them.
+        lse = tl.where(valid_row, maximum * LN_2 + tl.log(safe_d), -float("inf"))
+        if FLAT_Q2:
+            q_idx_s = batch & 1
+            eff_flat_1d = q_idx_s * heads_per_query + flat_h_1d
+            out_base = (
+                Out
+                + (
+                    (tbl_batch * NUM_SPLITS + split_idx) * total_heads
+                    + eff_flat_1d[:, None]
+                )
+                * 512
+            )
+            lse_ptrs = (
+                Lse + (tbl_batch * NUM_SPLITS + split_idx) * total_heads + eff_flat_1d
+            )
+        else:
+            out_base = (
+                Out
+                + ((batch * NUM_SPLITS + split_idx) * total_heads + flat_h_1d[:, None])
+                * 512
+            )
+            lse_ptrs = Lse + (batch * NUM_SPLITS + split_idx) * total_heads + flat_h_1d
+        if HEADS_ALIGNED:
+            tl.store(out_base + d256_l, (acc_l * inv_d[:, None]).to(tl.float32))
+            tl.store(out_base + d256_r, (acc_r * inv_d[:, None]).to(tl.float32))
+            tl.store(lse_ptrs, lse)
+        else:
+            tl.store(
+                out_base + d256_l,
+                (acc_l * inv_d[:, None]).to(tl.float32),
+                mask=head_mask_1d[:, None],
+            )
+            tl.store(
+                out_base + d256_r,
+                (acc_r * inv_d[:, None]).to(tl.float32),
+                mask=head_mask_1d[:, None],
+            )
+            tl.store(lse_ptrs, lse, mask=head_mask_1d)
+    else:
+        # Match FlashMLA convention: +inf LSE when a row sees no valid tokens.
+        lse = tl.where(valid_row, maximum * LN_2 + tl.log(safe_d), float("inf"))
+        if FLAT_Q2:
+            q_idx_s = batch & 1
+            out_base = Out + (batch * heads_per_query + flat_h_1d[:, None]) * 512
+            lse_ptrs = (
+                Lse
+                + tbl_batch
+                + flat_h_1d * batch_size
+                + q_idx_s * (batch_size * heads_per_query)
+            )
+        else:
+            out_base = Out + (batch * total_heads + flat_h_1d[:, None]) * 512
+            if SINGLE_QUERY:
+                lse_ptrs = Lse + batch + h_idx_1d * batch_size
+            elif CONTIG_Q2_H16:
+                q_h16 = (flat_h_1d >= 16).to(tl.int32)
+                h_h16 = flat_h_1d & 15
+                lse_ptrs = Lse + batch + h_h16 * batch_size + q_h16 * (batch_size * 16)
+            else:
+                lse_ptrs = (
+                    Lse
+                    + batch
+                    + h_idx_1d * batch_size
+                    + q_idx_1d * (batch_size * heads_per_query)
+                )
+        if HEADS_ALIGNED:
+            tl.store(out_base + d256_l, (acc_l * inv_d[:, None]).to(OUT_DTYPE))
+            tl.store(out_base + d256_r, (acc_r * inv_d[:, None]).to(OUT_DTYPE))
+            tl.store(lse_ptrs, lse)
+        else:
+            tl.store(
+                out_base + d256_l,
+                (acc_l * inv_d[:, None]).to(OUT_DTYPE),
+                mask=head_mask_1d[:, None],
+            )
+            tl.store(
+                out_base + d256_r,
+                (acc_r * inv_d[:, None]).to(OUT_DTYPE),
+                mask=head_mask_1d[:, None],
+            )
+            tl.store(lse_ptrs, lse, mask=head_mask_1d)
+
+
+@triton.jit
+def dense_int8_mla_tle_bh16_bk64_kernel(
+    Q,
+    QR,
+    KV,
+    KR,
+    KS,
+    QS,
+    Table,
+    Lengths,
+    BatchOrder,
+    Out,
+    Lse,
+    Q_STRIDE0: tl.constexpr,
+    Q_STRIDE1: tl.constexpr,
+    Q_STRIDE2: tl.constexpr,
+    QR_STRIDE0: tl.constexpr,
+    QR_STRIDE1: tl.constexpr,
+    QR_STRIDE2: tl.constexpr,
+    KV_STRIDE0: tl.constexpr,
+    KV_STRIDE1: tl.constexpr,
+    KR_STRIDE0: tl.constexpr,
+    KR_STRIDE1: tl.constexpr,
+    QS_STRIDE0: tl.constexpr,
+    QS_STRIDE1: tl.constexpr,
+    QS_STRIDE2: tl.constexpr,
+    KS_STRIDE0: tl.constexpr,
+    KS_STRIDE1: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    batch_size,
+    total_heads,
+    heads_per_query,
+    softmax_scale,
+    NUM_SPLITS: tl.constexpr,
+    USE_BATCH_ORDER: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    SINGLE_QUERY: tl.constexpr,
+    HEADS_ALIGNED: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    """High-occupancy 4-warp BK=64 kernel for BH=16 (51.7 KiB SMEM, 4 CTAs/SM)."""
+    BH: tl.constexpr = 16
+    head_block = tl.program_id(0)
+    split_idx = tl.program_id(1)
+    raw_batch = tl.program_id(2)
+    batch = (
+        tl.load(BatchOrder + raw_batch).to(tl.int32) if USE_BATCH_ORDER else raw_batch
+    )
+    head_base = head_block * BH
+
+    length = tl.load(Lengths + batch)
+    total_pages = (length + 63) // 64
+    if NUM_SPLITS > 1:
+        pages_per_split = (total_pages + NUM_SPLITS - 1) // NUM_SPLITS
+        start_page = split_idx * pages_per_split
+        end_page = tl.minimum(start_page + pages_per_split, total_pages)
+    else:
+        start_page = 0
+        end_page = total_pages
+    n_pages = tl.maximum(end_page - start_page, 0)
+    end_tok = tl.minimum(length, end_page * 64)
+
+    q_buf = tle.gpu.alloc(
+        [BH, 512], dtype=tl.int8, scope=tle.gpu.smem, layout=swizzled_2d(16, 32)
+    )
+    q_pe_buf = tle.gpu.alloc(
+        [BH, 64], dtype=OUT_DTYPE, scope=tle.gpu.smem, layout=swizzled_2d(8, 8)
+    )
+    kv_buf = tle.gpu.alloc(
+        [64, 512], dtype=tl.int8, scope=tle.gpu.smem, layout=swizzled_2d(16, 32)
+    )
+    kr_buf = tle.gpu.alloc(
+        [64, 64], dtype=OUT_DTYPE, scope=tle.gpu.smem, layout=swizzled_2d(8, 8)
+    )
+    p_buf = tle.gpu.alloc(
+        [BH, 64], dtype=tl.int8, scope=tle.gpu.smem, layout=swizzled_2d(16, 4)
+    )
+    rescale_buf = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem, layout=None)
+    cscale_buf = tle.gpu.alloc([BH], dtype=tl.float32, scope=tle.gpu.smem, layout=None)
+
+    flat_h_1d = head_base + tl.arange(0, BH)
+    if HEADS_ALIGNED:
+        safe_flat_1d = flat_h_1d
+    else:
+        head_mask_1d = flat_h_1d < total_heads
+        safe_flat_1d = tl.where(head_mask_1d, flat_h_1d, 0)
+    if SINGLE_QUERY:
+        q_idx_1d = 0
+        h_idx_1d = safe_flat_1d
+        if HEADS_ALIGNED:
+            qs = tl.load(QS + batch * QS_STRIDE0 + h_idx_1d * QS_STRIDE2)
+        else:
+            qs = tl.load(
+                QS + batch * QS_STRIDE0 + h_idx_1d * QS_STRIDE2,
+                mask=head_mask_1d,
+                other=0.0,
+            )
+    else:
+        q_idx_1d = safe_flat_1d // heads_per_query
+        h_idx_1d = safe_flat_1d % heads_per_query
+        if HEADS_ALIGNED:
+            qs = tl.load(
+                QS + batch * QS_STRIDE0 + q_idx_1d * QS_STRIDE1 + h_idx_1d * QS_STRIDE2
+            )
+        else:
+            qs = tl.load(
+                QS + batch * QS_STRIDE0 + q_idx_1d * QS_STRIDE1 + h_idx_1d * QS_STRIDE2,
+                mask=head_mask_1d,
+                other=0.0,
+            )
+        q_len = total_heads // heads_per_query
+        query_limit = (
+            (length - (q_len - 1 - q_idx_1d))
+            if CAUSAL
+            else tl.full([BH], 0, dtype=tl.int32) + length
         )
-        tl.store(Stats + (split * 2 * H + heads) * B + batch, maximum, valid_heads)
-        tl.store(
-            Stats + ((split * 2 + 1) * H + heads) * B + batch, denominator, valid_heads
+    qs_log2 = qs * (softmax_scale * LOG2_E)
+
+    flat_h = head_base + tl.arange(0, BH)[:, None]
+    d512 = tl.arange(0, 512)[None, :]
+    d256_l = tl.arange(0, 256)[None, :]
+    d256_r = tl.arange(256, 512)[None, :]
+    d64 = tl.arange(0, 64)[None, :]
+    if HEADS_ALIGNED:
+        if SINGLE_QUERY:
+            q_row = Q + batch * Q_STRIDE0 + flat_h * Q_STRIDE2
+            qr_row = QR + batch * QR_STRIDE0 + flat_h * QR_STRIDE2
+        else:
+            q_idx = flat_h // heads_per_query
+            h_idx = flat_h % heads_per_query
+            q_row = Q + batch * Q_STRIDE0 + q_idx * Q_STRIDE1 + h_idx * Q_STRIDE2
+            qr_row = QR + batch * QR_STRIDE0 + q_idx * QR_STRIDE1 + h_idx * QR_STRIDE2
+        tle.gpu.copy(q_row + d512, q_buf, [BH, 512], is_async=True)
+        tle.gpu.copy(qr_row + d64, q_pe_buf, [BH, 64], is_async=True)
+    else:
+        head_valid = flat_h < total_heads
+        safe_flat = tl.where(head_valid, flat_h, 0)
+        if SINGLE_QUERY:
+            q_row = Q + batch * Q_STRIDE0 + safe_flat * Q_STRIDE2
+            qr_row = QR + batch * QR_STRIDE0 + safe_flat * QR_STRIDE2
+        else:
+            q_idx = safe_flat // heads_per_query
+            h_idx = safe_flat % heads_per_query
+            q_row = Q + batch * Q_STRIDE0 + q_idx * Q_STRIDE1 + h_idx * Q_STRIDE2
+            qr_row = QR + batch * QR_STRIDE0 + q_idx * QR_STRIDE1 + h_idx * QR_STRIDE2
+        tle.gpu.copy(
+            q_row + d512, q_buf, [BH, 512], mask=head_valid, other=0, is_async=True
         )
-        if head_tile == 0 and split == 0:
-            tl.store(Offsets + batch, batch)
-            if batch == 0:
-                tl.store(Offsets + B, B)
+        tle.gpu.copy(
+            qr_row + d64, q_pe_buf, [BH, 64], mask=head_valid, other=0, is_async=True
+        )
+    tle.gpu.async_commit_group()
+
+    rows64 = tl.arange(0, 64)[:, None]
+    tok64 = tl.arange(0, 64)
+    maximum = tl.full([BH], -float("inf"), dtype=tl.float32)
+    denominator = tl.zeros([BH], dtype=tl.float32)
+    acc_l = tl.zeros([BH, 256], dtype=tl.float32)
+    acc_r = tl.zeros([BH, 256], dtype=tl.float32)
+
+    p0 = tl.load(
+        Table + batch * TABLE_STRIDE + start_page,
+        mask=start_page < end_page,
+        other=0,
+    ).to(tl.int64)
+    if n_pages > 0:
+        v0 = (start_page * 64 + rows64) < end_tok
+        tle.gpu.copy(
+            KV + p0 * KV_STRIDE0 + rows64 * KV_STRIDE1 + d512,
+            kv_buf,
+            [64, 512],
+            mask=v0,
+            other=0,
+            is_async=True,
+        )
+        tle.gpu.async_commit_group()
+
+    if SINGLE_QUERY:
+        n_full = tl.maximum((end_tok - start_page * 64) // 64, 0)
+        for t in range(n_full):
+            page_idx = start_page + t
+            nxt_page = page_idx + 1
+            rem_nxt = end_tok - nxt_page * 64
+            tle.gpu.async_wait_group(0)
+            tle.gpu.copy(
+                KR + p0 * KR_STRIDE0 + rows64 * KR_STRIDE1 + d64,
+                kr_buf,
+                [64, 64],
+                is_async=True,
+            )
+            tle.gpu.async_commit_group()
+            ks_cur = tl.load(KS + p0 * KS_STRIDE0 + tok64 * KS_STRIDE1)
+            np0 = tl.load(
+                Table + batch * TABLE_STRIDE + nxt_page,
+                mask=nxt_page < end_page,
+                other=0,
+            ).to(tl.int64)
+
+            content_scores = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kv_buf))),
+                out_dtype=tl.int32,
+            ).to(tl.float32)
+            tle.gpu.async_wait_group(0)
+            qk = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_pe_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kr_buf))),
+                content_scores,
+                out_dtype=tl.float32,
+            )
+
+            scores = qk * qs_log2[:, None] * ks_cur[None, :]
+            new_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
+            probabilities = tl.exp2(scores - new_maximum[:, None])
+            rescale = tl.exp2(maximum - new_maximum)
+            scaled_probabilities = probabilities * ks_cur[None, :]
+            probability_sum, scaled_probability_max = tl.reduce(
+                (probabilities, scaled_probabilities), 1, sum_and_max
+            )
+            denominator = denominator * rescale + probability_sum
+            probability_scale = tl.maximum(
+                scaled_probability_max * P7_INV_MAX_QUANT, MIN_PROBABILITY_SCALE
+            )
+            norm_p = scaled_probabilities * native_rcpf(probability_scale)[:, None]
+            p_q = quantize_mla_probabilities_p7(norm_p)
+            tl.store(tle.gpu.local_ptr(p_buf), p_q)
+            tl.store(tle.gpu.local_ptr(rescale_buf), rescale)
+            tl.store(tle.gpu.local_ptr(cscale_buf), probability_scale)
+
+            # Split PV into two 256-col subslices so all kv_buf loads finish
+            # before the next async KV overwrite starts.
+            kvl = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows64, d256_l), shape=(64, 256))
+            )
+            pq = tl.load(tle.gpu.local_ptr(p_buf))
+            rs_pv = tl.load(tle.gpu.local_ptr(rescale_buf))
+            cs_pv = tl.load(tle.gpu.local_ptr(cscale_buf))
+            hl = tl.dot(pq, kvl, out_dtype=tl.int32)
+            acc_l = acc_l * rs_pv[:, None] + hl.to(tl.float32) * cs_pv[:, None]
+            kvr = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows64, d256_r), shape=(64, 256))
+            )
+            if nxt_page < end_page:
+                tle.gpu.copy(
+                    KV + np0 * KV_STRIDE0 + rows64 * KV_STRIDE1 + d512,
+                    kv_buf,
+                    [64, 512],
+                    mask=rows64 < rem_nxt,
+                    other=0,
+                    is_async=True,
+                )
+                tle.gpu.async_commit_group()
+            hr = tl.dot(pq, kvr, out_dtype=tl.int32)
+            acc_r = acc_r * rs_pv[:, None] + hr.to(tl.float32) * cs_pv[:, None]
+
+            maximum = new_maximum
+            p0 = np0
+
+        if n_full < n_pages:
+            rem_cur = end_tok - (start_page + n_full) * 64
+            tle.gpu.async_wait_group(0)
+            tle.gpu.copy(
+                KR + p0 * KR_STRIDE0 + rows64 * KR_STRIDE1 + d64,
+                kr_buf,
+                [64, 64],
+                mask=rows64 < rem_cur,
+                other=0,
+                is_async=True,
+            )
+            tle.gpu.async_commit_group()
+            ks_cur = tl.load(
+                KS + p0 * KS_STRIDE0 + tok64 * KS_STRIDE1,
+                mask=tok64 < rem_cur,
+                other=0.0,
+            )
+            content_scores = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kv_buf))),
+                out_dtype=tl.int32,
+            ).to(tl.float32)
+            tle.gpu.async_wait_group(0)
+            qk = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_pe_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kr_buf))),
+                content_scores,
+                out_dtype=tl.float32,
+            )
+            scores = qk * qs_log2[:, None] * ks_cur[None, :]
+            scores = tl.where(tok64[None, :] < rem_cur, scores, -float("inf"))
+            new_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
+            safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
+            probabilities = tl.exp2(scores - safe_maximum[:, None])
+            rescale = tl.exp2(maximum - safe_maximum)
+            scaled_probabilities = probabilities * ks_cur[None, :]
+            probability_sum, scaled_probability_max = tl.reduce(
+                (probabilities, scaled_probabilities), 1, sum_and_max
+            )
+            denominator = denominator * rescale + probability_sum
+            probability_scale = tl.maximum(
+                scaled_probability_max * P7_INV_MAX_QUANT, MIN_PROBABILITY_SCALE
+            )
+            norm_p = scaled_probabilities * native_rcpf(probability_scale)[:, None]
+            p_q = quantize_mla_probabilities_p7(norm_p)
+            tl.store(tle.gpu.local_ptr(p_buf), p_q)
+            tl.store(tle.gpu.local_ptr(rescale_buf), rescale)
+            tl.store(tle.gpu.local_ptr(cscale_buf), probability_scale)
+
+            kvl = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows64, d256_l), shape=(64, 256))
+            )
+            pq = tl.load(tle.gpu.local_ptr(p_buf))
+            rs_pv = tl.load(tle.gpu.local_ptr(rescale_buf))
+            cs_pv = tl.load(tle.gpu.local_ptr(cscale_buf))
+            hl = tl.dot(pq, kvl, out_dtype=tl.int32)
+            acc_l = acc_l * rs_pv[:, None] + hl.to(tl.float32) * cs_pv[:, None]
+            kvr = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows64, d256_r), shape=(64, 256))
+            )
+            hr = tl.dot(pq, kvr, out_dtype=tl.int32)
+            acc_r = acc_r * rs_pv[:, None] + hr.to(tl.float32) * cs_pv[:, None]
+            maximum = new_maximum
+    else:
+        for t in range(n_pages):
+            page_idx = start_page + t
+            nxt_page = page_idx + 1
+            rem_cur = end_tok - page_idx * 64
+            tle.gpu.async_wait_group(0)
+            tle.gpu.copy(
+                KR + p0 * KR_STRIDE0 + rows64 * KR_STRIDE1 + d64,
+                kr_buf,
+                [64, 64],
+                mask=rows64 < rem_cur,
+                other=0,
+                is_async=True,
+            )
+            tle.gpu.async_commit_group()
+            ks_cur = tl.load(
+                KS + p0 * KS_STRIDE0 + tok64 * KS_STRIDE1,
+                mask=tok64 < rem_cur,
+                other=0.0,
+            )
+            np0 = tl.load(
+                Table + batch * TABLE_STRIDE + nxt_page,
+                mask=nxt_page < end_page,
+                other=0,
+            ).to(tl.int64)
+
+            content_scores = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kv_buf))),
+                out_dtype=tl.int32,
+            ).to(tl.float32)
+            tle.gpu.async_wait_group(0)
+            qk = tl.dot(
+                tl.load(tle.gpu.local_ptr(q_pe_buf)),
+                tl.trans(tl.load(tle.gpu.local_ptr(kr_buf))),
+                content_scores,
+                out_dtype=tl.float32,
+            )
+
+            scores = qk * qs_log2[:, None] * ks_cur[None, :]
+            if nxt_page >= end_page - 1:
+                visible = (page_idx * 64 + tok64[None, :]) < query_limit[:, None]
+                scores = tl.where(visible, scores, -float("inf"))
+            new_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
+            safe_maximum = tl.where(new_maximum == -float("inf"), 0.0, new_maximum)
+            probabilities = tl.exp2(scores - safe_maximum[:, None])
+            rescale = tl.exp2(maximum - safe_maximum)
+            scaled_probabilities = probabilities * ks_cur[None, :]
+            probability_sum, scaled_probability_max = tl.reduce(
+                (probabilities, scaled_probabilities), 1, sum_and_max
+            )
+            denominator = denominator * rescale + probability_sum
+            probability_scale = tl.maximum(
+                scaled_probability_max * P7_INV_MAX_QUANT, MIN_PROBABILITY_SCALE
+            )
+            norm_p = scaled_probabilities * native_rcpf(probability_scale)[:, None]
+            p_q = quantize_mla_probabilities_p7(norm_p)
+            tl.store(tle.gpu.local_ptr(p_buf), p_q)
+            tl.store(tle.gpu.local_ptr(rescale_buf), rescale)
+            tl.store(tle.gpu.local_ptr(cscale_buf), probability_scale)
+
+            kvl = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows64, d256_l), shape=(64, 256))
+            )
+            pq = tl.load(tle.gpu.local_ptr(p_buf))
+            rs_pv = tl.load(tle.gpu.local_ptr(rescale_buf))
+            cs_pv = tl.load(tle.gpu.local_ptr(cscale_buf))
+            hl = tl.dot(pq, kvl, out_dtype=tl.int32)
+            acc_l = acc_l * rs_pv[:, None] + hl.to(tl.float32) * cs_pv[:, None]
+            kvr = tl.load(
+                tle.gpu.local_ptr(kv_buf, indices=(rows64, d256_r), shape=(64, 256))
+            )
+            if nxt_page < end_page:
+                tle.gpu.copy(
+                    KV + np0 * KV_STRIDE0 + rows64 * KV_STRIDE1 + d512,
+                    kv_buf,
+                    [64, 512],
+                    mask=rows64 < (rem_cur - 64),
+                    other=0,
+                    is_async=True,
+                )
+                tle.gpu.async_commit_group()
+            hr = tl.dot(pq, kvr, out_dtype=tl.int32)
+            acc_r = acc_r * rs_pv[:, None] + hr.to(tl.float32) * cs_pv[:, None]
+
+            maximum = new_maximum
+            p0 = np0
+
+    valid_row = (
+        (denominator > 0.0) if HEADS_ALIGNED else ((denominator > 0.0) & head_mask_1d)
+    )
+    safe_d = tl.where(valid_row, denominator, 1.0)
+    inv_d = 1.0 / safe_d
+    if NUM_SPLITS > 1:
+        lse = tl.where(valid_row, maximum * LN_2 + tl.log(safe_d), -float("inf"))
+        out_base = (
+            Out
+            + ((batch * NUM_SPLITS + split_idx) * total_heads + flat_h_1d[:, None])
+            * 512
+        )
+        lse_ptrs = Lse + (batch * NUM_SPLITS + split_idx) * total_heads + flat_h_1d
+        if HEADS_ALIGNED:
+            tl.store(out_base + d256_l, (acc_l * inv_d[:, None]).to(tl.float32))
+            tl.store(out_base + d256_r, (acc_r * inv_d[:, None]).to(tl.float32))
+            tl.store(lse_ptrs, lse)
+        else:
+            tl.store(
+                out_base + d256_l,
+                (acc_l * inv_d[:, None]).to(tl.float32),
+                mask=head_mask_1d[:, None],
+            )
+            tl.store(
+                out_base + d256_r,
+                (acc_r * inv_d[:, None]).to(tl.float32),
+                mask=head_mask_1d[:, None],
+            )
+            tl.store(lse_ptrs, lse, mask=head_mask_1d)
+    else:
+        lse = tl.where(valid_row, maximum * LN_2 + tl.log(safe_d), float("inf"))
+        out_base = Out + (batch * total_heads + flat_h_1d[:, None]) * 512
+        if SINGLE_QUERY:
+            lse_ptrs = Lse + batch + h_idx_1d * batch_size
+        else:
+            lse_ptrs = (
+                Lse
+                + batch
+                + h_idx_1d * batch_size
+                + q_idx_1d * (batch_size * heads_per_query)
+            )
+        if HEADS_ALIGNED:
+            tl.store(out_base + d256_l, (acc_l * inv_d[:, None]).to(OUT_DTYPE))
+            tl.store(out_base + d256_r, (acc_r * inv_d[:, None]).to(OUT_DTYPE))
+            tl.store(lse_ptrs, lse)
+        else:
+            tl.store(
+                out_base + d256_l,
+                (acc_l * inv_d[:, None]).to(OUT_DTYPE),
+                mask=head_mask_1d[:, None],
+            )
+            tl.store(
+                out_base + d256_r,
+                (acc_r * inv_d[:, None]).to(OUT_DTYPE),
+                mask=head_mask_1d[:, None],
+            )
+            tl.store(lse_ptrs, lse, mask=head_mask_1d)
+
+
+@triton.jit
+def merge_splits_kernel(
+    PartOut,
+    PartLse,
+    Out,
+    Lse,
+    batch_size,
+    total_heads,
+    heads_per_query,
+    NUM_SPLITS: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    batch = pid // total_heads
+    flat_h = pid % total_heads
+    q_idx = flat_h // heads_per_query
+    h_idx = flat_h % heads_per_query
+    d = tl.arange(0, 512)
+    m = -float("inf")
+    for s in tl.static_range(NUM_SPLITS):
+        ls = tl.load(PartLse + (batch * NUM_SPLITS + s) * total_heads + flat_h)
+        m = tl.maximum(m, ls)
+    safe_m = tl.where(m == -float("inf"), 0.0, m)
+    acc = tl.zeros([512], dtype=tl.float32)
+    denom = 0.0
+    for s in tl.static_range(NUM_SPLITS):
+        ls = tl.load(PartLse + (batch * NUM_SPLITS + s) * total_heads + flat_h)
+        w = tl.where(ls == -float("inf"), 0.0, tl.exp(ls - safe_m))
+        po = tl.load(
+            PartOut + ((batch * NUM_SPLITS + s) * total_heads + flat_h) * 512 + d
+        )
+        acc += po * w
+        denom += w
+    inv_d = tl.where(denom > 0.0, 1.0 / denom, 0.0)
+    lse = tl.where(denom > 0.0, safe_m + tl.log(denom), float("inf"))
+    tl.store(
+        Out + (batch * total_heads + flat_h) * 512 + d, (acc * inv_d).to(OUT_DTYPE)
+    )
+    tl.store(
+        Lse + batch + h_idx * batch_size + q_idx * (batch_size * heads_per_query), lse
+    )
+
+
+def select_launch_config(
+    batch: int,
+    total_heads: int,
+    table_pages: int,
+    num_splits_override: Optional[int],
+    is_varlen: bool,
+    mean_pages: int,
+    queries: int,
+) -> tuple[int, int]:
+    """Select (head_tile, num_splits) for 64-SM PPU-ZW810E occupancy."""
+    bh = 16 if total_heads <= 16 else 32
+    if num_splits_override is not None:
+        return bh, num_splits_override
+
+    head_blocks = triton.cdiv(total_heads, bh)
+    base_ctas = head_blocks * batch
+
+    if is_varlen:
+        if bh == 32:
+            if base_ctas <= 32 and table_pages >= 32:
+                num_splits = 4
+            elif base_ctas <= 64 and table_pages >= 16:
+                num_splits = 2
+            elif (
+                base_ctas <= 128
+                and queries == 2
+                and total_heads == 32
+                and mean_pages >= 96
+            ):
+                num_splits = 2
+            else:
+                num_splits = 1
+        else:
+            # 4-warp BK=64 fits 4 CTAs/SM (256 CTAs/wave), so S=4/8 fills 2-4 waves.
+            if base_ctas <= 32 and table_pages >= 32:
+                num_splits = 8
+            elif base_ctas <= 128 and mean_pages >= 192:
+                num_splits = 8
+            elif base_ctas <= 128 and mean_pages >= 16:
+                num_splits = 4
+            else:
+                num_splits = 1
+    else:
+        if bh == 16:
+            if base_ctas <= 64 and table_pages >= 32:
+                num_splits = 8
+            elif base_ctas <= 128 and table_pages >= 192:
+                num_splits = 8
+            elif base_ctas <= 128 and table_pages >= 16:
+                num_splits = 4
+            else:
+                num_splits = 1
+        else:
+            if base_ctas <= 32 and table_pages >= 32:
+                num_splits = 8
+            elif base_ctas <= 128 and table_pages >= 96:
+                num_splits = 4
+            elif base_ctas <= 128 and table_pages >= 16:
+                num_splits = 2
+            else:
+                num_splits = 1
+
+    min_pages_per_split = 2 if bh == 16 else 4
+    while num_splits > 1 and table_pages < num_splits * min_pages_per_split:
+        num_splits //= 2
+    return bh, num_splits
 
 
 class FlashMLAInt8PreparedHandle:
-    """Reuse workspace for one/two-token decode; calls must be serialized on one stream."""
+    """Zero-reallocation replay handle for PPU dense INT8 MLA decode."""
 
     def __init__(
         self,
         tensors: tuple[torch.Tensor, ...],
         splits: int,
-        scale: float,
-        causal: bool = False,
+        bh: int,
+        softmax_scale: float,
+        causal: bool,
+        sort_requests: bool,
     ):
+        q, qr, kv, kr, qs, ks, table, lengths = tensors
         self.tensors = tensors
-        query, rope = tensors[:2]
-        self.batch, self.queries, self.heads, _ = query.shape
-        self.total_heads = self.queries * self.heads
-        self.causal = causal
         self.splits = splits
-        self.scale = scale
-        self.output = torch.empty(
-            (self.batch, self.queries, self.heads, 512),
-            dtype=rope.dtype,
-            device=query.device,
+        self.bh = bh
+        self.softmax_scale = softmax_scale
+        self.causal = causal
+        self.batch, self.queries, self.heads, _ = q.shape
+        self.total_heads = self.queries * self.heads
+        self.out_dtype_tl = tl.float16 if qr.dtype == torch.float16 else tl.bfloat16
+        self.use_order = bool(sort_requests and 16 <= self.batch <= MAX_GPU_SORT_BATCH)
+
+        self.out = torch.empty(
+            (self.batch, self.queries, self.heads, HEAD_DIM_NOPE),
+            dtype=qr.dtype,
+            device=q.device,
         )
         self.lse = torch.empty_strided(
             (self.batch, self.heads, self.queries),
             (1, self.batch, self.batch * self.heads),
             dtype=torch.float32,
-            device=query.device,
+            device=q.device,
         )
-        workspace_splits = splits if splits > 1 else 0
-        self.partial = torch.empty(
-            (workspace_splits, self.batch, self.total_heads, 512),
-            dtype=torch.float32,
-            device=query.device,
+        # When Q==2 and H is a multiple of BH=32 with contiguous layout, flatten
+        # (B, 2) -> 2*B slots so Q=2 uses the single-query peeled hot loop.
+        self.flat_q2 = bool(
+            self.queries == 2
+            and self.bh == 32
+            and self.heads >= 32
+            and (self.heads % 32) == 0
+            and 0 < self.batch <= 1024
+            and q.stride(0) == 2 * q.stride(1)
+            and q.stride(1) == self.heads * q.stride(2)
+            and qr.stride(0) == 2 * qr.stride(1)
+            and qr.stride(1) == self.heads * qr.stride(2)
+            and qs.stride(0) == 2 * qs.stride(1)
+            and qs.stride(1) == self.heads * qs.stride(2)
+            and self.out.stride(0) == 2 * self.out.stride(1)
+            and self.out.stride(1) == self.heads * self.out.stride(2)
+            and self.out.stride(2) == HEAD_DIM_NOPE
+            and self.lse.stride(0) == 1
+            and self.lse.stride(1) == self.batch
+            and self.lse.stride(2) == self.batch * self.heads
         )
-        self.stats = torch.empty(
-            (workspace_splits, 2, self.total_heads, self.batch),
-            dtype=torch.float32,
-            device=query.device,
+        self.contig_q2_h16 = bool(
+            not self.flat_q2
+            and self.queries == 2
+            and self.heads == 16
+            and self.bh == 32
+            and q.stride(1) == 16 * q.stride(2)
+            and qr.stride(1) == 16 * qr.stride(2)
+            and qs.stride(1) == 16 * qs.stride(2)
         )
-        self.offsets = torch.empty(
-            (self.batch + 1 if splits > 1 else 0,),
-            dtype=torch.int32,
-            device=query.device,
-        )
+        if self.flat_q2:
+            self.flat_order = torch.empty(
+                (self.batch * 2,), dtype=torch.int32, device=q.device
+            )
+            self.eff_lengths = torch.empty(
+                (self.batch * 2,), dtype=torch.int32, device=q.device
+            )
+            self.batch_order = None
+        elif self.batch > 0 and self.total_heads > 0 and self.use_order:
+            self.batch_order = torch.empty(
+                (self.batch,), dtype=torch.int32, device=q.device
+            )
+            self.flat_order = None
+            self.eff_lengths = None
+        else:
+            self.batch_order = None
+            self.flat_order = None
+            self.eff_lengths = None
+
+        if self.batch > 0 and self.total_heads > 0 and self.splits > 1:
+            self.part_out = torch.empty(
+                (self.batch, self.splits, self.total_heads, HEAD_DIM_NOPE),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            self.part_lse = torch.empty(
+                (self.batch, self.splits, self.total_heads),
+                dtype=torch.float32,
+                device=q.device,
+            )
+        else:
+            self.part_out = None
+            self.part_lse = None
 
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.batch == 0 or self.heads == 0:
-            return self.output, self.lse
-        query, rope, kv, kv_rope, qs, ks, table, lengths = self.tensors
-        dense_int8_mla_kernel[
-            lambda meta: (
-                triton.cdiv(self.total_heads, meta["BH"]),
+        if self.batch == 0 or self.total_heads == 0:
+            return self.out, self.lse
+        q, qr, kv, kr, qs, ks, block_table, cache_seqlens = self.tensors
+        if self.flat_q2:
+            n_pow2 = triton.next_power_of_2(max(self.batch, 16))
+            prep_flat_q2_kernel[(1,)](
+                cache_seqlens,
+                self.flat_order,
+                self.eff_lengths,
                 self.batch,
-                self.splits,
-            )
-        ](
-            *self.tensors,
-            self.partial,
-            self.stats,
-            self.offsets,
-            self.output,
-            self.lse,
-            query.stride(),
-            rope.stride(),
-            kv.stride(),
-            kv_rope.stride(),
-            qs.stride(),
-            ks.stride(),
-            table.stride(0),
-            lengths.stride(0),
-            self.batch,
-            self.total_heads,
-            self.heads,
-            self.splits,
-            self.scale,
-            self.causal,
-        )
-        if self.splits > 1:
-            _flash_int8_merge_splits[(self.batch, self.total_heads)](
-                self.partial,
-                self.stats,
-                self.output,
-                self.lse,
-                self.offsets,
-                self.batch,
-                self.total_heads,
-                512,
-                self.batch,
-                self.splits,
-                self.total_heads * 512,
-                512,
-                True,
+                self.causal,
+                self.use_order,
+                n_pow2,
                 num_warps=4,
             )
-        return self.output, self.lse
+            batch_order = self.flat_order
+            lengths_arg = self.eff_lengths
+            use_batch_order = True
+            grid = (self.heads // self.bh, self.splits, self.batch * 2)
+            q_s0, qr_s0, qs_s0 = q.stride(1), qr.stride(1), qs.stride(1)
+            single_query = True
+            heads_aligned = True
+        else:
+            if self.use_order and self.batch_order is not None:
+                n_pow2 = triton.next_power_of_2(self.batch)
+                sort_requests_kernel[(1,)](
+                    cache_seqlens, self.batch_order, self.batch, n_pow2, num_warps=4
+                )
+                batch_order = self.batch_order
+            else:
+                batch_order = cache_seqlens
+            lengths_arg = cache_seqlens
+            use_batch_order = self.use_order and self.batch_order is not None
+            grid = (triton.cdiv(self.total_heads, self.bh), self.splits, self.batch)
+            q_s0, qr_s0, qs_s0 = q.stride(0), qr.stride(0), qs.stride(0)
+            single_query = self.queries == 1
+            heads_aligned = (self.total_heads % self.bh) == 0
+
+        if self.splits > 1:
+            tgt_out, tgt_lse = self.part_out, self.part_lse
+        else:
+            tgt_out, tgt_lse = self.out, self.lse
+
+        if self.bh == 16:
+            dense_int8_mla_tle_bh16_bk64_kernel[grid](
+                q,
+                qr,
+                kv,
+                kr,
+                ks,
+                qs,
+                block_table,
+                lengths_arg,
+                batch_order,
+                tgt_out,
+                tgt_lse,
+                q_s0,
+                q.stride(1),
+                q.stride(2),
+                qr_s0,
+                qr.stride(1),
+                qr.stride(2),
+                kv.stride(0),
+                kv.stride(1),
+                kr.stride(0),
+                kr.stride(1),
+                qs_s0,
+                qs.stride(1),
+                qs.stride(2),
+                ks.stride(0),
+                ks.stride(1),
+                block_table.stride(0),
+                self.batch,
+                self.total_heads,
+                self.heads,
+                self.softmax_scale,
+                self.splits,
+                use_batch_order,
+                self.causal,
+                single_query,
+                heads_aligned,
+                self.out_dtype_tl,
+                num_warps=4,
+                num_stages=1,
+            )
+        else:
+            dense_int8_mla_tle_kernel[grid](
+                q,
+                qr,
+                kv,
+                kr,
+                ks,
+                qs,
+                block_table,
+                lengths_arg,
+                batch_order,
+                tgt_out,
+                tgt_lse,
+                q_s0,
+                q.stride(1),
+                q.stride(2),
+                qr_s0,
+                qr.stride(1),
+                qr.stride(2),
+                kv.stride(0),
+                kv.stride(1),
+                kr.stride(0),
+                kr.stride(1),
+                qs_s0,
+                qs.stride(1),
+                qs.stride(2),
+                ks.stride(0),
+                ks.stride(1),
+                block_table.stride(0),
+                self.batch,
+                self.total_heads,
+                self.heads,
+                self.softmax_scale,
+                self.splits,
+                use_batch_order,
+                self.causal,
+                single_query,
+                heads_aligned,
+                self.flat_q2,
+                self.contig_q2_h16,
+                self.out_dtype_tl,
+                num_warps=8,
+                num_stages=1,
+            )
+        if self.splits > 1:
+            merge_splits_kernel[(self.batch * self.total_heads,)](
+                self.part_out,
+                self.part_lse,
+                self.out,
+                self.lse,
+                self.batch,
+                self.total_heads,
+                self.heads,
+                self.splits,
+                self.out_dtype_tl,
+                num_warps=4,
+            )
+        return self.out, self.lse
 
 
 def prepare_flash_mla_with_kvcache_w8a8(
@@ -884,36 +1571,42 @@ def prepare_flash_mla_with_kvcache_w8a8(
     k_scale: torch.Tensor,
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    head_dim_v: int = 512,
+    head_dim_v: int = HEAD_DIM_NOPE,
     *,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     num_splits: Optional[int] = None,
+    sort_requests: Optional[bool] = None,
 ) -> tuple[FlashMLAInt8PreparedHandle, tuple[torch.Tensor, torch.Tensor]]:
-    """RoPE inputs are divided by the content scale, matching PR851.
+    """Validate inputs, prepare a zero-reallocation replay handle, and execute once.
 
-    Active page IDs and lengths must be valid; active scales finite and positive.
-    Unused cache slots may contain NaNs.
-    Queries are the final one or two cache tokens; causal masks preserve their order.
+    RoPE inputs are divided by the content scale. Active page IDs and lengths
+    must be valid; active scales must be finite and positive. Unused cache
+    slots may contain NaNs. Queries correspond to the final one or two cache
+    tokens, and causal masks preserve their order.
     """
     if k_cache_lora.ndim == 4 and k_cache_lora.shape[2] == 1:
         k_cache_lora = k_cache_lora.squeeze(2)
         k_cache_rope = k_cache_rope.squeeze(2)
         k_scale = k_scale.squeeze(2)
-    if q_nope.ndim != 4 or q_nope.shape[1] not in (1, 2) or q_nope.shape[-1] != 512:
+    if (
+        q_nope.ndim != 4
+        or q_nope.shape[1] not in (1, 2)
+        or q_nope.shape[-1] != HEAD_DIM_NOPE
+    ):
         raise NotImplementedError("requires Q [batch, 1 or 2, heads, 512]")
     batch, queries, heads, _ = q_nope.shape
     if (
         k_cache_lora.ndim != 3
-        or k_cache_lora.shape[1:] != (64, 512)
-        or head_dim_v != 512
+        or k_cache_lora.shape[1:] != (PAGE_BLOCK_SIZE, HEAD_DIM_NOPE)
+        or head_dim_v != HEAD_DIM_NOPE
     ):
         raise NotImplementedError("requires KV [pages, 64, 512] and head_dim_v=512")
     expected_shapes = (
-        (batch, queries, heads, 64),
-        (k_cache_lora.shape[0], 64, 64),
+        (batch, queries, heads, HEAD_DIM_ROPE),
+        (k_cache_lora.shape[0], PAGE_BLOCK_SIZE, HEAD_DIM_ROPE),
         (batch, queries, heads, 1),
-        (k_cache_lora.shape[0], 64, 1),
+        (k_cache_lora.shape[0], PAGE_BLOCK_SIZE, 1),
         (batch,),
     )
     for tensor, shape in zip(
@@ -955,26 +1648,36 @@ def prepare_flash_mla_with_kvcache_w8a8(
             raise ValueError(
                 "all tensors must share a device and contiguous last dimension"
             )
-    scale = 576**-0.5 if softmax_scale is None else float(softmax_scale)
+    scale = HEAD_DIM_TOTAL**-0.5 if softmax_scale is None else float(softmax_scale)
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("softmax_scale must be finite and positive")
-    splits = num_splits
-    if splits is None:
-        splits = min(
-            16,
-            triton.next_power_of_2(
-                max(1, 64 // max(1, batch * triton.cdiv(queries * heads, 16)))
-            ),
-        )
-        # Low-head decode benefits from shorter KV loops even at large batch size.
-        minimum_splits = (
-            2 if queries * heads <= 16 and block_table.shape[1] >= 64 else 1
-        )
-        splits = max(minimum_splits, splits)
-        splits = min(splits, max(1, triton.next_power_of_2(block_table.shape[1])))
-    if splits not in (1, 2, 4, 8, 16):
+    if num_splits is not None and num_splits not in (1, 2, 4, 8, 16):
         raise ValueError("num_splits must be one of 1, 2, 4, 8, 16")
-    handle = FlashMLAInt8PreparedHandle(tensors, splits, scale, causal)
+
+    is_varlen = bool(batch > 1 and (cache_seqlens != cache_seqlens[0]).any().item())
+    mean_pages = (
+        int(round(cache_seqlens.float().mean().item() / PAGE_BLOCK_SIZE))
+        if (num_splits is None and is_varlen)
+        else block_table.shape[1]
+    )
+    bh, splits = select_launch_config(
+        batch,
+        queries * heads,
+        block_table.shape[1],
+        num_splits_override=num_splits,
+        is_varlen=is_varlen,
+        mean_pages=mean_pages,
+        queries=queries,
+    )
+    should_sort = is_varlen if sort_requests is None else bool(sort_requests)
+    handle = FlashMLAInt8PreparedHandle(
+        tensors,
+        splits,
+        bh,
+        scale,
+        causal,
+        sort_requests=should_sort,
+    )
     return handle, handle()
 
 
@@ -987,7 +1690,7 @@ def flash_mla_with_kvcache_w8a8(
     k_scale: torch.Tensor,
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    head_dim_v: int = 512,
+    head_dim_v: int = HEAD_DIM_NOPE,
     tile_scheduler_metadata: None = None,
     num_splits: Optional[int] = None,
     softmax_scale: Optional[float] = None,

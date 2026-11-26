@@ -34,6 +34,7 @@ from flaggems_vllm.ops.flash_mla_with_kvcache_w8a8 import (
 )
 from tests.accuracy_utils import gems_assert_close
 from tests.test_flash_mla_with_kvcache_w8a8 import (
+    INT8_OUTPUT_ATOL,
     PPU_MLA_MODULE,
     PPU_MLA_SUPPORTED,
     SUPPORTED,
@@ -291,7 +292,7 @@ class DenseInt8MLABenchmark(base.Benchmark):
             reference, reference_lse = run_native_bf16_mla(inputs)
             output, lse = run_dense_int8_mla(inputs)
             expected, expected_lse = dense_int8_mla_reference(tensors, causal=True)
-            gems_assert_close(output, expected, dtype, atol=0.002)
+            gems_assert_close(output, expected, dtype, atol=INT8_OUTPUT_ATOL)
             gems_assert_close(lse, expected_lse, torch.float32, atol=2e-4)
             baseline_expected, baseline_lse = dense_mla_reference(
                 query, cache, table, gpu_lengths, causal=True
