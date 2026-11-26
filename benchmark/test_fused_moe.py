@@ -81,6 +81,12 @@ def _get_supported_dtypes():
     if VENDOR == "thead":
         # The PPU DeepGEMM expert path only accepts bfloat16 weights.
         return [torch.bfloat16]
+    if VENDOR == "mthreads":
+        # The two 285B shapes do not fit in fp16: the production path keeps
+        # ~27 GiB resident and the fp16 weights need 25.8 GB, so a default
+        # (both dtype) run cannot finish. Gate the op to bf16 until the
+        # production entry can release that memory.
+        return [torch.bfloat16]
     return [torch.bfloat16, torch.float16]
 
 
