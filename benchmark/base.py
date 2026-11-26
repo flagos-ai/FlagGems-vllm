@@ -581,13 +581,18 @@ class Benchmark:
                                 f"factor={factor} vs_base={speedup:.3f}"
                             )
                         else:
-                            # No baseline match is optional when the on-machine
-                            # torch reference exists: origin speedup remains the
-                            # primary metric and is already recorded.  Only a
-                            # vendor with no native reference has no usable
-                            # baseline at all.
+                            # No baseline match: record and print the precise
+                            # reason (op / shape / dtype missing) so it can be
+                            # aggregated later.
+                            metric.base_miss_reason = miss_reason
+                            print(f"[vs Base][未匹配] {miss_reason}")
+                            # Method A hard error: when there is no on-machine
+                            # reference (torch_op is None, i.e. the vendor has no
+                            # native implementation) AND the NV baseline has no
+                            # matching record, there is no usable baseline at all
+                            # -> fail this case instead of silently yielding a
+                            # speedup/compared_speedup that are both None.
                             if self.torch_op is None:
-                                metric.base_miss_reason = miss_reason
                                 raise RuntimeError(
                                     f"no baseline available for '{self.op_name}'"
                                     f" (dtype={dtype}): vendor-native missing and"

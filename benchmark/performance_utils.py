@@ -500,8 +500,11 @@ class Benchmark:
                                 f"factor={factor} vs_base={speedup:.3f}"
                             )
                         else:
-                            # Optional external baseline miss: keep the
-                            # on-machine speedup and do not record an error.
+                            # No baseline match: record and print the precise
+                            # reason (op / shape / dtype missing) so it can be
+                            # aggregated later.
+                            metric.base_miss_reason = miss_reason
+                            print(f"[vs Base][未匹配] {miss_reason}")
                     if "gbps" in self.to_bench_metrics:
                         metric.gbps_base = self.get_gbps(
                             args, latency=metric.latency_base
