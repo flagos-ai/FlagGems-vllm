@@ -43,7 +43,7 @@
   },
   {
     "backend": "nvidia-cuda133",
-    "runner_label": "nvidia-a100-1",
+    "runner_label": "h20",
     "label": "vendor/NVIDIA",
     "gpu_check": "tools/gpu_check_nvidia.sh",
     "enabled": true

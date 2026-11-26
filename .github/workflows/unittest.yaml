@@ -275,9 +275,11 @@ jobs:
           python tools/select_ci_backends.py "${args[@]}" | tee -a "${GITHUB_OUTPUT}"
 
   python-op:
-    name: python-op (nvidia tests and benchmarks)
+    name: python-op (generic triton tests and benchmarks)
     needs: preprocess
     # Default: never execute fork-controlled code on the self-hosted A100 runner.
+    # A100 runs the generic upstream Triton baseline (`COMPILER=triton`), while
+    # NVIDIA-specific (`nvidia-cuda133` + FlagTree) runs remain on H20.
     # Maintainers may opt in a fork PR with the write-gated `ci/nvidia` label
     # (same trust model as `ci/all-vendors`).
     if: >-
@@ -290,6 +292,7 @@ jobs:
     with:
       backend: nvidia-cuda133
       runner_label: nvidia-a100-1
+      compiler: triton
       gpu_check_script: tools/gpu_check_nvidia.sh
       changed_files: ${{ needs.preprocess.outputs.targets }}
       pr_id: ${{ needs.preprocess.outputs.pr_id }}

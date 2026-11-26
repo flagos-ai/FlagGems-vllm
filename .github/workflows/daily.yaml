@@ -50,7 +50,7 @@ jobs:
   python-op:
     name: python-op (nvidia full tests and benchmarks)
     needs: prepare
-    runs-on: nvidia-a100-1
+    runs-on: h20
     timeout-minutes: 360
     env:
       FLAGGEMS_VENDOR: nvidia
