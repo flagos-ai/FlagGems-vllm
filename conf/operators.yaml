@@ -1034,6 +1034,18 @@ ops:
   - Quantization
   stages:
   - beta: '5.4'
+- id: fused_kimi_k3_mla_decode_q_concat_ds_mla_insert
+  description: Concatenate Kimi-K3 decode queries and store scaled E4M3FN latent
+    groups, four FP32 scales and the positional key in a 656-byte paged cache row.
+  for:
+  - _C.fused_kimi_k3_mla_decode_q_concat_ds_mla_insert
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - beta: '0.3'
 - id: fused_kimi_k3_mla_kv_concat
   description: 'Copy Kimi-K3 NoPE keys and broadcast the shared PE component into a
 

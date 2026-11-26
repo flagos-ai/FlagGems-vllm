@@ -2020,3 +2020,8 @@ flash_mla_sparse_fwd:
   - META: {BK: 64, BH: 64}
     num_warps: 8
     num_stages: 4
+
+fused_kimi_k3_mla_decode_q_concat_ds_mla_insert:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
