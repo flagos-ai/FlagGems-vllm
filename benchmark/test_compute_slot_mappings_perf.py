@@ -18,7 +18,7 @@ import pytest
 import torch
 
 import flaggems_vllm
-from tests.test_slot_mappings import HAS_UPSTREAM, _upstream_slot_kernel
+from tests.test_compute_slot_mappings import HAS_UPSTREAM, _upstream_slot_kernel
 
 from . import base
 
