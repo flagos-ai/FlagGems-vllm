@@ -22,6 +22,7 @@ import triton.language as tl
 from flaggems_vllm.ops.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn as _general_hc_split_sinkhorn,
 )
+
 LOG2E = tl.constexpr(1.4426950408889634)
 
 

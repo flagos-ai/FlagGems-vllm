@@ -56,8 +56,9 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
             k, cache, slots, quant_block_size, scale_fmt = args
             yield k, cache, slots, quant_block_size, {"scale_fmt": scale_fmt}
 
+
 @pytest.mark.skipif(
-    flag_gems.vendor_name == "enflame",
+    flaggems_vllm.vendor_name == "enflame",
     reason="aten and cpu dosenot support",
 )
 @pytest.mark.indexer_k_quant_and_cache
