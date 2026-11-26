@@ -31,6 +31,9 @@ from flaggems_vllm.ops.cast_sigmoid import cast_sigmoid
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
+from flaggems_vllm.ops.fused_kimi_k3_mla_key_concat_kv_cache_insert import (
+    fused_kimi_k3_mla_key_concat_kv_cache_insert,
+)
 from flaggems_vllm.ops.fused_kimi_k3_mla_kv_concat import fused_kimi_k3_mla_kv_concat
 from flaggems_vllm.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
@@ -365,6 +368,7 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
+    "fused_kimi_k3_mla_key_concat_kv_cache_insert",
     "fused_kimi_k3_mla_kv_concat",
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",

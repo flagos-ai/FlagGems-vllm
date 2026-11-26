@@ -1034,6 +1034,20 @@ ops:
   - Quantization
   stages:
   - beta: '5.4'
+- id: fused_kimi_k3_mla_key_concat_kv_cache_insert
+  description: >-
+    Assemble per-head Kimi-K3 prefill keys and insert shared latent keys into the
+    paged cache. Optionally rotate the query and key tails with interleaved RoPE.
+  for:
+  - _C.fused_kimi_k3_mla_key_concat_kv_cache_insert
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '0.3'
 - id: fused_kimi_k3_mla_kv_concat
   description: 'Copy Kimi-K3 NoPE keys and broadcast the shared PE component into a
 
