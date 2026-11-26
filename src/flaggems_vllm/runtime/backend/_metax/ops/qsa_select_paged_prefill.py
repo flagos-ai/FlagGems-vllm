@@ -937,14 +937,6 @@ def _prefill_logits(
             triton.cdiv(min(num_queries, max_query_len), meta["TILE_R"]),
             triton.cdiv(logits_width, meta["BLOCK_N"] * meta["K_TILES"]),
         )
-        '''
-        if kernel is _qsa_prefill_score_kernel:
-            constants = dict(constants)
-            constants["ELEMENTWISE"] = (
-                runtime.device.vendor_name == "metax"
-                and q.dtype == torch.float8_e4m3fn
-            )
-        '''
     kernel[grid](
         q,
         k_cache,
