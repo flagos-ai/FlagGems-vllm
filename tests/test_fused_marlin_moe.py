@@ -2026,7 +2026,15 @@ _W4A16_CASES += _cases(
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
-    "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
+    "int8",
+    W8A16_CONFIGS
+    + [
+        (1, 8, 4096, 256, 2),  # split the first projection across K
+        (67, 129, 4096, 256, 2),  # stable routing with empty experts
+        (513, 8, 256, 512, 2),  # dense experts with a partial final tile
+        (33, 8, 384, 256, 2),  # odd number of K128 groups
+    ],
+    marks=_MTHREADS_NO_INT8,
 )
 
 _W8A16_CASES += [
