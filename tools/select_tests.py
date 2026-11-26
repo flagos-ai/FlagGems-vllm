@@ -260,6 +260,15 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_thead/fused/marlin_fragments.py": [
         "tests/test_fused_marlin_moe.py"
     ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/flash_attention/common.py": [
+        "tests/test_flash_attn_varlen_func.py",
+        "tests/test_scaled_dot_product_attention.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/tle_utils.py": [
+        "tests/test_flash_attn_varlen_func.py",
+        "tests/test_fused_marlin_moe.py",
+        "tests/test_scaled_dot_product_attention.py",
+    ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
@@ -451,6 +460,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_fused_marlin_moe_w4a16_mxfp4.py",
         "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
         "benchmark/test_fused_marlin_moe_w8a16_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_thead/ops/flash_attention/common.py": [
+        "benchmark/test_flash_attn_varlen_func.py",
     ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": [
         "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
