@@ -51,7 +51,7 @@ MAX_EXPERTS = 512
 MAX_HIDDEN_SIZE = 7168
 MAX_INTERMEDIATE_SIZE = 14336
 # Per grouped batch, excluding caller inputs, the returned output and allocator reservations.
-GROUPED_WORKSPACE_BYTES = 1 << 30
+GROUPED_WORKSPACE_BYTES = 2 << 30
 
 
 @contextmanager
@@ -525,6 +525,7 @@ def dequantize_k_stages(
     BN: tl.constexpr,
     BITS: tl.constexpr,
     STAGE_N: tl.constexpr = 0,
+    TRANSPOSED_S: tl.constexpr = False,
 ):
     EFF_STAGE_N: tl.constexpr = STAGE_N if STAGE_N > 0 else BN
     STAGES: tl.constexpr = (
@@ -543,7 +544,16 @@ def dequantize_k_stages(
     for kb in range(K // 128):
         for chunk in range(VBN // CB):
             result = load_weight_tile(
-                Q, S, expert, col + SUB * VBN + chunk * CB, kb, N, K, CB, BITS
+                Q,
+                S,
+                expert,
+                col + SUB * VBN + chunk * CB,
+                kb,
+                N,
+                K,
+                CB,
+                BITS,
+                TRANSPOSED_S,
             )
             # Wait once before overwriting either half of the GM stage.
             if iteration >= STAGES and chunk == 0:
@@ -580,6 +590,7 @@ def dequantize_adaptive_weights(
     K: tl.constexpr,
     TASKS: tl.constexpr,
     GRID: tl.constexpr,
+    TRANSPOSED_S: tl.constexpr = False,
 ):
     iteration = 0
     for task in range(PID, TASKS, GRID):
@@ -602,6 +613,7 @@ def dequantize_adaptive_weights(
                     128,
                     8,
                     512,
+                    TRANSPOSED_S,
                 )
             elif remaining <= 64:
                 if panel < N // 512:
@@ -619,6 +631,7 @@ def dequantize_adaptive_weights(
                         512,
                         8,
                         512,
+                        TRANSPOSED_S,
                     )
             else:
                 if panel < N // 256:
@@ -636,6 +649,7 @@ def dequantize_adaptive_weights(
                         256,
                         8,
                         512,
+                        TRANSPOSED_S,
                     )
     drain_weight_ring(iteration, 2)
 
@@ -724,6 +738,41 @@ def cube_gemm(
 
 
 @triton.jit
+def transpose_scales_kernel(
+    S,
+    Out,
+    E: tl.constexpr,
+    N: tl.constexpr,
+    G: tl.constexpr,
+    GP: tl.constexpr,
+    BN: tl.constexpr,
+):
+    tiles_n: tl.constexpr = N // BN
+    ni = tl.arange(0, BN)
+    gi = tl.arange(0, GP)
+    for task in range(tl.program_id(0), E * tiles_n, tl.num_programs(0)):
+        expert = task // tiles_n
+        col = (task % tiles_n) * BN
+        src = S + (expert.to(tl.int64) * N + col + ni[:, None]) * G + gi[None, :]
+        vals = tl.load(src, gi[None, :] < G, other=0)
+        dst = Out + (expert.to(tl.int64) * G + gi[:, None]) * N + col + ni[None, :]
+        tl.store(dst, tl.trans(vals), gi[:, None] < G)
+
+
+def transpose_scales(s):
+    e, n, g = s.shape
+    gp = triton.next_power_of_2(g)
+    bn = min(n & -n, 256 if gp <= 32 else 128 if gp <= 64 else 64)
+    out = torch.empty((e, g, n), device=s.device, dtype=s.dtype)
+    cores = vector_core_count(s)
+    grid = min(e * (n // bn), cores)
+    transpose_scales_kernel[(grid,)](
+        s, out, e, n, g, gp, bn, num_warps=1, multibuffer=True
+    )
+    return out
+
+
+@triton.jit
 def load_weight_tile(
     Q,
     S,
@@ -734,6 +783,7 @@ def load_weight_tile(
     K: tl.constexpr,
     RB: tl.constexpr,
     BITS: tl.constexpr,
+    TRANSPOSED_S: tl.constexpr = False,
 ):
     group_bytes: tl.constexpr = 128 // (8 // BITS)
     groups: tl.constexpr = K // 128
@@ -745,7 +795,12 @@ def load_weight_tile(
     # The public layout uses offset-binary codes, packed low nibble first for INT4.
     signed_codes = (codes ^ (0x88 if BITS == 4 else 0x80)).to(tl.uint8)
     q = tl.reshape(signed_codes, (RB * group_bytes,))
-    scales = tl.load(S + group)
+    if TRANSPOSED_S:
+        scales = tl.load(
+            S + (expert.to(tl.int64) * groups + kb) * N + col + tl.arange(0, RB)
+        )
+    else:
+        scales = tl.load(S + group)
     if BITS == 4:
         h = tl.full((RB * 128,), 0, tl.float16)
         if USE_TLE_RAW_CALL:
@@ -780,6 +835,7 @@ def dequantize_weights(
     MERGE: tl.constexpr,
     BITS: tl.constexpr,
     Offsets=None,
+    TRANSPOSED_S: tl.constexpr = False,
 ):
     STAGES: tl.constexpr = 4 if Work.dtype.element_ty == tl.float16 and BN == 512 else 2
     iteration = 0
@@ -793,7 +849,20 @@ def dequantize_weights(
             active = active & ((tile - begin // 128) % 2 == 0)
         if active:
             iteration = dequantize_k_stages(
-                Q, S, Work, expert, col, PID, SUB, iteration, N, K, BN, BITS
+                Q,
+                S,
+                Work,
+                expert,
+                col,
+                PID,
+                SUB,
+                iteration,
+                N,
+                K,
+                BN,
+                BITS,
+                0,
+                TRANSPOSED_S,
             )
     drain_weight_ring(iteration, STAGES)
 
@@ -955,6 +1024,7 @@ def gemm_kernel(
     TAIL_TILES: tl.constexpr = False,
     Routes=None,
     TopK: tl.constexpr = 1,
+    TRANSPOSED_S: tl.constexpr = False,
 ):
     with tle.scope(core_mode="cube"):
         if TAIL_TILES:
@@ -1038,6 +1108,7 @@ def gemm_kernel(
                 K,
                 TASKS,
                 GRID,
+                TRANSPOSED_S,
             )
         else:
             dequantize_weights(
@@ -1055,6 +1126,7 @@ def gemm_kernel(
                 MERGE,
                 BITS,
                 Offsets,
+                TRANSPOSED_S,
             )
 
 
@@ -1073,6 +1145,7 @@ def expert_panel_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     GRID: tl.constexpr,
+    TRANSPOSED_S: tl.constexpr = False,
 ):
     STAGES: tl.constexpr = 1
     pid = tl.program_id(0)
@@ -1189,7 +1262,16 @@ def expert_panel_kernel(
                 vector_stage = (pid * STAGES + vector_iteration % STAGES) * BN * K
                 for kb in range(K // 128):
                     decoded = load_weight_tile(
-                        Q, S, vector_expert, vector_col, kb, N, K, VBN, 8
+                        Q,
+                        S,
+                        vector_expert,
+                        vector_col,
+                        kb,
+                        N,
+                        K,
+                        VBN,
+                        8,
+                        TRANSPOSED_S,
                     )
                     if kb >= 2:
                         sync_ring_wait("cube", "vector", 4)
@@ -1227,6 +1309,9 @@ def grouped_quantized_gemm(
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
         "num_aicore"
     ]
+    transposed_s = s.shape[2] >= 8
+    if transposed_s:
+        s = transpose_scales(s)
     if expert_panel:
         panel_bn = 256
         panel_grid = min(w.shape[0] * (n // panel_bn), cores)
@@ -1247,6 +1332,7 @@ def grouped_quantized_gemm(
             bm,
             panel_bn,
             panel_grid,
+            transposed_s,
             disable_auto_inject_block_sync=True,
             num_warps=1,
             enable_fp_fusion=False,
@@ -1300,6 +1386,7 @@ def grouped_quantized_gemm(
         tail_tiles,
         routes,
         topk,
+        transposed_s,
         disable_auto_inject_block_sync=True,
         num_warps=1,
         enable_fp_fusion=False,
@@ -1899,15 +1986,20 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
             bm, use_small_m, padded = grouped_route_geometry(
                 batch, t, e, k, n, bits, x.dtype
             )
-            # Spread short batches across vector cores; cap the sort tile for large batches.
-            route_block = min(
-                1024,
-                max(
-                    32,
-                    triton.next_power_of_2(
-                        triton.cdiv(r, properties["num_vectorcore"])
+            # Use a single chunk for small batches to avoid the prefix-sum kernel;
+            # spread larger batches across vector cores.
+            route_block = (
+                min(1024, max(32, triton.next_power_of_2(r)))
+                if r <= 1024
+                else min(
+                    1024,
+                    max(
+                        32,
+                        triton.next_power_of_2(
+                            triton.cdiv(r, properties["num_vectorcore"])
+                        ),
                     ),
-                ),
+                )
             )
             route_chunks = triton.cdiv(r, route_block)
             need_routes = use_small_m or bits != 8 or k != 4096
