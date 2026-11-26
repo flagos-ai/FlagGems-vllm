@@ -2861,6 +2861,119 @@ else:
         return asm
 
     @triton.constexpr_function
+    def gather_topk128_asm(page_stride):
+        # Four lanes copy a 64-byte feature group. Each group of four lanes
+        # follows two indices, 64 tokens apart, and keeps both addresses live.
+        asm = """
+        {
+        .reg .b32 tid, lane, warp, row, chunk, offset, swizzle, base;
+        .reg .b32 id<2>, exp_lo<2>, exp_hi<2>, largest<2>, smallest<2>, size<2>;
+        .reg .b32 tmp, u, exponent, slot, delta, fac, kdst, rdst, flag, a, b, c, d;
+        .reg .b64 idx_ptr, src<2>, page<2>, meta, byte_offset;
+        .reg .b16 xlo, xhi;
+        .reg .pred valid<2>, first, skip, wide;
+        mov.u32 tid, %tid.x;
+        and.b32 tid, tid, 255;
+        and.b32 lane, tid, 31;
+        shr.u32 warp, tid, 5;
+        and.b32 chunk, lane, 3;
+        shr.u32 row, lane, 2;
+        mad.lo.u32 row, warp, 8, row;
+        mul.wide.u32 idx_ptr, row, 4;
+        add.u64 idx_ptr, idx_ptr, $3;
+        ld.global.L1::evict_first.s32 id0, [idx_ptr];
+        ld.global.L1::evict_first.s32 id1, [idx_ptr+256];
+        mov.u32 flag, 0;
+        and.b32 swizzle, row, 7;
+        shl.b32 swizzle, swizzle, 4;
+        shl.b32 offset, chunk, 4;
+        xor.b32 base, swizzle, offset;
+        mad.lo.u32 base, row, 128, base;
+        """
+        for half in range(2):
+            asm += f"""
+            setp.lt.u32 valid{half}, id{half}, $7;
+            @!valid{half} mov.u32 id{half}, 0;
+            selp.u32 size{half}, 16, 0, valid{half};
+            shr.u32 exponent, id{half}, 6;
+            mul.wide.u32 page{half}, exponent, {page_stride};
+            add.u64 page{half}, page{half}, $2;
+            and.b32 slot, id{half}, 63;
+            mad.wide.u32 meta, slot, 8, page{half};
+            ld.global.v2.b32 {{exp_lo{half},exp_hi{half}}}, [meta+36864];
+            mad.wide.u32 src{half}, slot, 576, page{half};
+            cvt.u64.u32 byte_offset, offset;
+            add.u64 src{half}, src{half}, byte_offset;
+            """
+        for half in range(2):
+            asm += f"and.b32 largest{half},exp_lo{half},255; mov.u32 smallest{half},largest{half};\n"
+            for group in range(1, 7):
+                word = "exp_lo" if group < 4 else "exp_hi"
+                asm += f"""
+                bfe.u32 exponent, {word}{half}, {(group % 4) * 8}, 8;
+                max.u32 largest{half}, largest{half}, exponent;
+                min.u32 smallest{half}, smallest{half}, exponent;
+                """
+            asm += f"""
+            sub.u32 delta, largest{half}, smallest{half};
+            setp.gt.and.u32 wide, delta, 2, valid{half};
+            @wide mov.u32 flag, 1;
+            shl.b32 exponent, largest{half}, 23;
+            setp.eq.u32 first, largest{half}, 0;
+            @first mov.u32 exponent, 0x00400000;
+            @!valid{half} mov.u32 exponent, 0xbf800000;
+            setp.eq.u32 first, chunk, 0;
+            mad.lo.u32 tmp, row, 4, $6;
+            @first st.shared.b32 [tmp+{half * 256}], exponent;
+            """
+        # A panel holds 64 rows by 128 FP8 channels per half. The last
+        # transfer also brings in the two 64-byte pieces of BF16 RoPE.
+        for panel in range(4):
+            for group in range(2 * panel, min(2 * panel + 2, 7)):
+                asm += f"xor.b32 exponent,base,{(group % 2) * 64}; add.u32 kdst,$4,exponent;\n"
+                for half in range(2):
+                    dest = half * 32768 + panel * 8192
+                    asm += f"cp.async.cg.shared.global [kdst+{dest}],[src{half}+{group * 64}],16,size{half};\n"
+            if panel == 3:
+                for piece in range(2):
+                    asm += f"xor.b32 exponent,base,{piece * 64}; add.u32 rdst,$5,exponent;\n"
+                    for half in range(2):
+                        asm += (
+                            f"cp.async.cg.shared.global [rdst+{half * 8192}],"
+                            f"[src{half}+{448 + piece * 64}],16,size{half};\n"
+                        )
+            asm += "cp.async.commit_group;\n"
+        for panel in range(4):
+            asm += f"cp.async.wait_group {3 - panel};\n"
+            for group in range(2 * panel, min(2 * panel + 2, 7)):
+                asm += f"xor.b32 exponent,base,{(group % 2) * 64}; add.u32 kdst,$4,exponent;\n"
+                word = "exp_lo" if group < 4 else "exp_hi"
+                for half in range(2):
+                    dest = half * 32768 + panel * 8192
+                    label = f"END_GROUP_{group}_{half}"
+                    asm += f"""
+                    bfe.u32 exponent, {word}{half}, {(group % 4) * 8}, 8;
+                    setp.eq.u32 skip, exponent, largest{half};
+                    @skip bra {label};
+                    sub.u32 delta, largest{half}, exponent;
+                    min.u32 delta, delta, 15;
+                    sub.u32 fac, 15, delta;
+                    shl.b32 fac, fac, 10;
+                    prmt.b32 fac, fac, fac, 0x1010;
+                    ld.shared.v4.b32 {{a,b,c,d}}, [kdst+{dest}];
+                    """
+                    asm += rescale_fp8_registers()
+                    asm += f"st.shared.v4.b32 [kdst+{dest}],{{a,b,c,d}}; {label}:\n"
+            # Each of the eight producer warps signals after its writes to both halves.
+            asm += f"""
+            bar.warp.sync 0xffffffff;
+            fence.proxy.async.shared::cta;
+            setp.eq.u32 first, lane, 0;
+            @first mbarrier.arrive.shared::cta.b64 _, [${8 + panel}];
+            """
+        return asm + "mov.b32 $0,flag; }"
+
+    @triton.constexpr_function
     def gather_asm(block, page_stride, panel_rows, warps, prefetched):
         # A subgroup of two or four lanes owns one selected row. Every lane keeps
         # that row's address and exponent word through both copying and rescaling.
@@ -4093,6 +4206,7 @@ else:
         H: tl.constexpr,
         STRIDE: tl.constexpr,
         SCALE: tl.constexpr,
+        OUTPUT_TILES: tl.constexpr = 1,
     ):
         rows = b.to(tl.int64) * H + group * 16 + tl.arange(0, 16)
         d = tl.arange(0, 512)
@@ -4146,6 +4260,8 @@ else:
         tl.store(
             Output + rows[:, None] * 512 + d[None, :],
             acc * tl.where(denominator > 0.0, 1.0 / denominator, 0.0)[:, None],
+            mask=(OUTPUT_TILES == 1)
+            | (d[None, :] // (512 // OUTPUT_TILES) == tl.program_id(2)),
         )
         tl.store(
             L + rows,
@@ -4154,6 +4270,7 @@ else:
                 m * 0.6931471805599453 + tl.log(denominator),
                 float("inf"),
             ),
+            mask=(OUTPUT_TILES == 1) | (tl.program_id(2) == 0),
         )
 
     @triton.jit
@@ -4422,6 +4539,562 @@ else:
                         SCALE,
                     )
 
+    @tlc.builtin
+    def model1_barrier_address(slot, _semantic=None):
+        """Expose a TLE barrier slot to the producer's per-warp PTX arrival."""
+        ptr_type = tl.pointer_type(tl.int64, 3)
+        zero = _semantic.to_tensor(0)
+        handle = _semantic.builder.create_local_pointers(
+            ptr_type.to_ir(_semantic.builder), slot.handle, zero.handle
+        )
+        return tl.tensor(handle.get_result(0), ptr_type)
+
+    @triton.jit
+    def model1_load_key_pair(
+        Cache,
+        Idx,
+        repair_flags,
+        key_tiles,
+        key_rope,
+        key_scales,
+        transposed_values,
+        panel_barriers,
+        values_ready,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        STRIDE: tl.constexpr,
+        OUTPUT_TILES: tl.constexpr,
+    ):
+        batch = tl.program_id(0)
+        # Eight producer warps gather both 64-key halves. Each 128-channel
+        # panel can be consumed as soon as its final dequantizing stores finish.
+        lane = tl.arange(0, 256)
+        key_flags = tl.inline_asm_elementwise(
+            gather_topk128_asm(STRIDE),
+            "=r,r,l,l,r,r,r,r,r,r,r,r",
+            [
+                lane,
+                Cache.to(tl.uint64),
+                (Idx + batch.to(tl.int64) * 128).to(tl.uint64),
+                tle.gpu.local_ptr(key_tiles.slot(0), (0, 0))
+                .to(tl.uint64)
+                .to(tl.uint32),
+                tle.gpu.local_ptr(key_rope.slot(0), (0, 0)).to(tl.uint64).to(tl.uint32),
+                tle.gpu.local_ptr(key_scales.slot(0), (0,)).to(tl.uint64).to(tl.uint32),
+                N,
+                model1_barrier_address(panel_barriers[0]).to(tl.uint64).to(tl.uint32),
+                model1_barrier_address(panel_barriers[1]).to(tl.uint64).to(tl.uint32),
+                model1_barrier_address(panel_barriers[2]).to(tl.uint64).to(tl.uint32),
+                model1_barrier_address(panel_barriers[3]).to(tl.uint64).to(tl.uint32),
+            ],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+        tl.inline_asm_elementwise(
+            "{ fence.proxy.async.shared::cta; mov.u32 $0,$1; }",
+            "=r,r",
+            [key_flags],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+        tl.debug_barrier()
+        half = tl.inline_asm_elementwise(
+            "{.reg .u32 t; mov.u32 t,%tid.x; shr.u32 t,t,7; and.b32 $0,t,1;}",
+            "=r,r",
+            [lane],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+        # Each group of four warps transposes one half for the later PV product.
+        key_address = (
+            tle.gpu.local_ptr(key_tiles.slot(0), (0, 0)).to(tl.uint64).to(tl.uint32)
+            + half * 32768
+        )
+        value_address = (
+            tle.gpu.local_ptr(transposed_values.slot(0), (0, 0))
+            .to(tl.uint64)
+            .to(tl.uint32)
+            + half * 32768
+        )
+        for group in tl.static_range(4):
+            if OUTPUT_TILES == 1 or tl.program_id(2) == group:
+                for warp_half in tl.static_range(1 if group == 3 else 2):
+                    tl.inline_asm_elementwise(
+                        sparse_fp8_transpose_asm(),
+                        "=r,r,r,r,r",
+                        [
+                            lane,
+                            key_address + group * 8192,
+                            value_address + group * 8192,
+                            warp_half * 4,
+                        ],
+                        dtype=tl.uint32,
+                        is_pure=False,
+                        pack=1,
+                    )
+        tl.inline_asm_elementwise(
+            "{ fence.proxy.async.shared::cta; mov.u32 $0,$1; }",
+            "=r,r",
+            [lane],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+        tl.store(tle.gpu.local_ptr(repair_flags, (0,)), tl.max(key_flags, 0))
+        tle.gpu.barrier_arrive(values_ready[0])
+
+    @triton.constexpr_function
+    def model1_store64_asm(permuted):
+        # Pair adjacent BF16 output elements held by a lane. The content
+        # accumulator has the column permutation introduced by the V transpose.
+        code = """{
+        .reg .b32 tid,row,col,ofs,a,b,c,d; .reg .b64 addr;
+        mov.u32 tid,%tid.x; and.b32 tid,tid,127;
+        shr.u32 row,tid,5; shl.b32 row,row,4;
+        and.b32 col,tid,31; shr.u32 col,col,2; add.u32 row,row,col;
+        and.b32 col,tid,3;
+        """
+        code += "shl.b32 col,col,3;" if permuted else "shl.b32 col,col,2;"
+        code += (
+            "mad.lo.u32 ofs,row,1024,col; cvt.u64.u32 addr,ofs; add.u64 addr,addr,$64;"
+        )
+        if permuted:
+            for group in range(4):
+                k = 32 + group * 8
+                for j, reg in enumerate(("a", "b", "c", "d")):
+                    code += f"cvt.rn.bf16x2.f32 {reg}, ${k+4+j}, ${k+j};"
+                code += (
+                    f"st.global.cs.v2.b32 [addr+{group*32}],{{a,b}}; "
+                    f"st.global.cs.v2.b32 [addr+{8192+group*32}],{{c,d}};"
+                )
+        else:
+            for group in range(8):
+                k = 32 + group * 4
+                code += f"cvt.rn.bf16x2.f32 a,${k+1},${k}; cvt.rn.bf16x2.f32 b,${k+3},${k+2};"
+                code += f"st.global.cs.b32 [addr+{group*16}],a; st.global.cs.b32 [addr+{8192+group*16}],b;"
+        return code + "mov.u32 $0,0; }"
+
+    MODEL1_STORE64_CONSTRAINTS = tl.constexpr(
+        ",".join(["=r"] * 32 + ["f"] * 32 + ["l"] * 32)
+    )
+
+    @triton.jit
+    def model1_store64(
+        value, factor, out, first, start: tl.constexpr, permuted: tl.constexpr
+    ):
+        base = (out + first * 512 + start).to(tl.uint64)
+        tl.inline_asm_elementwise(
+            model1_store64_asm(permuted),
+            MODEL1_STORE64_CONSTRAINTS,
+            [value * factor[:, None], base],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=32,
+        )
+
+    @triton.jit
+    def model1_value_band(
+        fp8_prob,
+        transposed_values,
+        Out,
+        batch,
+        head_block,
+        inverse,
+        scale,
+        H: tl.constexpr,
+        start: tl.constexpr,
+        width: tl.constexpr,
+    ):
+        value = tle.gpu.wgmma(
+            fp8_prob.slot(0),
+            tle_subslice(transposed_values.slot(0), [start, 0], [width, 64]),
+            trans_b=True,
+        )
+        value = tle.gpu.wgmma(
+            fp8_prob.slot(1),
+            tle_subslice(transposed_values.slot(1), [start, 0], [width, 64]),
+            value,
+            trans_b=True,
+        )
+        value = tle.gpu.wgmma_wait(0, value)
+        if width == 128:
+            sparse_fp8_publish_output(
+                value, inverse * scale, Out, batch, head_block, H, start, True
+            )
+        else:
+            model1_store64(
+                value, inverse * scale, Out, batch * H + head_block * 64, start, True
+            )
+
+    @triton.jit
+    def model1_reciprocal(x):
+        return tl.inline_asm_elementwise(
+            "rcp.approx.ftz.f32 $0,$1;",
+            "=f,f",
+            [x],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+    @triton.jit
+    def model1_compute_key_half(
+        Q,
+        QR,
+        QS,
+        Out,
+        L,
+        repair_flags,
+        query_tile,
+        query_rope,
+        query_scale,
+        key_tiles,
+        key_rope,
+        key_scales,
+        transposed_values,
+        fp8_prob,
+        bf16_prob,
+        row_maxima,
+        row_sums,
+        panel_barriers,
+        query_ready,
+        max_ready,
+        values_ready,
+        output_ready,
+        HALF: tl.constexpr,
+        H: tl.constexpr,
+        SCALE: tl.constexpr,
+        OUTPUT_TILES: tl.constexpr,
+    ):
+        batch = tl.program_id(0).to(tl.int64)
+        head_block = tl.program_id(1)
+        head_rows = HALF * 32 + tl.arange(0, 32)
+        heads = batch * H + head_block * 64 + head_rows
+        col = tl.arange(0, 512)
+        group = tl.arange(0, 8)
+        q = tl.load(Q + heads[:, None] * 448 + col[None, :], col[None, :] < 448, 0.0)
+        scales = tl.load(
+            QS + heads[:, None] * 7 + group[None, :], group[None, :] < 7, 0.0
+        )
+        unit = tl.max(scales, 1)
+        # Only exact power-of-two gains of one, one half, or one quarter
+        # use the fast FP16 rescale. Other rows are recomputed before return.
+        scale_delta = unit[:, None].to(tl.uint32, bitcast=True) - scales.to(
+            tl.uint32, bitcast=True
+        )
+        needs_repair = tl.max(
+            (
+                (group[None, :] < 7)
+                & (((scale_delta & 0x007FFFFF) != 0) | (scale_delta > 0x01000000))
+            ).to(tl.int32),
+            1,
+        )
+        needs_repair |= (unit < 4.70197740328915e-38).to(tl.int32)
+        flag = tle.gpu.local_ptr(repair_flags, (1 + HALF,))
+        tl.store(flag, tl.max(needs_repair, 0))
+        gain = (
+            ((15 - tl.minimum(scale_delta >> 23, 2)) << 10)
+            .to(tl.uint16)
+            .to(tl.float16, bitcast=True)
+        )
+        normalized = (
+            q.to(tl.float16)
+            * tl.broadcast_to(gain[:, :, None], (32, 8, 64)).reshape(32, 512)
+        ).to(tl.float8e4nv)
+        tl.store(
+            tle.gpu.local_ptr(tle_subslice(query_tile, [HALF * 32, 0], [32, 512])),
+            normalized,
+        )
+        tl.store(tle.gpu.local_ptr(query_scale, (head_rows,)), unit)
+        cd = tl.arange(0, 64)
+        tl.store(
+            tle.gpu.local_ptr(tle_subslice(query_rope, [HALF * 32, 0], [32, 64])),
+            tl.load(QR + heads[:, None] * 64 + cd[None, :]),
+        )
+        tle.gpu.barrier_wait(query_ready[0])
+        key = key_tiles.slot(HALF)
+        tle.gpu.barrier_wait(panel_barriers[0], phaseIdx=0)
+        score = tle.gpu.wgmma(
+            tle_subslice(query_tile, [0, 0], [64, 128]),
+            tle_subslice(key, [0, 0], [64, 128]),
+            trans_b=True,
+        )
+        tle.gpu.barrier_wait(panel_barriers[1], phaseIdx=0)
+        score = tle.gpu.wgmma(
+            tle_subslice(query_tile, [0, 128], [64, 128]),
+            tle_subslice(key, [0, 128], [64, 128]),
+            score,
+            trans_b=True,
+        )
+        tle.gpu.barrier_wait(panel_barriers[2], phaseIdx=0)
+        score = tle.gpu.wgmma(
+            tle_subslice(query_tile, [0, 256], [64, 128]),
+            tle_subslice(key, [0, 256], [64, 128]),
+            score,
+            trans_b=True,
+        )
+        tle.gpu.barrier_wait(panel_barriers[3], phaseIdx=0)
+        score = tle.gpu.wgmma(
+            tle_subslice(query_tile, [0, 384], [64, 64]),
+            tle_subslice(key, [0, 384], [64, 64]),
+            score,
+            trans_b=True,
+        )
+        rope = tle.gpu.wgmma(query_rope, key_rope.slot(HALF), trans_b=True)
+        score = tle.gpu.wgmma_wait(0, score)
+        rope = tle.gpu.wgmma_wait(0, rope)
+        key_unit = tl.load(tle.gpu.local_ptr(key_scales.slot(HALF)))
+        query_unit = tl.load(tle.gpu.local_ptr(query_scale))
+        logits = tl.where(
+            key_unit[None, :] >= 0.0,
+            (score * query_unit[:, None] * key_unit[None, :] + rope)
+            * (SCALE * 1.4426950408889634),
+            -float("inf"),
+        )
+        half_max = tl.max(logits, 1)
+        tl.store(tle.gpu.local_ptr(row_maxima.slot(HALF)), half_max)
+        tle.gpu.barrier_wait(max_ready[0])
+        row_max = tl.maximum(
+            half_max, tl.load(tle.gpu.local_ptr(row_maxima.slot(1 - HALF)))
+        )
+        p = tl.exp2(logits - tl.where(row_max == -float("inf"), 0.0, row_max)[:, None])
+        tl.store(tle.gpu.local_ptr(row_sums.slot(HALF)), tl.sum(p, 1))
+        k0 = tl.load(tle.gpu.local_ptr(key_scales.slot(0)))
+        k1 = tl.load(tle.gpu.local_ptr(key_scales.slot(1)))
+        peak = tl.max(tl.maximum(k0, k1), 0)
+        floor = tl.min(
+            tl.minimum(
+                tl.where(k0 > 0.0, k0, float("inf")),
+                tl.where(k1 > 0.0, k1, float("inf")),
+            ),
+            0,
+        )
+        if HALF == 0:
+            # Retain the BF16 reference path for wide scales and large logits.
+            large_scores = (
+                tl.max(query_unit, 0) * peak * tl.abs(SCALE * 1.4426950408889634)
+                > QK_RECOMPUTE_THRESHOLD
+            )
+            tiny_scale = (peak > 0.0) & (peak < (448.0 * 1.17549435e-38))
+            tl.store(flag, 1, mask=(peak > 4.0 * floor) | large_scores | tiny_scale)
+        scale = peak * (1.0 / 448.0)
+        scale = tl.where(scale >= 1.17549435e-38, scale, 1.0)
+        publish_p_fp8_sw64_coupled_stmatrix(
+            fp8_prob.slot(HALF),
+            p * (tl.maximum(key_unit, 0.0)[None, :] * model1_reciprocal(scale)),
+        )
+        tl.store(tle.gpu.local_ptr(bf16_prob.slot(HALF)), p.to(tl.bfloat16))
+        tle.gpu.barrier_wait(values_ready[0])
+        denominator = tl.load(tle.gpu.local_ptr(row_sums.slot(0))) + tl.load(
+            tle.gpu.local_ptr(row_sums.slot(1))
+        )
+        inverse = model1_reciprocal(tl.where(denominator > 0.0, denominator, 1.0))
+        rows = batch * H + head_block * 64 + tl.arange(0, 64)
+        if OUTPUT_TILES == 1:
+            model1_value_band(
+                fp8_prob,
+                transposed_values,
+                Out,
+                batch,
+                head_block,
+                inverse,
+                scale,
+                H,
+                HALF * 256,
+                128,
+            )
+            model1_value_band(
+                fp8_prob,
+                transposed_values,
+                Out,
+                batch,
+                head_block,
+                inverse,
+                scale,
+                H,
+                HALF * 256 + 128,
+                64 if HALF == 1 else 128,
+            )
+        else:
+            for band in tl.static_range(4):
+                if tl.program_id(2) == band:
+                    if band < 3 or HALF == 0:
+                        model1_value_band(
+                            fp8_prob,
+                            transposed_values,
+                            Out,
+                            batch,
+                            head_block,
+                            inverse,
+                            scale,
+                            H,
+                            band * 128 + HALF * 64,
+                            64,
+                        )
+        if HALF == 1:
+            if OUTPUT_TILES == 1 or tl.program_id(2) == 3:
+                tail = tle.gpu.wgmma(bf16_prob.slot(0), key_rope.slot(0))
+                tail = tle.gpu.wgmma(bf16_prob.slot(1), key_rope.slot(1), tail)
+                tail = tle.gpu.wgmma_wait(0, tail)
+                model1_store64(
+                    tail, inverse, Out, batch * H + head_block * 64, 448, False
+                )
+        else:
+            if OUTPUT_TILES == 1 or tl.program_id(2) == 0:
+                tl.store(
+                    L + rows,
+                    tl.where(
+                        denominator > 0.0,
+                        row_max * 0.6931471805599453 + tl.log(denominator),
+                        float("inf"),
+                    ),
+                )
+        tle.gpu.barrier_wait(output_ready[0])
+
+    @triton.jit
+    def model1_key_pair(
+        Q,
+        QR,
+        QS,
+        Cache,
+        Idx,
+        Out,
+        L,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        STRIDE: tl.constexpr,
+        SCALE: tl.constexpr,
+        OUTPUT_TILES: tl.constexpr,
+        KEY_SPLITS: tl.constexpr,
+    ):
+        if KEY_SPLITS > 1:
+            split_offset = (
+                tl.program_id(0).to(tl.int64) * (KEY_SPLITS - 1)
+                + tl.program_id(2) // OUTPUT_TILES
+            )
+            Idx = Idx + split_offset * 128
+            Out = Out + split_offset * H * 512
+            L = L + split_offset * H
+        query_tile = tle.gpu.alloc([64, 512], tl.float8e4nv, scope=tle.gpu.smem)
+        query_rope = tle.gpu.alloc([64, 64], tl.bfloat16, scope=tle.gpu.smem)
+        query_scale = tle.gpu.alloc(
+            [64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+        )
+        key_tiles = tle.gpu.alloc([2, 64, 512], tl.float8e4nv, scope=tle.gpu.smem)
+        key_rope = tle.gpu.alloc([2, 64, 64], tl.bfloat16, scope=tle.gpu.smem)
+        key_scales = tle.gpu.alloc(
+            [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+        )
+        transposed_values = tle.gpu.alloc(
+            [2, 512, 64], tl.float8e4nv, scope=tle.gpu.smem
+        )
+        fp8_prob = tle.gpu.alloc([2, 64, 64], tl.float8e4nv, scope=tle.gpu.smem)
+        bf16_prob = tle.gpu.alloc([2, 64, 64], tl.bfloat16, scope=tle.gpu.smem)
+        row_maxima = tle.gpu.alloc(
+            [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+        )
+        row_sums = tle.gpu.alloc(
+            [2, 64], tl.float32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+        )
+        repair_flags = tle.gpu.alloc(
+            [4], tl.int32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+        )
+        panel_barriers = tle.gpu.alloc_barriers(4, arrive_count=8)
+        # Two 128-thread consumers exchange Q and row maxima. Together
+        # with the producer they publish PV operands before the output phase.
+        query_ready = sparse_named_barriers(1, 256, 16)
+        max_ready = sparse_named_barriers(1, 256, 17)
+        values_ready = sparse_named_barriers(1, 512, 18)
+        output_ready = sparse_named_barriers(1, 256, 19)
+        consumers = (
+            Q,
+            QR,
+            QS,
+            Out,
+            L,
+            repair_flags,
+            query_tile,
+            query_rope,
+            query_scale,
+            key_tiles,
+            key_rope,
+            key_scales,
+            transposed_values,
+            fp8_prob,
+            bf16_prob,
+            row_maxima,
+            row_sums,
+            panel_barriers,
+            query_ready,
+            max_ready,
+            values_ready,
+            output_ready,
+        )
+        constants = (
+            H,
+            SCALE,
+            OUTPUT_TILES,
+        )
+        tle.gpu.warp_specialize(
+            [
+                (model1_compute_key_half, consumers + (0,) + constants),
+                (model1_compute_key_half, consumers + (1,) + constants),
+                (
+                    model1_load_key_pair,
+                    (
+                        Cache,
+                        Idx,
+                        repair_flags,
+                        key_tiles,
+                        key_rope,
+                        key_scales,
+                        transposed_values,
+                        panel_barriers,
+                        values_ready,
+                        H,
+                        N,
+                        STRIDE,
+                        OUTPUT_TILES,
+                    ),
+                ),
+            ],
+            [4, 8],
+            [160, 64],
+        )
+        # Both consumers have finished writing these columns. The default
+        # partition repairs only this CTA's output slice when a scale was unsafe.
+        risk = (
+            tl.load(tle.gpu.local_ptr(repair_flags, (0,)))
+            | tl.load(tle.gpu.local_ptr(repair_flags, (1,)))
+            | tl.load(tle.gpu.local_ptr(repair_flags, (2,)))
+        )
+        if risk:
+            batch = tl.program_id(0).to(tl.int64)
+            head_block = tl.program_id(1)
+            for group in range(4):
+                repair_heads(
+                    Q,
+                    QR,
+                    QS,
+                    Cache.to(tl.pointer_type(tl.float8e4nv)),
+                    Cache.to(tl.pointer_type(tl.uint8)),
+                    Cache.to(tl.pointer_type(tl.bfloat16)),
+                    Idx,
+                    Out,
+                    L,
+                    batch,
+                    head_block * 4 + group,
+                    N,
+                    128,
+                    H,
+                    STRIDE,
+                    SCALE,
+                    OUTPUT_TILES,
+                )
+
     model1_short_plans = {}
 
     def model1_attention(
@@ -4482,6 +5155,45 @@ else:
             for quantized_values in (q_rope, q_scale, packed_cache, indices)
         ):
             raise ValueError("Model1 tensors must share a CUDA device")
+
+        if topk == 128 or (topk == 640 and batch <= 16):
+            # Split a short query over output bands; a 640-key query
+            # instead supplies enough CTAs by splitting its selected keys.
+            out = q_rope.new_empty((batch, 1, heads, 512))
+            lse = q_scale.new_empty((batch, heads, 1))
+            key_splits = topk // 128
+            output_tiles = 4 if batch <= 16 and key_splits == 1 else 1
+            part = (
+                out
+                if key_splits == 1
+                else out.new_empty((batch, key_splits, heads, 512))
+            )
+            stats = (
+                lse if key_splits == 1 else lse.new_empty((batch, key_splits, heads))
+            )
+            model1_key_pair[(batch, heads // 64, output_tiles * key_splits)](
+                q,
+                q_rope,
+                q_scale,
+                packed_cache,
+                indices,
+                part,
+                stats,
+                heads,
+                tokens,
+                packed_cache.stride(0),
+                scale,
+                output_tiles,
+                key_splits,
+                num_warps=4,
+                ptx_options="--register-usage-level=6",
+                num_stages=1,
+            )
+            if key_splits > 1:
+                merge[(batch, heads, 1)](
+                    part, stats, out, lse, heads, key_splits, 512, num_warps=2
+                )
+            return out, lse
 
         work = batch * (heads // 64)
         if (batch <= 16 and topk <= 640) or (work <= 64 and topk <= 128):
