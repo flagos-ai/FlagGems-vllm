@@ -36,7 +36,7 @@ general FlagGems operators internally. Install a matching `flag-gems` release
 
 ```bash
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
 Use `--no-deps` when the vendor image already provides PyTorch/NumPy. In a
@@ -152,7 +152,7 @@ All defaults come from `src/flaggems_vllm/backends.yaml` and can be overridden:
 | `VENV_DIR` | Virtual environment directory (default `.venv`). |
 | `PIP_INDEX_URL` | Primary package index (default: PyPI; use a regional mirror if needed). |
 | `FLAG_GEMS_VERSION` | Override the registry's `flag-gems` pin (default 5.4.0). |
-| `FLAG_GEMS_INDEX` | Index that publishes `flag-gems` (default: FlagOS hosted index). |
+| `FLAG_GEMS_INDEX` | Index that publishes `flag-gems` (default: FlagOS daily index). |
 | `VLLM_VERSION` | Override a profile whose vLLM pin is `vllm==...` (NVIDIA). |
 | `VLLM_PACKAGE` | Full vLLM requirement or wheel URL; wins over `VLLM_VERSION`. |
 | `COMPILER` | `flagtree`, `triton` or `keep`. |
@@ -218,7 +218,7 @@ python -m pip install "setuptools>=64,<82" wheel packaging pybind11 PyYAML sqlal
 
 # FlagGems runtime
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
 ### 3. Install the compiler (FlagTree or Triton)
@@ -375,7 +375,7 @@ For the full FlagOS vLLM plugin stack, install in this order:
 ```bash
 # 1. FlagGems (general operator backend)
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 
 # 2. FlagGems-vllm (vLLM-specific operators)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git

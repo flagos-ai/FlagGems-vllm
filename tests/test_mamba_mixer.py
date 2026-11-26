@@ -36,17 +36,26 @@ except ImportError as exc:  # pragma: no cover - depends on installed vLLM build
         allow_module_level=True,
     )
 try:
-    from flaggems_vllm.ops.mamba_mixer import mamba_mixer as triton_mamba_mixer
-except ImportError as exc:  # pragma: no cover - indicates the op was not installed
+    import flaggems_vllm
+
+    triton_mamba_mixer = flaggems_vllm.mamba_mixer
+except (ImportError, AttributeError) as exc:  # pragma: no cover
     pytest.skip(
-        f"Could not import flaggems_vllm.ops.mamba_mixer: {exc}",
+        f"Could not import flaggems_vllm.mamba_mixer: {exc}",
         allow_module_level=True,
     )
+
+try:
+    import vllm._custom_ops  # noqa: F401 - loads torch.ops._C
+
+    _HAS_VLLM_SELECTIVE_SCAN = hasattr(torch.ops._C, "selective_scan_fwd")
+except (ImportError, AttributeError, RuntimeError):
+    _HAS_VLLM_SELECTIVE_SCAN = False
 
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="MambaMixer Triton correctness tests require an NVIDIA CUDA device",
+    reason="MambaMixer Triton correctness tests require a CUDA/HIP device",
 )
 
 
@@ -257,6 +266,75 @@ def _ssm_transform_reference(
     return dt, b, c
 
 
+def _torch_selective_scan_reference(
+    u: torch.Tensor,
+    ssm_state: torch.Tensor,
+    delta: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    z: torch.Tensor | None,
+    delta_bias: torch.Tensor | None,
+    *,
+    query_start_loc: torch.Tensor | None,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    null_block_id: int,
+) -> torch.Tensor:
+    """Exact FP32 sequential SSM reference when vLLM._C.selective_scan_fwd is absent."""
+    intermediate_size, total_tokens = u.shape
+    state_size = A.shape[1]
+    out = torch.empty_like(u)
+    if query_start_loc is None:
+        starts = [0]
+        ends = [total_tokens]
+    else:
+        qsl = query_start_loc.tolist()
+        starts = qsl[:-1]
+        ends = qsl[1:]
+    num_seqs = len(starts)
+    c_idx = (
+        cache_indices.tolist() if cache_indices is not None else list(range(num_seqs))
+    )
+    h_init = (
+        has_initial_state.tolist()
+        if has_initial_state is not None
+        else [False] * num_seqs
+    )
+    A_f = A.float()
+    D_f = D.float()
+    db_f = delta_bias.float() if delta_bias is not None else None
+    for s in range(num_seqs):
+        s_start, s_end = starts[s], ends[s]
+        slot = c_idx[s]
+        slot_valid = slot != null_block_id and slot >= 0
+        if slot_valid and h_init[s]:
+            state = ssm_state[slot].float().clone()
+        else:
+            state = torch.zeros(
+                (intermediate_size, state_size), device=u.device, dtype=torch.float32
+            )
+        for t in range(s_start, s_end):
+            u_t = u[:, t].float()
+            dt_t = delta[:, t].float()
+            if db_f is not None:
+                dt_t = dt_t + db_f
+            dt_t = F.softplus(dt_t)
+            b_t = B[:, t].float()
+            c_t = C[:, t].float()
+            d_a = torch.exp(dt_t[:, None] * A_f)
+            d_b = dt_t[:, None] * b_t[None, :]
+            state = state * d_a + d_b * u_t[:, None]
+            y_t = (state * c_t[None, :]).sum(dim=-1) + D_f * u_t
+            if z is not None:
+                y_t = y_t * F.silu(z[:, t].float())
+            out[:, t] = y_t.to(out.dtype)
+        if slot_valid and s_end > s_start:
+            ssm_state[slot].copy_(state.to(ssm_state.dtype))
+    return out
+
+
 def _vllm_prefill_reference(
     hidden_states: torch.Tensor,
     weights: dict[str, torch.Tensor | None],
@@ -304,22 +382,39 @@ def _vllm_prefill_reference(
     )
     # vLLM selective_scan_fn writes the gated result into its z argument.
     scan_gate = gate.transpose(0, 1).contiguous()
-    scan_out = selective_scan_fn(
-        conv_out,
-        ssm_state,
-        dt.transpose(0, 1).contiguous(),
-        weights["A"],
-        b.transpose(0, 1).contiguous(),
-        c.transpose(0, 1).contiguous(),
-        weights["D"],
-        scan_gate,
-        weights["dt_proj_bias"],
-        delta_softplus=True,
-        query_start_loc=query_start_loc,
-        cache_indices=cache_indices,
-        has_initial_state=has_initial_state,
-        null_block_id=NULL_BLOCK_ID,
-    )
+    if _HAS_VLLM_SELECTIVE_SCAN:
+        scan_out = selective_scan_fn(
+            conv_out,
+            ssm_state,
+            dt.transpose(0, 1).contiguous(),
+            weights["A"],
+            b.transpose(0, 1).contiguous(),
+            c.transpose(0, 1).contiguous(),
+            weights["D"],
+            scan_gate,
+            weights["dt_proj_bias"],
+            delta_softplus=True,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            null_block_id=NULL_BLOCK_ID,
+        )
+    else:
+        scan_out = _torch_selective_scan_reference(
+            conv_out,
+            ssm_state,
+            dt.transpose(0, 1).contiguous(),
+            weights["A"],
+            b.transpose(0, 1).contiguous(),
+            c.transpose(0, 1).contiguous(),
+            weights["D"],
+            scan_gate,
+            weights["dt_proj_bias"],
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            null_block_id=NULL_BLOCK_ID,
+        )
     return F.linear(
         scan_out.transpose(0, 1).contiguous(),
         weights["out_proj_weight"],
@@ -651,4 +746,132 @@ def test_mamba_mixer_decode_matches_vllm(dtype, use_rms_norm):
         ssm_state_ref,
         dtype,
         name="Decode SSM State",
+    )
+
+
+@pytest.mark.mamba_mixer
+def test_mamba_mixer_export_and_vendor_dispatch():
+    assert "mamba_mixer" in flaggems_vllm.ops.__all__
+    assert callable(flaggems_vllm.ops.mamba_mixer)
+    assert callable(flaggems_vllm.mamba_mixer)
+    if flaggems_vllm.vendor_name == "hygon":
+        from flaggems_vllm.runtime.backend._hygon.ops.mamba_mixer import (
+            mamba_mixer as hygon_mamba_mixer,
+        )
+
+        assert flaggems_vllm.mamba_mixer is hygon_mamba_mixer
+    elif flaggems_vllm.vendor_name == "nvidia":
+        assert flaggems_vllm.mamba_mixer is flaggems_vllm.ops.mamba_mixer
+
+
+@pytest.mark.mamba_mixer
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+    ids=["fp16", "bf16", "fp32"],
+)
+@pytest.mark.parametrize("use_rms_norm", [False, True], ids=["no-rmsnorm", "rmsnorm"])
+def test_mamba_mixer_prefill_multi_chunk_matches_reference(dtype, use_rms_norm):
+    """Multi-chunk variable-length prefill (>64 tokens) across chunk boundaries."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(2028)
+    hidden_size = 64
+    intermediate_size = 128
+    state_size = 16
+    time_step_rank = 8
+    kernel_size = 4
+    seq_lens = (3, 131, 64)
+    batch_size = len(seq_lens)
+    num_actual_tokens = sum(seq_lens)
+    cache_slots = batch_size + 1
+    rms_norm_eps = 1e-5
+    activation = "silu"
+    weights = _make_weights(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        state_size=state_size,
+        time_step_rank=time_step_rank,
+        kernel_size=kernel_size,
+        dtype=dtype,
+        device=device,
+        use_rms_norm=use_rms_norm,
+    )
+    reference_cache, triton_cache = _make_cache_pair(
+        cache_slots=cache_slots,
+        intermediate_size=intermediate_size,
+        kernel_size=kernel_size,
+        state_size=state_size,
+        activation_dtype=dtype,
+        device=device,
+    )
+    conv_state_ref, ssm_state_ref = reference_cache
+    conv_state_tri, ssm_state_tri = triton_cache
+    hidden_states = _randn(
+        (num_actual_tokens, hidden_size),
+        device=device,
+        dtype=dtype,
+        scale=0.15,
+    )
+    query_start_loc = torch.tensor(
+        [0, seq_lens[0], seq_lens[0] + seq_lens[1], num_actual_tokens],
+        dtype=torch.int32,
+        device=device,
+    )
+    # Slot 0 is NULL_BLOCK_ID and must remain untouched.
+    cache_indices = torch.tensor([1, 2, 3], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor(
+        [True, False, True], dtype=torch.bool, device=device
+    )
+    with torch.inference_mode():
+        expected = _vllm_prefill_reference(
+            hidden_states,
+            weights,
+            conv_state_ref,
+            ssm_state_ref,
+            query_start_loc,
+            cache_indices,
+            has_initial_state,
+            use_rms_norm=use_rms_norm,
+            rms_norm_eps=rms_norm_eps,
+            activation=activation,
+        )
+        actual = triton_mamba_mixer(
+            hidden_states,
+            weights["in_proj_weight"],
+            weights["conv1d_weight"],
+            weights["x_proj_weight"],
+            weights["dt_proj_weight"],
+            weights["A"],
+            weights["D"],
+            weights["out_proj_weight"],
+            in_proj_bias=weights["in_proj_bias"],
+            conv1d_bias=weights["conv1d_bias"],
+            dt_proj_bias=weights["dt_proj_bias"],
+            out_proj_bias=weights["out_proj_bias"],
+            conv_state=conv_state_tri,
+            ssm_state=ssm_state_tri,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            dt_norm_weight=weights["dt_norm_weight"],
+            b_norm_weight=weights["b_norm_weight"],
+            c_norm_weight=weights["c_norm_weight"],
+            use_rms_norm=use_rms_norm,
+            rms_norm_eps=rms_norm_eps,
+            activation=activation,
+            null_block_id=NULL_BLOCK_ID,
+        )
+        torch.cuda.synchronize()
+    _assert_close(actual, expected, dtype, name="Multi-chunk prefill output")
+    _assert_close(
+        conv_state_tri,
+        conv_state_ref,
+        dtype,
+        name="Multi-chunk prefill Conv State",
+    )
+    _assert_close(
+        ssm_state_tri,
+        ssm_state_ref,
+        dtype,
+        name="Multi-chunk prefill SSM State",
     )

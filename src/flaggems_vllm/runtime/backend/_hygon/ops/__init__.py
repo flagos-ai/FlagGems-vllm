@@ -53,6 +53,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._hygon.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.runtime.backend._hygon.ops.megamoe import megamoe_int8
 from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -73,6 +74,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.triton_scaled_mm import triton_sca
 from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_int8_bmm import (
     w8a8_block_int8_bmm,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.w8a8_block_matmul import w8a8_block_matmul
 
 __all__ = [
     "chunk_gated_delta_rule_w8a16",
@@ -90,6 +92,7 @@ __all__ = [
     "gemma_rms_norm",
     "inplace_fused_experts",
     "int8_einsum",
+    "mamba_mixer",
     "megamoe_int8",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
@@ -106,4 +109,5 @@ __all__ = [
     "topk_softplus_sqrt",
     "triton_scaled_mm",
     "w8a8_block_int8_bmm",
+    "w8a8_block_matmul",
 ]
