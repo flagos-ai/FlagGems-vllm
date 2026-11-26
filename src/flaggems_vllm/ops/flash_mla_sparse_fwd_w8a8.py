@@ -37,8 +37,10 @@ else:
         NVMMASharedLayout,
         SliceLayout,
     )
+    from triton.experimental.gluon.language import _core as glc
     from triton.experimental.gluon.language.nvidia import hopper
     from triton.experimental.gluon.language.nvidia.hopper import async_copy
+    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
     from flaggems_vllm import runtime
     from flaggems_vllm.ops.flash_mla import _get_num_sms as get_num_sms
@@ -86,6 +88,72 @@ else:
             pack=1,
         )
 
+    @triton.constexpr_function
+    def sparse_fp8_transpose_asm():
+        return (
+            "{\n"
+            ".reg .b32 tid, lane, warp, src_row, tmp, tmp2;\n"
+            ".reg .b32 src_log, src_phys, src_addr0, src_addr1;\n"
+            ".reg .b32 dst_row_r, dst_col, dst_log0, dst_log1;\n"
+            ".reg .b32 dst_phys0, dst_phys1, dst_addr0, dst_addr1;\n"
+            ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+            ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 tid, tid, 127;\n"
+            "and.b32 lane, tid, 31;\n"
+            "shr.u32 warp, tid, 5;\n"
+            "add.u32 warp, warp, $4;\n"
+            # The coupled P permutation cancels the source-row bit permutation.
+            "mov.u32 src_row, lane;\n"
+            "shl.b32 src_log, src_row, 7;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 src_log, src_log, tmp;\n"
+            "shr.u32 tmp, src_log, 7;\n"
+            "and.b32 tmp, tmp, 7;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 src_phys, src_log, tmp;\n"
+            "add.u32 src_addr0, $2, src_phys;\n"
+            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{a0, a1, a2, a3}, [src_addr0];\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+            "{b0, b1, b2, b3}, [src_addr1];\n"
+            "prmt.b32 c0, a0, a1, 0x6420;\n"
+            "prmt.b32 c1, a0, a1, 0x7531;\n"
+            "prmt.b32 c2, a2, a3, 0x6420;\n"
+            "prmt.b32 c3, a2, a3, 0x7531;\n"
+            "prmt.b32 d0, b0, b1, 0x6420;\n"
+            "prmt.b32 d1, b0, b1, 0x7531;\n"
+            "prmt.b32 d2, b2, b3, 0x6420;\n"
+            "prmt.b32 d3, b2, b3, 0x7531;\n"
+            # Consecutive rows distribute each matrix store over all shared banks.
+            "and.b32 dst_row_r, lane, 15;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 dst_row_r, dst_row_r, tmp;\n"
+            "shr.u32 dst_col, lane, 4;\n"
+            "and.b32 dst_col, dst_col, 1;\n"
+            "shl.b32 dst_col, dst_col, 4;\n"
+            "shl.b32 dst_log0, dst_row_r, 6;\n"
+            "add.u32 dst_log0, dst_log0, dst_col;\n"
+            "add.u32 dst_log1, dst_log0, 32;\n"
+            "shr.u32 tmp, dst_log0, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 dst_phys0, dst_log0, tmp;\n"
+            "shr.u32 tmp2, dst_log1, 7;\n"
+            "and.b32 tmp2, tmp2, 3;\n"
+            "shl.b32 tmp2, tmp2, 4;\n"
+            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
+            "add.u32 dst_addr0, $3, dst_phys0;\n"
+            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr0], {c0, c1, c2, c3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
+            "[dst_addr1], {d0, d1, d2, d3};\n"
+            "mov.u32 $0, $1;\n"
+            "}"
+        )
+
     @triton.jit
     def sparse_fp8_transpose_values(
         s_src,
@@ -98,69 +166,7 @@ else:
         src_base = tle.gpu.local_ptr(s_src, (0, 0))
         dst_base = tle.gpu.local_ptr(s_dst, (dst_row, 0))
         return tl.inline_asm_elementwise(
-            asm=(
-                "{\n"
-                ".reg .b32 tid, lane, warp, src_row, tmp, tmp2;\n"
-                ".reg .b32 src_log, src_phys, src_addr0, src_addr1;\n"
-                ".reg .b32 dst_row_r, dst_col, dst_log0, dst_log1;\n"
-                ".reg .b32 dst_phys0, dst_phys1, dst_addr0, dst_addr1;\n"
-                ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
-                ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
-                "mov.u32 tid, %tid.x;\n"
-                "and.b32 tid, tid, 127;\n"
-                "and.b32 lane, tid, 31;\n"
-                "shr.u32 warp, tid, 5;\n"
-                "add.u32 warp, warp, $4;\n"
-                # The coupled P permutation cancels the source-row bit permutation.
-                "mov.u32 src_row, lane;\n"
-                "shl.b32 src_log, src_row, 7;\n"
-                "shl.b32 tmp, warp, 4;\n"
-                "add.u32 src_log, src_log, tmp;\n"
-                "shr.u32 tmp, src_log, 7;\n"
-                "and.b32 tmp, tmp, 7;\n"
-                "shl.b32 tmp, tmp, 4;\n"
-                "xor.b32 src_phys, src_log, tmp;\n"
-                "add.u32 src_addr0, $2, src_phys;\n"
-                "add.u32 src_addr1, src_addr0, 4096;\n"
-                "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-                "{a0, a1, a2, a3}, [src_addr0];\n"
-                "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-                "{b0, b1, b2, b3}, [src_addr1];\n"
-                "prmt.b32 c0, a0, a1, 0x6420;\n"
-                "prmt.b32 c1, a0, a1, 0x7531;\n"
-                "prmt.b32 c2, a2, a3, 0x6420;\n"
-                "prmt.b32 c3, a2, a3, 0x7531;\n"
-                "prmt.b32 d0, b0, b1, 0x6420;\n"
-                "prmt.b32 d1, b0, b1, 0x7531;\n"
-                "prmt.b32 d2, b2, b3, 0x6420;\n"
-                "prmt.b32 d3, b2, b3, 0x7531;\n"
-                # Consecutive rows distribute each matrix store over all shared banks.
-                "and.b32 dst_row_r, lane, 15;\n"
-                "shl.b32 tmp, warp, 4;\n"
-                "add.u32 dst_row_r, dst_row_r, tmp;\n"
-                "shr.u32 dst_col, lane, 4;\n"
-                "and.b32 dst_col, dst_col, 1;\n"
-                "shl.b32 dst_col, dst_col, 4;\n"
-                "shl.b32 dst_log0, dst_row_r, 6;\n"
-                "add.u32 dst_log0, dst_log0, dst_col;\n"
-                "add.u32 dst_log1, dst_log0, 32;\n"
-                "shr.u32 tmp, dst_log0, 7;\n"
-                "and.b32 tmp, tmp, 3;\n"
-                "shl.b32 tmp, tmp, 4;\n"
-                "xor.b32 dst_phys0, dst_log0, tmp;\n"
-                "shr.u32 tmp2, dst_log1, 7;\n"
-                "and.b32 tmp2, tmp2, 3;\n"
-                "shl.b32 tmp2, tmp2, 4;\n"
-                "xor.b32 dst_phys1, dst_log1, tmp2;\n"
-                "add.u32 dst_addr0, $3, dst_phys0;\n"
-                "add.u32 dst_addr1, $3, dst_phys1;\n"
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
-                "[dst_addr0], {c0, c1, c2, c3};\n"
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 "
-                "[dst_addr1], {d0, d1, d2, d3};\n"
-                "mov.u32 $0, $1;\n"
-                "}"
-            ),
+            asm=sparse_fp8_transpose_asm(),
             constraints="=r,r,r,r,r",
             args=[carrier, src_base, dst_base, tl.full((), warp_offset, tl.uint32)],
             dtype=tl.uint32,
@@ -2761,6 +2767,31 @@ else:
         return first, count
 
     @triton.jit
+    def model1_block_info(
+        block,
+        split,
+        BLOCKS: tl.constexpr,
+        S: tl.constexpr,
+        PREFIX: tl.constexpr,
+        TAIL: tl.constexpr,
+        TAIL_SPLITS: tl.constexpr,
+    ):
+        if TAIL_SPLITS:
+            # Only the final, underfilled SM wave shares each query across CTAs.
+            index = tl.maximum(block - PREFIX, 0)
+            start, count = split_block_range(index % TAIL_SPLITS, BLOCKS, TAIL_SPLITS)
+            tail = block >= PREFIX
+            return (
+                tl.where(tail, PREFIX + index // TAIL_SPLITS, block),
+                tl.where(tail, block + TAIL, block),
+                tl.where(tail, start, 0),
+                tl.where(tail, count, BLOCKS),
+            )
+        else:
+            start, count = split_block_range(split, BLOCKS, S)
+            return block, block * S + split, start, count
+
+    @triton.jit
     def scaled_bytes(quantized, ratios, R: tl.constexpr):
         factors = tl.broadcast_to(ratios[:, :, None], (R, 8, 64)).reshape(R, 512)
         return (quantized.to(tl.float32) * factors).to(tl.float8e4nv)
@@ -2826,7 +2857,136 @@ else:
         tl.store(Scale + ids, tl.where(hi - lo > 2, -scale, scale), ids < N)
 
     @triton.constexpr_function
-    def gather_asm(block, page_stride, panel_rows, warps):
+    def rescale_fp8_registers():
+        asm = ""
+        for reg in ("a", "b", "c", "d"):
+            asm += f"""
+            mov.b32 {{xlo,xhi}},{reg};
+            cvt.rn.f16x2.e4m3x2 tmp,xlo;
+            cvt.rn.f16x2.e4m3x2 u,xhi;
+            mul.f16x2 tmp,tmp,fac;
+            mul.f16x2 u,u,fac;
+            cvt.rn.satfinite.e4m3x2.f16x2 xlo,tmp;
+            cvt.rn.satfinite.e4m3x2.f16x2 xhi,u;
+            mov.b32 {reg},{{xlo,xhi}};
+            """
+        return asm
+
+    @triton.constexpr_function
+    def gather_topk128_asm(page_stride):
+        # Four lanes copy a 64-byte feature group. Each group of four lanes
+        # follows two indices, 64 tokens apart, and keeps both addresses live.
+        asm = """
+        {
+        .reg .b32 tid, lane, warp, row, chunk, offset, swizzle, base;
+        .reg .b32 id<2>, exp_lo<2>, exp_hi<2>, largest<2>, smallest<2>, size<2>;
+        .reg .b32 tmp, u, exponent, slot, delta, fac, kdst, rdst, flag, a, b, c, d;
+        .reg .b64 idx_ptr, src<2>, page<2>, meta, byte_offset;
+        .reg .b16 xlo, xhi;
+        .reg .pred valid<2>, first, skip, wide;
+        mov.u32 tid, %tid.x;
+        and.b32 tid, tid, 255;
+        and.b32 lane, tid, 31;
+        shr.u32 warp, tid, 5;
+        and.b32 chunk, lane, 3;
+        shr.u32 row, lane, 2;
+        mad.lo.u32 row, warp, 8, row;
+        mul.wide.u32 idx_ptr, row, 4;
+        add.u64 idx_ptr, idx_ptr, $3;
+        ld.global.L1::evict_first.s32 id0, [idx_ptr];
+        ld.global.L1::evict_first.s32 id1, [idx_ptr+256];
+        mov.u32 flag, 0;
+        and.b32 swizzle, row, 7;
+        shl.b32 swizzle, swizzle, 4;
+        shl.b32 offset, chunk, 4;
+        xor.b32 base, swizzle, offset;
+        mad.lo.u32 base, row, 128, base;
+        """
+        for half in range(2):
+            asm += f"""
+            setp.lt.u32 valid{half}, id{half}, $7;
+            @!valid{half} mov.u32 id{half}, 0;
+            selp.u32 size{half}, 16, 0, valid{half};
+            shr.u32 exponent, id{half}, 6;
+            mul.wide.u32 page{half}, exponent, {page_stride};
+            add.u64 page{half}, page{half}, $2;
+            and.b32 slot, id{half}, 63;
+            mad.wide.u32 meta, slot, 8, page{half};
+            ld.global.v2.b32 {{exp_lo{half},exp_hi{half}}}, [meta+36864];
+            mad.wide.u32 src{half}, slot, 576, page{half};
+            cvt.u64.u32 byte_offset, offset;
+            add.u64 src{half}, src{half}, byte_offset;
+            """
+        for half in range(2):
+            asm += f"and.b32 largest{half},exp_lo{half},255; mov.u32 smallest{half},largest{half};\n"
+            for group in range(1, 7):
+                word = "exp_lo" if group < 4 else "exp_hi"
+                asm += f"""
+                bfe.u32 exponent, {word}{half}, {(group % 4) * 8}, 8;
+                max.u32 largest{half}, largest{half}, exponent;
+                min.u32 smallest{half}, smallest{half}, exponent;
+                """
+            asm += f"""
+            sub.u32 delta, largest{half}, smallest{half};
+            setp.gt.and.u32 wide, delta, 2, valid{half};
+            @wide mov.u32 flag, 1;
+            shl.b32 exponent, largest{half}, 23;
+            setp.eq.u32 first, largest{half}, 0;
+            @first mov.u32 exponent, 0x00400000;
+            @!valid{half} mov.u32 exponent, 0xbf800000;
+            setp.eq.u32 first, chunk, 0;
+            mad.lo.u32 tmp, row, 4, $6;
+            @first st.shared.b32 [tmp+{half * 256}], exponent;
+            """
+        # A panel holds 64 rows by 128 FP8 channels per half. The last
+        # transfer also brings in the two 64-byte pieces of BF16 RoPE.
+        for panel in range(4):
+            for group in range(2 * panel, min(2 * panel + 2, 7)):
+                asm += f"xor.b32 exponent,base,{(group % 2) * 64}; add.u32 kdst,$4,exponent;\n"
+                for half in range(2):
+                    dest = half * 32768 + panel * 8192
+                    asm += f"cp.async.cg.shared.global [kdst+{dest}],[src{half}+{group * 64}],16,size{half};\n"
+            if panel == 3:
+                for piece in range(2):
+                    asm += f"xor.b32 exponent,base,{piece * 64}; add.u32 rdst,$5,exponent;\n"
+                    for half in range(2):
+                        asm += (
+                            f"cp.async.cg.shared.global [rdst+{half * 8192}],"
+                            f"[src{half}+{448 + piece * 64}],16,size{half};\n"
+                        )
+            asm += "cp.async.commit_group;\n"
+        for panel in range(4):
+            asm += f"cp.async.wait_group {3 - panel};\n"
+            for group in range(2 * panel, min(2 * panel + 2, 7)):
+                asm += f"xor.b32 exponent,base,{(group % 2) * 64}; add.u32 kdst,$4,exponent;\n"
+                word = "exp_lo" if group < 4 else "exp_hi"
+                for half in range(2):
+                    dest = half * 32768 + panel * 8192
+                    label = f"END_GROUP_{group}_{half}"
+                    asm += f"""
+                    bfe.u32 exponent, {word}{half}, {(group % 4) * 8}, 8;
+                    setp.eq.u32 skip, exponent, largest{half};
+                    @skip bra {label};
+                    sub.u32 delta, largest{half}, exponent;
+                    min.u32 delta, delta, 15;
+                    sub.u32 fac, 15, delta;
+                    shl.b32 fac, fac, 10;
+                    prmt.b32 fac, fac, fac, 0x1010;
+                    ld.shared.v4.b32 {{a,b,c,d}}, [kdst+{dest}];
+                    """
+                    asm += rescale_fp8_registers()
+                    asm += f"st.shared.v4.b32 [kdst+{dest}],{{a,b,c,d}}; {label}:\n"
+            # Each of the eight producer warps signals after its writes to both halves.
+            asm += f"""
+            bar.warp.sync 0xffffffff;
+            fence.proxy.async.shared::cta;
+            setp.eq.u32 first, lane, 0;
+            @first mbarrier.arrive.shared::cta.b64 _, [${8 + panel}];
+            """
+        return asm + "mov.b32 $0,flag; }"
+
+    @triton.constexpr_function
+    def gather_asm(block, page_stride, panel_rows, warps, prefetched):
         # A subgroup of two or four lanes owns one selected row. Every lane keeps
         # that row's address and exponent word through both copying and rescaling.
         rows = block // warps
@@ -2849,18 +3009,24 @@ else:
     add.u32 pos,$8,row;
     setp.lt.u32 ok,pos,$9;
     mov.u32 id,-1;
-    mul.wide.u32 address,pos,4;
-    add.u64 ptr,$3,address;
-    @ok ld.global.L1::evict_first.s32 id,[ptr];
+    """
+        if prefetched:
+            asm += "mad.lo.u32 tmp,pos,4,$10; @ok ld.shared.s32 id,[tmp];\n"
+        else:
+            asm += "mul.wide.u32 address,pos,4; add.u64 ptr,$3,address; @ok ld.global.L1::evict_first.s32 id,[ptr];\n"
+        asm += f"""
     setp.lt.u32 ok,id,$7;
     @!ok mov.u32 id,0;
     shr.u32 page,id,6;
     and.b32 slot,id,63;
     mul.wide.u32 address,page,{page_stride};
     add.u64 pg,$2,address;
-    mul.wide.u32 address,slot,8;
-    add.u64 ptr,pg,address;
-    ld.global.v2.b32 {{e0,e1}},[ptr+36864];
+    """
+        if prefetched:
+            asm += "mad.lo.u32 tmp,pos,8,$11; mov.b32 e0,0; mov.b32 e1,0; @ok ld.shared.v2.b32 {e0,e1},[tmp];\n"
+        else:
+            asm += "mul.wide.u32 address,slot,8; add.u64 ptr,pg,address; ld.global.v2.b32 {e0,e1},[ptr+36864];\n"
+        asm += """
     mul.wide.u32 address,slot,576;
     add.u64 src,pg,address;
     shl.b32 off,chunk,4;
@@ -2875,24 +3041,30 @@ else:
     mad.lo.u32 tmp,row,128,$5;
     add.u32 rbase,tmp,off;
     """
+        copies = []
         for g in range(9):
+            group_copy = ""
             for seg in range(4 // lanes):
                 column_offset = (g % 2) * 64 + seg * lanes * 16
                 adr = g * 64 + seg * lanes * 16
                 if g < 7:
-                    asm += f"xor.b32 kdst,kbase,{column_offset};\n"
-                    asm += f"cp.async.cg.shared.global [kdst+{(g//2)*panel_rows*128}],[src+{adr}],16,sz;\n"
+                    group_copy += f"xor.b32 kdst,kbase,{column_offset};\n"
+                    group_copy += f"cp.async.cg.shared.global [kdst+{(g//2)*panel_rows*128}],[src+{adr}],16,sz;\n"
                 else:
                     column_offset = (g - 7) * 64 + seg * lanes * 16
-                    asm += f"xor.b32 rdst,rbase,{column_offset};\ncp.async.cg.shared.global [rdst],[src+{adr}],16,sz;\n"
-        asm += """
-    cp.async.commit_group;
-    and.b32 hi,e0,255;
-    mov.b32 lo,hi;
-    """
-        for g in range(1, 7):
-            asm += f"bfe.u32 ex,{'e0' if g<4 else 'e1'},{(g%4)*8},8; min.u32 lo,lo,ex; max.u32 hi,hi,ex;\n"
-        asm += """
+                    group_copy += (
+                        f"xor.b32 rdst,rbase,{column_offset};\n"
+                        f"cp.async.cg.shared.global [rdst],[src+{adr}],16,sz;\n"
+                    )
+            copies.append(group_copy)
+        metadata = ""
+        if prefetched:
+            metadata += "shr.u32 hi,e1,24;\n"
+        else:
+            metadata += "and.b32 hi,e0,255; mov.b32 lo,hi;\n"
+            for g in range(1, 7):
+                metadata += f"bfe.u32 ex,{'e0' if g<4 else 'e1'},{(g%4)*8},8; min.u32 lo,lo,ex; max.u32 hi,hi,ex;\n"
+        metadata += """
     shl.b32 tmp,hi,23;
     setp.eq.u32 first,hi,0;
     @first mov.b32 tmp,0x00400000;
@@ -2900,10 +3072,19 @@ else:
     setp.eq.u32 first,chunk,0;
     mad.lo.u32 sdst,row,4,$6;
     @first st.shared.b32 [sdst],tmp;
-    sub.u32 delta,hi,lo;
-    setp.gt.and.u32 wide,delta,2,ok;
-    selp.u32 flag,1,0,wide;
-    setp.ne.and.u32 diff,delta,0,ok;
+    """
+        if prefetched:
+            metadata += (
+                "mov.u32 flag,0; mul.lo.u32 word,hi,0x01010101; setp.ne.u32 diff,e0,word; "
+                "setp.ne.or.u32 diff,e1,word,diff; and.pred diff,diff,ok;\n"
+            )
+        else:
+            metadata += (
+                "sub.u32 delta,hi,lo; setp.gt.and.u32 wide,delta,2,ok; "
+                "selp.u32 flag,1,0,wide; setp.ne.and.u32 diff,delta,0,ok;\n"
+            )
+        asm += "".join(copies) + "cp.async.commit_group;\n" + metadata
+        asm += """
     vote.sync.any.pred any_diff,diff,0xffffffff;
     cp.async.wait_group 0;
     @!any_diff bra DONE;
@@ -2929,17 +3110,7 @@ else:
         asm += f"mad.lo.u32 kdst,tmp,{panel_rows*128},kdst;\n"
         for seg in range(4 // lanes):
             asm += f"xor.b32 rdst,kdst,{seg*lanes*16};\nld.shared.v4.b32 {{a,b,c,d}},[rdst];\n"
-            for reg in ("a", "b", "c", "d"):
-                asm += f"""
-            mov.b32 {{xlo,xhi}},{reg};
-            cvt.rn.f16x2.e4m3x2 tmp,xlo;
-            cvt.rn.f16x2.e4m3x2 u,xhi;
-            mul.f16x2 tmp,tmp,fac;
-            mul.f16x2 u,u,fac;
-            cvt.rn.satfinite.e4m3x2.f16x2 xlo,tmp;
-            cvt.rn.satfinite.e4m3x2.f16x2 xhi,u;
-            mov.b32 {reg},{{xlo,xhi}};
-            """
+            asm += rescale_fp8_registers()
             asm += "st.shared.v4.b32 [rdst],{a,b,c,d};\n"
         return (
             asm
@@ -3166,14 +3337,17 @@ else:
         T: tl.constexpr,
         BK: tl.constexpr,
         STRIDE: tl.constexpr,
+        id_address,
+        exponent_address,
+        PREFETCHED: tl.constexpr,
     ):
         return tl.inline_asm_elementwise(
             (
                 warp_gather_asm(BK, STRIDE, BK, 8)
                 if BK == 128
-                else gather_asm(BK, STRIDE, BK, 8)
+                else gather_asm(BK, STRIDE, BK, 8, PREFETCHED)
             ),
-            "=r,r,l,l,r,r,r,r,r,r",
+            "=r,r,l,l,r,r,r,r,r,r,r,r",
             [
                 tl.arange(0, 256),
                 K.to(tl.uint64),
@@ -3184,6 +3358,8 @@ else:
                 N,
                 first_pos,
                 tl.full((), T, tl.uint32),
+                id_address,
+                exponent_address,
             ],
             dtype=tl.uint32,
             is_pure=False,
@@ -3211,10 +3387,68 @@ else:
         BK: tl.constexpr,
         BUFS: tl.constexpr,
         PREPACK: tl.constexpr,
+        PREFIX: tl.constexpr,
+        TAIL: tl.constexpr,
+        TAIL_SPLITS: tl.constexpr,
     ):
-        b = tl.program_id(0)
-        first, count = split_block_range(tl.program_id(2), tl.cdiv(T, BK), S)
-        repair = tl.full((), 0, tl.int32)
+        b, _, first, count = model1_block_info(
+            tl.program_id(0),
+            tl.program_id(2),
+            tl.cdiv(T, BK),
+            S,
+            PREFIX,
+            TAIL,
+            TAIL_SPLITS,
+        )
+        # Resolve the two dependent global reads for all short-list tiles up front.
+        PREFETCHED: tl.constexpr = (
+            T > 128 and T <= 640 and BK == 64 and S == 1 and not PREPACK
+        )
+        if PREFETCHED:
+            width: tl.constexpr = triton.next_power_of_2(T)
+            saved_ids = tle.gpu.alloc(
+                [width], tl.int32, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            )
+            saved_words = tle.gpu.alloc(
+                [width], tl.int64, scope=tle.gpu.smem, nv_mma_shared_layout=False
+            )
+            pos = tl.arange(0, width)
+            token = tl.load(
+                Idx + b.to(tl.int64) * T + pos,
+                (pos < T) & (pos >= first * BK) & (pos < (first + count) * BK),
+                -1,
+            )
+            valid_token = (token >= 0) & (token < N)
+            selected = tl.where(valid_token, token, 0)
+            page = (selected // 64).to(tl.int64) * STRIDE
+            word = tl.load(
+                K.to(tl.pointer_type(tl.int64)) + page // 8 + 4608 + selected % 64,
+                valid_token,
+                0,
+            )
+            maximum = (word & 255).to(tl.uint32)
+            minimum = maximum
+            for group in tl.static_range(1, 7):
+                exponent = ((word >> (8 * group)) & 255).to(tl.uint32)
+                maximum = tl.maximum(maximum, exponent)
+                minimum = tl.minimum(minimum, exponent)
+            repair = tl.max((valid_token & (maximum - minimum > 2)).to(tl.int32), 0)
+            packed_word = (word.to(tl.uint64) & 0x00FFFFFFFFFFFFFF) | (
+                maximum.to(tl.uint64) << 56
+            )
+            tl.store(tle.gpu.local_ptr(saved_ids), token)
+            tl.store(
+                tle.gpu.local_ptr(saved_words), packed_word.to(tl.int64, bitcast=True)
+            )
+            tl.debug_barrier()
+            id_address = tle.gpu.local_ptr(saved_ids, (0,)).to(tl.uint64).to(tl.uint32)
+            exponent_address = (
+                tle.gpu.local_ptr(saved_words, (0,)).to(tl.uint64).to(tl.uint32)
+            )
+        else:
+            repair = tl.full((), 0, tl.int32)
+            id_address = 0
+            exponent_address = 0
         for step in range(count):
             buf, cycle = step % BUFS, step // BUFS
             if BUFS == 1:
@@ -3297,6 +3531,9 @@ else:
                     T,
                     BK,
                     STRIDE,
+                    id_address,
+                    exponent_address,
+                    PREFETCHED,
                 )
                 repair |= tl.max(flag, 0).to(tl.int32)
             tl.inline_asm_elementwise(
@@ -3401,6 +3638,9 @@ else:
         SPLITS: gl.constexpr,
         BK: gl.constexpr,
     ):
+        K = K.to(gl.pointer_type(gl.float8e4nv))
+        KS = KS.to(gl.pointer_type(gl.int64))
+        KR = KR.to(gl.pointer_type(gl.bfloat16))
         # All eight warps cooperate when a split is exactly one block. There
         # is no running softmax state, inter-partition handoff or KV recycling.
         layout: gl.constexpr = BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0])
@@ -3531,10 +3771,21 @@ else:
         BK: tl.constexpr,
         BUFS: tl.constexpr,
         RING: tl.constexpr,
+        PREFIX: tl.constexpr,
+        TAIL: tl.constexpr,
+        TAIL_SPLITS: tl.constexpr,
     ):
-        b, hb, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-        rows = (b * S + split) * H + hb * 64 + tl.arange(0, 64)
-        _, count = split_block_range(split, tl.cdiv(T, BK), S)
+        hb = tl.program_id(1)
+        b, output_row, _, count = model1_block_info(
+            tl.program_id(0),
+            tl.program_id(2),
+            tl.cdiv(T, BK),
+            S,
+            PREFIX,
+            TAIL,
+            TAIL_SPLITS,
+        )
+        rows = (output_row) * H + hb * 64 + tl.arange(0, 64)
         maximum = tl.full((64,), -float("inf"), tl.float32)
         denom = tl.full((64,), 0.0, tl.float32)
         prev = tl.full((64,), 1.0, tl.float32)
@@ -3685,8 +3936,20 @@ else:
         S: tl.constexpr,
         BK: tl.constexpr,
         BUFS: tl.constexpr,
+        PREFIX: tl.constexpr,
+        TAIL: tl.constexpr,
+        TAIL_SPLITS: tl.constexpr,
     ):
-        b, hb, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        hb = tl.program_id(1)
+        b, output_row, _, count = model1_block_info(
+            tl.program_id(0),
+            tl.program_id(2),
+            tl.cdiv(T, BK),
+            S,
+            PREFIX,
+            TAIL,
+            TAIL_SPLITS,
+        )
         h = (b * H + tl.program_id(1) * 64) + tl.arange(0, 64)
         d = tl.arange(0, 512)
         if S > 1 and T > 640:
@@ -3708,27 +3971,41 @@ else:
             mx = tl.max(scales, 1)
             mn = tl.min(tl.where(scales > 0.0, scales, float("inf")), 1)
             qrepair = tl.max((mx > 4.0 * mn).to(tl.int32), 0)
-            cols128 = tl.arange(0, 128)
-            inv = 1.0 / tl.where(mx > 0.0, mx, 1.0)
-            for pair in tl.static_range(4):
-                dims = pair * 128 + cols128
-                qpart = tl.load(
-                    Q + h[:, None] * 448 + dims[None, :],
-                    dims[None, :] < 448,
+            if T == 128 and S == 1:
+                # Stage the short list's full query from a single load of its group scales.
+                content = tl.load(
+                    Q + h[:, None] * 448 + d[None, :],
+                    d[None, :] < 448,
                     0.0,
                     eviction_policy="evict_first",
                 )
-                qleft = tl.load(QS + h * 7 + 2 * pair) * inv
-                if pair < 3:
-                    qright = tl.load(QS + h * 7 + 2 * pair + 1) * inv
-                else:
-                    qright = 0.0
-                ratio = tl.where(cols128[None, :] < 64, qleft[:, None], qright[:, None])
-                qnorm = (qpart.to(tl.float32) * ratio).to(tl.float8e4nv)
-                tl.store(
-                    tle.gpu.local_ptr(tle_subslice(sq, [0, pair * 128], [64, 128])),
-                    qnorm,
-                )
+                ratios = scales / tl.where(mx > 0.0, mx, 1.0)[:, None]
+                normalized = scaled_bytes(content, ratios, 64)
+                tl.store(tle.gpu.local_ptr(sq), normalized)
+            else:
+                cols128 = tl.arange(0, 128)
+                inv = 1.0 / tl.where(mx > 0.0, mx, 1.0)
+                for pair in tl.static_range(4):
+                    dims = pair * 128 + cols128
+                    qpart = tl.load(
+                        Q + h[:, None] * 448 + dims[None, :],
+                        dims[None, :] < 448,
+                        0.0,
+                        eviction_policy="evict_first",
+                    )
+                    qleft = tl.load(QS + h * 7 + 2 * pair) * inv
+                    if pair < 3:
+                        qright = tl.load(QS + h * 7 + 2 * pair + 1) * inv
+                    else:
+                        qright = 0.0
+                    ratio = tl.where(
+                        cols128[None, :] < 64, qleft[:, None], qright[:, None]
+                    )
+                    qnorm = (qpart.to(tl.float32) * ratio).to(tl.float8e4nv)
+                    tl.store(
+                        tle.gpu.local_ptr(tle_subslice(sq, [0, pair * 128], [64, 128])),
+                        qnorm,
+                    )
         tl.store(tle.gpu.local_ptr(qs), mx)
         tl.store(
             tle.gpu.local_ptr(sr),
@@ -3740,7 +4017,6 @@ else:
         tle.gpu.barrier_arrive(qfull[0])
         tl.atomic_or(Flags + b, 1, mask=qrepair != 0, sem="relaxed")
         tl.atomic_or(RepairState, 1, mask=qrepair != 0, sem="relaxed")
-        _, count = split_block_range(split, tl.cdiv(T, BK), S)
         a1 = tl.full((64, 128), 0.0, tl.float32)
         a = tl.full((64, 128), 0.0, tl.float32)
         c = tl.full((64, 128), 0.0, tl.float32)
@@ -3811,9 +4087,9 @@ else:
                 pass
         tle.gpu.barrier_wait(ofull[0])
         f = tl.load(tle.gpu.local_ptr(factor))
-        sparse_fp8_publish_output(a, f, Output, b * S + split, hb, H, 0, S == 1)
-        sparse_fp8_publish_output(a1, f, Output, b * S + split, hb, H, 128, S == 1)
-        sparse_fp8_publish_output(c, f, Output, b * S + split, hb, H, 256, S == 1)
+        sparse_fp8_publish_output(a, f, Output, output_row, hb, H, 0, S == 1)
+        sparse_fp8_publish_output(a1, f, Output, output_row, hb, H, 128, S == 1)
+        sparse_fp8_publish_output(c, f, Output, output_row, hb, H, 256, S == 1)
 
     @triton.jit
     def model1_fp8(
@@ -3838,6 +4114,9 @@ else:
         BK: tl.constexpr,
         BUFS: tl.constexpr,
         PREPACK: tl.constexpr,
+        PREFIX: tl.constexpr,
+        TAIL: tl.constexpr,
+        TAIL_SPLITS: tl.constexpr,
     ):
         K = E.to(tl.pointer_type(tl.float8e4nv))
         KR = PackedRope if PREPACK else E.to(tl.pointer_type(tl.bfloat16))
@@ -3912,6 +4191,9 @@ else:
                         BK,
                         BUFS,
                         RING,
+                        PREFIX,
+                        TAIL,
+                        TAIL_SPLITS,
                     ),
                 ),
                 (
@@ -3936,6 +4218,9 @@ else:
                         BK,
                         BUFS,
                         PREPACK,
+                        PREFIX,
+                        TAIL,
+                        TAIL_SPLITS,
                     ),
                 ),
                 (
@@ -3969,6 +4254,9 @@ else:
                         S,
                         BK,
                         BUFS,
+                        PREFIX,
+                        TAIL,
+                        TAIL_SPLITS,
                     ),
                 ),
             ],
@@ -4105,6 +4393,38 @@ else:
             else:
                 pass
 
+    @triton.jit
+    def model1_merge_short(
+        Part, Stats, Out, Lse, H: tl.constexpr, S: tl.constexpr, D: tl.constexpr
+    ):
+        # Each CTA owns one full output row and accumulates its short list of splits.
+        b = tl.program_id(0)
+        h = tl.program_id(1)
+        row = b * S * H + h
+        col = tl.program_id(2) * D + tl.arange(0, D)
+        maximum = tl.full((), -float("inf"), tl.float32)
+        stats = ()
+        for split in tl.static_range(S):
+            z = tl.load(Stats + row + split * H)
+            stats += (z,)
+            maximum = tl.maximum(maximum, z)
+        safe = tl.where(maximum == -float("inf"), 0.0, maximum)
+        total = tl.full((), 0.0, tl.float32)
+        value = tl.full((D,), 0.0, tl.float32)
+        for split in tl.static_range(S):
+            w = tl.exp(stats[split] - safe)
+            v = tl.load(Part + (row + split * H) * 512 + col).to(tl.float32)
+            value = tl.fma(v, w, value)
+            total += w
+        outrow = b * H + h
+        tl.store(
+            Out + outrow * 512 + col, value * (1.0 / tl.where(total > 0.0, total, 1.0))
+        )
+        if tl.program_id(2) == 0:
+            tl.store(
+                Lse + outrow, tl.where(total > 0.0, safe + tl.log(total), float("inf"))
+            )
+
     @gluon.jit
     def merge(
         o_part,
@@ -4151,6 +4471,896 @@ else:
             mask=gl.program_id(2) == 0,
         )
 
+    @triton.jit
+    def model1_pack_rows(
+        Content,
+        Rope,
+        Scales,
+        Unified,
+        Magnitude,
+        Bounds,
+        Global,
+        B: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        STRIDE: tl.constexpr,
+        CACHE: tl.constexpr,
+        ROWS: tl.constexpr,
+    ):
+        row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+        d = tl.arange(0, 512)
+        groups = tl.arange(0, 8)
+        rd = tl.arange(0, 64)
+        if CACHE:
+            base = (row // 64).to(tl.int64) * STRIDE
+            payload = base + row % 64 * 576
+            half = payload // 2 + 224
+            exponent = tl.load(
+                Scales + (base + 36864 + (row % 64) * 8)[:, None] + groups[None, :],
+                row[:, None] < N,
+                0,
+            ).to(tl.int32)
+            scales = tl.where(
+                groups[None, :] < 7,
+                tl.maximum(exponent << 23, 0x00400000).to(tl.float32, bitcast=True),
+                0.0,
+            )
+        else:
+            payload = row.to(tl.int64) * 448
+            half = row.to(tl.int64) * 64
+            scales = tl.load(
+                Scales + row[:, None] * 7 + groups[None, :], groups[None, :] < 7, 0.0
+            )
+        valid = row < N
+        data = tl.load(
+            Content + payload[:, None] + d[None, :],
+            valid[:, None] & (d[None, :] < 448),
+            0.0,
+        )
+        rope = tl.load(Rope + half[:, None] + rd[None, :], valid[:, None], 0.0).to(
+            tl.float32
+        )
+        largest = tl.max(scales, 1)
+        smallest = tl.min(tl.where(groups[None, :] < 7, scales, float("inf")), 1)
+        rope_scale = tl.max(tl.abs(rope), 1) * (1.0 / 448.0)
+        # Rounding the tail scale up to a power of two preserves the original
+        # FP8 content when the seven E8M0 groups share a scale.
+        bits = rope_scale.to(tl.uint32, bitcast=True)
+        rope_unit = ((bits + 0x007FFFFF) & 0x7F800000).to(tl.float32, bitcast=True)
+        unit = tl.maximum(largest, rope_unit)
+        inv = 1.0 / tl.where(unit > 0.0, unit, 1.0)
+        ratio = tl.broadcast_to(
+            (scales * inv[:, None])[:, :, None], (ROWS, 8, 64)
+        ).reshape(ROWS, 512)
+        tail = tl.broadcast_to(
+            (rope * inv[:, None])[:, None, :], (ROWS, 8, 64)
+        ).reshape(ROWS, 512)
+        norm = tl.where(d[None, :] < 448, data.to(tl.float32) * ratio, tail)
+        tl.store(
+            Unified + row.to(tl.int64)[:, None] * 512 + d[None, :],
+            norm.to(tl.float8e4nv),
+            valid[:, None],
+        )
+        tl.store(Magnitude + row, unit, valid)
+        wide = (
+            (largest > 4.0 * smallest)
+            | (rope_scale > 4.0 * smallest)
+            | ((rope_scale > 0.0) & (rope_scale * 32.0 < unit))
+        )
+        if CACHE:
+            tl.store(Bounds + row, tl.where(wide, -unit, unit), valid)
+            tl.atomic_max(
+                Global,
+                tl.max(tl.where(valid, unit, 0.0), 0).to(tl.int32, bitcast=True),
+                sem="relaxed",
+            )
+            if tl.max((valid & wide).to(tl.int32), 0):
+                tl.atomic_or(Global + 1, 1, sem="relaxed")
+        else:
+            maximum = tl.max(unit, 0)
+            tl.store(
+                Bounds + tl.program_id(0),
+                tl.where(tl.max(wide.to(tl.int32), 0) != 0, -maximum, maximum),
+            )
+
+    @triton.jit
+    def model1_packed_repair(
+        Q,
+        QR,
+        QS,
+        K,
+        E,
+        KR,
+        Idx,
+        Out,
+        L,
+        QBounds,
+        KBounds,
+        Global,
+        B,
+        N,
+        T: tl.constexpr,
+        H: tl.constexpr,
+        STRIDE: tl.constexpr,
+        SCALE: tl.constexpr,
+    ):
+        kmax = tl.load(Global).to(tl.float32, bitcast=True)
+        wide_cache = tl.load(Global + 1)
+        for b in range(tl.program_id(0), B, tl.num_programs(0)):
+            qs = tl.load(QBounds + b * (H // 16) + tl.arange(0, H // 16))
+            amplification = tl.max(tl.abs(qs), 0) * tl.abs(SCALE * 1.4426950408889634)
+            unsafe = tl.min(qs, 0) < 0.0
+            if wide_cache != 0 or amplification * kmax > QK_RECOMPUTE_THRESHOLD:
+                for step in range(tl.cdiv(T, 256)):
+                    pos = step * 256 + tl.arange(0, 256)
+                    idx = tl.load(Idx + b.to(tl.int64) * T + pos, pos < T, -1)
+                    valid = (idx >= 0) & (idx < N)
+                    ks = tl.load(KBounds + tl.where(valid, idx, 0), valid, 0.0)
+                    unsafe |= (tl.min(ks, 0) < 0.0) | (
+                        amplification * tl.max(tl.abs(ks), 0) > QK_RECOMPUTE_THRESHOLD
+                    )
+            if unsafe:
+                for group in range(H // 16):
+                    repair_heads(
+                        Q,
+                        QR,
+                        QS,
+                        K,
+                        E,
+                        KR,
+                        Idx,
+                        Out,
+                        L,
+                        b,
+                        group,
+                        N,
+                        T,
+                        H,
+                        STRIDE,
+                        SCALE,
+                    )
+
+    @gluon.jit
+    def load_model1_short_group(
+        Q, QS, K, h, token_offsets, columns, exponents, valid, group: gl.constexpr
+    ):
+        query = gl.load(Q + (h * 448 + group * 64)[:, None] + columns[None, :])
+        key = gl.load(
+            K + (token_offsets + group * 64)[:, None] + columns[None, :],
+            valid[:, None],
+            0.0,
+        )
+        query_scale = gl.load(QS + h * 7 + group)
+        exponent = ((exponents >> (group * 8)) & 255).to(gl.int32)
+        key_scale = gl.maximum(exponent << 23, 0x00400000).to(gl.float32, bitcast=True)
+        return query, key, query_scale, key_scale
+
+    @gluon.jit
+    def model1_short_heads(
+        Q,
+        QR,
+        QS,
+        Cache,
+        Indices,
+        Out,
+        Lse,
+        H: gl.constexpr,
+        T: gl.constexpr,
+        N: gl.constexpr,
+        STRIDE: gl.constexpr,
+        SCALE: gl.constexpr,
+        DV: gl.constexpr,
+    ):
+        BH: gl.constexpr = 16
+        BK: gl.constexpr = 128
+        acc: gl.constexpr = NVMMADistributedLayout([2, 0], [1, 8], [16, 8])
+        ar: gl.constexpr = gl.DotOperandLayout(0, acc, 4)
+        br: gl.constexpr = gl.DotOperandLayout(1, acc, 4)
+        ah: gl.constexpr = gl.DotOperandLayout(0, acc, 2)
+        bh: gl.constexpr = gl.DotOperandLayout(1, acc, 2)
+        ld: gl.constexpr = BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0])
+        rv: gl.constexpr = SliceLayout(1, ld)
+        cv: gl.constexpr = SliceLayout(0, ld)
+        batch = gl.program_id(0)
+        h = (
+            batch * H
+            + gl.program_id(1) * BH
+            + gl.arange(0, BH, layout=gl.constexpr(rv))
+        )
+        col0 = gl.program_id(2) * DV
+        pos = gl.arange(0, BK, layout=gl.constexpr(rv))
+        idx = gl.load(Indices + batch * T + pos, pos < T, -1)
+        valid = (idx >= 0) & (idx < N)
+        idx = gl.where(valid, idx, 0)
+        page = (idx // 64).to(gl.int64) * STRIDE
+        off = page + idx % 64 * 576
+        d = gl.arange(0, 64, layout=gl.constexpr(cv))
+        e = gl.load(
+            Cache.to(gl.pointer_type(gl.uint64)) + page // 8 + 4608 + idx % 64, valid, 0
+        )
+        fp8 = Cache.to(gl.pointer_type(gl.float8e4nv))
+        rope = Cache.to(gl.pointer_type(gl.bfloat16))
+        qr = gl.load(QR + h[:, None] * 64 + d[None, :])
+        kr = gl.load(rope + (off // 2 + 224)[:, None] + d[None, :], valid[:, None], 0.0)
+        zero = gl.full((BH, BK), 0, gl.float32, layout=gl.constexpr(acc))
+        LOOKAHEAD: gl.constexpr = 3 if DV == 256 else 7
+        qk_tiles = ()
+        for g in gl.static_range(LOOKAHEAD):
+            qk_tiles += (load_model1_short_group(Q, QS, fp8, h, off, d, e, valid, g),)
+        score = hopper.mma_v2(
+            gl.convert_layout(qr, gl.constexpr(ah)),
+            gl.convert_layout(gl.permute(kr, (1, 0)), gl.constexpr(bh)),
+            zero,
+        )
+        for g in gl.static_range(7):
+            query, key, qs, ks = qk_tiles[g]
+            dot = hopper.mma_v2(
+                gl.convert_layout(query, gl.constexpr(ar)),
+                gl.convert_layout(gl.permute(key, (1, 0)), gl.constexpr(br)),
+                zero,
+            )
+            score += (
+                dot
+                * gl.convert_layout(qs, gl.constexpr(SliceLayout(1, acc)))[:, None]
+                * gl.convert_layout(ks, gl.constexpr(SliceLayout(0, acc)))[None, :]
+            )
+            if g + LOOKAHEAD < 7:
+                qk_tiles += (
+                    load_model1_short_group(
+                        Q, QS, fp8, h, off, d, e, valid, g + LOOKAHEAD
+                    ),
+                )
+        score = gl.where(
+            gl.convert_layout(valid, gl.constexpr(SliceLayout(0, acc)))[None, :],
+            score * (SCALE * 1.4426950408889634),
+            -float("inf"),
+        )
+        m = gl.max(score, 1)
+        p = gl.exp2(score - gl.where(m == -float("inf"), 0.0, m)[:, None])
+        den = gl.sum(p, 1)
+        oh = (
+            batch * H
+            + gl.program_id(1) * BH
+            + gl.arange(0, BH, layout=gl.constexpr(SliceLayout(1, acc)))
+        )
+        prob = gl.convert_layout(p.to(gl.bfloat16), gl.constexpr(ah))
+        inv = 1.0 / gl.where(den > 0.0, den, 1.0)
+        oc = gl.arange(0, 64, gl.constexpr(SliceLayout(0, acc)))
+        # Each CTA already has the selected keys and their scales from QK.
+        for tile in gl.static_range(512 // DV):
+            if gl.program_id(2) == tile:
+                for g in gl.static_range(tile * (DV // 64), (tile + 1) * (DV // 64)):
+                    if g == 7:
+                        value = kr
+                    else:
+                        value = (
+                            qk_tiles[g][1].to(gl.float32) * qk_tiles[g][3][:, None]
+                        ).to(gl.bfloat16)
+                    ans = hopper.mma_v2(
+                        prob,
+                        gl.convert_layout(value, gl.constexpr(bh)),
+                        gl.full((BH, 64), 0.0, gl.float32, layout=gl.constexpr(acc)),
+                    )
+                    gl.store(
+                        Out + oh[:, None] * 512 + g * 64 + oc[None, :],
+                        ans * inv[:, None],
+                    )
+        if col0 == 0:
+            gl.store(
+                Lse + oh,
+                gl.where(den > 0.0, m * 0.6931471805599453 + gl.log(den), float("inf")),
+            )
+
+    @glc.builtin
+    def model1_shared_ptr(buf, _semantic=None):
+        builder = _semantic.builder
+        ty = gl.pointer_type(buf.dtype, 3)
+        zero = _semantic.to_tensor(0).handle
+        op = builder.create_local_pointers(
+            ty.to_ir(builder), buf.handle, *([zero] * len(buf.shape))
+        )
+        return gl.tensor(op.get_result(0), ty)
+
+    @gluon.jit
+    def key_half_address(tile, half, offset: gl.constexpr = 0):
+        lo = model1_shared_ptr(tile.index(offset)).to(gl.uint64).to(gl.uint32)
+        hi = model1_shared_ptr(tile.index(offset + 1)).to(gl.uint64).to(gl.uint32)
+        return gl.where(half != 0, hi, lo)
+
+    @gluon.jit
+    def publish_model1_probabilities(tile, weights):
+        # stmatrix applies the token permutation used by sparse_fp8_transpose_asm.
+        gl.inline_asm_elementwise(
+            """
+            {
+            .reg .b16 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;
+            .reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;
+            .reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;
+            mov.u32 tid, %tid.x;
+            and.b32 warp_off, tid, 96;
+            shl.b32 warp_off, warp_off, 5;
+            and.b32 row_off, tid, 15;
+            shl.b32 row_off, row_off, 6;
+            or.b32 common, warp_off, row_off;
+            and.b32 tmp, tid, 16;
+            or.b32 common, common, tmp;
+            cvt.rn.satfinite.e4m3x2.f32 h0, $33, $32;
+            cvt.rn.satfinite.e4m3x2.f32 h1, $35, $34;
+            cvt.rn.satfinite.e4m3x2.f32 h2, $37, $36;
+            cvt.rn.satfinite.e4m3x2.f32 h3, $39, $38;
+            cvt.rn.satfinite.e4m3x2.f32 h4, $41, $40;
+            cvt.rn.satfinite.e4m3x2.f32 h5, $43, $42;
+            cvt.rn.satfinite.e4m3x2.f32 h6, $45, $44;
+            cvt.rn.satfinite.e4m3x2.f32 h7, $47, $46;
+            cvt.rn.satfinite.e4m3x2.f32 h8, $49, $48;
+            cvt.rn.satfinite.e4m3x2.f32 h9, $51, $50;
+            cvt.rn.satfinite.e4m3x2.f32 h10, $53, $52;
+            cvt.rn.satfinite.e4m3x2.f32 h11, $55, $54;
+            cvt.rn.satfinite.e4m3x2.f32 h12, $57, $56;
+            cvt.rn.satfinite.e4m3x2.f32 h13, $59, $58;
+            cvt.rn.satfinite.e4m3x2.f32 h14, $61, $60;
+            cvt.rn.satfinite.e4m3x2.f32 h15, $63, $62;
+            mov.b32 a0, {h0, h2};
+            mov.b32 a1, {h1, h3};
+            mov.b32 a2, {h4, h6};
+            mov.b32 a3, {h5, h7};
+            mov.b32 b0, {h8, h10};
+            mov.b32 b1, {h9, h11};
+            mov.b32 b2, {h12, h14};
+            mov.b32 b3, {h13, h15};
+            shr.u32 tmp, common, 7;
+            and.b32 tmp, tmp, 3;
+            shl.b32 tmp, tmp, 4;
+            xor.b32 phys0, common, tmp;
+            add.u32 common, common, 32;
+            shr.u32 tmp, common, 7;
+            and.b32 tmp, tmp, 3;
+            shl.b32 tmp, tmp, 4;
+            xor.b32 phys1, common, tmp;
+            add.u32 addr0, $64, phys0;
+            add.u32 addr1, $64, phys1;
+            stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};
+            stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};
+            fence.proxy.async.shared::cta;
+            mov.u32 $0, $64;
+            }
+            """,
+            "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
+            "f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,"
+            "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r",
+            [weights, model1_shared_ptr(tile).to(gl.uint64).to(gl.uint32)],
+            gl.uint32,
+            is_pure=False,
+            pack=32,
+        )
+
+    @gluon.jit
+    def model1_load_128_keys(
+        Cache,
+        Idx,
+        sk,
+        kr,
+        ks,
+        vt,
+        bars,
+        panel_ready,
+        Flags,
+        H: gl.constexpr,
+        N: gl.constexpr,
+        PAGE_STRIDE: gl.constexpr,
+    ):
+        lane_ids = gl.arange(0, 256, gl.constexpr(BlockedLayout([1], [32], [8], [0])))
+        b = gl.program_id(0)
+        half = gl.inline_asm_elementwise(
+            "{.reg .b32 t; mov.u32 t,%tid.x; shr.u32 t,t,7; and.b32 $0,t,1;}",
+            "=r,r",
+            [lane_ids],
+            gl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+        keys_addr = key_half_address(sk, half, 0)
+        data = gl.inline_asm_elementwise(
+            gather_topk128_asm(PAGE_STRIDE),
+            "=r,r,l,l,r,r,r,r,r,r,r,r",
+            [
+                lane_ids,
+                Cache.to(gl.uint64),
+                (Idx + b.to(gl.int64) * 128).to(gl.uint64),
+                model1_shared_ptr(sk.index(0)).to(gl.uint64).to(gl.uint32),
+                model1_shared_ptr(kr.index(0)).to(gl.uint64).to(gl.uint32),
+                model1_shared_ptr(ks.index(0)).to(gl.uint64).to(gl.uint32),
+                N,
+                model1_shared_ptr(panel_ready.index(0)).to(gl.uint64).to(gl.uint32),
+                model1_shared_ptr(panel_ready.index(1)).to(gl.uint64).to(gl.uint32),
+                model1_shared_ptr(panel_ready.index(2)).to(gl.uint64).to(gl.uint32),
+                model1_shared_ptr(panel_ready.index(3)).to(gl.uint64).to(gl.uint32),
+            ],
+            gl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+        risk = gl.max(data, 0).to(gl.int32)
+        values_addr = key_half_address(vt, half, 0)
+        gl.thread_barrier()
+        for g in gl.static_range(4):
+            for w in gl.static_range(1 if g == 3 else 2):
+                gl.inline_asm_elementwise(
+                    sparse_fp8_transpose_asm(),
+                    "=r,r,r,r,r",
+                    [lane_ids, keys_addr + g * 8192, values_addr + g * 8192, w * 4],
+                    gl.uint32,
+                    is_pure=False,
+                    pack=1,
+                )
+        gl.thread_barrier()
+        hopper.fence_async_shared()
+        hopper.mbarrier.arrive(bars.index(2))
+        gl.store(Flags + (b * (H // 64) + gl.program_id(1)) * 3, risk)
+
+    @gluon.jit
+    def store_model1_output_band(
+        result, tile, offset: gl.constexpr, width: gl.constexpr
+    ):
+        bands = gl.reshape(result, (64, width // 16, 2, 8))
+        natural = gl.reshape(gl.permute(bands, (0, 1, 3, 2)), (64, width))
+        tile.slice(offset, width, 1).store(natural)
+
+    @gluon.jit
+    def model1_compute_128(
+        Q,
+        QR,
+        QS,
+        Out,
+        L,
+        Flags,
+        sq,
+        qr,
+        qm,
+        sk,
+        kr,
+        ks,
+        vt,
+        sp,
+        pr,
+        maxima,
+        denominators,
+        bars,
+        panel_ready,
+        HALF: gl.constexpr,
+        H: gl.constexpr,
+        SCALE: gl.constexpr,
+        WIDE_OFFSETS: gl.constexpr,
+    ):
+        ld: gl.constexpr = BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+        lr: gl.constexpr = SliceLayout(1, ld)
+        lc: gl.constexpr = SliceLayout(0, ld)
+        score_layout: gl.constexpr = NVMMADistributedLayout(
+            [3, 0], [4, 1], [16, 64, 32]
+        )
+        rope_layout: gl.constexpr = NVMMADistributedLayout([3, 0], [4, 1], [16, 64, 16])
+        value_layout: gl.constexpr = NVMMADistributedLayout(
+            [3, 0], [4, 1], [16, 128, 32]
+        )
+        b = gl.program_id(0)
+        hb = gl.program_id(1)
+        row = b.to(gl.int64) if WIDE_OFFSETS else b
+        h = row * H + hb * 64 + HALF * 32 + gl.arange(0, 32, gl.constexpr(lr))
+        d = gl.arange(0, 512, gl.constexpr(lc))
+        g = gl.arange(0, 8, gl.constexpr(lc))
+        q = gl.load(Q + h[:, None] * 448 + d[None, :], d[None, :] < 448, 0.0)
+        scales = gl.load(QS + h[:, None] * 7 + g[None, :], g[None, :] < 7, 0.0)
+        unit = gl.max(scales, 1)
+        # For normal positive scales, exponent deltas of zero, one and two
+        # are exact FP16 gains. Check all mantissa bits before using this path.
+        difference = unit[:, None].to(gl.uint32, bitcast=True) - scales.to(
+            gl.uint32, bitcast=True
+        )
+        incompatible = ((difference & 0x007FFFFF) != 0) | (difference > 0x01000000)
+        unsafe = gl.max(((g[None, :] < 7) & incompatible).to(gl.int32), 1)
+        unsafe |= (unit < 4.70197740328915e-38).to(gl.int32)
+        group_flag = Flags + (b * (H // 64) + hb) * 3 + 1 + HALF
+        gl.store(group_flag, gl.max(unsafe, 0))
+        delta = gl.minimum(difference >> 23, 2)
+        fp16_ratio = ((15 - delta) << 10).to(gl.uint16).to(gl.float16, bitcast=True)
+        tiled: gl.constexpr = BlockedLayout([1, 1, 8], [4, 1, 8], [4, 1, 1], [2, 1, 0])
+        ratios = gl.expand_dims(
+            gl.convert_layout(fp16_ratio, gl.constexpr(SliceLayout(2, tiled))), 2
+        )
+        fp16 = gl.convert_layout(
+            gl.reshape(q.to(gl.float16), (32, 8, 64)), gl.constexpr(tiled)
+        )
+        normalized = gl.reshape((fp16 * ratios).to(gl.float8e4nv), (32, 512))
+        sq.slice(HALF * 32, 32, 0).store(normalized)
+        qm.slice(HALF * 32, 32, 0).store(unit)
+        rd = gl.arange(0, 64, gl.constexpr(lc))
+        qr.slice(HALF * 32, 32, 0).store(gl.load(QR + h[:, None] * 64 + rd[None, :]))
+        hopper.fence_async_shared()
+        gl.thread_barrier()
+        hopper.mbarrier.arrive(bars.index(0))
+        hopper.mbarrier.wait(bars.index(0), phase=0)
+        key = sk.index(HALF)
+        hopper.mbarrier.wait(panel_ready.index(0), phase=0)
+        score = hopper.warpgroup_mma(
+            sq.slice(0, 128, 1),
+            key.slice(0, 128, 1).permute((1, 0)),
+            gl.full((64, 64), 0.0, gl.float32, layout=gl.constexpr(score_layout)),
+            use_acc=False,
+            is_async=True,
+        )
+        hopper.mbarrier.wait(panel_ready.index(1), phase=0)
+        score = hopper.warpgroup_mma(
+            sq.slice(128, 128, 1),
+            key.slice(128, 128, 1).permute((1, 0)),
+            score,
+            is_async=True,
+        )
+        hopper.mbarrier.wait(panel_ready.index(2), phase=0)
+        score = hopper.warpgroup_mma(
+            sq.slice(256, 128, 1),
+            key.slice(256, 128, 1).permute((1, 0)),
+            score,
+            is_async=True,
+        )
+        hopper.mbarrier.wait(panel_ready.index(3), phase=0)
+        score = hopper.warpgroup_mma(
+            sq.slice(384, 64, 1),
+            key.slice(384, 64, 1).permute((1, 0)),
+            score,
+            is_async=True,
+        )
+        rope = hopper.warpgroup_mma(
+            qr,
+            kr.index(HALF).permute((1, 0)),
+            gl.full((64, 64), 0.0, gl.float32, layout=gl.constexpr(rope_layout)),
+            use_acc=False,
+            is_async=True,
+        )
+        score, rope = hopper.warpgroup_mma_wait(0, deps=(score, rope))
+        kfactor = ks.index(HALF).load(gl.constexpr(SliceLayout(0, score_layout)))
+        logits = gl.where(
+            kfactor[None, :] >= 0.0,
+            (
+                score
+                * qm.load(gl.constexpr(SliceLayout(1, score_layout)))[:, None]
+                * kfactor[None, :]
+                + gl.convert_layout(rope, gl.constexpr(score_layout))
+            )
+            * (SCALE * 1.4426950408889634),
+            -float("inf"),
+        )
+        m = gl.max(logits, 1)
+        maxima.index(HALF).store(m)
+        gl.thread_barrier()
+        hopper.mbarrier.arrive(bars.index(1))
+        hopper.mbarrier.wait(bars.index(1), phase=0)
+        top = gl.maximum(
+            m, maxima.index(1 - HALF).load(gl.constexpr(SliceLayout(1, score_layout)))
+        )
+        p = gl.exp2(logits - gl.where(top == -float("inf"), 0.0, top)[:, None])
+        denominators.index(HALF).store(gl.sum(p, 1))
+        k0 = ks.index(0).load(gl.constexpr(SliceLayout(0, score_layout)))
+        k1 = ks.index(1).load(gl.constexpr(SliceLayout(0, score_layout)))
+        peak = gl.max(gl.maximum(k0, k1), 0)
+        floor = gl.min(
+            gl.minimum(
+                gl.where(k0 > 0.0, k0, float("inf")),
+                gl.where(k1 > 0.0, k1, float("inf")),
+            ),
+            0,
+        )
+        if HALF == 0:
+            gl.store(group_flag, 1, mask=peak > 4.0 * floor)
+        value_scale = peak * (1.0 / 448.0)
+        value_scale = gl.where(value_scale > 0.0, value_scale, 1.0)
+        weighted = p * (gl.maximum(kfactor, 0.0)[None, :] / value_scale)
+        publish_model1_probabilities(sp.index(HALF), weighted)
+        pr.index(HALF).store(p.to(gl.bfloat16))
+        gl.thread_barrier()
+        hopper.fence_async_shared()
+        hopper.mbarrier.arrive(bars.index(2))
+        hopper.mbarrier.wait(bars.index(2), phase=0)
+        den = denominators.index(0).load(
+            gl.constexpr(SliceLayout(1, value_layout))
+        ) + denominators.index(1).load(gl.constexpr(SliceLayout(1, value_layout)))
+        inv = 1.0 / gl.where(den > 0.0, den, 1.0)
+        first_head = b * H + hb * 64
+        # Both score products and the value transpose have finished using the key tile.
+        s_out = sk.index(HALF)._reinterpret(
+            gl.bfloat16, [64, 256], gl.constexpr(NVMMASharedLayout(128, 16))
+        )
+        for t in gl.static_range(2):
+            if HALF == 0 or t == 0:
+                value = hopper.warpgroup_mma(
+                    sp.index(0),
+                    vt.index(0).slice(HALF * 256 + t * 128, 128, 0).permute((1, 0)),
+                    gl.full(
+                        (64, 128), 0.0, gl.float32, layout=gl.constexpr(value_layout)
+                    ),
+                    use_acc=False,
+                    is_async=True,
+                )
+                value = hopper.warpgroup_mma(
+                    sp.index(1),
+                    vt.index(1).slice(HALF * 256 + t * 128, 128, 0).permute((1, 0)),
+                    value,
+                    is_async=True,
+                )
+                value = hopper.warpgroup_mma_wait(0, deps=(value,))
+                store_model1_output_band(
+                    (value * (inv * value_scale)[:, None]).to(gl.bfloat16),
+                    s_out,
+                    t * 128,
+                    128,
+                )
+                if t == 0:
+                    gl.thread_barrier()
+                    hopper.fence_async_shared()
+                    hopper.tma.async_copy_shared_to_global(
+                        Out, [first_head, HALF * 256], s_out.slice(0, 128, 1)
+                    )
+            else:
+                last = hopper.warpgroup_mma(
+                    sp.index(0),
+                    vt.index(0).slice(384, 64, 0).permute((1, 0)),
+                    gl.full(
+                        (64, 64), 0.0, gl.float32, layout=gl.constexpr(score_layout)
+                    ),
+                    use_acc=False,
+                    is_async=True,
+                )
+                last = hopper.warpgroup_mma(
+                    sp.index(1),
+                    vt.index(1).slice(384, 64, 0).permute((1, 0)),
+                    last,
+                    is_async=True,
+                )
+                last = hopper.warpgroup_mma_wait(0, deps=(last,))
+                store_model1_output_band(
+                    (
+                        last
+                        * gl.convert_layout(
+                            inv * value_scale,
+                            gl.constexpr(SliceLayout(1, score_layout)),
+                        )[:, None]
+                    ).to(gl.bfloat16),
+                    s_out,
+                    128,
+                    64,
+                )
+        if HALF == 1:
+            tail = hopper.warpgroup_mma(
+                pr.index(0),
+                kr.index(0),
+                gl.full((64, 64), 0.0, gl.float32, layout=gl.constexpr(rope_layout)),
+                use_acc=False,
+                is_async=True,
+            )
+            tail = hopper.warpgroup_mma(pr.index(1), kr.index(1), tail, is_async=True)
+            tail = hopper.warpgroup_mma_wait(0, deps=(tail,))
+            s_out.slice(192, 64, 1).store(
+                (
+                    tail
+                    * gl.convert_layout(inv, gl.constexpr(SliceLayout(1, rope_layout)))[
+                        :, None
+                    ]
+                ).to(gl.bfloat16)
+            )
+        else:
+            oh = first_head + gl.arange(
+                0, 64, gl.constexpr(SliceLayout(1, score_layout))
+            )
+            norm = gl.convert_layout(den, gl.constexpr(SliceLayout(1, score_layout)))
+            gl.store(
+                L + oh,
+                gl.where(
+                    norm > 0.0, top * 0.6931471805599453 + gl.log(norm), float("inf")
+                ),
+            )
+
+        gl.thread_barrier()
+        hopper.fence_async_shared()
+        hopper.tma.async_copy_shared_to_global(
+            Out, [first_head, HALF * 256 + 128], s_out.slice(128, 128, 1)
+        )
+        hopper.tma.store_wait(0)
+
+    @gluon.jit
+    def model1_topk128(
+        Q,
+        QR,
+        QS,
+        Cache,
+        Idx,
+        Out,
+        L,
+        Flags,
+        H: gl.constexpr,
+        N: gl.constexpr,
+        PAGE_STRIDE: gl.constexpr,
+        SCALE: gl.constexpr,
+        WIDE_OFFSETS: gl.constexpr,
+    ):
+        key_layout: gl.constexpr = NVMMASharedLayout(128, 8)
+        transposed_layout: gl.constexpr = NVMMASharedLayout(64, 8)
+        bf16_layout: gl.constexpr = NVMMASharedLayout(128, 16)
+        scalar_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+        sq = gl.allocate_shared_memory(
+            gl.float8e4nv, (64, 512), gl.constexpr(key_layout)
+        )
+        qr = gl.allocate_shared_memory(gl.bfloat16, (64, 64), gl.constexpr(bf16_layout))
+        qm = gl.allocate_shared_memory(gl.float32, (64,), gl.constexpr(scalar_layout))
+        sk = gl.allocate_shared_memory(
+            gl.float8e4nv, (2, 64, 512), gl.constexpr(key_layout)
+        )
+        kr = gl.allocate_shared_memory(
+            gl.bfloat16, (2, 64, 64), gl.constexpr(bf16_layout)
+        )
+        ks = gl.allocate_shared_memory(gl.float32, (2, 64), gl.constexpr(scalar_layout))
+        vt = gl.allocate_shared_memory(
+            gl.float8e4nv, (2, 512, 64), gl.constexpr(transposed_layout)
+        )
+        sp = gl.allocate_shared_memory(
+            gl.float8e4nv, (2, 64, 64), gl.constexpr(transposed_layout)
+        )
+        pr = gl.allocate_shared_memory(
+            gl.bfloat16, (2, 64, 64), gl.constexpr(bf16_layout)
+        )
+        maxima = gl.allocate_shared_memory(
+            gl.float32, (2, 64), gl.constexpr(scalar_layout)
+        )
+        denominators = gl.allocate_shared_memory(
+            gl.float32, (2, 64), gl.constexpr(scalar_layout)
+        )
+        bars = gl.allocate_shared_memory(
+            gl.int64, (3, 1), gl.constexpr(hopper.mbarrier.MBarrierLayout())
+        )
+        for i in gl.static_range(3):
+            hopper.mbarrier.init(bars.index(i), count=3 if i == 2 else 2)
+        panel_ready = gl.allocate_shared_memory(
+            gl.int64, (4, 1), gl.constexpr(hopper.mbarrier.MBarrierLayout())
+        )
+        for z in gl.static_range(4):
+            hopper.mbarrier.init(panel_ready.index(z), count=8)
+        gl.warp_specialize(
+            [
+                (
+                    model1_compute_128,
+                    (
+                        Q,
+                        QR,
+                        QS,
+                        Out,
+                        L,
+                        Flags,
+                        sq,
+                        qr,
+                        qm,
+                        sk,
+                        kr,
+                        ks,
+                        vt,
+                        sp,
+                        pr,
+                        maxima,
+                        denominators,
+                        bars,
+                        panel_ready,
+                        0,
+                        H,
+                        SCALE,
+                        WIDE_OFFSETS,
+                    ),
+                ),
+                (
+                    model1_compute_128,
+                    (
+                        Q,
+                        QR,
+                        QS,
+                        Out,
+                        L,
+                        Flags,
+                        sq,
+                        qr,
+                        qm,
+                        sk,
+                        kr,
+                        ks,
+                        vt,
+                        sp,
+                        pr,
+                        maxima,
+                        denominators,
+                        bars,
+                        panel_ready,
+                        1,
+                        H,
+                        SCALE,
+                        WIDE_OFFSETS,
+                    ),
+                ),
+                (
+                    model1_load_128_keys,
+                    (
+                        Cache,
+                        Idx,
+                        sk,
+                        kr,
+                        ks,
+                        vt,
+                        bars,
+                        panel_ready,
+                        Flags,
+                        H,
+                        N,
+                        PAGE_STRIDE,
+                    ),
+                ),
+            ],
+            [4, 8],
+            [192, 64],
+        )
+
+    @triton.jit
+    def model1_topk128_repair(
+        Q,
+        QR,
+        QS,
+        K,
+        E,
+        KR,
+        Idx,
+        Out,
+        L,
+        Flags,
+        B,
+        N,
+        T: tl.constexpr,
+        H: tl.constexpr,
+        PAGE_STRIDE: tl.constexpr,
+        SCALE: tl.constexpr,
+    ):
+        slot = tl.program_id(0) * 16 + tl.arange(0, 16)
+        valid = slot < B * (H // 64)
+        bad = (
+            tl.load(Flags + slot * 3, valid, 0)
+            | tl.load(Flags + slot * 3 + 1, valid, 0)
+            | tl.load(Flags + slot * 3 + 2, valid, 0)
+        )
+        if tl.max(bad, 0) == 0:
+            return
+        for g in range(
+            tl.program_id(0) * 16,
+            tl.minimum((tl.program_id(0) + 1) * 16, B * (H // 64)),
+        ):
+            if (
+                tl.load(Flags + g * 3)
+                | tl.load(Flags + g * 3 + 1)
+                | tl.load(Flags + g * 3 + 2)
+            ):
+                for j in tl.static_range(4):
+                    repair_heads(
+                        Q,
+                        QR,
+                        QS,
+                        K,
+                        E,
+                        KR,
+                        Idx,
+                        Out,
+                        L,
+                        g // (H // 64),
+                        g % (H // 64) * 4 + j,
+                        N,
+                        T,
+                        H,
+                        PAGE_STRIDE,
+                        SCALE,
+                    )
+
+    model1_short_plans = {}
+
     def model1_attention(
         q: torch.Tensor,
         q_rope: torch.Tensor,
@@ -4161,7 +5371,7 @@ else:
         tokens: int,
         scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch, heads, width = q.shape
+        batch, _, heads, width = q.shape
         pages = packed_cache.shape[0]
         topk = indices.shape[-1]
         if batch == 0 or heads not in (64, 128) or width != 448 or topk == 0:
@@ -4171,13 +5381,13 @@ else:
         if q.dtype != torch.float8_e4m3fn or not q.is_contiguous():
             raise ValueError("Query content must be contiguous E4M3")
         if (
-            q_rope.shape != (batch, heads, 64)
+            q_rope.shape != (batch, 1, heads, 64)
             or q_rope.dtype != torch.bfloat16
             or not q_rope.is_contiguous()
         ):
             raise ValueError("Query RoPE must be contiguous BF16 [batch, heads, 64]")
         if (
-            q_scale.shape != (batch, heads, 7)
+            q_scale.shape != (batch, 1, heads, 7)
             or q_scale.dtype != torch.float32
             or not q_scale.is_contiguous()
         ):
@@ -4210,9 +5420,211 @@ else:
         ):
             raise ValueError("Model1 tensors must share a CUDA device")
 
+        if topk == 128 and batch > 64:
+            out = q_rope.new_empty((batch, 1, heads, 512))
+            lse = q_scale.new_empty((batch, heads, 1))
+            flags = indices.new_empty((batch, heads // 64, 3))
+            desc = TensorDescriptor(
+                out,
+                [batch * heads, 512],
+                [512, 1],
+                [64, 128],
+                NVMMASharedLayout(128, 16),
+            )
+            model1_topk128[(batch, heads // 64)](
+                q,
+                q_rope,
+                q_scale,
+                packed_cache,
+                indices,
+                desc,
+                lse,
+                flags,
+                heads,
+                tokens,
+                packed_cache.stride(0),
+                scale,
+                q.numel() > 0x7FFFFFFF,
+                num_warps=4,
+                ptx_options="--register-usage-level=6",
+                num_stages=1,
+            )
+            keys, exponents, rope, stride, _, _ = cache_views(packed_cache)
+            model1_topk128_repair[(triton.cdiv(batch * (heads // 64), 16),)](
+                q,
+                q_rope,
+                q_scale,
+                keys,
+                exponents.view(torch.uint8),
+                rope,
+                indices,
+                out,
+                lse,
+                flags,
+                batch,
+                tokens,
+                128,
+                heads,
+                stride,
+                scale,
+                num_warps=4,
+                num_stages=1,
+            )
+            return out, lse
+
+        if batch <= 16 and topk <= 640:
+            bk = 64 if topk <= 64 else 128
+            splits = triton.cdiv(topk, bk)
+            grid = (batch, heads // 64, splits)
+            out = q_rope.new_empty((batch, 1, heads, 512))
+            lse = q_scale.new_empty((batch, heads, 1))
+            if splits == 1:
+                part, stats = out, lse
+            else:
+                part = out.new_empty((batch, splits, heads, 512))
+                stats = lse.new_empty((batch, splits, heads))
+            stride = packed_cache.stride(0)
+            args = (
+                q,
+                q_rope,
+                q_scale,
+                packed_cache,
+                packed_cache,
+                packed_cache,
+                indices,
+                part,
+                stats,
+                scale,
+                tokens,
+                topk,
+                stride,
+                heads,
+                splits,
+                bk,
+            )
+            if topk == 128:
+                dv = 64 if batch <= 4 else 128 if batch <= 8 else 256
+                grid = (batch, heads // 16, 512 // dv)
+                args = (
+                    q,
+                    q_rope,
+                    q_scale,
+                    packed_cache,
+                    indices,
+                    out,
+                    lse,
+                    heads,
+                    topk,
+                    tokens,
+                    stride,
+                    scale,
+                    dv,
+                )
+                attention = model1_short_heads
+            else:
+                attention = one_block
+            alignment = (
+                q.data_ptr() % 16,
+                q_rope.data_ptr() % 16,
+                q_scale.data_ptr() % 16,
+                indices.data_ptr() % 16,
+            )
+            key = (q.device, batch, heads, scale, tokens, topk, stride, alignment)
+            runners = model1_short_plans.get(key)
+            if runners is None:
+                main = attention[grid](*args, num_warps=8, num_stages=1)
+                reduce = None
+                if splits > 1:
+                    reduce = model1_merge_short[(batch, heads, 1)](
+                        part, stats, out, lse, heads, splits, 512, num_warps=2
+                    )[(batch, heads, 1)]
+                if len(model1_short_plans) >= 128:
+                    model1_short_plans.clear()
+                model1_short_plans[key] = (main[grid], reduce)
+            else:
+                main, reduce = runners
+                main(*args)
+                if splits > 1:
+                    reduce(part, stats, out, lse, heads, splits, 512)
+            return out, lse
+        q, q_rope, q_scale = q[:, 0], q_rope[:, 0], q_scale[:, 0]
         fp8_keys, exponent_words, bf16_keys, page_stride, _, _ = cache_views(
             packed_cache
         )
+        if topk >= 512 and tokens == pages * 64 and batch * topk >= 8 * tokens:
+            # Amortize the conversion over repeated cache visits in this call.
+            query = q.new_empty((batch, 1, heads, 512))
+            cache = q.new_empty((pages, 64, 512))
+            qs = q_scale.new_empty((batch, 1, heads, 1))
+            ks = q_scale.new_empty((pages, 64, 1))
+            query_bounds = q_scale.new_empty((batch, heads // 16))
+            key_bounds = q_scale.new_empty((tokens,))
+            key_range = indices.new_zeros((2,))
+            model1_pack_rows[(batch * heads // 16,)](
+                q,
+                q_rope,
+                q_scale,
+                query,
+                qs,
+                query_bounds,
+                key_range,
+                batch,
+                heads,
+                batch * heads,
+                0,
+                False,
+                16,
+                num_warps=8,
+            )
+            model1_pack_rows[(triton.cdiv(tokens, 32),)](
+                fp8_keys,
+                bf16_keys,
+                packed_cache,
+                cache,
+                ks,
+                key_bounds,
+                key_range,
+                batch,
+                heads,
+                tokens,
+                page_stride,
+                True,
+                32,
+                num_warps=8,
+            )
+            out, lse = sparse_attention(
+                query,
+                q_rope[:, None, :, :0],
+                cache,
+                q_rope.new_empty((pages, 64, 0)),
+                qs,
+                ks,
+                indices,
+                scale,
+            )
+            model1_packed_repair[(min(batch, 256),)](
+                q,
+                q_rope,
+                q_scale,
+                fp8_keys,
+                packed_cache,
+                bf16_keys,
+                indices,
+                out,
+                lse,
+                query_bounds,
+                key_bounds,
+                key_range,
+                batch,
+                tokens,
+                topk,
+                heads,
+                page_stride,
+                scale,
+                num_warps=8,
+                num_stages=1,
+            )
+            return out, lse
         sm = torch.cuda.get_device_properties(q.device).multi_processor_count
         work = batch * (heads // 64)
         sm_limit = sm // work
@@ -4235,10 +5647,31 @@ else:
             )
         # Bound FP8 MMA accumulation before the FP32 split reduction.
         splits = max(splits, triton.cdiv(topk, 4096))
-        out = torch.empty((batch, heads, 512), dtype=torch.bfloat16, device=q.device)
-        lse = torch.empty((batch, heads), dtype=torch.float32, device=q.device)
-        part = out if splits == 1 else out.new_empty((batch, splits, heads, 512))
-        stats = lse if splits == 1 else lse.new_empty((batch, splits, heads))
+        wave = sm // (heads // 64)
+        remainder = batch % wave
+        tail_splits = 0
+        if (
+            128 < topk <= 640
+            and splits == 1
+            and wave < batch <= 8 * wave
+            and 0 < remainder < wave // 2
+        ):
+            tail_splits = min(5, wave // remainder, num_blocks)
+        if tail_splits > 1:
+            prefix = batch - remainder
+            grid_batch = prefix + remainder * tail_splits
+            part = q_rope.new_empty((batch + remainder * tail_splits, heads, 512))
+            stats = q_scale.new_empty((batch + remainder * tail_splits, heads))
+            out, lse = part[:batch], stats[:batch]
+        else:
+            prefix, remainder, tail_splits = 0, 0, 0
+            grid_batch = batch
+            out = torch.empty(
+                (batch, heads, 512), dtype=torch.bfloat16, device=q.device
+            )
+            lse = torch.empty((batch, heads), dtype=torch.float32, device=q.device)
+            part = out if splits == 1 else out.new_empty((batch, splits, heads, 512))
+            stats = lse if splits == 1 else lse.new_empty((batch, splits, heads))
         if exact:
             one_block[(batch, heads // 64, splits)](
                 q,
@@ -4260,7 +5693,7 @@ else:
                 num_warps=8,
                 num_stages=1,
             )
-            return out, lse
+            return out[:, None], lse[:, :, None]
         repair_flags = torch.zeros(batch + 1, dtype=torch.int32, device=q.device)
         flags, repair_state = repair_flags[1:], repair_flags[:1]
         exponent_bytes = exponent_words.view(torch.uint8)
@@ -4289,7 +5722,7 @@ else:
             )
         else:
             normalized, token_scale, rope_cache = fp8_keys, q_scale, bf16_keys
-        model1_fp8[(batch, heads // 64, splits)](
+        model1_fp8[(grid_batch, heads // 64, splits)](
             rope_cache,
             query,
             q_rope,
@@ -4311,11 +5744,25 @@ else:
             block,
             128 // block,
             prepack,
+            prefix,
+            remainder,
+            tail_splits,
             ptx_options="--register-usage-level=2",
             num_warps=4,
             num_stages=1,
         )
-        if splits == 1:
+        if tail_splits:
+            merge[(remainder, heads, 1)](
+                part[batch:],
+                stats[batch:],
+                out[prefix:],
+                lse[prefix:],
+                heads,
+                tail_splits,
+                512,
+                num_warps=2,
+            )
+        elif splits == 1:
             pass  # The attention kernel wrote the final output directly.
         elif splits == 2:
             merge_two[(batch, heads // 2)](part, stats, out, lse, heads, num_warps=2)
@@ -4352,7 +5799,7 @@ else:
             num_warps=8,
             num_stages=1,
         )
-        return out, lse
+        return out[:, None], lse[:, :, None]
 
     SPARSE_LAUNCH_CACHE_LIMIT = 128
 
@@ -4452,10 +5899,10 @@ else:
                 )
             if q_rope.shape[1] != 1 or q_scale.shape[1] != 1:
                 raise ValueError("Expected singleton RoPE and scale query length")
-            output, lse = model1_attention(
-                q_nope[:, 0],
-                q_rope[:, 0],
-                q_scale[:, 0],
+            return model1_attention(
+                q_nope,
+                q_rope,
+                q_scale,
                 k_cache_lora,
                 indices,
                 tokens=(
@@ -4463,7 +5910,6 @@ else:
                 ),
                 scale=512**-0.5 if softmax_scale is None else float(softmax_scale),
             )
-            return output[:, None], lse[:, :, None]
         if cache_tokens is not None or k_cache_rope is None or k_scale is None:
             raise ValueError("Separate V32 pages require explicit RoPE and scales")
         if (

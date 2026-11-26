@@ -290,6 +290,102 @@ def test_native_v4_sparse_attention(topk):
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
 @pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+@pytest.mark.parametrize(
+    "batch,heads,tokens,topk",
+    [
+        (8, 128, 665, 128),
+        (16, 64, 665, 128),
+        (96, 64, 665, 128),
+        (16, 64, 193, 640),
+        (160, 64, 16533, 640),
+        (32, 64, 256, 640),
+    ],
+)
+def test_native_v4_group_scales(batch, heads, tokens, topk):
+    shape = (batch, heads, 512, tokens, 1, topk, 512, False, False, 17)
+    inputs = make_sparse_inputs(shape)
+    # Only some queries and physical tokens require the wider scale range.
+    inputs[0][::4, :, :64].mul_(16)
+    inputs[1][::13, :, :64].mul_(16)
+    inputs[2][0].fill_(-1)
+    baseline, packed = native_v4_inputs(inputs)
+    # The public query format accepts positive FP32 scales between powers of two.
+    columns = slice(64, 128)
+    group_scale = packed[4][:, 0, :, 1:2]
+    group_scale.mul_(1.3)
+    baseline[0][..., columns].copy_(
+        (packed[0][:, 0, :, columns].float() * group_scale).to(torch.bfloat16)
+    )
+    reference, _, reference_lse = flashmla_reference().flash_mla_sparse_fwd(*baseline)
+    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed, cache_tokens=tokens)
+    for columns in (slice(None), slice(448, None)):
+        assert_sparse_fixture_close(
+            output[:, 0, :, columns],
+            lse[:, :, 0],
+            reference[..., columns],
+            reference_lse,
+        )
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+def test_native_v4_topk128_one_valid_key():
+    batch, heads, tokens = 65, 64, 193
+    inputs = make_sparse_inputs(
+        (batch, heads, 512, tokens, 1, 128, 512, False, False, 71)
+    )
+    indices = inputs[2]
+    rows = torch.arange(batch, device=indices.device)
+    chosen = (rows * 47 + 63) % tokens
+    chosen[1] = 64
+    chosen[-1] = tokens - 1
+    # Alternate which 64-key half holds the one valid index, including the last page.
+    positions = (rows * 9) % 64 + (rows % 2) * 64
+    indices.fill_(-1)
+    indices[:, :, 1::2] = tokens
+    indices[rows, 0, positions] = chosen.to(indices.dtype)
+    baseline, packed = native_v4_inputs(inputs)
+    output, lse = flaggems_vllm.flash_mla_sparse_fwd_w8a8(*packed, cache_tokens=tokens)
+    value = baseline[1][chosen, 0, :][:, None, :].expand(-1, heads, -1)
+    expected_lse = (baseline[0].float() * value.float()).sum(-1) * baseline[3]
+    assert_sparse_fixture_close(output[:, 0], lse[:, :, 0], value, expected_lse)
+    gems_assert_equal(output[:, 0, :, NOPE:], value[..., NOPE:])
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+def test_native_v4_topk128_replay():
+    shape = (65, 128, 512, 665, 1, 128, 512, False, False, 31)
+    inputs = make_sparse_inputs(shape)
+    inputs[2][0].fill_(-1)
+    inputs[2][1, :, 64:].fill_(-1)
+    baseline, packed = native_v4_inputs(inputs)
+    op = flaggems_vllm.flash_mla_sparse_fwd_w8a8
+    op(*packed, cache_tokens=665)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, lse = op(*packed, cache_tokens=665)
+
+    # Change the scale of only one head block, then restore it on the same graph.
+    scale = packed[4][::2, 0, :64, 2:3]
+    original = scale.clone()
+    columns = slice(128, 192)
+    query = packed[0][::2, 0, :64, columns].float()
+    for factor in (1.0, 1.3, 1.0):
+        scale.copy_(original * factor)
+        baseline[0][::2, :64, columns].copy_((query * scale).to(torch.bfloat16))
+        graph.replay()
+        reference, _, reference_lse = flashmla_reference().flash_mla_sparse_fwd(
+            *baseline
+        )
+        for part in (slice(None), slice(448, None)):
+            assert_sparse_fixture_close(
+                output[:, 0, :, part], lse[:, :, 0], reference[..., part], reference_lse
+            )
+
+
+@pytest.mark.flash_mla_sparse_fwd_w8a8
+@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
 def test_native_v4_long_value_reduction():
     # A nonzero value mean exposes bias when many FP8 MMA tiles share an accumulator.
     inputs = make_sparse_inputs((240, 64, 512, 8448, 1, 8320, 512, False, False, 212))
