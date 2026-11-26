@@ -7,13 +7,12 @@ import pytest
 import torch
 
 import flaggems_vllm
-from flaggems_vllm.ops.mhc.mhc_pre_broadcast import (
-    derive_fn_broadcast,
-    mhc_pre_broadcast,
-)
+from flaggems_vllm.ops.mhc.mhc_pre_broadcast import derive_fn_broadcast
 from tests.test_mhc_pre_broadcast import mhc_pre_broadcast_ref
 
 from . import base
+
+mhc_pre_broadcast = flaggems_vllm.mhc_pre_broadcast
 
 VENDOR = flaggems_vllm.vendor_name
 
@@ -33,6 +32,39 @@ _NATIVE_MHC_PRE_BROADCAST = {
 }
 
 
+def _wrap_vllm_native(op):
+    """vLLM's mhc_pre_broadcast_tilelang has n_splits before norm_weight,
+    so the 10th positional arg would be taken as n_splits. Pass
+    norm_weight by keyword instead."""
+
+    def _adapter(
+        residual,
+        fn_broadcast,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+    ):
+        return op(
+            residual,
+            fn_broadcast,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight=norm_weight,
+        )
+
+    return _adapter
+
+
 def _get_baseline_mhc_pre_broadcast_op():
     """Vendor-native mhc_pre_broadcast if available, else the PyTorch
     reference implementation already shipped alongside the Triton kernel
@@ -42,7 +74,9 @@ def _get_baseline_mhc_pre_broadcast_op():
     if entry is not None:
         module_name, attr = entry
         try:
-            return getattr(importlib.import_module(module_name), attr)
+            return _wrap_vllm_native(
+                getattr(importlib.import_module(module_name), attr)
+            )
         except (ImportError, AttributeError) as exc:
             warnings.warn(
                 f"mhc_pre_broadcast benchmark: {VENDOR} declares a native "

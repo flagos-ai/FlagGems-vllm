@@ -204,8 +204,35 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
     @staticmethod
     def get_performance_test_params():
         cases = (
-            # V32 sparse FP8 decode: d_qk=576, 656-byte cache.
+            # V32 sparse FP8 decode (d_qk=576, 656-byte cache): GLM-5.2 decodes
+            # with 64 heads, topk 2048 and 64-token pages, over a batch sweep
+            # that crosses the partition counts the backends schedule with; the
+            # rest vary topk, page size and head count.
             [
+                TestParam(
+                    batch=batch,
+                    topk=2048,
+                    h_q=64,
+                    d_qk=576,
+                    is_fp8=True,
+                    have_attn_sink=True,
+                    use_out=True,
+                )
+                for batch in [1, 2, 8, 16, 20, 21, 32, 64, 80, 128]
+            ]
+            + [
+                TestParam(
+                    batch=64,
+                    topk=topk,
+                    h_q=64,
+                    d_qk=576,
+                    is_fp8=True,
+                    have_attn_sink=True,
+                    use_out=True,
+                )
+                for topk in [128, 512, 1024, 4096]
+            ]
+            + [
                 TestParam(
                     batch=128,
                     topk=topk,
@@ -213,24 +240,30 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
                     d_qk=576,
                     is_fp8=True,
                     have_attn_sink=True,
+                    use_out=True,
                 )
-                for topk in [128, 256, 512, 1024, 2048]
+                for topk in [512, 2048]
             ]
             + [
                 TestParam(
-                    batch=64,
-                    topk=topk,
-                    h_q=128,
+                    batch=batch,
+                    topk=2048,
+                    h_q=64,
                     d_qk=576,
+                    page_block_size=page_block_size,
                     is_fp8=True,
                     have_attn_sink=True,
+                    use_out=True,
                 )
-                for topk in [256, 512, 1024, 2048, 4096]
+                for batch, page_block_size in [(16, 16), (16, 2), (64, 16), (64, 2)]
             ]
-            # MODEL1 sparse FP8 decode: log-like d_qk=512, 584-byte cache.
+            # MODEL1 sparse FP8 decode (log-like d_qk=512, 584-byte cache):
+            # DeepSeek-V4 decodes with 64 heads, topk 128 and dynamic lengths,
+            # either alone or with an extra cache of 512 tokens in 64-token
+            # pages or 8192 in pages of 2.
             + [
                 TestParam(
-                    batch=512,
+                    batch=batch,
                     topk=128,
                     h_q=64,
                     d_qk=512,
@@ -239,23 +272,30 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
                     have_attn_sink=True,
                     have_topk_length=True,
                     use_out=True,
-                ),
-                TestParam(
-                    batch=512,
-                    topk=128,
-                    h_q=64,
-                    d_qk=512,
-                    num_pages=512,
-                    is_fp8=True,
-                    have_attn_sink=True,
-                    have_topk_length=True,
-                    extra_topk=512,
-                    extra_page_block_size=64,
+                    extra_topk=extra_topk,
+                    extra_page_block_size=extra_page_block_size,
                     extra_num_pages=512,
-                    use_out=True,
-                ),
+                )
+                for extra_topk, extra_page_block_size in [(0, 64), (512, 64), (8192, 2)]
+                for batch in [1, 8, 32, 128, 512]
+            ]
+            + [
                 TestParam(
-                    batch=512,
+                    batch=128,
+                    topk=topk,
+                    h_q=64,
+                    d_qk=512,
+                    num_pages=512,
+                    is_fp8=True,
+                    have_attn_sink=True,
+                    have_topk_length=True,
+                    use_out=True,
+                )
+                for topk in [512, 1024]
+            ]
+            + [
+                TestParam(
+                    batch=batch,
                     topk=128,
                     h_q=64,
                     d_qk=512,
@@ -263,11 +303,22 @@ class FlashMLAWithKVCacheBenchmark(base.Benchmark):
                     is_fp8=True,
                     have_attn_sink=True,
                     have_topk_length=True,
-                    extra_topk=8192,
-                    extra_page_block_size=2,
-                    extra_num_pages=512,
                     use_out=True,
-                ),
+                )
+                for batch in [20, 21]
+            ]
+            + [
+                TestParam(
+                    batch=256,
+                    topk=128,
+                    h_q=128,
+                    d_qk=512,
+                    num_pages=512,
+                    is_fp8=True,
+                    have_attn_sink=True,
+                    have_topk_length=True,
+                    use_out=True,
+                )
             ]
             # Dense BF16 decode: seq_q=1 only.
             + [
