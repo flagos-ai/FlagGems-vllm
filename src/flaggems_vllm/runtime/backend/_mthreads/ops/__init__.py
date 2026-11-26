@@ -18,11 +18,11 @@ from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
 from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
     cooperative_topk,
 )
-from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
-    fused_q_kv_rmsnorm,
-)
 from flaggems_vllm.runtime.backend._mthreads.ops.deep_gemm_fp8_o_proj import (
     deep_gemm_fp8_o_proj,
+)
+from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
+    fused_q_kv_rmsnorm,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.dequantize_and_gather_k_cache import (
     dequantize_and_gather_k_cache,

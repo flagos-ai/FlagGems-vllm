@@ -245,10 +245,7 @@ def _o_proj_bmm_kernel(
         y = tl.load(y_base + k_offs[None, :] * y_stride_k)
         product = tl.dot(x, tl.trans(y), out_dtype=tl.float32)
         row_scale = tl.load(
-            xs_ptr
-            + group * xs_stride_b
-            + offs_m * xs_stride_m
-            + k_block * xs_stride_k,
+            xs_ptr + group * xs_stride_b + offs_m * xs_stride_m + k_block * xs_stride_k,
             mask=mask_m,
             other=0.0,
         )
@@ -256,9 +253,7 @@ def _o_proj_bmm_kernel(
         acc += product * (row_scale[:, None] * col_scale[None, :])
 
     z_offs = (
-        group * z_stride_b
-        + offs_m[:, None] * z_stride_m
-        + offs_n[None, :] * z_stride_n
+        group * z_stride_b + offs_m[:, None] * z_stride_m + offs_n[None, :] * z_stride_n
     )
     tl.store(z_ptr + z_offs, acc, mask_m[:, None])
 
@@ -886,5 +881,3 @@ def deep_gemm_fp8_o_proj(
 
     assert callable(wo_b), "`wo_b` must be a callable linear layer"
     return wo_b(out.flatten(1))
-
-

@@ -440,9 +440,7 @@ def test_perf_deep_gemm_fp8_o_proj_ascend_vs_h100():
 
 
 @pytest.mark.deep_gemm_fp8_o_proj
-@pytest.mark.skipif(
-    not _is_mthreads(), reason="MThreads-only: H100-equivalent speedup"
-)
+@pytest.mark.skipif(not _is_mthreads(), reason="MThreads-only: H100-equivalent speedup")
 def test_perf_deep_gemm_fp8_o_proj_mthreads_vs_h100():
     """Cross-chip speedup of the MThreads FP8 kernel against H100 DeepGEMM.
 
