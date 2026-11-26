@@ -454,13 +454,14 @@ def _consume(
                     next_scales = ()
                     for p in tl.static_range(0, N_SLICES):
                         next_scale = row * weights[p]
-                        # The ratio of two UE8M0 products is a power of two:
-                        # subtract the FP32 bit patterns and re-add the bias.
-                        ratio = (
-                            acc_scales[p].to(tl.int32, bitcast=True)
-                            - next_scale.to(tl.int32, bitcast=True)
-                            + 0x3F800000
-                        ).to(tl.float32, bitcast=True)
+                        # Running-accumulator rescale: everything stays expressed
+                        # in the current block's scale, and the last scale is
+                        # applied once after the loop. The ratio of two
+                        # arbitrary FP32 block scales is not a power of two, so
+                        # this is a real division (the bit-pattern subtraction
+                        # is only valid for the UE8M0 scales it was written
+                        # for).
+                        ratio = acc_scales[p] / tl.maximum(next_scale, 1e-30)
                         rescaled = rescaled + (accs[p] * ratio[:, None],)
                         next_scales = next_scales + (next_scale,)
                     accs = rescaled

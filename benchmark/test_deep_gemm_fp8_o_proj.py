@@ -121,6 +121,11 @@ def _is_ascend():
     return flaggems_vllm.vendor_name == "ascend"
 
 
+def _is_mthreads():
+    """MThreads keeps the native block-scale FP8 path but has no vLLM DeepGEMM."""
+    return flaggems_vllm.vendor_name == "mthreads"
+
+
 def _scaling_compute_dtype():
     """Precision this implementation actually computes in.
 
@@ -134,6 +139,11 @@ def _scaling_compute_dtype():
         return torch.int8
     if _is_ascend():
         return torch.float16
+    if _is_mthreads():
+        # The MThreads kernel runs the block-scaled product on the S5000's FP8
+        # tensor cores, so its divisor is the fp8 peak ratio for tensor-bound
+        # records instead of the bf16 io dtype's.
+        return torch.float8_e4m3fn
     return None
 
 
@@ -328,9 +338,14 @@ class DeepGemmFP8OProjBenchmark(base.Benchmark):
 
 @pytest.mark.deep_gemm_fp8_o_proj
 @pytest.mark.skipif(
-    not (HOPPER_AVAILABLE or _is_int8_transport_vendor() or _is_ascend()),
+    not (
+        HOPPER_AVAILABLE
+        or _is_int8_transport_vendor()
+        or _is_ascend()
+        or _is_mthreads()
+    ),
     reason="requires an NVIDIA Hopper or a non-FP8-einsum vendor "
-    "(MetaX/Hygon/PPU/Ascend)",
+    "(MetaX/Hygon/PPU/Ascend) or MThreads",
 )
 def test_perf_deep_gemm_fp8_o_proj_gems_vs_vllm():
     # vLLM's op is only importable from a build that ships DeepSeek-V4, and its
@@ -420,5 +435,20 @@ def test_perf_deep_gemm_fp8_o_proj_ascend_vs_h100():
     The reference is the same H100 record used for MetaX/Hygon; ``factor`` is
     the Ascend910B4/H100 peak ratio of the record's bottleneck resource from
     ``_scaling_factors`` (mem -> bandwidth, tensor -> FP16 peak).
+    """
+    _run_h100_baseline_comparison()
+
+
+@pytest.mark.deep_gemm_fp8_o_proj
+@pytest.mark.skipif(not _is_mthreads(), reason="MThreads-only: H100-equivalent speedup")
+def test_perf_deep_gemm_fp8_o_proj_mthreads_vs_h100():
+    """Cross-chip speedup of the MThreads FP8 kernel against H100 DeepGEMM.
+
+    There is no vLLM DeepGEMM build for MUSA, so the reference is the H100
+    record collected with the same inputs and timing method. The harness prints
+    ``vs Base = (base_ms / latency) / factor`` where ``factor`` is the
+    S5000-vs-H800 peak ratio of the record's bottleneck resource from
+    ``_scaling_factors`` (mem -> bandwidth, tensor -> FP8 peak, since the
+    MThreads kernel keeps the block-scaled FP8 product on FP8 tensor cores).
     """
     _run_h100_baseline_comparison()
