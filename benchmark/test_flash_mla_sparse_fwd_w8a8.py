@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -119,6 +121,15 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             [torch.bfloat16],
         )
         self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
+
+    def set_shapes(self, shape_file_path):
+        super().set_shapes(shape_file_path)
+        if Path(shape_file_path).samefile(Path(__file__).with_name("core_shapes.yaml")):
+            # Built-in D512 shapes use Model1 pages, including in parallel workers.
+            self.shapes = [
+                (*shape, "v4") if shape[2] == 512 and shape[-1] != "v4" else shape
+                for shape in self.shapes
+            ]
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
