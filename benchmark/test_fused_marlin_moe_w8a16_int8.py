@@ -474,8 +474,10 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
     ]
 
     def set_shapes(self, shape_file_path=None):
-        if shape_file_path is None or Path(shape_file_path).resolve() == Path(
-            self.DEFAULT_SHAPE_FILES
+        if (
+            shape_file_path is None
+            or Path(shape_file_path).resolve()
+            == Path(self.DEFAULT_SHAPE_FILES).resolve()
         ):
             self.shapes = self.DEFAULT_SHAPES.copy()
             self.shape_desc = self.DEFAULT_SHAPE_DESC

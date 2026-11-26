@@ -7,14 +7,42 @@ FP16 weight decoding uses native INT8 conversion and FP16 multiplication.
 GEMM accumulation and router-weighted reduction use FP32.
 """
 
+import inspect
 from functools import lru_cache
 from typing import Callable, Optional
 
 import torch
 import triton
-import triton.experimental.tle as tle
 import triton.language as tl
 import triton.language.extra.cann.extension as al
+
+try:
+    import triton.experimental.tle as tle_api
+    import triton.experimental.tle.language.raw as tle_raw
+except (AttributeError, ImportError):
+    tle_api = None
+    tle_raw = None
+
+try:
+    from triton.experimental.tle import is_tle_supported as tle_is_supported
+except (AttributeError, ImportError):
+    tle_is_supported = None
+
+tle = tle_api
+USE_TLE_RAW_CALL = tl.constexpr(
+    tle_raw is not None and "out" in inspect.signature(tle_raw.call).parameters
+)
+
+TLE_COMMON_FEATURES = (
+    "dsa.alloc",
+    "dsa.copy",
+    "dsa.extract_slice",
+    "dsa.hint",
+    "dsa.subview",
+    "dsa.to_buffer",
+    "dsa.to_tensor",
+)
+TLE_INT4_FEATURES = TLE_COMMON_FEATURES + ("raw.call",)
 
 GROUP_SIZE = 128
 MAX_EXPERTS = 512
@@ -22,6 +50,95 @@ MAX_HIDDEN_SIZE = 7168
 MAX_INTERMEDIATE_SIZE = 14336
 # Per grouped batch, excluding caller inputs, the returned output and allocator reservations.
 GROUPED_WORKSPACE_BYTES = 1 << 30
+
+
+def check_tle_support(bits: int) -> None:
+    if tle_api is None:
+        raise NotImplementedError("Ascend fused_marlin_moe requires Triton TLE support")
+    features = TLE_INT4_FEATURES if bits == 4 else TLE_COMMON_FEATURES
+    if tle_is_supported is not None and not tle_is_supported(features):
+        raise NotImplementedError(
+            "Current Triton/TLE backend does not support required Ascend Marlin MoE primitives"
+        )
+
+
+def use_expert_panel(bits, dtype, k, n, bm, r, e, cores) -> bool:
+    return (
+        bits == 8
+        and dtype == torch.float16
+        and k == 4096
+        and n == 256
+        and bm == 128
+        and r >= e * 256
+        and e >= cores
+    )
+
+
+@triton.jit
+def sync_ring_wait(SRC: tl.constexpr, DST: tl.constexpr, FLAG: tl.constexpr):
+    if SRC == "vector":
+        tle.dsa.ascend.sync_block_wait(
+            SRC,
+            DST,
+            FLAG,
+            sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
+            receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
+        )
+    else:
+        tle.dsa.ascend.sync_block_wait(
+            SRC,
+            DST,
+            FLAG,
+            sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
+            receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
+        )
+
+
+@triton.jit
+def sync_ring_set(SRC: tl.constexpr, DST: tl.constexpr, FLAG: tl.constexpr):
+    if SRC == "vector":
+        tle.dsa.ascend.sync_block_set(
+            SRC,
+            DST,
+            FLAG,
+            sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
+            receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
+        )
+    else:
+        tle.dsa.ascend.sync_block_set(
+            SRC,
+            DST,
+            FLAG,
+            sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
+            receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
+        )
+
+
+@triton.jit
+def load_a_tile(
+    A,
+    row,
+    k_offset,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    RowEnd=None,
+    USE_BLOCK_PTR: tl.constexpr = False,
+):
+    if USE_BLOCK_PTR:
+        a = tl.load(
+            tl.make_block_ptr(
+                A + row * K, (BM, K), (K, 1), (0, k_offset), (BM, 128), (1, 0)
+            )
+        )
+    else:
+        mi = tl.arange(0, BM)
+        ki = tl.arange(0, 128)
+        ptr = A + (row + mi[:, None]) * K + k_offset + ki[None, :]
+        if RowEnd is None:
+            a = tl.load(ptr)
+        else:
+            a = tl.load(ptr, (row + mi[:, None]) < RowEnd, other=0)
+    return a
 
 
 @triton.jit
@@ -32,55 +149,63 @@ def load_cube_weight_stage(
     BN: tl.constexpr,
     PANEL_N: tl.constexpr = 0,
     STREAM_FIRST: tl.constexpr = False,
+    STAGE_N: tl.constexpr = 0,
 ):
+    ni = tl.arange(0, BN)
+    ki = tl.arange(0, 128)
     if PANEL_N:
-        ni = tl.arange(0, BN)
-        ki = tl.arange(0, 128)
         if STREAM_FIRST:
-            al.sync_block_wait(
-                "vector",
-                "cube",
-                2,
-                sender_pipe=al.PIPE.PIPE_MTE3,
-                receiver_pipe=al.PIPE.PIPE_MTE2,
-            )
+            sync_ring_wait("vector", "cube", 2)
         b = tl.load(Work + iteration * PANEL_N * 128 + ni[None, :] * 128 + ki[:, None])
         if STREAM_FIRST:
-            al.sync_block_set(
-                "cube",
-                "vector",
-                4,
-                sender_pipe=al.PIPE.PIPE_MTE2,
-                receiver_pipe=al.PIPE.PIPE_MTE3,
-            )
+            sync_ring_set("cube", "vector", 4)
     else:
+        EFF_STAGE_N: tl.constexpr = STAGE_N if STAGE_N > 0 else BN
         STAGES: tl.constexpr = (
-            4 if Work.dtype.element_ty == tl.float16 and BN == 512 else 2
+            2
+            if STAGE_N > 0
+            else (4 if Work.dtype.element_ty == tl.float16 and BN == 512 else 2)
         )
         tl.static_assert((STAGES & (STAGES - 1)) == 0)
-        ni = tl.arange(0, BN)
-        ki = tl.arange(0, 128)
-        tle.dsa.ascend.sync_block_wait(
-            "vector",
-            "cube",
-            2,
-            sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
-            receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
-        )
+        sync_ring_wait("vector", "cube", 2)
         b = tl.load(
             Work
-            + (pid * STAGES + (iteration & (STAGES - 1))) * BN * 128
+            + (pid * STAGES + (iteration & (STAGES - 1))) * EFF_STAGE_N * 128
             + ni[None, :] * 128
             + ki[:, None]
         )
-        tle.dsa.ascend.sync_block_set(
-            "cube",
-            "vector",
-            3,
-            sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
-            receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
-        )
+        sync_ring_set("cube", "vector", 3)
     return b
+
+
+@triton.jit
+def dot_resident_pairs(
+    a_all,
+    Work,
+    pid,
+    iteration,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    PANEL_N: tl.constexpr = 0,
+    STREAM_FIRST: tl.constexpr = False,
+):
+    zero = pid * 0
+    acc = tl.full((BM, BN), 0, tl.float32)
+    for pair in range(K // 256):
+        a0 = tle.dsa.extract_slice(a_all, [zero, pair * 256], [BM, 128], [1, 1])
+        b0 = load_cube_weight_stage(Work, pid, iteration, BN, PANEL_N, STREAM_FIRST)
+        a1 = tle.dsa.extract_slice(a_all, [zero, pair * 256 + 128], [BM, 128], [1, 1])
+        b1 = load_cube_weight_stage(Work, pid, iteration + 1, BN, PANEL_N, STREAM_FIRST)
+        acc = tl.dot(a0, b0, acc)
+        acc = tl.dot(a1, b1, acc)
+        iteration += 2
+    if K % 256:
+        a0 = tle.dsa.extract_slice(a_all, [zero, K - 128], [BM, 128], [1, 1])
+        b0 = load_cube_weight_stage(Work, pid, iteration, BN, PANEL_N, STREAM_FIRST)
+        acc = tl.dot(a0, b0, acc)
+        iteration += 1
+    return acc, iteration
 
 
 @triton.jit
@@ -100,17 +225,9 @@ def cube_tile(
 ):
     mi = tl.arange(0, BM)
     ni = tl.arange(0, BN)
-    ki = tl.arange(0, 128)
     acc = tl.full((BM, BN), 0, tl.float32)
     for kb in range(K // 128):
-        if RowEnd is None:
-            a = tl.load(A + (row + mi[:, None]) * K + kb * 128 + ki[None, :])
-        else:
-            a = tl.load(
-                A + (row + mi[:, None]) * K + kb * 128 + ki[None, :],
-                (row + mi[:, None]) < RowEnd,
-                other=0,
-            )
+        a = load_a_tile(A, row, kb * 128, K, BM, RowEnd)
         b = load_cube_weight_stage(Work, pid, iteration, BN)
         acc = tl.dot(a, b, acc)
         iteration += 1
@@ -137,13 +254,14 @@ def cube_tile_pair(
     RowEnd=None,
     PANEL_N: tl.constexpr = 0,
     STREAM_FIRST: tl.constexpr = False,
+    STAGE_N: tl.constexpr = 0,
+    USE_BLOCK_PTR: tl.constexpr = False,
 ):
     mi = tl.arange(0, BM)
     ni = tl.arange(0, BN)
-    ki = tl.arange(0, 128)
-    acc = tl.full((BM, BN), 0, tl.float32)
     RESIDENT: tl.constexpr = (
-        K == 4096
+        not USE_BLOCK_PTR
+        and K == 4096
         and (
             (BN == 512 and (BM == 32 or (BM == 16 and RowEnd is not None)))
             or (PANEL_N > 0 and BN == 256 and (BM == 16 or BM == 32))
@@ -160,51 +278,40 @@ def cube_tile_pair(
                 row + mi[:, None] < RowEnd,
                 other=0,
             )
-        zero = pid * 0
-    for pair in range(K // 256):
-        if RESIDENT:
-            a0 = tle.dsa.extract_slice(a_all, [zero, pair * 256], [BM, 128], [1, 1])
-        elif RowEnd is None:
-            a0 = tl.load(A + (row + mi[:, None]) * K + pair * 256 + ki[None, :])
-        else:
-            a0 = tl.load(
-                A + (row + mi[:, None]) * K + pair * 256 + ki[None, :],
-                row + mi[:, None] < RowEnd,
-                other=0,
+        acc, iteration = dot_resident_pairs(
+            a_all, Work, pid, iteration, K, BM, BN, PANEL_N, STREAM_FIRST
+        )
+    else:
+        acc = tl.full((BM, BN), 0, tl.float32)
+        for pair in range(K // 256):
+            a0 = load_a_tile(A, row, pair * 256, K, BM, RowEnd, USE_BLOCK_PTR)
+            b0 = load_cube_weight_stage(
+                Work, pid, iteration, BN, PANEL_N, STREAM_FIRST, STAGE_N
             )
-        b0 = load_cube_weight_stage(Work, pid, iteration, BN, PANEL_N, STREAM_FIRST)
-        if RESIDENT:
-            a1 = tle.dsa.extract_slice(
-                a_all, [zero, pair * 256 + 128], [BM, 128], [1, 1]
+            a1 = load_a_tile(A, row, pair * 256 + 128, K, BM, RowEnd, USE_BLOCK_PTR)
+            b1 = load_cube_weight_stage(
+                Work, pid, iteration + 1, BN, PANEL_N, STREAM_FIRST, STAGE_N
             )
-        elif RowEnd is None:
-            a1 = tl.load(A + (row + mi[:, None]) * K + pair * 256 + 128 + ki[None, :])
-        else:
-            a1 = tl.load(
-                A + (row + mi[:, None]) * K + pair * 256 + 128 + ki[None, :],
-                row + mi[:, None] < RowEnd,
-                other=0,
+            acc = tl.dot(a0, b0, acc)
+            acc = tl.dot(a1, b1, acc)
+            iteration += 2
+        if K % 256:
+            a0 = load_a_tile(A, row, K - 128, K, BM, RowEnd, USE_BLOCK_PTR)
+            b0 = load_cube_weight_stage(
+                Work, pid, iteration, BN, PANEL_N, STREAM_FIRST, STAGE_N
             )
-        b1 = load_cube_weight_stage(Work, pid, iteration + 1, BN, PANEL_N, STREAM_FIRST)
-        acc = tl.dot(a0, b0, acc)
-        acc = tl.dot(a1, b1, acc)
-        iteration += 2
-    if K % 256:
-        if RowEnd is None:
-            a0 = tl.load(A + (row + mi[:, None]) * K + (K - 128) + ki[None, :])
-        else:
-            a0 = tl.load(
-                A + (row + mi[:, None]) * K + (K - 128) + ki[None, :],
-                row + mi[:, None] < RowEnd,
-                other=0,
-            )
-        b0 = load_cube_weight_stage(Work, pid, iteration, BN, PANEL_N, STREAM_FIRST)
-        acc = tl.dot(a0, b0, acc)
-        iteration += 1
-    tl.store(
-        Output + (row + mi[:, None]) * N + col + ni[None, :],
-        acc.to(Output.dtype.element_ty),
-    )
+            acc = tl.dot(a0, b0, acc)
+            iteration += 1
+    if USE_BLOCK_PTR:
+        cp = tl.make_block_ptr(
+            Output + row * N + col, (BM, BN), (N, 1), (0, 0), (BM, BN), (1, 0)
+        )
+        tl.store(cp, acc.to(Output.dtype.element_ty))
+    else:
+        tl.store(
+            Output + (row + mi[:, None]) * N + col + ni[None, :],
+            acc.to(Output.dtype.element_ty),
+        )
     return iteration
 
 
@@ -247,16 +354,7 @@ def direct_cube_tile_pair(
             destination = tle.dsa.subview(a_buffer, [local_row, 0], [1, K], [1, 1])
             tle.dsa.copy(source, destination, [1, K])
     a_all = tle.dsa.to_tensor(a_buffer, writable=False)
-    zero = pid * 0
-    acc = tl.full((BM, BN), 0, tl.float32)
-    for pair in range(K // 256):
-        a0 = tle.dsa.extract_slice(a_all, [zero, pair * 256], [BM, 128], [1, 1])
-        b0 = load_cube_weight_stage(Work, pid, iteration, BN)
-        a1 = tle.dsa.extract_slice(a_all, [zero, pair * 256 + 128], [BM, 128], [1, 1])
-        b1 = load_cube_weight_stage(Work, pid, iteration + 1, BN)
-        acc = tl.dot(a0, b0, acc)
-        acc = tl.dot(a1, b1, acc)
-        iteration += 2
+    acc, iteration = dot_resident_pairs(a_all, Work, pid, iteration, K, BM, BN)
     tl.store(
         Output + (row + mi[:, None]) * N + col + ni[None, :],
         acc.to(Output.dtype.element_ty),
@@ -309,9 +407,7 @@ def direct_cube_gemm(
 
 
 @triton.jit
-def tail_task_info(
-    Experts, Counts, Offsets, task, N: tl.constexpr, TASKS: tl.constexpr
-):
+def tail_task_info(Experts, Counts, Offsets, task, N: tl.constexpr):
     tile = task // (N // 128)
     panel = task % (N // 128)
     expert = tl.load(Experts + tile)
@@ -326,66 +422,6 @@ def tail_task_info(
             remaining = tl.load(Counts + expert) - local_tile * 128
             paired = remaining > 128
     return active, paired, expert, tile, panel, remaining
-
-
-@triton.jit
-def load_adaptive_weight(Work, pid, iteration, BN: tl.constexpr):
-    ni = tl.arange(0, BN)
-    ki = tl.arange(0, 128)
-    al.sync_block_wait(
-        "vector",
-        "cube",
-        2,
-        sender_pipe=al.PIPE.PIPE_MTE3,
-        receiver_pipe=al.PIPE.PIPE_MTE2,
-    )
-    value = tl.load(
-        Work + (pid * 2 + iteration % 2) * 512 * 128 + ni[None, :] * 128 + ki[:, None]
-    )
-    al.sync_block_set(
-        "cube",
-        "vector",
-        3,
-        sender_pipe=al.PIPE.PIPE_MTE2,
-        receiver_pipe=al.PIPE.PIPE_MTE3,
-    )
-    return value
-
-
-@triton.jit
-def cube_adaptive_tile(
-    A,
-    Work,
-    Output,
-    row,
-    col,
-    pid,
-    iteration,
-    K: tl.constexpr,
-    N: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-):
-    acc = tl.full((BM, BN), 0, tl.float32)
-    for pair in range(K // 256):
-        ap0 = tl.make_block_ptr(
-            A + row * K, (BM, K), (K, 1), (0, pair * 256), (BM, 128), (1, 0)
-        )
-        a0 = tl.load(ap0)
-        b0 = load_adaptive_weight(Work, pid, iteration, BN)
-        ap1 = tl.make_block_ptr(
-            A + row * K, (BM, K), (K, 1), (0, pair * 256 + 128), (BM, 128), (1, 0)
-        )
-        a1 = tl.load(ap1)
-        b1 = load_adaptive_weight(Work, pid, iteration + 1, BN)
-        acc = tl.dot(a0, b0, acc)
-        acc = tl.dot(a1, b1, acc)
-        iteration += 2
-    cp = tl.make_block_ptr(
-        Output + row * N + col, (BM, BN), (N, 1), (0, 0), (BM, BN), (1, 0)
-    )
-    tl.store(cp, acc.to(Output.dtype.element_ty))
-    return iteration
 
 
 @triton.jit
@@ -405,11 +441,11 @@ def cube_adaptive_gemm(
     iteration = 0
     for task in range(PID, TASKS, GRID):
         active, paired, expert, tile, panel, remaining = tail_task_info(
-            Experts, Counts, Offsets, task, N, TASKS
+            Experts, Counts, Offsets, task, N
         )
         if active:
             if paired:
-                iteration = cube_adaptive_tile(
+                iteration = cube_tile_pair(
                     A,
                     Work,
                     Output,
@@ -421,42 +457,47 @@ def cube_adaptive_gemm(
                     N,
                     256,
                     128,
+                    STAGE_N=512,
+                    USE_BLOCK_PTR=True,
                 )
+            elif remaining <= 64:
+                if panel < N // 512:
+                    iteration = cube_tile_pair(
+                        A,
+                        Work,
+                        Output,
+                        tile * 128,
+                        panel * 512,
+                        PID,
+                        iteration,
+                        K,
+                        N,
+                        64,
+                        512,
+                        STAGE_N=512,
+                        USE_BLOCK_PTR=True,
+                    )
             else:
-                if remaining <= 64:
-                    if panel < N // 512:
-                        iteration = cube_adaptive_tile(
-                            A,
-                            Work,
-                            Output,
-                            tile * 128,
-                            panel * 512,
-                            PID,
-                            iteration,
-                            K,
-                            N,
-                            64,
-                            512,
-                        )
-                else:
-                    if panel < N // 256:
-                        iteration = cube_adaptive_tile(
-                            A,
-                            Work,
-                            Output,
-                            tile * 128,
-                            panel * 256,
-                            PID,
-                            iteration,
-                            K,
-                            N,
-                            128,
-                            256,
-                        )
+                if panel < N // 256:
+                    iteration = cube_tile_pair(
+                        A,
+                        Work,
+                        Output,
+                        tile * 128,
+                        panel * 256,
+                        PID,
+                        iteration,
+                        K,
+                        N,
+                        128,
+                        256,
+                        STAGE_N=512,
+                        USE_BLOCK_PTR=True,
+                    )
 
 
 @triton.jit
-def dequantize_adaptive_task(
+def dequantize_k_stages(
     Q,
     S,
     Work,
@@ -468,39 +509,47 @@ def dequantize_adaptive_task(
     N: tl.constexpr,
     K: tl.constexpr,
     BN: tl.constexpr,
+    BITS: tl.constexpr,
+    STAGE_N: tl.constexpr = 0,
 ):
+    EFF_STAGE_N: tl.constexpr = STAGE_N if STAGE_N > 0 else BN
+    STAGES: tl.constexpr = (
+        2
+        if STAGE_N > 0
+        else (4 if Work.dtype.element_ty == tl.float16 and BN == 512 else 2)
+    )
+    tl.static_assert((STAGES & (STAGES - 1)) == 0)
     VBN: tl.constexpr = BN // 2
-    CB: tl.constexpr = 128 if VBN >= 128 else VBN
+    MAX_ROWS: tl.constexpr = (
+        128 if BITS == 8 and Work.dtype.element_ty == tl.float16 else 64
+    )
+    CB: tl.constexpr = VBN if VBN <= MAX_ROWS else MAX_ROWS
     ns = tl.arange(0, CB)
-    kk = tl.arange(0, 128)
+    ks = tl.arange(0, 128)
     for kb in range(K // 128):
         for chunk in range(VBN // CB):
-            value = load_weight_tile(
-                Q, S, expert, col + SUB * VBN + chunk * CB, kb, N, K, CB, 8
+            result = load_weight_tile(
+                Q, S, expert, col + SUB * VBN + chunk * CB, kb, N, K, CB, BITS
             )
-            if iteration >= 2 and chunk == 0:
-                al.sync_block_wait(
-                    "cube",
-                    "vector",
-                    3,
-                    sender_pipe=al.PIPE.PIPE_MTE2,
-                    receiver_pipe=al.PIPE.PIPE_MTE3,
-                )
+            # Wait once before overwriting either half of the GM stage.
+            if iteration >= STAGES and chunk == 0:
+                sync_ring_wait("cube", "vector", 3)
             offset = (
-                (PID * 2 + iteration % 2) * 512 * 128
+                (PID * STAGES + (iteration & (STAGES - 1))) * EFF_STAGE_N * 128
                 + SUB * VBN * 128
                 + chunk * CB * 128
             )
-            tl.store(Work + offset + ns[:, None] * 128 + kk[None, :], value)
-        al.sync_block_set(
-            "vector",
-            "cube",
-            2,
-            sender_pipe=al.PIPE.PIPE_MTE3,
-            receiver_pipe=al.PIPE.PIPE_MTE2,
-        )
+            tl.store(Work + offset + ns[:, None] * 128 + ks[None, :], result)
+        # Notify Cube only after all subtiles have been stored.
+        sync_ring_set("vector", "cube", 2)
         iteration += 1
     return iteration
+
+
+@triton.jit
+def drain_weight_ring(iteration, STAGES: tl.constexpr):
+    for _ in range(tl.minimum(iteration, STAGES)):
+        sync_ring_wait("cube", "vector", 3)
 
 
 @triton.jit
@@ -521,52 +570,60 @@ def dequantize_adaptive_weights(
     iteration = 0
     for task in range(PID, TASKS, GRID):
         active, paired, expert, tile, panel, remaining = tail_task_info(
-            Experts, Counts, Offsets, task, N, TASKS
+            Experts, Counts, Offsets, task, N
         )
         if active:
             if paired:
-                iteration = dequantize_adaptive_task(
-                    Q, S, Work, expert, panel * 128, PID, SUB, iteration, N, K, 128
+                iteration = dequantize_k_stages(
+                    Q,
+                    S,
+                    Work,
+                    expert,
+                    panel * 128,
+                    PID,
+                    SUB,
+                    iteration,
+                    N,
+                    K,
+                    128,
+                    8,
+                    512,
                 )
+            elif remaining <= 64:
+                if panel < N // 512:
+                    iteration = dequantize_k_stages(
+                        Q,
+                        S,
+                        Work,
+                        expert,
+                        panel * 512,
+                        PID,
+                        SUB,
+                        iteration,
+                        N,
+                        K,
+                        512,
+                        8,
+                        512,
+                    )
             else:
-                if remaining <= 64:
-                    if panel < N // 512:
-                        iteration = dequantize_adaptive_task(
-                            Q,
-                            S,
-                            Work,
-                            expert,
-                            panel * 512,
-                            PID,
-                            SUB,
-                            iteration,
-                            N,
-                            K,
-                            512,
-                        )
-                else:
-                    if panel < N // 256:
-                        iteration = dequantize_adaptive_task(
-                            Q,
-                            S,
-                            Work,
-                            expert,
-                            panel * 256,
-                            PID,
-                            SUB,
-                            iteration,
-                            N,
-                            K,
-                            256,
-                        )
-    for _ in range(tl.minimum(iteration, 2)):
-        al.sync_block_wait(
-            "cube",
-            "vector",
-            3,
-            sender_pipe=al.PIPE.PIPE_MTE2,
-            receiver_pipe=al.PIPE.PIPE_MTE3,
-        )
+                if panel < N // 256:
+                    iteration = dequantize_k_stages(
+                        Q,
+                        S,
+                        Work,
+                        expert,
+                        panel * 256,
+                        PID,
+                        SUB,
+                        iteration,
+                        N,
+                        K,
+                        256,
+                        8,
+                        512,
+                    )
+    drain_weight_ring(iteration, 2)
 
 
 @triton.jit
@@ -677,7 +734,10 @@ def load_weight_tile(
     scales = tl.load(S + group)
     if BITS == 4:
         h = tl.full((RB * 128,), 0, tl.float16)
-        h = al.custom("cast_int4_to_fp16", q, 0, RB * 128, out=h)
+        if USE_TLE_RAW_CALL:
+            h = tle_raw.call("ascend_cast_int4_to_fp16", q, 0, RB * 128, out=h)
+        else:
+            h = tle.dsa.ascend.raw("cast_int4_to_fp16", q, 0, RB * 128, out=h)
     else:
         h = q.to(tl.int8, bitcast=True).to(tl.float16)
     values_h = tl.reshape(h, (RB, 128))
@@ -708,61 +768,20 @@ def dequantize_weights(
     Offsets=None,
 ):
     STAGES: tl.constexpr = 4 if Work.dtype.element_ty == tl.float16 and BN == 512 else 2
-    tl.static_assert((STAGES & (STAGES - 1)) == 0)
-    VBN: tl.constexpr = BN // 2
-    MAX_ROWS: tl.constexpr = (
-        128 if BITS == 8 and Work.dtype.element_ty == tl.float16 else 64
-    )
-    CB: tl.constexpr = VBN if VBN <= MAX_ROWS else MAX_ROWS
-    ns = tl.arange(0, CB)
-    ks = tl.arange(0, 128)
     iteration = 0
     for task in range(PID, TASKS, GRID):
         tile = task // (N // BN)
-        pn = task % (N // BN) * 2 + SUB
+        col = task % (N // BN) * BN
         expert = tl.load(Experts + tile)
         active = expert >= 0
         if MERGE:
             begin = tl.load(Offsets + tl.maximum(expert, 0))
             active = active & ((tile - begin // 128) % 2 == 0)
         if active:
-            for kb in range(K // 128):
-                for chunk in range(VBN // CB):
-                    result = load_weight_tile(
-                        Q, S, expert, pn * VBN + chunk * CB, kb, N, K, CB, BITS
-                    )
-                    # Wait once before overwriting either half of the GM stage.
-                    if iteration >= STAGES and chunk == 0:
-                        tle.dsa.ascend.sync_block_wait(
-                            "cube",
-                            "vector",
-                            3,
-                            sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
-                            receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
-                        )
-                    offset = (
-                        (PID * STAGES + (iteration & (STAGES - 1))) * BN * 128
-                        + SUB * VBN * 128
-                        + chunk * CB * 128
-                    )
-                    tl.store(Work + offset + ns[:, None] * 128 + ks[None, :], result)
-                # Notify Cube only after all subtiles have been stored.
-                tle.dsa.ascend.sync_block_set(
-                    "vector",
-                    "cube",
-                    2,
-                    sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
-                    receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
-                )
-                iteration += 1
-    for _ in range(tl.minimum(iteration, STAGES)):
-        tle.dsa.ascend.sync_block_wait(
-            "cube",
-            "vector",
-            3,
-            sender_pipe=tle.dsa.ascend.PIPE.PIPE_MTE2,
-            receiver_pipe=tle.dsa.ascend.PIPE.PIPE_MTE3,
-        )
+            iteration = dequantize_k_stages(
+                Q, S, Work, expert, col, PID, SUB, iteration, N, K, BN, BITS
+            )
+    drain_weight_ring(iteration, STAGES)
 
 
 @triton.jit
@@ -1138,16 +1157,10 @@ def expert_panel_kernel(
                             BN,
                             False,
                         )
-                al.sync_block_set(
-                    "cube",
-                    "vector",
-                    3,
-                    sender_pipe=al.PIPE.PIPE_MTE2,
-                    receiver_pipe=al.PIPE.PIPE_MTE3,
-                )
+                sync_ring_set("cube", "vector", 3)
                 cube_iteration += 1
     with tle.scope(core_mode="vector"):
-        sub = al.sub_vec_id()
+        sub = tle.dsa.ascend.sub_vec_id()
         VBN: tl.constexpr = BN // 2
         ns = tl.arange(0, VBN)
         ks = tl.arange(0, 128)
@@ -1158,26 +1171,14 @@ def expert_panel_kernel(
             vector_count = tl.load(Counts + vector_expert)
             if vector_count > 0:
                 if vector_iteration >= STAGES:
-                    al.sync_block_wait(
-                        "cube",
-                        "vector",
-                        3,
-                        sender_pipe=al.PIPE.PIPE_MTE2,
-                        receiver_pipe=al.PIPE.PIPE_MTE3,
-                    )
+                    sync_ring_wait("cube", "vector", 3)
                 vector_stage = (pid * STAGES + vector_iteration % STAGES) * BN * K
                 for kb in range(K // 128):
                     decoded = load_weight_tile(
                         Q, S, vector_expert, vector_col, kb, N, K, VBN, 8
                     )
                     if kb >= 2:
-                        al.sync_block_wait(
-                            "cube",
-                            "vector",
-                            4,
-                            sender_pipe=al.PIPE.PIPE_MTE2,
-                            receiver_pipe=al.PIPE.PIPE_MTE3,
-                        )
+                        sync_ring_wait("cube", "vector", 4)
                     tl.store(
                         Work
                         + vector_stage
@@ -1186,30 +1187,11 @@ def expert_panel_kernel(
                         + ks[None, :],
                         decoded,
                     )
-                    al.sync_block_set(
-                        "vector",
-                        "cube",
-                        2,
-                        sender_pipe=al.PIPE.PIPE_MTE3,
-                        receiver_pipe=al.PIPE.PIPE_MTE2,
-                    )
-                for group_drain in range(tl.minimum(K // 128, 2)):
-                    al.sync_block_wait(
-                        "cube",
-                        "vector",
-                        4,
-                        sender_pipe=al.PIPE.PIPE_MTE2,
-                        receiver_pipe=al.PIPE.PIPE_MTE3,
-                    )
+                    sync_ring_set("vector", "cube", 2)
+                for _ in range(tl.minimum(K // 128, 2)):
+                    sync_ring_wait("cube", "vector", 4)
                 vector_iteration += 1
-        for panel_drain in range(tl.minimum(vector_iteration, STAGES)):
-            al.sync_block_wait(
-                "cube",
-                "vector",
-                3,
-                sender_pipe=al.PIPE.PIPE_MTE2,
-                receiver_pipe=al.PIPE.PIPE_MTE3,
-            )
+        drain_weight_ring(vector_iteration, STAGES)
 
 
 def grouped_quantized_gemm(
@@ -1231,15 +1213,7 @@ def grouped_quantized_gemm(
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
         "num_aicore"
     ]
-    if (
-        expert_panel
-        and bits == 8
-        and a.dtype == torch.float16
-        and bm == 128
-        and k == 4096
-        and n == 512
-        and w.shape[0] >= cores
-    ):
+    if expert_panel:
         panel_bn = 256
         panel_grid = min(w.shape[0] * (n // panel_bn), cores)
         panel_work = torch.empty(
@@ -1369,8 +1343,8 @@ def small_fused_kernel(
     pid = tl.program_id(0)
     # Every physical pair enters each barrier, including pairs with no routes.
     # Global barrier 10 is separate from the GEMM ring flags 2 and 3.
-    with al.scope(core_mode="cube"):
-        al.sync_block_all("all", 10)
+    with tle.scope(core_mode="cube"):
+        tle.dsa.ascend.sync_block_all("all", 10)
         cube_gemm(
             ax,
             work,
@@ -1386,15 +1360,15 @@ def small_fused_kernel(
             False,
             TILE,
         )
-        al.sync_block_all("all", 10)
-        al.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
         cube_gemm(
             a, work, ep, z, pid, K, N, SM, BN2, M * T * (K // BN2), G, False, TILE
         )
-        al.sync_block_all("all", 10)
-        al.sync_block_all("all", 10)
-    with al.scope(core_mode="vector"):
-        sub = al.sub_vec_id()
+        tle.dsa.ascend.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
+    with tle.scope(core_mode="vector"):
+        sub = tle.dsa.ascend.sub_vec_id()
         vp = pid * 2 + sub
         kk = tl.arange(0, PK)
         for route in range(vp, M * T, G * 2):
@@ -1404,7 +1378,7 @@ def small_fused_kernel(
             tl.store(ax + route * SM * K + kk, x, kk < K)
             for row in range(1, SM):
                 tl.store(ax + (route * SM + row) * K + kk, 0, kk < K)
-        al.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
         dequantize_weights(
             Q1,
             S1,
@@ -1420,7 +1394,7 @@ def small_fused_kernel(
             False,
             BITS,
         )
-        al.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
         for act_block in range(vp, M * T * SM * tl.cdiv(N, 256), G * 2):
             act_row = act_block // tl.cdiv(N, 256)
             act_col = act_block % tl.cdiv(N, 256) * 256 + tl.arange(0, 256)
@@ -1432,7 +1406,7 @@ def small_fused_kernel(
             )
             value = av / (1 + tl.exp(-av)) * bv
             tl.store(a + act_row * N + act_col, value, act_col < N)
-        al.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
         dequantize_weights(
             Q2,
             S2,
@@ -1448,7 +1422,7 @@ def small_fused_kernel(
             False,
             BITS,
         )
-        al.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
         for combine_block in range(vp, M * tl.cdiv(K, 256), G * 2):
             combine_row = combine_block // tl.cdiv(K, 256)
             combine_col = combine_block % tl.cdiv(K, 256) * 256 + tl.arange(0, 256)
@@ -1458,10 +1432,10 @@ def small_fused_kernel(
                 zv = tl.load(
                     z + restore_route * SM * K + combine_col, combine_col < K, other=0
                 ).to(tl.float32)
-                prob = tl.load(P + restore_route)
+                prob = tl.load(P + restore_route).to(tl.float32)
                 total = total + zv * prob
             tl.store(O + combine_row * K + combine_col, total, combine_col < K)
-        al.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
 
 
 @lru_cache(maxsize=128)
@@ -1605,7 +1579,7 @@ def combine_kernel(
             pos = route
             if HAS_INV:
                 pos = tl.load(Inv + route)
-            prob = tl.load(P + route)
+            prob = tl.load(P + route).to(tl.float32)
             a = tl.load(A + pos * K + cols, cols < K, other=0).to(tl.float32)
             acc += a * prob
         tl.store(O + row * K + cols, acc, cols < K)
@@ -1880,11 +1854,12 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
         or topk_weights.shape != topk_ids.shape
     ):
         raise ValueError("Invalid routing shape")
-    if (
-        topk_ids.dtype not in (torch.int32, torch.int64)
-        or topk_weights.dtype != torch.float32
+    if topk_ids.dtype not in (torch.int32, torch.int64) or topk_weights.dtype not in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
     ):
-        raise ValueError("Routing requires integer IDs and FP32 weights")
+        raise ValueError("Routing requires integer IDs and floating-point weights")
     t = topk_ids.shape[1]
     if t < 1:
         raise ValueError("top_k must be positive")
@@ -1924,14 +1899,7 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
             need_routes = use_small_m or bits != 8 or k != 4096
             # packed_x and the down projection share storage. Both GEMMs run on the
             # same stream, so only the larger of their decode workspaces is live.
-            panel = (
-                bits == 8
-                and x.dtype == torch.float16
-                and k == 4096
-                and n == 256
-                and bm == 128
-                and r >= e * 256
-            )
+            panel = use_expert_panel(bits, x.dtype, k, n, bm, r, e, cores)
             decode_bytes = cores * (256 * k if panel else 4 * 512 * GROUP_SIZE) * 2
             workspace = (
                 padded * (k + 3 * n) * 2
@@ -1989,6 +1957,7 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
                 padded,
                 route_block,
                 need_routes,
+                panel,
             )
         del ids
         start = end
@@ -2031,12 +2000,12 @@ def grouped_route_moe(
     padded,
     route_block,
     need_routes,
+    panel,
 ):
     m, k = x.shape
     e, n2, _ = w1.shape
     n = n2 // 2
     t = topk_ids.shape[1]
-    r = m * t
     routes, counts, offsets, experts, inv = route_experts(
         topk_ids, e, bm, padded, route_block, need_routes
     )
@@ -2048,9 +2017,7 @@ def grouped_route_moe(
     h = torch.empty((padded, 2 * n), device=x.device, dtype=x.dtype)
     if not use_small_m:
         if bits == 8 and k == 4096:
-            if bm not in (32, 64) and not (
-                bm == 128 and x.dtype == torch.float16 and n == 256 and r >= e * 256
-            ):
+            if bm not in (32, 64) and not panel:
                 zero_expert_padding[(min(e, vector_core_count(x)),)](
                     counts, offsets, packed_x, e, bm, k, num_warps=1, multibuffer=False
                 )
@@ -2077,26 +2044,18 @@ def grouped_route_moe(
         grouped_quantized_gemm(packed_x, w1, s1, experts, h, bm, bits, counts, offsets)
     elif bits == 8 and k == 4096 and n == 256 and bm == 128:
         grouped_quantized_gemm(
-            packed_x, w1, s1, experts, h, bm, bits, counts, offsets, True, r >= e * 256
+            packed_x, w1, s1, experts, h, bm, bits, counts, offsets, True, panel
         )
     else:
         grouped_quantized_gemm(packed_x, w1, s1, experts, h, bm, bits, offsets=offsets)
     del routes
     a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
-    mask_tail = (
-        bits == 8
-        and x.dtype == torch.float16
-        and k == 4096
-        and n == 256
-        and bm == 128
-        and r >= e * 256
-    )
     apply_swiglu(
         h,
         a,
         offsets,
-        tile_experts=experts if mask_tail else None,
-        counts=counts if mask_tail else None,
+        tile_experts=experts if panel else None,
+        counts=counts if panel else None,
         bm=bm,
     )
     del h
@@ -2196,16 +2155,10 @@ def fused_marlin_moe(
         raise NotImplementedError(
             "Bias, extra quantization metadata, callbacks and caller-owned workspaces are unsupported"
         )
-    if global_num_experts not in (-1, w1.shape[0]):
-        raise NotImplementedError("Expert parallel mappings are unsupported")
-    if hidden_states.device.type != "npu" or hidden_states.dtype not in (
-        torch.bfloat16,
-        torch.float16,
-    ):
-        raise NotImplementedError("Ascend BF16 or FP16 activations are required")
-    if topk_ids.device != hidden_states.device or not topk_ids.is_contiguous():
-        raise NotImplementedError("Routing IDs must be contiguous on the input NPU")
     bits = 4 if quant_type_id == QUANT_TYPE_UINT4B8 else 8
+    check_tle_support(bits)
+    if w1.ndim == 3 and global_num_experts not in (-1, w1.shape[0]):
+        raise NotImplementedError("Expert parallel mappings are unsupported")
     return run_quantized_moe(
         hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, bits
     )

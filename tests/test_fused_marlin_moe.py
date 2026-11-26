@@ -686,8 +686,6 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
         device,
     )
 
-    if flaggems_vllm.vendor_name == "ascend":
-        tw = tw.float()
     result = flaggems_vllm.fused_marlin_moe(
         hidden_states=hs,
         w1=w1_q,
@@ -1410,8 +1408,6 @@ def _check_w8a16_int8(config, dtype):
         dtype,
         device,
     )
-    if flaggems_vllm.vendor_name == "ascend":
-        tw = tw.float()
     result = flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
