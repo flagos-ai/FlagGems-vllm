@@ -54,5 +54,6 @@ __all__ = [
     "enable_symm_mem",
     "SUPPORTED_FP8_DTYPE",
     "gumbel_sample",
+    "triton_reshape_and_cache_flash_per_token_head_quant",
     "use_symm_mem",
 ]
