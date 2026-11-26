@@ -34,7 +34,6 @@ from flaggems_vllm.ops.persistent_topk import HAS_TLE, persistent_topk
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.libentry import LibEntry
 
-
 _MTHREADS_TILE_CONFIGS = (
     (4, 64, 1, 4),
     (8, 64, 4, 4),
@@ -746,7 +745,9 @@ def _validate_inputs(
 ):
     tensors = (q, k_cache, page_table, query_start_loc, visible_blocks, block_indices)
     vendor = runtime.device.vendor_name
-    expected_device = {"nvidia": "cuda", "mthreads": "musa", "thead": "cuda"}.get(vendor)
+    expected_device = {"nvidia": "cuda", "mthreads": "musa", "thead": "cuda"}.get(
+        vendor
+    )
     if expected_device is None or q.device.type != expected_device:
         raise NotImplementedError("QSA prefill requires NVIDIA SM90 or MThreads MUSA")
     if any(t.device != q.device for t in tensors):

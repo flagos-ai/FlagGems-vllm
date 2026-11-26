@@ -20,7 +20,8 @@ import flaggems_vllm
 from . import base
 
 try:
-    import vllm._custom_ops  # registers torch.ops._C on plugin platforms
+    import vllm._custom_ops  # noqa: F401 - registers torch.ops._C on plugin platforms
+
     if flaggems_vllm.vendor_name == "metax":
         from vllm_metax.models.qwen4_exp.metax.ops.qsa_indexer_fallback import (
             qsa_select_paged_prefill as vendor_qsa,
@@ -73,8 +74,7 @@ def make_inputs(scenario, dtype, device, seed=20261121):
     generator = torch.Generator(device=device).manual_seed(seed)
     rows = sum(query_lengths)
     compressed_lengths = [
-        (max_seq_len + COMPRESS_RATIO - 1) // COMPRESS_RATIO
-        for _ in query_lengths
+        (max_seq_len + COMPRESS_RATIO - 1) // COMPRESS_RATIO for _ in query_lengths
     ]
     pages_per_request = [
         (length + PAGE_SIZE - 1) // PAGE_SIZE for length in compressed_lengths
@@ -129,9 +129,7 @@ def make_inputs(scenario, dtype, device, seed=20261121):
         )
     query_start_loc = torch.tensor(starts, dtype=torch.int32, device=device)
     visible_blocks = torch.cat(visible_parts)
-    block_indices = torch.empty(
-        (rows, BLOCK_TOPK), dtype=torch.int32, device=device
-    )
+    block_indices = torch.empty((rows, BLOCK_TOPK), dtype=torch.int32, device=device)
     return (
         q,
         k_cache,

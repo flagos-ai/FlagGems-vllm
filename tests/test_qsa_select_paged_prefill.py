@@ -14,6 +14,8 @@
 
 """Correctness tests and shared inference fixtures for QSA paged prefill."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -385,6 +387,7 @@ def vllm_reference():
         else "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer"
     )
     import vllm._custom_ops  # noqa: F401 - registers torch.ops._C
+
     return pytest.importorskip(
         module,
         reason="vLLM QSA is required for the native cross-check",
@@ -692,9 +695,7 @@ if not cfg.QUICK_MODE:
             pytest.param(
                 dict(
                     query_lengths=queries,
-                    compressed_lengths=tuple(
-                        (maximum + 3) // 4 for _ in queries
-                    ),
+                    compressed_lengths=tuple((maximum + 3) // 4 for _ in queries),
                     page_size=196,
                     visible=[
                         (maximum - query + row + 1) // 4
@@ -872,9 +873,6 @@ def test_qsa_select_paged_prefill_invalid_contract(accelerator, case) -> None:
         error = ValueError
     with pytest.raises(error):
         flaggems_vllm.qsa_select_paged_prefill(*inputs.launch_args())
-
-
-from unittest.mock import patch
 
 
 def _ppu_device_capability(cls, device_id=0):
