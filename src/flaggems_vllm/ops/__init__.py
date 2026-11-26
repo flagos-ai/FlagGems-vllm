@@ -513,6 +513,7 @@ if _runtime.device.vendor_name == "hygon":
     from flaggems_vllm.runtime.backend._hygon.fused import attention as hygon_attention
     from flaggems_vllm.runtime.backend._hygon.ops import (
         int8_einsum,
+        megapreattention,
         w8a8_block_int8_bmm,
     )
 
@@ -520,6 +521,7 @@ if _runtime.device.vendor_name == "hygon":
     __all__ += [
         "flash_attn_varlen_func_w8a8_int8",
         "int8_einsum",
+        "megapreattention",
         "w8a8_block_int8_bmm",
     ]
 

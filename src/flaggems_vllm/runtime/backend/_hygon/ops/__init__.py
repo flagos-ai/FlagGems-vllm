@@ -55,6 +55,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
 from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._hygon.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.runtime.backend._hygon.ops.megamoe import megamoe_int8
+from flaggems_vllm.runtime.backend._hygon.ops.megapreattention import megapreattention
 from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -94,6 +95,7 @@ __all__ = [
     "int8_einsum",
     "mamba_mixer",
     "megamoe_int8",
+    "megapreattention",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
