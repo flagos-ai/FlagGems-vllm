@@ -1117,6 +1117,18 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: fused_moe_lora
+  description: Apply expert- and adapter-specific LoRA updates to routed MoE outputs.
+  for:
+  - vllm.lora.ops.triton_ops.fused_moe_lora_op.fused_moe_lora
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: fused_q
   description: |
     Fuse MQA query RoPE and FP8 packing with indexer query RoPE,

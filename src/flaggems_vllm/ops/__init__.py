@@ -122,6 +122,7 @@ from flaggems_vllm.ops.fused_moe import (
     invoke_fused_moe_triton_kernel,
     outplace_fused_experts,
 )
+from flaggems_vllm.ops.fused_moe_lora import fused_moe_lora
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
 from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
@@ -369,6 +370,7 @@ __all__ = [
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
+    "fused_moe_lora",
     "fused_q",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
