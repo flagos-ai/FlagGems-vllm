@@ -60,6 +60,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_q import fused_q
 from flaggems_vllm.runtime.backend._ascend.ops.gather_conv_state import (
     gather_conv_state,
 )
@@ -75,6 +76,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.group_list_cumsum import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.grouped_topk import grouped_topk
 from flaggems_vllm.runtime.backend._ascend.ops.hc_combine import hc_combine
+from flaggems_vllm.runtime.backend._ascend.ops.hc_down_silu import hc_down_silu
 from flaggems_vllm.runtime.backend._ascend.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
@@ -170,6 +172,7 @@ __all__ = [
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
+    "fused_q",
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
     "gather_kda_state",
@@ -178,6 +181,7 @@ __all__ = [
     "group_list_cumsum",
     "grouped_topk",
     "hc_combine",
+    "hc_down_silu",
     "ihc_pre",
     "indexer_epilogue",
     "indexer_gemm_score",

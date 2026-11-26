@@ -92,6 +92,7 @@ STRICT_PIP_CHECK="${STRICT_PIP_CHECK:-0}"
 UV_REFRESH="${UV_REFRESH:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 VENV_CREATED=0
+PYTHON_PREFERENCE="only-managed"
 BACKEND_ARG=""
 BACKEND=""
 BACKEND_VENDOR=""
@@ -334,16 +335,31 @@ install_uv() {
 }
 
 install_python() {
-  printf "Installing Python ${PYTHON_VERSION} ..."
+  printf "Installing Python ${PYTHON_VERSION} ...\n"
   if [ "${DRY_RUN}" = "1" ]; then
     printf " [dry-run] uv python install %s\n" "${PYTHON_VERSION}"
     return 0
   fi
-  UV_PYTHON_INSTALL_MIRROR="${UV_PYTHON_INSTALL_MIRROR}" \
-    uv python install "${PYTHON_VERSION}" \
-      --python-preference only-managed -q \
-    || die "unable to install Python ${PYTHON_VERSION}"
-  ok
+  if UV_PYTHON_INSTALL_MIRROR="${UV_PYTHON_INSTALL_MIRROR}" \
+      uv python install "${PYTHON_VERSION}" \
+        --python-preference only-managed; then
+    ok
+    return 0
+  fi
+  warn "Python mirror ${UV_PYTHON_INSTALL_MIRROR} failed; retrying default uv source"
+  if env -u UV_PYTHON_INSTALL_MIRROR \
+      uv python install "${PYTHON_VERSION}" \
+        --python-preference only-managed; then
+    ok
+    return 0
+  fi
+  if uv python find "${PYTHON_VERSION}" --python-preference system >/dev/null 2>&1; then
+    warn "falling back to system Python ${PYTHON_VERSION}"
+    PYTHON_PREFERENCE="system"
+    ok
+    return 0
+  fi
+  die "unable to install Python ${PYTHON_VERSION}"
 }
 
 create_venv() {
@@ -354,7 +370,7 @@ create_venv() {
   fi
   uv venv "${VENV_DIR}" \
     --python "${PYTHON_VERSION}" \
-    --python-preference only-managed \
+    --python-preference "${PYTHON_PREFERENCE}" \
     --seed \
     -q \
     || die "unable to create virtual environment at ${VENV_DIR}"

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+
 import pytest
 import torch
 import triton
@@ -19,7 +21,7 @@ from triton import language as tl
 
 import flaggems_vllm
 from flaggems_vllm.runtime import torch_device_fn
-from flaggems_vllm.utils import libentry
+from flaggems_vllm.utils import libentry, libtuner
 
 pytestmark = [
     pytest.mark.libentry,
@@ -108,3 +110,31 @@ def test_key_with_options_rebuilds_an_entry():
     entry_key = entry.key([x, y, 256], [], [256])
     assert entry_key not in _entries(entry)
     assert entry_key + entry._launch_options_key(options) in _entries(entry)
+
+
+def _tuner(cache_version=None):
+    configs = [triton.Config({"BLOCK": 128}), triton.Config({"BLOCK": 256})]
+    return libtuner(configs=configs, key=["n"], cache_version=cache_version)(
+        _scale_kernel
+    )
+
+
+def test_unversioned_tuner_keeps_its_table_name():
+    """Tuning tables written before `cache_version` existed must stay valid."""
+    tuner = _tuner()
+
+    legacy_hash = hashlib.md5(
+        f"{tuner.cache_key}{tuner.configs_hash}".encode("utf-8")
+    ).hexdigest()[:32]
+    assert tuner.kernel_hash == legacy_hash
+
+
+def test_cache_version_names_a_separate_table():
+    """`prune_configs_by` runs only on a cache miss, so a changed pruning rule
+    needs a new table or shapes tuned under the old rule keep their result."""
+    unversioned, first, second = _tuner(), _tuner("v1"), _tuner("v2")
+
+    assert first.config_table_name != unversioned.config_table_name
+    assert first.config_table_name != second.config_table_name
+    # The same version names the same table, so a restart still finds it.
+    assert _tuner("v1").config_table_name == first.config_table_name

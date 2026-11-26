@@ -67,15 +67,13 @@ class KdaStateScatterBenchmark(base.Benchmark):
 
 
 def _torch_scatter(cache, idx, vals):
-    out = cache.clone()
-    out[idx] = vals.transpose(-1, -2).contiguous().to(out.dtype)
-    return out
+    cache[idx] = vals.transpose(-1, -2).contiguous().to(cache.dtype)
+    return cache
 
 
 def _gems_scatter(cache, idx, vals):
-    out = cache.clone()
-    flaggems_vllm.scatter_kda_state(out, idx, vals)
-    return out
+    flaggems_vllm.scatter_kda_state(cache, idx, vals)
+    return cache
 
 
 @pytest.mark.scatter_kda_state
