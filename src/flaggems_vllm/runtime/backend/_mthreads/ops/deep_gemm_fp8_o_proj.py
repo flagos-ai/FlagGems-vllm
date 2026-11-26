@@ -57,6 +57,7 @@ from flaggems_vllm.ops.deep_gemm_fp8_o_proj import (
 )
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._mthreads.ops.fused_inv_rope_fp8_quant import (
+    _fused_inv_rope_fp8_quant_heads,
     fused_inv_rope_fp8_quant,
 )
 from flaggems_vllm.runtime.backend._mthreads.ops.w8a8_block_fp8_bmm import (
@@ -211,6 +212,58 @@ def _weight_supported(
         o_lora_rank // _QUANT_BLOCK,
         reduction // _QUANT_BLOCK,
     )
+
+
+def _quant_heads(
+    o, positions, cos_sin_cache, n_groups, heads_per_group, nope_dim, rope_dim
+):
+    """Inverse RoPE + group FP8 quant, with the prefill tile width retuned.
+
+    Same kernel and math as ``fused_inv_rope_fp8_quant``; only the tile width
+    and warp count differ. That wrapper tiles eight heads per CTA from 128
+    tokens up, which measures 11-13% slower on the S5000 than four heads at
+    every prefill point (4096/8: 490 -> 430 us, 4096/16: 922 -> 806 us,
+    8192/8: 929 -> 830 us, 2048/16: 486 -> 434 us), because the eight-head tile
+    halves the CTA count while each CTA is already only a few KB of traffic.
+    """
+    heads = o.shape[1]
+    tokens = o.shape[0]
+    heads_per_program = 4
+    aligned_tokens = triton.cdiv(tokens, 4) * 4
+    scale_cols = heads_per_group * 4
+    output = torch.empty(
+        (n_groups, tokens, heads_per_group * (nope_dim + rope_dim)),
+        device=o.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    scales = torch.empty(
+        n_groups * scale_cols * aligned_tokens, device=o.device, dtype=torch.float32
+    ).as_strided(
+        (n_groups, tokens, scale_cols),
+        (scale_cols * aligned_tokens, 1, aligned_tokens),
+    )
+    _fused_inv_rope_fp8_quant_heads[
+        (aligned_tokens, triton.cdiv(heads, heads_per_program))
+    ](
+        o,
+        positions,
+        cos_sin_cache,
+        output,
+        scales,
+        tokens,
+        heads,
+        heads_per_group,
+        o.stride(0),
+        o.stride(1),
+        cos_sin_cache.stride(0),
+        aligned_tokens,
+        1e-10,
+        HEADS=heads_per_program,
+        PACKED=0,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output.transpose(0, 1), scales.transpose(0, 1)
 
 
 def _use_tle(num_tokens: int, n_groups: int) -> bool:
@@ -509,17 +562,28 @@ def deep_gemm_fp8_o_proj(
         }
 
         if not prequantized:
-            act, act_scale = fused_inv_rope_fp8_quant(
-                o,
-                positions,
-                cos_sin_cache,
-                n_groups,
-                heads_per_group,
-                nope_dim=nope_dim,
-                rope_dim=rope_dim,
-                quant_group_size=_QUANT_BLOCK,
-                tma_aligned_scales=False,
-            )
+            if num_tokens >= 1024:
+                act, act_scale = _quant_heads(
+                    o,
+                    positions,
+                    cos_sin_cache,
+                    n_groups,
+                    heads_per_group,
+                    nope_dim,
+                    rope_dim,
+                )
+            else:
+                act, act_scale = fused_inv_rope_fp8_quant(
+                    o,
+                    positions,
+                    cos_sin_cache,
+                    n_groups,
+                    heads_per_group,
+                    nope_dim=nope_dim,
+                    rope_dim=rope_dim,
+                    quant_group_size=_QUANT_BLOCK,
+                    tma_aligned_scales=False,
+                )
 
         if use_tle:
             _tle_bmm(act, act_scale, weight, weight_scale, out, num_tokens, n_groups)
