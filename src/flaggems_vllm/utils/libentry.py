@@ -311,6 +311,7 @@ class LibTuner(triton.runtime.Autotuner):
         flagtune_op_id=None,
         flagtune_variant=None,
         flagtune_dtype_resolver=None,
+        cache_version=None,
     ):
         custom_do_bench = do_bench is not None
         # NOTE(zhengyang): See discussion in https://github.com/triton-lang/triton/pull/4496
@@ -405,6 +406,8 @@ class LibTuner(triton.runtime.Autotuner):
             flagtune_dtype_resolver
         ):
             raise TypeError("flagtune_dtype_resolver must be a trusted callable")
+        # Must be set before `kernel_hash` is first read.
+        self.cache_version = cache_version
         self._flagtune_default_configs = self.configs
         self._flagtune_default_strategy = strategy
         self._flagtune_warned = False
@@ -562,8 +565,13 @@ class LibTuner(triton.runtime.Autotuner):
 
     @cached_property
     def kernel_hash(self) -> str:
+        # The hash covers the kernel source and the candidate list, not the
+        # rules that prune the list per shape. `cache_version` lets a kernel
+        # whose pruning rule changes start a new table. Left unset, the hash is
+        # the same as before, so existing tuning results are kept.
+        version = "" if self.cache_version is None else f"@{self.cache_version}"
         return hashlib.md5(
-            f"{self.cache_key}{self.configs_hash}".encode("utf-8")
+            f"{self.cache_key}{self.configs_hash}{version}".encode("utf-8")
         ).hexdigest()[:32]
 
     @cached_property
@@ -967,8 +975,14 @@ def libtuner(
     flagtune_op_id=None,
     flagtune_variant=None,
     flagtune_dtype_resolver=None,
+    cache_version=None,
 ):
     """Decorator for triton library autotuner.
+
+    `cache_version` is mixed into the name of the persisted tuning table. Pass
+    it when `prune_configs_by` changes which candidates a shape may use: the
+    pruning only runs on a cache miss, so shapes tuned under the old rule would
+    otherwise keep their old result. Change the value whenever the rule changes.
 
     `strategy` is a function that takes a key and returns a value.
     It accepts a string, which is the name of a registered strategy, or a callable function.
@@ -1007,6 +1021,7 @@ def libtuner(
             flagtune_op_id=flagtune_op_id,
             flagtune_variant=flagtune_variant,
             flagtune_dtype_resolver=flagtune_dtype_resolver,
+            cache_version=cache_version,
         )
 
     return decorator
