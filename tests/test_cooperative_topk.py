@@ -132,8 +132,10 @@ def test_metax_tail_selection(width, k):
 
 @gpu
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX radix repair")
-def test_metax_mixed_rows_radix_repair():
-    width, k = 65539, 512
+@pytest.mark.parametrize("width", [16388, 16389, 65539])
+def test_metax_mixed_rows_radix_repair(width):
+    # Exercise both sides of the four-column tail handled by the final tile.
+    k = 512
     scores = torch.zeros((4, width), dtype=torch.float32)
     # The high-scoring tail overflows the compact candidate buffer. Rotate
     # that row through the batch to check that reused scratch is reset.
@@ -151,6 +153,24 @@ def test_metax_mixed_rows_radix_repair():
         output.fill_(-17)
         flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
         _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX tile screening")
+def test_metax_repair_retains_ties_at_full_tile_minimum():
+    width, k = 262149, 1024
+    length = width - 2
+    scores = torch.full((1, width), -4.0)
+    # The retained candidates from this tile cover only a fraction of the
+    # 7.0 scores needed after the higher scores in two other tiles.
+    scores[0, 2048:4096] = 7.0
+    scores[0, 12:16] = 9.0
+    scores[0, 262144:length] = 11.0
+    scores[0, length:] = float("nan")
+    logits = scores.to(device)
+    lengths, output, workspace = _buffers(logits, [length], k)
+    flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    _check(logits, lengths, output, k, reference_on_cpu=True)
 
 
 @gpu

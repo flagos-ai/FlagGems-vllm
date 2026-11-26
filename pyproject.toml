@@ -150,7 +150,6 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-"flaggems_vllm.runtime.backend._metax.ops" = ["cooperative_topk.cu"]
 "flaggems_vllm" = ["backends.yaml"]
 "flaggems_vllm.runtime" = ["*/**/*.yaml"]
 "flaggems_vllm.runtime.backend._nvidia.hopper.mega.megamoe" = ["*.cu"]
