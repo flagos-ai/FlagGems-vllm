@@ -6,5 +6,8 @@
   "results/megamoe-1351/raw.tar.gz": "e853fc958cb9e82ee1154d4906c7316838aef01c4688f01709cb1e2ee46eca3c",
   "results/ci-1356-1361/summary.json": "6fb4c54ec8e8de8230b8543f0a24c77bd05c55d7032a940b6332c6d24c4bb639",
   "results/ci-1356-1361/README.md": "0afeafabed12706be6fd975bc1493ea05a1af229a9ed4fe82d6306d09485d448",
-  "results/ci-1356-1361/raw.tar.gz": "be7951b63d38aeeddec82b2ec8cd1448718ef44121a1eeb1d6bdeb2e6c0a5825"
+  "results/ci-1356-1361/raw.tar.gz": "be7951b63d38aeeddec82b2ec8cd1448718ef44121a1eeb1d6bdeb2e6c0a5825",
+  "results/kunlunxin-1248/qualification.json": "5cf609ab85982180aa3acd0707e46c11d83fb2ff0ebe7e1e8f7b2f1bf96e9f4a",
+  "results/kunlunxin-1248/raw.tar.gz": "522d622d22c95091362099f565c64adbfa1803453c8f4f87818fc0e59ba38996",
+  "results/kunlunxin-1248/README.md": "c3f1fd78e90607c53e89982b9fd47b3cafacacf2cba231441e07e119c43b2bd7"
 }

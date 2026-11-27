@@ -1,0 +1,47 @@
+{
+  "candidate": "7991a6c7b28169cf41d7e7a26712c7bc0d51dc55",
+  "tree": "00ea6d4a437425502576748896736e4d33b86df4",
+  "cases": 11,
+  "passed": 11,
+  "failed": 0,
+  "skipped": 0,
+  "process_exit": 0,
+  "natural_cleanup": true,
+  "post_idle": true,
+  "native_performance_run": false,
+  "installed_identity": {
+    "commit": "7991a6c7b28169cf41d7e7a26712c7bc0d51dc55",
+    "tree": "00ea6d4a437425502576748896736e4d33b86df4",
+    "installed_python_config_files_matched": 871,
+    "provider_origin": "/flagos/lib/python3.10/site-packages/flaggems_vllm",
+    "vendor": "kunlunxin",
+    "versions": {
+      "flaggems_vllm": "0.3.0.dev1",
+      "flag-gems": "5.4.0",
+      "torch": "2.9.0+cu129",
+      "vllm": "0.32.0+flagos",
+      "flagtree": "0.7.0+xpu3.6"
+    },
+    "device": {
+      "visible_count": 1,
+      "logical_device": 0,
+      "pci_bus_id": 132
+    },
+    "passed": true
+  },
+  "raw_bytes": 9269,
+  "raw_sha256": "522d622d22c95091362099f565c64adbfa1803453c8f4f87818fc0e59ba38996",
+  "case_names": [
+    "test_v2_apply_grammar_bitmask[167-dtype0]",
+    "test_v2_apply_grammar_bitmask[151939-dtype1]",
+    "test_v2_apply_penalties[1031-dtype0]",
+    "test_v2_apply_penalties[2057-dtype1]",
+    "test_v2_apply_penalties[151939-dtype2]",
+    "test_v2_apply_penalties[248320-dtype3]",
+    "test_empty_penalties_preserve_logits_shape",
+    "test_v2_penalty_bincount[167-185]",
+    "test_v2_penalty_bincount[151939-185]",
+    "test_v2_penalty_bincount[151939-2048]",
+    "test_v2_penalty_bincount[167-0]"
+  ]
+}
