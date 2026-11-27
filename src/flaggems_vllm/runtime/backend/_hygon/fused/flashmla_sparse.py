@@ -405,9 +405,9 @@ def _backend_launch_options(dqk: int, split: bool, single: bool) -> dict:
 
     ``sched_latency`` makes the scheduler assume a longer LDS latency, so it
     hoists the ds_reads of the PV operand away from the mmacs that consume
-    them; 23 of the inner loop's 44 ``s_waitcnt`` are otherwise a fully
-    blocking ``lgkmcnt(0)``, and with only 3 work groups per CU there is no
-    other wave to cover that latency. How far to go depends on how much loop
+    them; most of the inner loop's ``s_waitcnt lgkmcnt(0)`` barrier pairs sit
+    immediately before an mmac without this hint, and with only 3 work groups
+    per CU there is no other wave to cover that latency. How far to go depends on how much loop
     there is to hoist across: the multi-block loop wants ``ds80`` (1.05-1.09x
     over ``ds32``), while the peeled single-block body has nothing to hide
     behind and the same value costs it 2-4%.
@@ -662,7 +662,6 @@ def flash_mla_sparse_fwd(
         assert topk_length.dtype == torch.int32
         assert topk_length.shape == (SQ,), "topk_length error shape"
 
-    # check from FlashMLA
     assert HKV == 1, "h_kv is expected to be 1"
     assert HQ == 64 or HQ == 128, "Unsupported h_q"
     assert DQK == 576 or DQK == 512, "Unsupported d_qk"
