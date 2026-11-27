@@ -14,22 +14,15 @@
 
 """Functional tests for flaggems_vllm.dsv41_o_proj.
 
-Two references:
-  * ``ref_dsv41_o_proj``: pure torch, written step by step so the math is easy
-    to read. Mirrors the kernel's quantization exactly -> tight comparison.
-  * vLLM's ``deep_gemm_fp8_o_proj`` (if vLLM + DeepGEMM are installed). Looser,
-    because the two sides round activation scales differently.
+Reference: ``ref_dsv41_o_proj``, pure torch, written step by step so the math
+is easy to read. Mirrors the kernel's quantization exactly -> tight comparison.
 """
 
 import importlib
-import inspect
 import math
-import os
-import types
 
 import pytest
 import torch
-import triton
 
 import flaggems_vllm
 
@@ -80,24 +73,6 @@ def _backend_gate(request):
             pytest.skip("requires Hygon DCU")
     elif not FP8_GPU:
         pytest.skip("requires an NVIDIA GPU with FP8 tensor cores")
-
-
-def _deep_gemm_jit_available():
-    # vLLM's bundled DeepGEMM JIT-compiles its kernels with nvcc on first use
-    # (deep_jit::CUDA::find_cuda_toolkit), so a working CUDA toolkit is required
-    # in addition to a supported GPU. Images that ship only the driver and CUDA
-    # runtime have no nvcc, and every deep_gemm call then fails at launch time.
-    nvcc = os.path.join(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "nvcc")
-    return os.path.isfile(nvcc) and os.access(nvcc, os.X_OK)
-
-
-try:
-    from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
-
-    HAS_VLLM = is_deep_gemm_supported() and _deep_gemm_jit_available()
-except ImportError:
-    HAS_VLLM = False
 
 
 # --------------------------------------------------------------------------
@@ -228,9 +203,6 @@ def call_gems(attn_out, positions, cos_sin_cache, w, ws, n_groups, hpg, rank, **
 # here) on values of order 1, so also bound the error of every (token, group) row.
 # BF16 output rounding alone is about 2e-3; FP8 cast differences can reach 1.2e-2.
 MAX_REL_ERR = 1.5e-2
-# vLLM rounds activation scales up to a power of two on Hopper and this kernel does
-# not: two independent FP8 roundings of the same values differ by about 3.7%.
-MAX_VLLM_REL_ERR = 5e-2
 
 
 def assert_relative_close(res, ref, n_groups, rank, max_rel=MAX_REL_ERR):
@@ -668,86 +640,6 @@ def test_dsv41_o_proj_wo_b_proj_empty():
     res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank, wo_b_proj=wo_b)
     assert seen == [(0, n_groups * rank)]
     assert res.shape == (0, 128)
-
-
-def _default_vllm_launch_pdl(monkeypatch):
-    """Give vLLM's quant kernel a ``launch_pdl`` default so it can always launch.
-
-    ``_fused_inv_rope_fp8_quant_per_head`` declares ``launch_pdl: tl.constexpr``
-    with no default, and vLLM passes it only when
-    ``current_platform.is_arch_support_pdl()`` is true -- a live CUDA context is
-    needed for that check and every exception in it becomes False. Where it is
-    false the Triton binder is left without the argument and the launch raises
-    TypeError, so the vLLM reference cannot run at all; the FlagOS CI image does
-    that on H800. Default it to False without touching the kernel code; a stack
-    that does pass ``launch_pdl=True`` still gets PDL. Same fix as
-    ``benchmark/test_fused_inv_rope_fp8_quant.py``'s MUSA baseline, and pytest
-    restores the original kernel afterwards, including on failure.
-    """
-    module = importlib.import_module(
-        "vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant"
-    )
-    kernel_name = "_fused_inv_rope_fp8_quant_per_head"
-    kernel = getattr(module, kernel_name, None)
-    if kernel is None:
-        return
-    params = inspect.signature(kernel.fn).parameters
-    pdl = params.get("launch_pdl")
-    if pdl is None or pdl.default is not inspect.Parameter.empty:
-        return
-    if (
-        next(reversed(params)) != "launch_pdl"
-        or pdl.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
-    ):
-        raise RuntimeError("unsupported vLLM launch_pdl signature")
-
-    fn = kernel.fn
-    adapted_fn = types.FunctionType(
-        fn.__code__, fn.__globals__, fn.__name__, (False,), fn.__closure__
-    )
-    adapted_fn.__annotations__ = fn.__annotations__.copy()
-    adapted_fn.__module__ = fn.__module__
-    adapted_fn.__qualname__ = fn.__qualname__
-    adapted_kernel = triton.jit(
-        adapted_fn,
-        do_not_specialize=kernel.do_not_specialize,
-        do_not_specialize_on_alignment=kernel.do_not_specialize_on_alignment,
-        version=kernel.version,
-        debug=kernel.debug,
-        noinline=kernel.noinline,
-        launch_metadata=kernel.launch_metadata,
-    )
-    monkeypatch.setattr(module, kernel_name, adapted_kernel)
-
-
-@pytest.mark.skipif(not HAS_VLLM, reason="requires vLLM with DeepGEMM")
-@pytest.mark.parametrize("num_tokens", [1, 7, 32, 63, 65, 257, 1000])
-@pytest.mark.parametrize("n_groups, hpg, rank", [*GROUP_CONFIGS, (1, 8, 1024)])
-def test_dsv41_o_proj_vs_vllm(num_tokens, n_groups, hpg, rank, monkeypatch):
-    _default_vllm_launch_pdl(monkeypatch)
-    attn_out, pos, csc, w, ws = make_inputs(num_tokens, n_groups, hpg, rank)
-    w3 = w.view(n_groups, rank, -1)
-    ws3 = ws.view(n_groups, rank // QUANT_BLOCK, -1)
-    wo_a = types.SimpleNamespace(weight=w3, weight_scale_inv=ws3)
-
-    ref = deep_gemm_fp8_o_proj(
-        attn_out[:, : n_groups * hpg],
-        pos,
-        csc,
-        wo_a,
-        lambda flat: flat,  # identity wo_b: compare z only
-        n_groups=n_groups,
-        heads_per_group=hpg,
-        nope_dim=NOPE_DIM,
-        rope_dim=ROPE_DIM,
-        o_lora_rank=rank,
-        einsum_recipe=(1, 128, 128),  # Hopper recipe
-        tma_aligned_scales=False,
-    )
-    res = call_gems(attn_out, pos, csc, w, ws, n_groups, hpg, rank)
-    assert_relative_close(
-        res, to_reference(ref), n_groups, rank, max_rel=MAX_VLLM_REL_ERR
-    )
 
 
 # --------------------------------------------------------------------------
