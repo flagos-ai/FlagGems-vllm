@@ -745,9 +745,12 @@ def _validate_inputs(
 ):
     tensors = (q, k_cache, page_table, query_start_loc, visible_blocks, block_indices)
     vendor = runtime.device.vendor_name
-    expected_device = {"nvidia": "cuda", "mthreads": "musa", "thead": "cuda"}.get(
-        vendor
-    )
+    expected_device = {
+        "nvidia": "cuda",
+        "mthreads": "musa",
+        "thead": "cuda",
+        "hygon": "cuda",
+    }.get(vendor)
     if expected_device is None or q.device.type != expected_device:
         raise NotImplementedError("QSA prefill requires NVIDIA SM90 or MThreads MUSA")
     if any(t.device != q.device for t in tensors):
@@ -971,6 +974,12 @@ def qsa_select_paged_prefill(
             return
         if not HAS_TLE:
             raise NotImplementedError("QSA prefill Top-K requires Triton TLE")
+        if runtime.device.vendor_name == "hygon":
+            import flaggems_vllm
+
+            topk_impl = flaggems_vllm.persistent_topk
+        else:
+            topk_impl = persistent_topk
         try:
             budget_mb = int(os.environ.get("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512"))
         except ValueError as exc:
@@ -986,7 +995,17 @@ def qsa_select_paged_prefill(
         workspace = torch.empty(
             (rows_per_chunk, logits_width), dtype=torch.float32, device=q.device
         )
-        topk_workspace = torch.empty((1024 * 1024,), dtype=torch.uint8, device=q.device)
+        topk_workspace_bytes = 1024 * 1024
+        if runtime.device.vendor_name == "hygon":
+            # Hygon's persistent_topk (mbtopk) keeps one 256-bin histogram
+            # and five u32 state words per row, so the workspace must
+            # scale with the chunk's row count instead of a fixed 1 MiB.
+            topk_workspace_bytes = max(
+                topk_workspace_bytes, rows_per_chunk * (256 + 5) * 4
+            )
+        topk_workspace = torch.empty(
+            (topk_workspace_bytes,), dtype=torch.uint8, device=q.device
+        )
         launch_metadata = _prefill_score_metadata(q, k_cache, page_table)
         for query_offset in range(0, rows, rows_per_chunk):
             num_queries = min(rows_per_chunk, rows - query_offset)
@@ -1004,7 +1023,7 @@ def qsa_select_paged_prefill(
                 launch_metadata=launch_metadata,
             )
             query_slice = slice(query_offset, query_offset + num_queries)
-            persistent_topk(
+            topk_impl(
                 logits,
                 visible_blocks[query_slice],
                 block_indices[query_slice],
