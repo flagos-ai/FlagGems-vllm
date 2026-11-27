@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -21,6 +23,7 @@ from tests.test_flash_mla_sparse_fwd_w8a8 import (
     assert_sparse_fixture_close,
     flashmla_reference,
     make_sparse_inputs,
+    native_v4_inputs,
     quantize_sparse_fp8_fixture,
 )
 
@@ -39,20 +42,39 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
         )
         self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
 
+    def set_shapes(self, shape_file_path):
+        super().set_shapes(shape_file_path)
+        if Path(shape_file_path).samefile(Path(__file__).with_name("core_shapes.yaml")):
+            # Built-in D512 shapes use Model1 pages, including in parallel workers.
+            self.shapes = [
+                (*shape, "v4") if shape[2] == 512 and shape[-1] != "v4" else shape
+                for shape in self.shapes
+            ]
+
     def get_input_iter(self, dtype):
         for shape in self.shapes:
-            if len(shape) not in (7, 10):
+            native_v4 = shape[-1] == "v4"
+            parameters = shape[:-1] if native_v4 else shape
+            if len(parameters) not in (7, 10):
                 raise ValueError(
                     "Sparse MLA shapes need SQ,HQ,DQK,SKV,HKV,TOPK,DV, "
                     "optionally followed by sink,topk_length,seed"
                 )
-            inputs = make_sparse_inputs(shape, dtype=dtype)
-            packed = quantize_sparse_fp8_fixture(*inputs)
+            inputs = make_sparse_inputs(parameters, dtype=dtype)
+            if native_v4:
+                inputs, packed = native_v4_inputs(inputs)
+            else:
+                packed = quantize_sparse_fp8_fixture(*inputs)
             reference, _, reference_lse = self.torch_op(*inputs)
             output, lse = self.gems_op(*packed)
-            assert_sparse_fixture_close(
-                output[:, 0], lse[:, :, 0], reference, reference_lse
-            )
+            channels = (slice(None), slice(448, None)) if native_v4 else (slice(None),)
+            for columns in channels:
+                assert_sparse_fixture_close(
+                    output[:, 0, :, columns],
+                    lse[:, :, 0],
+                    reference[..., columns],
+                    reference_lse,
+                )
             yield inputs, packed, shape
 
     def unpack_to_args_kwargs(self, input_tuple):
@@ -64,7 +86,7 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
     def get_latency(self, op, *args, **kwargs):
         original, packed, _ = args[0]
         selected = packed if op is self.gems_op else original
-        return super().get_latency(op, *selected)
+        return super().get_latency(op, *selected, **kwargs)
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8

@@ -169,6 +169,192 @@ LSE_FINALIZE_BLOCK = 256
 
 if HAS_TLE:
 
+    @triton.jit
+    def fence_proxy_async_shared(carrier):
+        return tl.inline_asm_elementwise(
+            "{ fence.proxy.async.shared::cta; mov.b32 $0, $1; }",
+            "=r,r",
+            [carrier],
+            dtype=carrier.dtype,
+            is_pure=False,
+            pack=1,
+        )
+
+    @triton.jit
+    def cp_async_cg_16(dst, src, size):
+        tl.inline_asm_elementwise(
+            "{ cp.async.cg.shared.global [$1], [$2], 16, $3; mov.u32 $0, 0; }",
+            "=r,r,l,r",
+            [dst.to(tl.uint64).to(tl.uint32), src.to(tl.uint64), size],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+
+    @triton.jit
+    def cp_async_cg_16_pred(dst, src, size, pred):
+        tl.inline_asm_elementwise(
+            "{ .reg .pred active; setp.ne.u32 active, $4, 0; "
+            "@active cp.async.cg.shared.global [$1], [$2], 16, $3; mov.u32 $0, 0; }",
+            "=r,r,l,r,r",
+            [dst.to(tl.uint64).to(tl.uint32), src.to(tl.uint64), size, pred],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+
+    @triton.jit
+    def cp_async_wait_all(carrier, FENCE: tl.constexpr = False):
+        asm: tl.constexpr = (
+            "{ cp.async.commit_group; cp.async.wait_group 0; "
+            "fence.proxy.async.shared::cta; mov.u32 $0, $1; }"
+            if FENCE
+            else "{ cp.async.commit_group; cp.async.wait_group 0; mov.u32 $0, $1; }"
+        )
+        tl.inline_asm_elementwise(
+            asm,
+            "=r,r",
+            [carrier],
+            dtype=carrier.dtype,
+            is_pure=False,
+            pack=1,
+        )
+
+    @triton.constexpr_function
+    def publish_p_fp8_sw64_asm(prequantized: bool = False) -> str:
+        header = (
+            "{\n"
+            + (
+                ""
+                if prequantized
+                else ".reg .b16 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;\n"
+            )
+            + ".reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;\n"
+            ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 warp_off, tid, 96;\n"
+            "shl.b32 warp_off, warp_off, 5;\n"
+            "and.b32 row_off, tid, 15;\n"
+            "shl.b32 row_off, row_off, 6;\n"
+            "or.b32 common, warp_off, row_off;\n"
+            "and.b32 tmp, tid, 16;\n"
+            "or.b32 common, common, tmp;\n"
+        )
+        if prequantized:
+            conv_lines = []
+            dst_regs = ("a0", "a1", "a2", "a3", "b0", "b1", "b2", "b3")
+            for idx in range(4):
+                r0, r1 = 32 + idx * 2, 33 + idx * 2
+                conv_lines.append(
+                    f"prmt.b32 {dst_regs[idx * 2]}, ${r0}, ${r1}, 0x5410;\n"
+                )
+                conv_lines.append(
+                    f"prmt.b32 {dst_regs[idx * 2 + 1]}, ${r0}, ${r1}, 0x7632;\n"
+                )
+            conversion = "".join(conv_lines)
+            base_op = "$40"
+        else:
+            cvt_lines = [
+                f"cvt.rn.satfinite.e4m3x2.f32 h{i}, ${33 + 2 * i}, ${32 + 2 * i};\n"
+                for i in range(16)
+            ]
+            pack_lines = [
+                f"mov.b32 {'a' if i < 4 else 'b'}{i % 4}, "
+                f"{{h{(i // 2) * 4 + (i % 2)}, h{(i // 2) * 4 + (i % 2) + 2}}};\n"
+                for i in range(8)
+            ]
+            conversion = "".join(cvt_lines) + "".join(pack_lines)
+            base_op = "$64"
+        publication = (
+            "shr.u32 tmp, common, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 phys0, common, tmp;\n"
+            "add.u32 common, common, 32;\n"
+            "shr.u32 tmp, common, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 phys1, common, tmp;\n"
+            f"add.u32 addr0, {base_op}, phys0;\n"
+            f"add.u32 addr1, {base_op}, phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};\n"
+            "fence.proxy.async.shared::cta;\n"
+            f"mov.u32 $0, {base_op};\n"
+            "}"
+        )
+        return header + conversion + publication
+
+    @triton.constexpr_function
+    def publish_p_fp8_sw64_constraints(
+        packs: int = 1, prequantized: bool = False
+    ) -> str:
+        outputs = ["=r"] * (32 * packs)
+        inputs = (["r"] * (8 * packs)) if prequantized else (["f"] * (32 * packs))
+        bases = ["r"] * (32 * packs * packs)
+        return ",".join(outputs + inputs + bases)
+
+    @triton.constexpr_function
+    def vtranspose_fp8_64x128_coupled_asm() -> str:
+        """SW128 -> SW64 FP8 transpose with coupled K permutation and bank-distributed rows."""
+        return (
+            "{\n"
+            ".reg .b32 tid, lane, warp, src_row, tmp, tmp2;\n"
+            ".reg .b32 src_log, src_phys, src_addr0, src_addr1;\n"
+            ".reg .b32 dst_row_r, dst_col, dst_log0, dst_log1;\n"
+            ".reg .b32 dst_phys0, dst_phys1, dst_addr0, dst_addr1;\n"
+            ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
+            ".reg .b32 c0, c1, c2, c3, d0, d1, d2, d3;\n"
+            "mov.u32 tid, %tid.x;\n"
+            "and.b32 tid, tid, 127;\n"
+            "and.b32 lane, tid, 31;\n"
+            "shr.u32 warp, tid, 5;\n"
+            "add.u32 warp, warp, $4;\n"
+            "mov.u32 src_row, lane;\n"
+            "shl.b32 src_log, src_row, 7;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 src_log, src_log, tmp;\n"
+            "shr.u32 tmp, src_log, 7;\n"
+            "and.b32 tmp, tmp, 7;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 src_phys, src_log, tmp;\n"
+            "add.u32 src_addr0, $2, src_phys;\n"
+            "add.u32 src_addr1, src_addr0, 4096;\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {a0, a1, a2, a3}, [src_addr0];\n"
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {b0, b1, b2, b3}, [src_addr1];\n"
+            "prmt.b32 c0, a0, a1, 0x6420;\n"
+            "prmt.b32 c1, a0, a1, 0x7531;\n"
+            "prmt.b32 c2, a2, a3, 0x6420;\n"
+            "prmt.b32 c3, a2, a3, 0x7531;\n"
+            "prmt.b32 d0, b0, b1, 0x6420;\n"
+            "prmt.b32 d1, b0, b1, 0x7531;\n"
+            "prmt.b32 d2, b2, b3, 0x6420;\n"
+            "prmt.b32 d3, b2, b3, 0x7531;\n"
+            "and.b32 dst_row_r, lane, 15;\n"
+            "shl.b32 tmp, warp, 4;\n"
+            "add.u32 dst_row_r, dst_row_r, tmp;\n"
+            "shr.u32 dst_col, lane, 4;\n"
+            "and.b32 dst_col, dst_col, 1;\n"
+            "shl.b32 dst_col, dst_col, 4;\n"
+            "shl.b32 dst_log0, dst_row_r, 6;\n"
+            "add.u32 dst_log0, dst_log0, dst_col;\n"
+            "add.u32 dst_log1, dst_log0, 32;\n"
+            "shr.u32 tmp, dst_log0, 7;\n"
+            "and.b32 tmp, tmp, 3;\n"
+            "shl.b32 tmp, tmp, 4;\n"
+            "xor.b32 dst_phys0, dst_log0, tmp;\n"
+            "shr.u32 tmp2, dst_log1, 7;\n"
+            "and.b32 tmp2, tmp2, 3;\n"
+            "shl.b32 tmp2, tmp2, 4;\n"
+            "xor.b32 dst_phys1, dst_log1, tmp2;\n"
+            "add.u32 dst_addr0, $3, dst_phys0;\n"
+            "add.u32 dst_addr1, $3, dst_phys1;\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 [dst_addr0], {c0, c1, c2, c3};\n"
+            "stmatrix.sync.aligned.x4.m8n8.shared.b16 [dst_addr1], {d0, d1, d2, d3};\n"
+            "mov.u32 $0, $1;\n"
+            "}"
+        )
+
     # Saturating FP8 publication also supplies the bound for scaled probabilities.
     @triton.jit
     def publish_p_fp8_sw64_coupled_stmatrix(s_p, p):
@@ -183,65 +369,8 @@ if HAS_TLE:
             pack=1,
         )
         return tl.inline_asm_elementwise(
-            asm=(
-                "{\n"
-                ".reg .b16 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;\n"
-                ".reg .b32 tid, warp_off, row_off, common, tmp, phys0, phys1, addr0, addr1;\n"
-                ".reg .b32 a0, a1, a2, a3, b0, b1, b2, b3;\n"
-                "mov.u32 tid, %tid.x;\n"
-                "and.b32 warp_off, tid, 96;\n"
-                "shl.b32 warp_off, warp_off, 5;\n"
-                "and.b32 row_off, tid, 15;\n"
-                "shl.b32 row_off, row_off, 6;\n"
-                "or.b32 common, warp_off, row_off;\n"
-                "and.b32 tmp, tid, 16;\n"
-                "or.b32 common, common, tmp;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h0, $33, $32;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h1, $35, $34;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h2, $37, $36;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h3, $39, $38;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h4, $41, $40;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h5, $43, $42;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h6, $45, $44;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h7, $47, $46;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h8, $49, $48;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h9, $51, $50;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h10, $53, $52;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h11, $55, $54;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h12, $57, $56;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h13, $59, $58;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h14, $61, $60;\n"
-                "cvt.rn.satfinite.e4m3x2.f32 h15, $63, $62;\n"
-                "mov.b32 a0, {h0, h2};\n"
-                "mov.b32 a1, {h1, h3};\n"
-                "mov.b32 a2, {h4, h6};\n"
-                "mov.b32 a3, {h5, h7};\n"
-                "mov.b32 b0, {h8, h10};\n"
-                "mov.b32 b1, {h9, h11};\n"
-                "mov.b32 b2, {h12, h14};\n"
-                "mov.b32 b3, {h13, h15};\n"
-                "shr.u32 tmp, common, 7;\n"
-                "and.b32 tmp, tmp, 3;\n"
-                "shl.b32 tmp, tmp, 4;\n"
-                "xor.b32 phys0, common, tmp;\n"
-                "add.u32 common, common, 32;\n"
-                "shr.u32 tmp, common, 7;\n"
-                "and.b32 tmp, tmp, 3;\n"
-                "shl.b32 tmp, tmp, 4;\n"
-                "xor.b32 phys1, common, tmp;\n"
-                "add.u32 addr0, $64, phys0;\n"
-                "add.u32 addr1, $64, phys1;\n"
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr0], {a0, a1, a2, a3};\n"
-                "stmatrix.sync.aligned.x4.m8n8.shared.b16 [addr1], {b0, b1, b2, b3};\n"
-                "fence.proxy.async.shared::cta;\n"
-                "mov.u32 $0, $64;\n"
-                "}"
-            ),
-            constraints=(
-                "=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,=r,"
-                "=r,=r,=r,=r,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,r,r,r,r,"
-                "r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r,r"
-            ),
+            asm=publish_p_fp8_sw64_asm(False),
+            constraints=publish_p_fp8_sw64_constraints(1, False),
             args=[p, base_u32],
             dtype=tl.uint32,
             is_pure=False,
