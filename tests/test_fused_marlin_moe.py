@@ -1667,6 +1667,27 @@ def test_fused_marlin_moe_w8a16_inference_updates(
 
 
 @pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend workspace bound"
+)
+def test_fused_marlin_moe_w8a16_segmented_experts(monkeypatch):
+    # The hot expert spans several workspace segments. Other experts can be empty.
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    monkeypatch.setattr(backend, "GROUPED_WORKSPACE_BYTES", 24 << 20)
+    hs, w1, w2, ref1, ref2, probs, ids, s1, s2 = _make_inputs_w8a16_int8(
+        1057, 32, 1024, 1024, 4, torch.float16, flaggems_vllm.device
+    )
+    ids = ids.to(torch.int64) % 16
+    ids[:, 0] = 0
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, probs, ids, QUANT_TYPE_UINT8B128
+    )
+    expected = _reference_w8a16_grouped(hs, ref1, ref2, probs, ids)
+    error = compute_max_diff(actual.float(), expected)
+    gems_assert_close(error, torch.zeros_like(error), torch.float32, atol=0.04)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
@@ -2031,6 +2052,7 @@ _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
     "int8",
     W8A16_CONFIGS
     + [
+        (1, 8, 1024, 1024, 2),  # wide column tiles on both small-route projections
         (1, 8, 4096, 256, 2),  # split the first projection across K
         (67, 129, 4096, 256, 2),  # stable routing with empty experts
         (513, 8, 256, 512, 2),  # dense experts with a partial final tile

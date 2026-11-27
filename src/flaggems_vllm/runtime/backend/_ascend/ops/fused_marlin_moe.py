@@ -85,7 +85,12 @@ def use_expert_panel(bits, dtype, k, n, bm, r, e, cores) -> bool:
         and bm == 128
         and (
             (k == 4096 and n == 256 and r >= e * 256 and e >= cores)
-            or (n > 256 and k % 256 == 0 and n % 256 == 0 and r >= e * 64)
+            or (
+                n > 256
+                and k % 256 == 0
+                and n % 256 == 0
+                and r >= e * (128 if e < cores else 64)
+            )
         )
     )
 
@@ -1861,24 +1866,11 @@ def small_fused_kernel(
     PK: tl.constexpr,
     BN2: tl.constexpr,
     BITS: tl.constexpr,
+    BN1: tl.constexpr,
     SPLITS: tl.constexpr = 1,
 ):
     SM: tl.constexpr = 1 if BITS == 8 else 16
-    # INT8 uses a full Vector column tile; INT4 keeps its existing UB bound.
-    BN1: tl.constexpr = (
-        512
-        if BITS == 8
-        and X.dtype.element_ty == tl.float16
-        and K == 4096
-        and N == 256
-        and M * T > G // 2
-        else 256 if BITS == 8 or K > 4096 else 128
-    )
-    TILE: tl.constexpr = (
-        cube_tile_pair
-        if BITS == 8 and X.dtype.element_ty == tl.float16 and K == 4096 and N == 256
-        else cube_tile
-    )
+    TILE: tl.constexpr = cube_tile_pair if BN2 == 512 else cube_tile
     ep = EP
     ax = AX
     h = H
@@ -2007,19 +1999,18 @@ def small_fused_kernel(
 
 
 @lru_cache(maxsize=128)
-def small_route_workspace_sizes(
-    m, k, n, t, g, bits=4, wide_first=False, wide_second=False
-):
+def small_route_workspace_sizes(m, k, n, t, g, bits, first_columns, second_columns):
     r = m * t
     sm = 1 if bits == 8 else 16
-    bn1 = 512 if wide_first else 256 if bits == 8 or k > 4096 else GROUP_SIZE
-    bn2 = min(k & -k, 512 if wide_second else 256)
     sizes = (
         r * sm * k,
         r * sm * 2 * n,
         r * sm * n,
         r * sm * k,
-        g * (4 if wide_first or wide_second else 2) * max(bn1, bn2) * GROUP_SIZE,
+        g
+        * (4 if max(first_columns, second_columns) == 512 else 2)
+        * max(first_columns, second_columns)
+        * GROUP_SIZE,
     )
     return sizes
 
@@ -2031,16 +2022,19 @@ def small_route_moe(x, w1, w2, s1, s2, p, ids, out, bits):
     g = triton.runtime.driver.active.utils.get_device_properties(x.device.index)[
         "num_aicore"
     ]
-    wide_first = (
-        bits == 8
-        and x.dtype == torch.float16
-        and k == 4096
-        and n == 256
-        and m * t > g // 2
+    fp16_int8 = bits == 8 and x.dtype == torch.float16
+    split_projection = fp16_int8 and k == 4096 and n == 256
+    wide_projection = fp16_int8 and k % 1024 == 0 and n % 1024 == 0
+    first_columns = (
+        512
+        if wide_projection or (split_projection and m * t > g // 2)
+        else (256 if bits == 8 or k > 4096 else GROUP_SIZE)
     )
-    wide_second = bits == 8 and x.dtype == torch.float16 and k == 4096 and n == 256
-    sizes = small_route_workspace_sizes(m, k, n, t, g, bits, wide_first, wide_second)
-    splits = (16 if m * t <= g else 4) if wide_second else 1
+    second_columns = min(k & -k, 512 if wide_projection or split_projection else 256)
+    sizes = small_route_workspace_sizes(
+        m, k, n, t, g, bits, first_columns, second_columns
+    )
+    splits = (16 if m * t <= g else 4) if split_projection else 1
     if splits > 1:
         meta = ids
         buffers = [
@@ -2070,8 +2064,9 @@ def small_route_moe(x, w1, w2, s1, s2, p, ids, out, bits):
         t,
         g,
         triton.next_power_of_2(k),
-        min(k & -k, 512 if wide_second else 256),
+        second_columns,
         bits,
+        first_columns,
         SPLITS=splits,
         disable_auto_inject_block_sync=True,
         num_warps=1,
@@ -2384,6 +2379,135 @@ def zero_expert_padding(
                 tle.dsa.copy(zeros, PackedX + row * K + kk, [K])
 
 
+@triton.jit
+def clip_expert_ranges(
+    Counts,
+    Offsets,
+    LocalCounts,
+    LocalOffsets,
+    start,
+    rows,
+    E: tl.constexpr,
+    EP: tl.constexpr,
+):
+    expert = tl.arange(0, EP)
+    begin = tl.load(Offsets + expert, expert < E, other=0)
+    count = tl.load(Counts + expert, expert < E, other=0)
+    local_begin = tl.minimum(rows, tl.maximum(0, begin - start))
+    local_end = tl.minimum(rows, tl.maximum(0, begin + count - start))
+    tl.store(LocalCounts + expert, local_end - local_begin, expert < E)
+    tl.store(LocalOffsets + expert, local_begin, expert < E)
+    tl.store(
+        LocalOffsets + E, tl.minimum(rows, tl.maximum(0, tl.load(Offsets + E) - start))
+    )
+
+
+def segmented_expert_moe(x, w1, w2, s1, s2, probabilities, ids, out, cores):
+    """Process contiguous expert rows so a token batch split does not reread all experts."""
+    m, k = x.shape
+    e, _, gate_up, _ = w1.shape
+    n = gate_up // 2
+    routes_total = ids.numel()
+    topk = ids.shape[1]
+    align = 32
+    padded = (
+        triton.cdiv(routes_total + min(e, routes_total) * (align - 1), align) * align
+    )
+    block = 1024
+    chunks = triton.cdiv(routes_total, block)
+    # Reserve the routed output and metadata. The two projections reuse the
+    # same decode budget; packed inputs can be released before SwiGLU.
+    metadata_bytes = 4 * (
+        padded
+        + padded // align
+        + routes_total * (1 + int(ids.dtype == torch.int64))
+        + chunks * e
+        + 4 * e
+        + 2
+    )
+    panel_bytes = cores * 256 * max(k, n) * 2
+    available = GROUPED_WORKSPACE_BYTES - padded * k * 2 - metadata_bytes - panel_bytes
+    bytes_per_row = 2 * max(k + 2 * n, 3 * n)
+    step = min(padded, (available // bytes_per_row // align) * align)
+    if step < align:
+        return False
+    if ids.dtype == torch.int64:
+        ids32 = torch.empty((m, topk), device=x.device, dtype=torch.int32)
+        cast_expert_ids[(triton.cdiv(routes_total, 1024),)](
+            ids, ids32, routes_total, 1024
+        )
+        ids = ids32
+    routes, counts, offsets, experts, inverse = route_experts(
+        ids, e, align, padded, block, True
+    )
+    routed_out = torch.empty((padded, k), device=x.device, dtype=x.dtype)
+    local_counts = torch.empty_like(counts)
+    local_offsets = torch.empty_like(offsets)
+    for start in range(0, padded, step):
+        rows = min(step, padded - start)
+        tiles = experts.narrow(0, start // align, rows // align)
+        clip_expert_ranges[(1,)](
+            counts,
+            offsets,
+            local_counts,
+            local_offsets,
+            start,
+            rows,
+            e,
+            max(32, triton.next_power_of_2(e)),
+        )
+        packed = torch.empty((rows, k), device=x.device, dtype=x.dtype)
+        pack_hidden_states(
+            x,
+            routes.narrow(0, start, rows),
+            local_counts,
+            local_offsets,
+            tiles,
+            packed,
+            align,
+            topk,
+        )
+        hidden = torch.empty((rows, 2 * n), device=x.device, dtype=x.dtype)
+        grouped_quantized_gemm(
+            packed,
+            w1,
+            s1,
+            tiles,
+            hidden,
+            align,
+            8,
+            local_counts,
+            local_offsets,
+            expert_panel=True,
+        )
+        del packed
+        activated = torch.empty((rows, n), device=x.device, dtype=x.dtype)
+        apply_swiglu(
+            hidden,
+            activated,
+            local_offsets,
+            tile_experts=tiles,
+            counts=local_counts,
+            bm=align,
+        )
+        del hidden
+        grouped_quantized_gemm(
+            activated,
+            w2,
+            s2,
+            tiles,
+            routed_out.narrow(0, start, rows),
+            align,
+            8,
+            local_counts,
+            local_offsets,
+            expert_panel=True,
+        )
+        del activated
+    combine_expert_outputs(routed_out, probabilities, out, inverse)
+    return True
+
+
 def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
     """Return routed SwiGLU MoE with symmetric group128 weights."""
     if x.dtype not in (torch.bfloat16, torch.float16) or x.device.type != "npu":
@@ -2508,6 +2632,18 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
                 )
             )
             if workspace > GROUPED_WORKSPACE_BYTES:
+                if (
+                    start == 0
+                    and batch == m
+                    and panel
+                    and e >= cores
+                    and k % 1024 == 0
+                    and n % 1024 == 0
+                ):
+                    if segmented_expert_moe(
+                        x, w1, w2, s1, s2, topk_weights, topk_ids, out, cores
+                    ):
+                        return out
                 if batch == 1:
                     raise NotImplementedError(
                         "One token exceeds the Ascend MoE workspace or indexing limit"
