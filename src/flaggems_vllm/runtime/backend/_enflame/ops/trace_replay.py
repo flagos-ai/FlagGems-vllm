@@ -1,32 +1,8 @@
-# Copyright 2026 FlagOS Contributors
-# Copyright contributors to the vLLM project
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+#Enflame override for apply_trace_tokens.
+#Work around the observed GCU300 pointer-analysis failure for arith.maxsi.
+#Use tl.where to preserve valid indices; invalid-lane reads remain masked.
 
-"""Enflame (GCU) override of the generic ``apply_trace_tokens``.
 
-Identical to ``flaggems_vllm.ops.trace_replay`` except for one statement. The
-generic clamp uses ``tl.maximum``, which lowers to ``arith.maxsi``; the GCU300
-pointer-analysis pass cannot legalize that operation once its result feeds an
-address computation, so the kernel never compiles. This module uses::
-
-    safe_req_idx = tl.where(valid, req_state_idx, 0)
-
-The replacement is equivalent for every lane. ``valid`` implies
-``req_state_idx >= 0``, so both forms yield ``req_state_idx`` there; and every
-access that consumes ``safe_req_idx`` is masked by that same ``valid``, so the
-value chosen for an invalid lane is never observable.
-"""
 
 import torch
 import triton
