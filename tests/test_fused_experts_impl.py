@@ -38,8 +38,8 @@ fused_experts_impl = flaggems_vllm.ops_experts_impl
 device = flaggems_vllm.device
 vendor_name = flaggems_vllm.vendor_name
 
-if vendor_name in ("thead", "metax", "mthreads", "hygon"):
-    # These vendors' production MoE is not the stock fused_experts_impl.
+if vendor_name in ("thead", "metax", "mthreads", "hygon", "nvidia"):
+    # These vendors use the production FusedMoE path, not the stock function.
     from benchmark.test_fused_moe import production_moe_op
 
     _vllm_moe_reference = production_moe_op(vendor_name)
