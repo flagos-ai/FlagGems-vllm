@@ -1560,6 +1560,14 @@ triton_reshape_and_cache_flash_per_token_head_quant:
     num_warps: 1
     num_stages: 1
 
+fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl:
+  - META: {}
+    num_warps: 2
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
 split_kv_compress_norm_rope_insert_sparse_attn_cutedsl:
   - META: {BLOCK_D: 8}
     num_warps: 2

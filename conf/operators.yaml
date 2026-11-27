@@ -1103,6 +1103,21 @@ ops:
   - DataMovement
   stages:
   - beta: '5.4'
+- id: fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  description: |
+    Compress overlapping four-token groups in the DeepSeek V4 paged state cache,
+    apply weighted RMSNorm and interleaved RoPE, and write packed or full keys
+    to the destination cache.
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
 - id: fused_marlin_moe_w4a16
   description: 'Fused mixture-of-experts computation with 4-bit weights and 16-bit
 

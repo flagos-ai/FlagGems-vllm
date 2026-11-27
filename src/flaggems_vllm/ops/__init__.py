@@ -41,6 +41,9 @@ from flaggems_vllm.ops.fused_kimi_k3_mla_key_concat_kv_cache_insert import (
     fused_kimi_k3_mla_key_concat_kv_cache_insert,
 )
 from flaggems_vllm.ops.fused_kimi_k3_mla_kv_concat import fused_kimi_k3_mla_kv_concat
+from flaggems_vllm.ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
+)
 from flaggems_vllm.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
@@ -391,6 +394,7 @@ __all__ = [
     "fused_kimi_k3_mla_decode_q_concat_kv_cache_insert",
     "fused_kimi_k3_mla_key_concat_kv_cache_insert",
     "fused_kimi_k3_mla_kv_concat",
+    "fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
@@ -585,11 +589,21 @@ if _runtime.device.vendor_name == "metax":
 
     __all__.append("flash_attn_varlen_func_w8a8_int8")
 
-if _runtime.device.vendor_name == "ascend":
+if _runtime.device.vendor_name == "nvidia":
+    from flaggems_vllm.runtime.backend._nvidia import ops as nvidia_ops
+
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl = (  # noqa: F811
+        nvidia_ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+    )
+elif _runtime.device.vendor_name == "ascend":
+    from flaggems_vllm.runtime.backend._ascend import ops as ascend_ops
     from flaggems_vllm.runtime.backend._ascend.fused import (
         attention as ascend_attention,
     )
 
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl = (  # noqa: F811
+        ascend_ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+    )
     flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
     flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
     __all__.append("flash_attn_varlen_func_w8a8")
