@@ -2097,6 +2097,23 @@ ops:
   - Attention
   stages:
   - beta: '5.3'
+- id: qsa_select_paged_prefill
+  description: 'Select compressed QSA key groups for packed prefill queries from a paged
+
+    cache. Supports BF16 and FP8 E4M3FN on NVIDIA SM90, MThreads MUSA, and MetaX MACA with caller-provided visibility,
+
+    FP32 scoring, block Top-K 512/1024/2048, and -1 padding for short rows. Direct-call
+
+    Python API; does not expand group indices to original tokens.'
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.5'
 - id: qsa_sparse_paged_attention
   description: 'Computes sparse grouped-query attention over paged BF16 or FP8 KV
     caches
