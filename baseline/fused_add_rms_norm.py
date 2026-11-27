@@ -15,7 +15,7 @@
 import torch
 
 OP_NAME = "fused_add_rms_norm"
-DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+DTYPES = [torch.float16, torch.float32, torch.bfloat16]
 IS_INPLACE = True
 MUTATED_INPUTS = (0, 1)  # input and residual (positional args)
 NATIVE_UNAVAILABLE_REASON = None
@@ -23,27 +23,26 @@ NATIVE_UNAVAILABLE_REASON = None
 EPS = 1e-5
 INPUT_SEED = 20261123
 
-# Include cases exercised by tests/test_fused_add_rms_norm.py (which uses
-# REDUCTION_SHAPES[:2]), plus common LLM hidden sizes and large-width cases.
-# Each binding is a native two-dimensional input shape [M, N].
-SHAPES = [
-    (1, 4096),  # stable and representative first case for --check
+# Keep the exact workload order of the benchmark:
+# - Core: benchmark/core_shapes.yaml -> GenericBenchmarkExcluse1D
+# - Comprehensive: GenericBenchmark.set_more_shapes(), excluding the 1D case
+# Input ranks are intentionally preserved (both 2D and 3D).
+CORE_SHAPES = [
     (64, 64),
+    (1024, 1024),
     (4096, 4096),
-    (1, 2),
-    (2, 32),
-    (4096, 256),
-    (200, 40999),
-    (16, 4096),
-    (128, 4096),
-    (512, 4096),
-    (1, 8192),
-    (128, 8192),
-    (1, 16384),
-    (32, 16384),
-    (1, 32768),
-    (1, 65536),
+    (64, 512, 512),
+    (1024, 1024, 1024),
 ]
+COMPREHENSIVE_EXTRA_SHAPES = [
+    (10000, 1),
+    (10000, 256),
+    (10000, 65536),
+    (100, 1, 100),
+    (100, 256, 100),
+    (100, 65536, 100),
+]
+SHAPES = CORE_SHAPES + COMPREHENSIVE_EXTRA_SHAPES
 
 
 def native():
@@ -70,39 +69,65 @@ def native():
 
 
 def grid():
-    return [{"M": m, "N": n} for m, n in SHAPES]
+    return [{"shape": shape} for shape in SHAPES]
 
 
 def build_inputs(binding, dtype, device):
-    m, n = binding["M"], binding["N"]
+    shape = tuple(binding["shape"])
     generator = torch.Generator(device=device).manual_seed(INPUT_SEED)
-    inp = torch.randn((m, n), dtype=dtype, device=device, generator=generator)
-    residual = torch.randn((m, n), dtype=dtype, device=device, generator=generator)
-    weight = torch.randn((n,), dtype=dtype, device=device, generator=generator)
-    # vLLM native API: (input, residual, weight, epsilon)
+    inp = torch.randn(shape, dtype=dtype, device=device, generator=generator)
+    residual = torch.randn(shape, dtype=dtype, device=device, generator=generator)
+    weight = torch.randn((shape[-1],), dtype=dtype, device=device, generator=generator)
+    # vLLM native signature excludes the benchmark-only ``layer_shape`` arg.
     return (inp, residual, weight, EPS), {}
 
 
 def key_shape(binding):
-    return [binding["M"], binding["N"]]
+    return list(binding["shape"])
+
+
+def _contiguous_strides(shape):
+    strides = []
+    stride = 1
+    for dimension in reversed(shape):
+        strides.append(stride)
+        stride *= dimension
+    return list(reversed(strides))
 
 
 def config(binding, dtype):
-    m, n = binding["M"], binding["N"]
+    shape = tuple(binding["shape"])
     dtype_name = str(dtype)
-    matrix = {"shape": [m, n], "dtype": dtype_name, "stride": [n, 1]}
+    tensor = {
+        "shape": list(shape),
+        "dtype": dtype_name,
+        "stride": _contiguous_strides(shape),
+    }
+    rows = 1
+    for size in shape[:-1]:
+        rows *= size
+    hidden_size = shape[-1]
     return {
         "inputs": {
-            "input": dict(matrix),
-            "residual": dict(matrix),
-            "weight": {"shape": [n], "dtype": dtype_name, "stride": [1]},
+            "input": dict(tensor),
+            "residual": dict(tensor),
+            "weight": {
+                "shape": [hidden_size],
+                "dtype": dtype_name,
+                "stride": [1],
+            },
             "epsilon": {"scalar": EPS},
         },
         "outputs": {
-            "input": {**matrix, "aliases": "input"},
-            "residual": {**matrix, "aliases": "residual"},
+            "input": {**tensor, "aliases": "input"},
+            "residual": {**tensor, "aliases": "residual"},
         },
-        "dims": {"M": m, "N": n, "normalized_shape": [n]},
+        "dims": {
+            "shape": list(shape),
+            "rows": rows,
+            "hidden_size": hidden_size,
+            "normalized_shape": [hidden_size],
+        },
         "accumulate_dtype": "torch.float32",
         "input_seed": INPUT_SEED,
         "mutation": ["input", "residual"],
