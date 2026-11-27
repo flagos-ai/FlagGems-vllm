@@ -3429,7 +3429,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
             total,
             2 * n_inter,
             H,
-            STAGES=3,
+            STAGES=4 if wide else 3,
             BN=256 if wide else 128,
             NUM_WARPS=8 if wide else 4,
         )
@@ -3477,7 +3477,7 @@ def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
             n_inter,
             STAGES=2,
             BN=256 if wide2 else 128,
-            NUM_WARPS=8 if wide2 else 4,
+            NUM_WARPS=16 if wide2 else 4,
         )
     else:
         w2t = _dense_transpose_weights(w2)
