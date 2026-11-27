@@ -18,6 +18,7 @@ from flaggems_vllm.ops.FLA.fused_recurrent_gated_delta_rule import (
 from flaggems_vllm.runtime.backend._metax.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._metax.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
 )
@@ -65,6 +66,7 @@ else:
     from flaggems_vllm.ops.persistent_topk import persistent_topk
 
 __all__ = [
+    "cooperative_topk",
     "cp_gather_indexer_k_quant_cache",
     "deep_gemm_fp8_o_proj",
     "fused_experts_impl",

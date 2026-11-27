@@ -107,6 +107,73 @@ def test_cooperative_topk_random(shape, k):
 
 
 @gpu
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX tail selection")
+@pytest.mark.parametrize(
+    "width,k", [(513, 512), (4097, 1024), (2049, 2048), (16385, 2048)]
+)
+def test_metax_tail_selection(width, k):
+    # In the first five rows, the main tile has k - 1 scores above zero.
+    # The fifth row's high-ranking NaN tail is outside its valid length.
+    # Even an aligned row stride may have a misaligned first logit when a
+    # caller passes a column slice. Poison the columns around the view.
+    storage = torch.full((6, width + 3), float("nan"), dtype=torch.float32)
+    scores = storage[:, 1 : width + 1]
+    scores.zero_()
+    scores[:, : k - 1] = 2.0
+    scores[:, -1] = torch.tensor([1.0, 0.0, -1.0, -float("nan"), float("nan"), 0.0])
+    # Exercise a NaN threshold with enough ties to fill the output.
+    scores[-1, :k] = float("nan")
+    scores[-1, -1] = -float("nan")
+    logits = storage.to(device)[:, 1 : width + 1]
+    lengths, output, workspace = _buffers(logits, [width] * 4 + [width - 1, width], k)
+    flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX radix repair")
+@pytest.mark.parametrize("width", [16388, 16389, 65539])
+def test_metax_mixed_rows_radix_repair(width):
+    # Exercise both sides of the four-column tail handled by the final tile.
+    k = 512
+    scores = torch.zeros((4, width), dtype=torch.float32)
+    # The high-scoring tail overflows the compact candidate buffer. Rotate
+    # that row through the batch to check that reused scratch is reset.
+    scores[0, -2 * k :] = torch.arange(1, 2 * k + 1, dtype=torch.float32)
+    scores[0, -1] = -float("nan")
+    scores[1].normal_(generator=torch.Generator().manual_seed(7))
+    scores[2, k - 1 :] = float("nan")  # Masked suffix of a short row.
+    sizes = torch.tensor([width, width, k - 1, width], dtype=torch.int32)
+    logits = torch.empty_like(scores, device=device)
+    lengths, output, workspace = _buffers(logits, sizes.tolist(), k)
+    workspace.fill_(251)
+    for shift in range(4):
+        logits.copy_(scores.roll(shift, dims=0))
+        lengths.copy_(sizes.roll(shift))
+        output.fill_(-17)
+        flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+        _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "metax", reason="MetaX tile screening")
+def test_metax_repair_retains_ties_at_full_tile_minimum():
+    width, k = 262149, 1024
+    length = width - 2
+    scores = torch.full((1, width), -4.0)
+    # The retained candidates from this tile cover only a fraction of the
+    # 7.0 scores needed after the higher scores in two other tiles.
+    scores[0, 2048:4096] = 7.0
+    scores[0, 12:16] = 9.0
+    scores[0, 262144:length] = 11.0
+    scores[0, length:] = float("nan")
+    logits = scores.to(device)
+    lengths, output, workspace = _buffers(logits, [length], k)
+    flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
+    _check(logits, lengths, output, k, reference_on_cpu=True)
+
+
+@gpu
 @pytest.mark.parametrize("k", KS)
 @pytest.mark.parametrize("width", [4097, 16384, 65539, 262147])
 def test_mixed_lengths_rank_two_poison_padding_and_workspace_reuse(k, width):
@@ -282,12 +349,16 @@ def test_partial_wide_rows_with_near_zero_cutoff(rows, width):
         (65539, 255, 512),
         (65539, 256, 512),
         (65539, 257, 512),
+        (65539, 512, 512),
+        (65539, 513, 512),
         (65539, 255, 2048),
         (65539, 256, 2048),
         (65539, 257, 2048),
         (262147, 255, 512),
         (262147, 256, 512),
         (262147, 257, 512),
+        (262147, 1024, 512),
+        (262147, 1025, 512),
     ],
 )
 def test_threshold_bucket_capacity_boundaries(width, candidate_count, k):
@@ -702,6 +773,12 @@ def test_export_and_vendor_dispatch():
         )
 
         assert flaggems_vllm.cooperative_topk is iluvatar_cooperative_topk
+    elif flaggems_vllm.vendor_name == "metax":
+        from flaggems_vllm.runtime.backend._metax.ops.cooperative_topk import (
+            cooperative_topk as metax_cooperative_topk,
+        )
+
+        assert flaggems_vllm.cooperative_topk is metax_cooperative_topk
     elif flaggems_vllm.vendor_name == "mthreads":
         from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
             cooperative_topk as mthreads_cooperative_topk,

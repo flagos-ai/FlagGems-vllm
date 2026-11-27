@@ -554,3 +554,10 @@ mhc_shifted_reduce_coeff_metax:
   - META: {}
     num_warps: 8
     num_stages: 1
+
+cooperative_topk_c550_row:
+  - META:
+      BASE_BINS: 256
+      BASE_CAP: 32
+    num_warps: 8
+    num_stages: 1
