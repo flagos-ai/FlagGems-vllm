@@ -106,6 +106,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.matmul_persistent import (
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre_clamp_sinkhorn
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.pad_indexer_heads import (
+    pad_indexer_heads,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -198,6 +201,7 @@ __all__ = [
     "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
     "pack_seq_triton",
+    "pad_indexer_heads",
     "paged_scatter_triton",
     "per_token_group_quant_fp8",
     "persistent_topk",
