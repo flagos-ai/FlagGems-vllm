@@ -67,22 +67,20 @@ class KdaStateScatterBenchmark(base.Benchmark):
 
 
 def _torch_scatter(cache, idx, vals):
-    out = cache.clone()
-    out[idx] = vals.transpose(-1, -2).contiguous().to(out.dtype)
-    return out
+    cache[idx] = vals.transpose(-1, -2).contiguous().to(cache.dtype)
+    return cache
 
 
 def _gems_scatter(cache, idx, vals):
-    out = cache.clone()
-    flaggems_vllm.scatter_kda_state(out, idx, vals)
-    return out
+    flaggems_vllm.scatter_kda_state(cache, idx, vals)
+    return cache
 
 
-@pytest.mark.kda_state_scatter
+@pytest.mark.scatter_kda_state
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "ascend", reason="targets Ascend")
-def test_kda_state_scatter_perf():
+def test_scatter_kda_state_perf():
     KdaStateScatterBenchmark(
-        op_name="kda_state_scatter",
+        op_name="scatter_kda_state",
         torch_op=_torch_scatter,
         gems_op=_gems_scatter,
         dtypes=[torch.bfloat16],

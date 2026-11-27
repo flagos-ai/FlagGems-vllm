@@ -20,9 +20,6 @@ import torch
 from packaging.version import InvalidVersion, Version
 
 import flaggems_vllm
-from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
-    cp_gather_indexer_k_quant_cache as generic_cp_gather_indexer_k_quant_cache,
-)
 
 # Bind the top-level entry: on vendor backends with a specialized
 # implementation (runtime/backend/_<vendor>/ops), this is the vendor version
@@ -277,22 +274,22 @@ def test_cp_gather_indexer_k_quant_cache_matches_reference(
 
 @pytest.mark.cp_gather_indexer_k_quant_cache
 @torch.inference_mode()
-def test_cp_gather_indexer_k_quant_cache_generic_batch_31():
-    # One token per sequence makes cu_seqlen = [0, 1, ..., 31]. The
-    # previous iteration bound left token 0 unwritten in the generic kernel.
+def test_cp_gather_indexer_k_quant_cache_noncontiguous_batch_31():
+    # One token per sequence covers the batch-31 search boundary. The strided
+    # cache exercises the Ascend fallback without changing the gather semantics.
     batch_size, block_size, head_dim, scale_bytes = 31, 16, 128, 4
     fp8_dtype = _default_fp8_dtype()
     cache = torch.ones(
-        (batch_size, block_size, head_dim + scale_bytes),
+        (batch_size * 2, block_size, head_dim + scale_bytes),
         dtype=torch.uint8,
         device=device,
-    )
+    )[::2]
     block_table = torch.arange(batch_size, dtype=torch.int32, device=device).view(-1, 1)
     cu_seqlen = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
     dst_k = torch.zeros((batch_size, head_dim), dtype=torch.uint8, device=device)
     dst_scale = torch.zeros((batch_size, scale_bytes), dtype=torch.uint8, device=device)
 
-    generic_cp_gather_indexer_k_quant_cache(
+    cp_gather_indexer_k_quant_cache(
         cache, dst_k.view(fp8_dtype), dst_scale, block_table, cu_seqlen
     )
     for output in (dst_k, dst_scale):

@@ -82,7 +82,7 @@ def device() -> torch.device:
 
 @pytest.fixture(scope="module")
 def candidate_logprob():
-    return importlib.import_module("flaggems_vllm.ops.logprob")
+    return importlib.import_module(flaggems_vllm.compute_topk_scores.__module__)
 
 
 def _make_inputs(candidate, case: Case, device: torch.device, dtype: torch.dtype):

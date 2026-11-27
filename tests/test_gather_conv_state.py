@@ -80,10 +80,10 @@ def _ref_gather(conv_state, cache_indices):
 # reduced batch dimensions; the last case is an edge shape.
 
 
-@pytest.mark.kda_conv_gather
+@pytest.mark.gather_conv_state
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
-def test_conv_gather_accuracy(case, dtype):
+def test_gather_conv_state_accuracy(case, dtype):
     conv_state, idx = _make_inputs(case, dtype=dtype)
     ref_staged, ref_local = _ref_gather(conv_state, idx)
     staged, local = flaggems_vllm.gather_conv_state(conv_state, idx)

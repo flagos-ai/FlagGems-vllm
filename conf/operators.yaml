@@ -550,6 +550,29 @@ ops:
   - LinearAlg
   stages:
   - beta: '5.0'
+- id: deep_gemm_fp8_o_proj
+  description: 'DeepSeek-V4 attention output projection: inverse RoPE, group-wise
+    FP8 quantization, block-wise FP8 einsum over the o-LoRA weights, then wo_b.
+    Precisions: FP8 (E4M3) with 128x128 block scales on Hopper; Hygon, MetaX
+    and PPU transport the same block-quantized values as INT8 (INT8
+    tensor-core GEMM) because their Triton backends have no FP8 dot
+    lowering. Ascend keeps the block-quantized values but transports them
+    as FP16: it has neither an FP8 dot nor a device-side FP8 cast, and
+    folding the block scale into the GEMM K loop drops the throughput to
+    15 TFLOPS there.
+
+    '
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.o_proj.deep_gemm_fp8_o_proj
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - Quantization
+  stages:
+  - beta: '5.4'
 - id: dequantize_and_gather_k_cache
   description: 'Dequantizes FP8 K-cache entries and gathers them into a BF16 tensor
     for DeepSeekV4 attention.
@@ -1098,6 +1121,7 @@ ops:
   description: |
     Fuse MQA query RoPE and FP8 packing with indexer query RoPE,
     UE8M0 quantization, and index-weight scaling. Includes H20 scheduling.
+    Includes an Ascend specialization for the full BF16 workload, validated on 910B4-1.
   for:
     - vllm.models.deepseek_v32.common.kernels.fused_q
   labels:
@@ -1187,6 +1211,23 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: gather_conv_state
+  description: |
+    Stages the rows used by a batch out of the block-strided Kimi Delta
+    Attention (KDA) short-convolution state cache into a contiguous buffer
+    for the AscendC conv operator, emitting local row indices with PAD
+    markers in a single kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream has implemented its own Triton kernel.
+  for:
+    - torch chain (index_select -> contiguous -> arange -> masked_fill)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
 - id: gather_draft_sampled
   description: Gather logits-aligned draft tokens and positions for speculative verification.
   for:
@@ -1564,26 +1605,7 @@ ops:
   - stable: '2.2'
   - removed: '3.0'
   - beta: '5.3'
-- id: kda_conv_gather
-  description: 'Stages the rows used by a batch out of the block-strided Kimi Delta
-
-    Attention (KDA) short-convolution state cache into a contiguous buffer
-
-    for the AscendC conv operator, emitting local row indices with PAD
-
-    markers in a single kernel.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
-- id: kda_gate_cumsum
+- id: kda_gate_cumsum_triton
   description: 'Fused Triton replacement for the AscendC kda_gate_cumsum operator:
 
     computes the safe sigmoid gates of Kimi Delta Attention and their
@@ -1591,23 +1613,6 @@ ops:
     in-chunk cumulative sums with one program per (chunk, head) tile
 
     instead of one serial block per sequence.
-
-    '
-  for:
-  - None
-  labels:
-  - fused
-  - FLA
-  kind:
-  - Attention
-  stages:
-  - alpha: '5.4'
-- id: kda_state_scatter
-  description: 'Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
-
-    chunk operator back into the paged [H, V, K] cache layout with the
-
-    transpose and dtype cast folded into a single kernel.
 
     '
   for:
@@ -1708,7 +1713,7 @@ ops:
   stages:
   - alpha: '5.5'
 - id: matmul_persistent
-  description: vLLM batch-invariant matmul with bounded NVIDIA small-matrix optimization.
+  description: vLLM batch-invariant matmul with NVIDIA small-matrix and Ascend implementations.
   for:
     - vllm.model_executor.determinism.batch_invariant.matmul_batch_invariant
   labels:
@@ -2121,6 +2126,23 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.5'
+- id: quant_lightning_indexer
+  description: 'Ascend paged C4 logical top-k indexer with explicit request positions
+
+    and key lengths. Supports floating or INT8 queries/keys, per-query-head
+
+    scales and per-cache-row key scales without materializing gathered KV.
+
+    '
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
 - id: reglu
   description: 'Rectified Gated Linear Unit is a variant of GLU that uses ReLU instead
     of the sigmoid function for gating.
@@ -2208,6 +2230,22 @@ ops:
     than 0.30.0, the upstream has implemented its own Triton kernel.
   for:
     - torch chain (arange/masked_fill -> where/zeros_like/sum -> index_copy_)
+  labels:
+    - fused
+    - FLA
+  kind:
+    - Attention
+  stages:
+    - alpha: '5.4'
+- id: scatter_kda_state
+  description: |
+    Scatters the [N, H, K, V] KDA recurrent-state output of the AscendC
+    chunk operator back into the paged [H, V, K] cache layout with the
+    transpose and dtype cast folded into a single kernel.
+    Targeted at vllm-ascend versions earlier than 0.30.0. When it is later
+    than 0.30.0, the upstream use the native op npu_scatter_nd_update_.
+  for:
+    - torch chain (transpose -> contiguous -> cast -> index_put)
   labels:
     - fused
     - FLA
@@ -2398,6 +2436,33 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '5.0'
+- id: swiglu_group_quant
+  description: 'SwiGLU fused with block-wise FP8 quantization for Ascend 950DT
+
+    (A5 / arch35). The implementation lives under
+
+    `runtime/backend/_ascend/a5/ops/` and targets the CANN
+
+    `aclnnSwigluGroupQuant` interface: BF16/FP16 input, E4M3/E5M2 output,
+
+    optional per-token FP32 weight, clamp and group_index, and MX E8M0 scales
+
+    or block FP32 scales. Quant modes 0 and 1 are supported; HiFloat8 modes
+
+    2 and 3 are not available through Triton and raise an explicit error.
+
+    '
+  for:
+  - swiglu_group_quant
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  - MoE
+  kind:
+  - Quantization
+  stages:
+  - beta: '0.3'
 - id: top_k_per_row_decode
   description: 'Triton top-K per row for DeepSeek V4 decode-phase token selection.
 

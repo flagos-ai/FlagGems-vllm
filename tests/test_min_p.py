@@ -8,12 +8,8 @@ import torch
 
 try:
     from vllm.v1.worker.gpu.sample.min_p import apply_min_p as vllm_reference
-except ImportError as exc:
-    raise ImportError(
-        "Failed to import apply_min_p from vLLM. "
-        "Check that the installed vLLM version provides this API "
-        "and its dependencies are installed correctly."
-    ) from exc
+except ImportError:
+    vllm_reference = None
 
 from flaggems_vllm import apply_min_p
 from flaggems_vllm import device as DEVICE
@@ -23,6 +19,9 @@ from . import conftest as cfg
 
 pytestmark = [
     pytest.mark.apply_min_p,
+    pytest.mark.skipif(
+        vllm_reference is None, reason="vLLM min-p reference is unavailable"
+    ),
     pytest.mark.skipif(
         DEVICE == "cpu" or not runtime.torch_device_fn.is_available(),
         reason="requires the active accelerator",

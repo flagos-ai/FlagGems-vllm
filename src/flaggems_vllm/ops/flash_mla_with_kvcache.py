@@ -53,7 +53,6 @@ if HAS_TLE:
 else:
     HAS_TLE_MODEL1 = False
 
-
 # TLE constants for decode
 TLE_DECODE_BK = 64
 TLE_DECODE_BH = 64
@@ -68,13 +67,24 @@ TLE_DECODE_WORKER_NUM_WARPS = 4
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
-    """Stores tile scheduler metadata for FlashMLA."""
+    """Stores tile scheduler metadata for FlashMLA.
+
+    One object serves repeated calls that agree on everything in Config, which
+    every call after the first asserts, and a backend may keep a tile schedule
+    in tile_scheduler_metadata / num_splits across them. What Config cannot
+    assert is the dynamic lengths in topk_length and extra_topk_length, which a
+    schedule may also depend on, so an object belongs to one set of inputs: get
+    a fresh one from get_mla_metadata when the lengths change, exactly as the
+    CUDA interface takes cache_seqlens there and vLLM calls it once per forward
+    step before handing the result to every layer.
+    """
 
     @dataclasses.dataclass
     class Config:
         b: int
         s_q: int
         h_q: int
+        head_dim_k: int
         page_block_size: int
         h_k: int
         causal: bool
@@ -213,6 +223,10 @@ def _sparse_decode_kernel(
         kv_ids = tl.load(t_ptr, t_msk, other=-1)
         mask_ids = (kv_ids < SKV) & (kv_ids >= 0)
         kv_ids = tl.where(mask_ids, kv_ids, 0)
+        # int64, or the byte offsets below wrap once the cache passes 2**31
+        # elements -- 4.19M tokens, which a long-context batch reaches -- and
+        # the kernel reads the wrong tokens or faults.
+        kv_ids = kv_ids.to(tl.int64)
 
         if IS_FP8:
             # FP8 mode: load FP8 values and dequantize with per-128-element scales
@@ -849,34 +863,26 @@ def _dense_decode_kernel(
 # ============================================================================
 
 
-def flash_mla_with_kvcache(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    block_table: Optional[torch.Tensor],
-    cache_seqlens: Optional[torch.Tensor],
-    head_dim_v: int,
-    tile_scheduler_metadata: FlashMLASchedMeta,
-    num_splits: None = None,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    is_fp8_kvcache: bool = False,
-    indices: Optional[torch.Tensor] = None,
-    attn_sink: Optional[torch.Tensor] = None,
-    extra_k_cache: Optional[torch.Tensor] = None,
-    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
-    topk_length: Optional[torch.Tensor] = None,
-    extra_topk_length: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Triton implementation of flash_mla_with_kvcache.
-    Functionally equivalent to the CUDA implementation.
+def prepare_call(
+    q,
+    k_cache,
+    head_dim_v,
+    sched_meta,
+    num_splits,
+    softmax_scale,
+    causal,
+    is_fp8_kvcache,
+    indices,
+    extra_k_cache,
+    extra_indices_in_kvcache,
+    out,
+):
+    """Checks the arguments against sched_meta and allocates out and lse.
 
-    Returns:
-        out: (batch_size, seq_len_q, num_heads_q, head_dim_v)
-        softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32
+    Shared with the vendor entries that serve part of this operator, so the
+    schedule metadata contract and the output allocation stay in one place.
+    Returns out, lse, the resolved softmax_scale and topk.
     """
-    sched_meta = tile_scheduler_metadata
     assert isinstance(sched_meta, FlashMLASchedMeta)
     assert num_splits is None
     assert q.ndim == 4
@@ -903,6 +909,7 @@ def flash_mla_with_kvcache(
             q.shape[0],
             q.shape[1],
             q.shape[2],
+            q.shape[3],
             k_cache.shape[1],
             k_cache.shape[2],
             causal,
@@ -926,6 +933,9 @@ def flash_mla_with_kvcache(
         )
         assert sched_meta.config.h_q == q.shape[2], (
             "sched_meta.config.h_q must be equal to num_heads_q." + helper_msg
+        )
+        assert sched_meta.config.head_dim_k == q.shape[3], (
+            "sched_meta.config.head_dim_k must be equal to head_dim_k." + helper_msg
         )
         assert sched_meta.config.page_block_size == k_cache.shape[1], (
             "sched_meta.config.page_block_size must be equal to page_block_size."
@@ -954,8 +964,7 @@ def flash_mla_with_kvcache(
             "extra_indices_in_kvcache." + helper_msg
         )
 
-    batch_size, seq_q, num_heads_q, head_dim_k = q.shape
-    num_heads_k = k_cache.shape[2]
+    batch_size, seq_q, num_heads_q, _ = q.shape
 
     if out is None:
         out = torch.empty(
@@ -974,88 +983,174 @@ def flash_mla_with_kvcache(
         device=q.device,
     )
 
-    if indices is not None:
-        assert not causal, "causal must be False when sparse attention is enabled"
-        assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
+    return out, lse, softmax_scale, topk
+
+
+def validate_sparse_args(
+    q,
+    k_cache,
+    indices,
+    attn_sink,
+    topk_length,
+    extra_k_cache,
+    extra_indices_in_kvcache,
+    extra_topk_length,
+    head_dim_v,
+    topk,
+    causal,
+    is_fp8_kvcache,
+):
+    """Asserts the sparse decode contract, shared with the vendor entries."""
+    batch_size, seq_q, num_heads_q, head_dim_k = q.shape
+    num_heads_k = k_cache.shape[2]
+    assert not causal, "causal must be False when sparse attention is enabled"
+    assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
+    assert (
+        num_heads_k == 1
+    ), "Currently only MQA (h_kv == 1) is supported for sparse decoding"
+    assert head_dim_v == 512, "Only head_size_v == 512 is supported"
+    assert num_heads_q in (64, 128), "Only h_q == 64 or 128 is supported"
+    assert head_dim_k in (
+        512,
+        576,
+    ), "Only head_size_k == 512 or 576 is supported for sparse decoding"
+    assert q.dtype == torch.bfloat16
+    assert k_cache.dtype in (torch.float8_e4m3fn, torch.int8, torch.uint8)
+    assert topk is not None and topk > 0
+    assert topk % 64 == 0, "topk must be divisible by 64"
+    assert indices.ndim == 3 and indices.shape[:2] == (batch_size, seq_q)
+    assert indices.dtype == torch.int32
+    assert indices.stride(-1) == 1
+    if topk_length is not None:
+        assert topk_length.shape == (batch_size,)
+        assert topk_length.dtype == torch.int32
+        assert topk_length.is_contiguous()
+    if attn_sink is not None:
+        assert attn_sink.shape == (num_heads_q,)
+        assert attn_sink.dtype == torch.float32
+    if extra_k_cache is not None:
+        assert extra_indices_in_kvcache is not None, (
+            "extra_indices_in_kvcache must be provided when extra_k_cache "
+            "is provided"
+        )
+        assert extra_k_cache.dtype in (
+            torch.float8_e4m3fn,
+            torch.int8,
+            torch.uint8,
+        )
+    else:
+        assert extra_indices_in_kvcache is None, (
+            "extra_indices_in_kvcache must not be provided when extra_k_cache "
+            "is not provided"
+        )
+        assert extra_topk_length is None, (
+            "extra_topk_length must not be provided when extra_k_cache is "
+            "not provided"
+        )
+    if extra_indices_in_kvcache is not None:
+        assert extra_indices_in_kvcache.ndim == 3
+        assert extra_indices_in_kvcache.shape[:2] == (batch_size, seq_q)
+        assert extra_indices_in_kvcache.dtype == torch.int32
+        assert extra_indices_in_kvcache.stride(-1) == 1
+        assert extra_indices_in_kvcache.shape[-1] % 64 == 0
+    if extra_topk_length is not None:
+        assert extra_topk_length.shape == (batch_size,)
+        assert extra_topk_length.dtype == torch.int32
+        assert extra_topk_length.is_contiguous()
+    if head_dim_k == 576:
         assert (
-            num_heads_k == 1
-        ), "Currently only MQA (h_kv == 1) is supported for sparse decoding"
-        assert head_dim_v == 512, "Only head_size_v == 512 is supported"
-        assert num_heads_q in (64, 128), "Only h_q == 64 or 128 is supported"
-        assert head_dim_k in (
-            512,
-            576,
-        ), "Only head_size_k == 512 or 576 is supported for sparse decoding"
-        assert q.dtype == torch.bfloat16
-        assert k_cache.dtype in (torch.float8_e4m3fn, torch.int8, torch.uint8)
-        assert topk is not None and topk > 0
-        assert topk % 64 == 0, "topk must be divisible by 64"
-        assert indices.ndim == 3 and indices.shape[:2] == (batch_size, seq_q)
-        assert indices.dtype == torch.int32
-        assert indices.stride(-1) == 1
-        if topk_length is not None:
-            assert topk_length.shape == (batch_size,)
-            assert topk_length.dtype == torch.int32
-            assert topk_length.is_contiguous()
-        if attn_sink is not None:
-            assert attn_sink.shape == (num_heads_q,)
-            assert attn_sink.dtype == torch.float32
+            k_cache.shape[-1] == 656
+        ), "V32 sparse FP8 cache must use 656 bytes per token"
+        assert (
+            k_cache.stride(1) == 656
+        ), "The whole block must be contiguous for V32 KV cache"
+        assert topk_length is None, "V3.2/V32 does not support dynamic topk length"
+        assert extra_k_cache is None, "V3.2/V32 does not support extra KV cache"
+        assert (
+            extra_indices_in_kvcache is None
+        ), "V3.2/V32 does not support extra indices"
+        assert extra_topk_length is None, "V3.2/V32 does not support extra topk length"
+    else:
+        assert (
+            k_cache.shape[-1] == 584
+        ), "MODEL1 sparse FP8 cache must use 584 bytes per token"
+        assert (
+            k_cache.stride(1) == 584
+        ), "The whole block must be contiguous for MODEL1 KV cache"
         if extra_k_cache is not None:
-            assert extra_indices_in_kvcache is not None, (
-                "extra_indices_in_kvcache must be provided when extra_k_cache "
-                "is provided"
-            )
-            assert extra_k_cache.dtype in (
-                torch.float8_e4m3fn,
-                torch.int8,
-                torch.uint8,
-            )
-        else:
-            assert extra_indices_in_kvcache is None, (
-                "extra_indices_in_kvcache must not be provided when extra_k_cache "
-                "is not provided"
-            )
-            assert extra_topk_length is None, (
-                "extra_topk_length must not be provided when extra_k_cache is "
-                "not provided"
-            )
-        if extra_indices_in_kvcache is not None:
-            assert extra_indices_in_kvcache.ndim == 3
-            assert extra_indices_in_kvcache.shape[:2] == (batch_size, seq_q)
-            assert extra_indices_in_kvcache.dtype == torch.int32
-            assert extra_indices_in_kvcache.stride(-1) == 1
-            assert extra_indices_in_kvcache.shape[-1] % 64 == 0
-        if extra_topk_length is not None:
-            assert extra_topk_length.shape == (batch_size,)
-            assert extra_topk_length.dtype == torch.int32
-            assert extra_topk_length.is_contiguous()
-        if head_dim_k == 576:
-            assert (
-                k_cache.shape[-1] == 656
-            ), "V32 sparse FP8 cache must use 656 bytes per token"
-            assert (
-                k_cache.stride(1) == 656
-            ), "The whole block must be contiguous for V32 KV cache"
-            assert topk_length is None, "V3.2/V32 does not support dynamic topk length"
-            assert extra_k_cache is None, "V3.2/V32 does not support extra KV cache"
-            assert (
-                extra_indices_in_kvcache is None
-            ), "V3.2/V32 does not support extra indices"
-            assert (
-                extra_topk_length is None
-            ), "V3.2/V32 does not support extra topk length"
-        else:
-            assert (
-                k_cache.shape[-1] == 584
-            ), "MODEL1 sparse FP8 cache must use 584 bytes per token"
-            assert (
-                k_cache.stride(1) == 584
-            ), "The whole block must be contiguous for MODEL1 KV cache"
-            if extra_k_cache is not None:
-                assert extra_k_cache.ndim == 4
-                assert extra_k_cache.shape[2] == 1
-                assert extra_k_cache.shape[-1] == 584
-                assert extra_k_cache.stride(1) == 584
+            assert extra_k_cache.ndim == 4
+            assert extra_k_cache.shape[2] == 1
+            assert extra_k_cache.shape[-1] == 584
+            assert extra_k_cache.stride(1) == 584
+
+
+def flash_mla_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor],
+    cache_seqlens: Optional[torch.Tensor],
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    num_splits: None = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    is_fp8_kvcache: bool = False,
+    indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    scale_fmt: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Triton implementation of flash_mla_with_kvcache.
+    Functionally equivalent to the CUDA implementation.
+
+    scale_fmt names the format the FP8 KV cache scales were quantized in, as
+    passed to indexer_k_quant_and_cache; "ue8m0" means every scale is a power
+    of two, and None means unknown. This implementation reads the scales as
+    they are and ignores it; a backend may use it to select a cheaper
+    dequantization.
+
+    Returns:
+        out: (batch_size, seq_len_q, num_heads_q, head_dim_v)
+        softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32
+    """
+    sched_meta = tile_scheduler_metadata
+    out, lse, softmax_scale, topk = prepare_call(
+        q,
+        k_cache,
+        head_dim_v,
+        sched_meta,
+        num_splits,
+        softmax_scale,
+        causal,
+        is_fp8_kvcache,
+        indices,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        out,
+    )
+    batch_size, seq_q, num_heads_q, head_dim_k = q.shape
+    num_heads_k = k_cache.shape[2]
+
+    if indices is not None:
+        validate_sparse_args(
+            q,
+            k_cache,
+            indices,
+            attn_sink,
+            topk_length,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+            head_dim_v,
+            topk,
+            causal,
+            is_fp8_kvcache,
+        )
         _sparse_decode_dispatch(
             q,
             k_cache,
@@ -1076,6 +1171,7 @@ def flash_mla_with_kvcache(
             k_cache.shape[1],
             softmax_scale,
             is_fp8_kvcache,
+            sched_meta,
         )
     else:
         assert (
@@ -1143,6 +1239,7 @@ def _sparse_decode_dispatch(
     page_block_size,
     softmax_scale,
     is_fp8_kvcache,
+    sched_meta=None,
 ):
     """Launch sparse decode kernel."""
     BH = 64
