@@ -1,0 +1,10 @@
+{
+  "results/logprob-1349/qualification.json": "e78fec8a1ba0b0787edcdbca7ca23b49e0da4834dfe94125a5898b0afc1e50d4",
+  "results/logprob-1349/raw.tar.gz": "feef7985c226ccfafbb9f16f0601b457901e70d27781c3278e7e8c5348d595e5",
+  "results/logprob-1349/source-EOL-audit.json": "e456aefbe13f8172cd0fd8002ea23fde93b73d61c8386a0d9ac10da5bd7242ff",
+  "results/megamoe-1351/qualification.json": "aafb4c6ae36b46d5383a4e1e1c58cdf41fc3bd29a10a2a860c48290437880a28",
+  "results/megamoe-1351/raw.tar.gz": "e853fc958cb9e82ee1154d4906c7316838aef01c4688f01709cb1e2ee46eca3c",
+  "results/ci-1356-1361/summary.json": "6fb4c54ec8e8de8230b8543f0a24c77bd05c55d7032a940b6332c6d24c4bb639",
+  "results/ci-1356-1361/README.md": "0afeafabed12706be6fd975bc1493ea05a1af229a9ed4fe82d6306d09485d448",
+  "results/ci-1356-1361/raw.tar.gz": "be7951b63d38aeeddec82b2ec8cd1448718ef44121a1eeb1d6bdeb2e6c0a5825"
+}

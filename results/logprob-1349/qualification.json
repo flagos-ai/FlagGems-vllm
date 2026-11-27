@@ -1,0 +1,656 @@
+{
+  "status": "PASS",
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "pr_head": "7bbc34f47103d10dcf9b58c9722446978c1e75c4",
+  "tested_tree": "c9bd8301f6c7e8c6c9da5c58d37c4e64ccd6cc62",
+  "package_sha256": "b027a1bd02e74297d01a1fcbe8272a5e767b49243f8157e72f1539844f411538",
+  "physical_gpu": 4,
+  "source_files_matched": 1808,
+  "functional": {
+    "passed": 47,
+    "failures": 0,
+    "skipped": 0
+  },
+  "native_G6": {
+    "cases": 22,
+    "passed": 22,
+    "warmup_ms": 25,
+    "repetition_ms": 100,
+    "threshold": 0.9,
+    "minimum_speedup": 0.9813034354274784,
+    "rows": [
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              151936
+            ],
+            5,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.2329919934272766,
+        "candidate_ms": 0.05331199988722801,
+        "speedup": 4.370348025212512,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[decode-b1]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              16,
+              151936
+            ],
+            5,
+            [
+              16
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.2795200049877167,
+        "candidate_ms": 0.07545600086450577,
+        "speedup": 3.704410541046867,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[decode-b16]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              64,
+              151936
+            ],
+            5,
+            [
+              64
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.49540799856185913,
+        "candidate_ms": 0.21500800549983978,
+        "speedup": 2.3041374548364355,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[decode-b64]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              256,
+              151936
+            ],
+            5,
+            [
+              256
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 1.1414400339126587,
+        "candidate_ms": 0.8135039806365967,
+        "speedup": 1.4031154869327622,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[decode-b256]"
+      },
+      {
+        "dtype": "torch.float16",
+        "shape": [
+          [
+            [
+              16,
+              151936
+            ],
+            5,
+            [
+              16
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.22670400142669678,
+        "candidate_ms": 0.0721919983625412,
+        "speedup": 3.140292644182134,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[decode-b16-fp16]"
+      },
+      {
+        "dtype": "torch.bfloat16",
+        "shape": [
+          [
+            [
+              16,
+              151936
+            ],
+            5,
+            [
+              16
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.22896000742912292,
+        "candidate_ms": 0.0721919983625412,
+        "speedup": 3.171542728036257,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[decode-b16-bf16]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              151936
+            ],
+            20,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.2343360036611557,
+        "candidate_ms": 0.1324480026960373,
+        "speedup": 1.7692679307437136,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[medium-k-b1]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              64,
+              151936
+            ],
+            20,
+            [
+              64
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.4970559924840927,
+        "candidate_ms": 0.3657279908657074,
+        "speedup": 1.35908654764849,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[medium-k-b64]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              151936
+            ],
+            0,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.19392000138759613,
+        "candidate_ms": 0.025280000641942024,
+        "speedup": 7.670885936049529,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[sample-only-b1]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              64,
+              151936
+            ],
+            0,
+            [
+              64
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.2563839852809906,
+        "candidate_ms": 0.03513599932193756,
+        "speedup": 7.296903182739827,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[sample-only-b64]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              16,
+              151936
+            ],
+            5,
+            [
+              16
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": [
+              16
+            ],
+            "max_per_req_token_ids": 8,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.29468798637390137,
+        "candidate_ms": 0.08857599645853043,
+        "speedup": 3.326950846235962,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[custom-b16]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              64,
+              151936
+            ],
+            5,
+            [
+              64
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": [
+              64
+            ],
+            "max_per_req_token_ids": 8,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.496751993894577,
+        "candidate_ms": 0.21385599672794342,
+        "speedup": 2.3228340635522104,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[custom-b64]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              151936
+            ],
+            5,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": true
+          }
+        ],
+        "native_ms": 0.1223360002040863,
+        "candidate_ms": 0.04956800118088722,
+        "speedup": 2.4680438446095234,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[logits-b1]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              64,
+              151936
+            ],
+            5,
+            [
+              64
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": true
+          }
+        ],
+        "native_ms": 0.3468160033226013,
+        "candidate_ms": 0.19619199633598328,
+        "speedup": 1.767737776258064,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[logits-b64]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              151936
+            ],
+            0,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": true
+          }
+        ],
+        "native_ms": 0.08726400136947632,
+        "candidate_ms": 0.01833599992096424,
+        "speedup": 4.759162398866728,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[logits-k0-b1]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              32000
+            ],
+            5,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.0979200005531311,
+        "candidate_ms": 0.05225599929690361,
+        "speedup": 1.8738518422885329,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[small-vocab-b1]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              64,
+              32000
+            ],
+            5,
+            [
+              64
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.144896000623703,
+        "candidate_ms": 0.05443200096487999,
+        "speedup": 2.6619635151239653,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[small-vocab-b64]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              32000
+            ],
+            1025,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.11910399794578552,
+        "candidate_ms": 0.08761599659919739,
+        "speedup": 1.3593864427592048,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[wide-k]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              32000
+            ],
+            32000,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.18911999464035034,
+        "candidate_ms": 0.09663999825716019,
+        "speedup": 1.9569536222165462,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[full-vocab-logprob]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              64,
+              32000
+            ],
+            32000,
+            [
+              64
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": false
+          }
+        ],
+        "native_ms": 0.5168960094451904,
+        "candidate_ms": 0.49798399209976196,
+        "speedup": 1.0379771591967957,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[full-vocab-logprob-b64]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              1,
+              32000
+            ],
+            32000,
+            [
+              1
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": true
+          }
+        ],
+        "native_ms": 0.15014399588108063,
+        "candidate_ms": 0.10145599767565727,
+        "speedup": 1.4798927547001517,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[full-vocab-logits]"
+      },
+      {
+        "dtype": "torch.float32",
+        "shape": [
+          [
+            [
+              64,
+              32000
+            ],
+            32000,
+            [
+              64
+            ]
+          ],
+          {
+            "logprob_token_ids_state": null,
+            "expanded_idx_mapping": null,
+            "max_per_req_token_ids": 0,
+            "logits_mode": true
+          }
+        ],
+        "native_ms": 0.47363199293613434,
+        "candidate_ms": 0.48265600204467773,
+        "speedup": 0.9813034354274784,
+        "passed": true,
+        "test": "test_compute_topk_scores_perf[full-vocab-logits-b64]"
+      }
+    ]
+  },
+  "runtime": {
+    "torch": "2.13.0+cu130",
+    "triton": "3.6.0",
+    "vllm": "0.32.0",
+    "packages": {
+      "flag-gems": "5.4.0",
+      "flagtree": "0.7.0",
+      "flagcx": "0.14.1+cuda13.3"
+    },
+    "TLE": true,
+    "origins": {
+      "torch": "/usr/local/lib/python3.12/dist-packages/torch/__init__.py",
+      "triton": "/compiler/triton/__init__.py",
+      "flagtree": "/compiler/flagtree/__init__.py",
+      "flag_gems": "/legacy-deps/flag_gems/__init__.py",
+      "flagcx": "/deps/flagcx/__init__.py",
+      "vllm": "/usr/local/lib/python3.12/dist-packages/vllm/__init__.py",
+      "flaggems_vllm": "/candidate/src/flaggems_vllm/__init__.py",
+      "flaggems_vllm.ops.logprob": "/candidate/src/flaggems_vllm/ops/logprob.py"
+    },
+    "gpu": "NVIDIA H20-3e",
+    "device_count": 1,
+    "native_reference": "installed vllm0.32",
+    "cache": {
+      "FLAGGEMS_CACHE_DIR": "/results/cache/gems",
+      "TRITON_CACHE_DIR": "/results/cache/triton",
+      "XDG_CACHE_HOME": "/results/cache/xdg"
+    }
+  },
+  "state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-11-27T09:45:00.842029605Z",
+    "FinishedAt": "2026-11-27T09:47:14.346864042Z"
+  },
+  "natural_exit": true,
+  "positive_CID_absence": true,
+  "selectedGPU_after_idle_noPID": "asserted by launcher, exit0 and raw GPU/PID CSV retained",
+  "raw_archive": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\logprob-complete-raw-v2.tar.gz",
+  "raw_sha256": "feef7985c226ccfafbb9f16f0601b457901e70d27781c3278e7e8c5348d595e5",
+  "raw_bytes": 100507,
+  "no_retry": true,
+  "source_binding": {
+    "archive_working_tree_EOL": "Windows core.autocrlf=true converted1731 regularfiles LF-to-CRLF;74regularfiles rawidentical",
+    "code_and_yaml_only_CRLF_normalization_equal": true,
+    "all_other_differences": [],
+    "audit_file": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\source-EOL-audit.json",
+    "source_claim": "source logical Git tree after EOL normalization; raw archive not byte-identical Git blobs"
+  }
+}

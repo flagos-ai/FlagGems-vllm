@@ -1,0 +1,469 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 96dc87e..54f16e3 100755
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -170,12 +170,12 @@ def pytest_configure(config):
+ 
+     # Print info when first-parameter-only is enabled
+     if FIRST_PARAMETER_ONLY:
+-        print(f"\n{'='*70}")
++        print(f"\n{'=' * 70}")
+         print("FIRST-PARAMETER-ONLY MODE ENABLED")
+         print(
+             "   Each test function will run with only its first parameter combination"
+         )
+-        print(f"{'='*70}\n")
++        print(f"{'=' * 70}\n")
+ 
+ 
+ def _probe_device_context() -> bool:
+@@ -229,6 +229,8 @@ def pytest_runtest_teardown(item, nextitem):
+             "device context poisoned after %s, remaining tests will be skipped",
+             item.nodeid,
+         )
++        # An asynchronous fault may surface only after the test call passed.
++        pytest.fail(f"device context poisoned after {item.nodeid}")
+ 
+     if not RECORD_LOG:
+         return
+@@ -303,6 +305,10 @@ def pytest_runtest_logreport(report):
+             result["reason"] = reason
+         else:
+             result["reason"] = None
++    elif report.when == "teardown" and report.outcome == "failed":
++        if result["result"] != "failed":
++            result["result"] = "failed"
++            result["reason"] = get_reason(report)
+ 
+ 
+ def pytest_terminal_summary(terminalreporter):
+@@ -391,13 +397,13 @@ def pytest_collection_modifyitems(session, config, items):
+         original_count = len(items)
+         items[:] = kept_items
+ 
+-        print(f"\n{'='*70}")
++        print(f"\n{'=' * 70}")
+         print("FIRST-PARAMETER-ONLY MODE ENABLED (bfloat16 preferred)")
+         print(f"   Original tests: {original_count}")
+         print(f"   Running tests:  {len(kept_items)} (one per test function)")
+         print(f"      bfloat16 preferred: {bfloat16_count}")
+         print(f"      fallback (no bfloat16): {fallback_count}")
+-        print(f"{'='*70}\n")
++        print(f"{'=' * 70}\n")
+ 
+     if collect_marks_file:
+         report = []
+diff --git a/tools/select_tests.py b/tools/select_tests.py
+index cef5f7d..8e14e5f 100644
+--- a/tools/select_tests.py
++++ b/tools/select_tests.py
+@@ -597,6 +597,16 @@ def benchmarks_for_source(path: str, benchmarks: set[str]) -> list[str]:
+     return matching_targets_for_stem(stem, benchmarks, "benchmark")
+ 
+ 
++def tests_for_benchmark(path: str, tests: set[str]) -> list[str]:
++    stem = Path(path).stem.removeprefix("test_")
++    targets = set(matching_targets_for_stem(stem, tests, "tests"))
++    # Reuse existing dependencies when benchmark and functional names differ.
++    for source, benchmarks in EXPLICIT_SOURCE_TO_BENCHMARKS.items():
++        if path in benchmarks:
++            targets.update(tests_for_source(source, tests))
++    return sorted(targets)
++
++
+ def is_non_test_change(path: str) -> bool:
+     return path in NON_TEST_FILES or path.startswith(NON_TEST_PREFIXES)
+ 
+@@ -647,8 +657,14 @@ def select_targets(
+     smoke_required = any(
+         triggers_env_smoke_tests(path) for path in normalized_changed_files
+     )
++    # Tuning tables change generated kernels, so environment smoke is insufficient.
+     full_tests_required = any(
+-        path in FULL_TEST_TRIGGER_FILES for path in normalized_changed_files
++        path in FULL_TEST_TRIGGER_FILES
++        or (
++            path.startswith("src/flaggems_vllm/runtime/backend/_nvidia/")
++            and Path(path).name == "tune_configs.yaml"
++        )
++        for path in normalized_changed_files
+     )
+     full_benchmarks_required = any(
+         path in FULL_BENCHMARK_TRIGGER_FILES for path in normalized_changed_files
+@@ -660,6 +676,8 @@ def select_targets(
+ 
+         if path.startswith("benchmark/") and Path(path).name.startswith("test_"):
+             add_target(benchmark_targets, path, benchmarks)
++            for target in tests_for_benchmark(path, tests):
++                add_target(test_targets, target, tests)
+ 
+         source_tests = tests_for_source(path, tests)
+         for target in source_tests:
+diff --git a/tools/test_ci_device_context.py b/tools/test_ci_device_context.py
+new file mode 100644
+index 0000000..824249b
+--- /dev/null
++++ b/tools/test_ci_device_context.py
+@@ -0,0 +1,166 @@
++# Copyright 2026 FlagOS Contributors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import ast
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++
++class DeviceContextFailure(Exception):
++    pass
++
++
++class DeviceContextGuardTest(unittest.TestCase):
++    def setUp(self):
++        # Execute the real hooks without importing accelerator-only dependencies.
++        source = Path(__file__).resolve().parents[1] / "tests/conftest.py"
++        tree = ast.parse(source.read_text(encoding="utf-8"))
++        names = {
++            "_probe_device_context",
++            "pytest_runtest_setup",
++            "pytest_runtest_teardown",
++            "get_reason",
++            "pytest_runtest_logreport",
++        }
++        hooks = [
++            node
++            for node in tree.body
++            if isinstance(node, ast.FunctionDef) and node.name in names
++        ]
++        self.assertEqual(len(hooks), len(names))
++        self.backend = Mock()
++        self.backend.is_available.return_value = True
++        self.pytest = SimpleNamespace(
++            fail=Mock(side_effect=DeviceContextFailure),
++            skip=Mock(side_effect=unittest.SkipTest),
++            hookimpl=lambda **kwargs: lambda function: function,
++        )
++        self.namespace = {
++            "_DEVICE_CONTEXT_DEAD": False,
++            "RECORD_LOG": False,
++            "TEST_RESULTS": {},
++            "flaggems_vllm": SimpleNamespace(
++                runtime=SimpleNamespace(torch_device_fn=self.backend)
++            ),
++            "logging": Mock(),
++            "pytest": self.pytest,
++        }
++        module = ast.Module(body=hooks, type_ignores=[])
++        exec(compile(module, str(source), "exec"), self.namespace)
++        self.item = SimpleNamespace(nodeid="test_launch.py::test_async_launch")
++
++    def _finish_teardown(self):
++        hook = self.namespace["pytest_runtest_teardown"](self.item, None)
++        next(hook)
++        with self.assertRaises(StopIteration):
++            next(hook)
++
++    def test_async_fault_fails_current_test_and_skips_later_tests(self):
++        self.backend.synchronize.side_effect = RuntimeError("device context lost")
++
++        with self.assertRaises(DeviceContextFailure):
++            self._finish_teardown()
++
++        self.assertTrue(self.namespace["_DEVICE_CONTEXT_DEAD"])
++        self.pytest.fail.assert_called_once_with(
++            f"device context poisoned after {self.item.nodeid}"
++        )
++        with self.assertRaises(unittest.SkipTest):
++            self.namespace["pytest_runtest_setup"](self.item)
++        self._finish_teardown()
++        self.backend.synchronize.assert_called_once_with()
++
++    def test_healthy_context_keeps_scheduling_tests(self):
++        self._finish_teardown()
++        self.namespace["pytest_runtest_setup"](self.item)
++
++        self.assertFalse(self.namespace["_DEVICE_CONTEXT_DEAD"])
++        self.backend.synchronize.assert_called_once_with()
++        self.pytest.fail.assert_not_called()
++        self.pytest.skip.assert_not_called()
++
++    def test_teardown_fault_updates_a_successful_call_report(self):
++        report = self.namespace["pytest_runtest_logreport"]
++        report(
++            SimpleNamespace(
++                nodeid=self.item.nodeid, when="call", outcome="passed", longrepr=None
++            )
++        )
++        report(
++            SimpleNamespace(
++                nodeid=self.item.nodeid,
++                when="teardown",
++                outcome="failed",
++                longrepr="asynchronous device fault",
++            )
++        )
++        result = self.namespace["TEST_RESULTS"][self.item.nodeid]
++        self.assertEqual(result["result"], "failed")
++        self.assertEqual(result["reason"], "asynchronous device fault")
++
++    def test_teardown_fault_preserves_the_original_call_failure(self):
++        report = self.namespace["pytest_runtest_logreport"]
++        for when, reason in [
++            ("call", "original kernel fault"),
++            ("teardown", "device context lost"),
++        ]:
++            report(
++                SimpleNamespace(
++                    nodeid=self.item.nodeid,
++                    when=when,
++                    outcome="failed",
++                    longrepr=reason,
++                )
++            )
++        result = self.namespace["TEST_RESULTS"][self.item.nodeid]
++        self.assertEqual(result["result"], "failed")
++        self.assertEqual(result["reason"], "original kernel fault")
++
++    def test_healthy_teardown_preserves_the_call_outcome(self):
++        report = self.namespace["pytest_runtest_logreport"]
++        for outcome in ["passed", "failed", "skipped"]:
++            with self.subTest(outcome=outcome):
++                report(
++                    SimpleNamespace(
++                        nodeid=self.item.nodeid,
++                        when="call",
++                        outcome=outcome,
++                        longrepr="original outcome",
++                    )
++                )
++                expected = dict(self.namespace["TEST_RESULTS"][self.item.nodeid])
++                report(
++                    SimpleNamespace(
++                        nodeid=self.item.nodeid,
++                        when="teardown",
++                        outcome="passed",
++                        longrepr=None,
++                    )
++                )
++                self.assertEqual(
++                    self.namespace["TEST_RESULTS"][self.item.nodeid], expected
++                )
++
++    def test_unavailable_backend_does_not_require_synchronization(self):
++        self.backend.is_available.return_value = False
++
++        self._finish_teardown()
++        self.namespace["pytest_runtest_setup"](self.item)
++
++        self.assertFalse(self.namespace["_DEVICE_CONTEXT_DEAD"])
++        self.backend.synchronize.assert_not_called()
++        self.pytest.fail.assert_not_called()
++        self.pytest.skip.assert_not_called()
+diff --git a/tools/test_ci_helpers.py b/tools/test_ci_helpers.py
+index 8086e0b..7decfb2 100644
+--- a/tools/test_ci_helpers.py
++++ b/tools/test_ci_helpers.py
+@@ -81,6 +81,75 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
+             ["tests/deep/nested/test_second.py", "tests/test_first.py"],
+         )
+ 
++    def test_nvidia_tuning_changes_select_all_functional_tests(self):
++        self.make_file("tests/test_first.py")
++        self.make_file("tests/deep/nested/test_second.py")
++        self.make_file("benchmark/test_first.py")
++
++        for directory in ("_nvidia", "_nvidia/hopper"):
++            with self.subTest(directory=directory):
++                mode, tests, benchmarks = select_tests.select_targets(
++                    self.repo_root,
++                    [
++                        f"src/flaggems_vllm/runtime/backend/{directory}/tune_configs.yaml"
++                    ],
++                )
++                self.assertEqual(mode, "smoke")
++                self.assertEqual(
++                    tests,
++                    ["tests/deep/nested/test_second.py", "tests/test_first.py"],
++                )
++                self.assertEqual(benchmarks, [])
++
++    def test_benchmark_changes_keep_functional_tests_without_benchmarks(self):
++        cases = (
++            ("deep/nested/test_mul.py", "tests/deep/nested/test_mul.py"),
++            ("test_fused_marlin_moe_w8a16_fp8.py", "tests/test_fused_marlin_moe.py"),
++            ("test_fused_marlin_moe_w8a16_int8.py", "tests/test_fused_marlin_moe.py"),
++        )
++        changed_files = self.repo_root / "changed.txt"
++        for benchmark, target in cases:
++            with self.subTest(benchmark=benchmark):
++                self.make_file(f"benchmark/{benchmark}")
++                self.make_file(target)
++                changed_files.write_text(f"benchmark/{benchmark}\n", encoding="utf-8")
++                result = subprocess.run(
++                    [
++                        sys.executable,
++                        str(Path(select_tests.__file__).resolve()),
++                        "--repo-root",
++                        str(self.repo_root),
++                        "--changed-files",
++                        str(changed_files),
++                        "--no-benchmarks",
++                        "--format",
++                        "json",
++                    ],
++                    capture_output=True,
++                    text=True,
++                    check=True,
++                )
++                payload = json.loads(result.stdout)
++                self.assertEqual(payload["mode"], "selected")
++                self.assertEqual(payload["tests"], [target])
++                self.assertEqual(payload["benchmarks"], [])
++
++    def test_docs_and_environment_changes_keep_zero_operator_targets(self):
++        self.make_file("tests/test_mul.py")
++        self.make_file("benchmark/test_mul.py")
++        cases = (
++            ("docs/guide.md", "skip"),
++            ("pyproject.toml", "smoke"),
++            ("src/flaggems_vllm/runtime/backend/_nvidia/__init__.py", "smoke"),
++            ("src/flaggems_vllm/runtime/backend/_metax/tune_configs.yaml", "smoke"),
++        )
++        for path, mode in cases:
++            with self.subTest(path=path):
++                self.assertEqual(
++                    select_tests.select_targets(self.repo_root, [path]),
++                    (mode, [], []),
++                )
++
+     def test_backend_operator_change_selects_matching_test(self):
+         self.make_file("tests/test_mul.py")
+ 
+@@ -991,9 +1060,17 @@ class ConftestDeviceProbeTest(unittest.TestCase):
+         def skip(msg=""):
+             raise Skipped(msg)
+ 
++        class Failed(Exception):
++            pass
++
++        def fail(msg=""):
++            raise Failed(msg)
++
+         stub_pytest.hookimpl = hookimpl
+         stub_pytest.skip = skip
+         stub_pytest.Skipped = Skipped
++        stub_pytest.fail = fail
++        stub_pytest.Failed = Failed
+ 
+         saved = {}
+         overrides = {
+@@ -1064,7 +1141,7 @@ class ConftestDeviceProbeTest(unittest.TestCase):
+         item = types.SimpleNamespace(nodeid="tests/test_fault.py::test_kernel")
+         gen = conftest.pytest_runtest_teardown(item, None)
+         next(gen)
+-        with self.assertRaises(StopIteration):
++        with self.assertRaisesRegex(stub_pytest.Failed, "device context poisoned"):
+             next(gen)
+         self.assertTrue(conftest._DEVICE_CONTEXT_DEAD)
+         with self.assertRaises(stub_pytest.Skipped):
+@@ -1150,6 +1227,88 @@ class ConftestDeviceProbeTest(unittest.TestCase):
+             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+             self.assertIn("2 passed", proc.stdout)
+ 
++    @unittest.skipUnless(
++        importlib.util.find_spec("pytest") is not None, "requires pytest"
++    )
++    def test_pytest_subprocess_async_fault_fails_and_records_json(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmp = Path(tmpdir)
++            pkg = tmp / "flaggems_vllm"
++            pkg.mkdir()
++            (pkg / "__init__.py").write_text(
++                'from flaggems_vllm import runtime\ndevice = "cuda"\n',
++                encoding="utf-8",
++            )
++            (pkg / "runtime.py").write_text(
++                textwrap.dedent(
++                    """\
++                    from types import SimpleNamespace
++                    device = SimpleNamespace(name="cuda", vendor_name="nvidia")
++                    fault = False
++                    class _Dev:
++                        @staticmethod
++                        def is_available():
++                            return True
++                        @staticmethod
++                        def synchronize():
++                            if fault:
++                                raise RuntimeError("asynchronous device fault")
++                    torch_device_fn = _Dev()
++                    """
++                ),
++                encoding="utf-8",
++            )
++            (tmp / "fcntl.py").write_text(
++                "LOCK_EX = 2\ndef flock(*args, **kwargs):\n    return None\n",
++                encoding="utf-8",
++            )
++            tests_dir = tmp / "tests"
++            tests_dir.mkdir()
++            (tests_dir / "conftest.py").write_text(
++                self.CONFTEST_PATH.read_text(encoding="utf-8"),
++                encoding="utf-8",
++            )
++            (tests_dir / "test_async_fault.py").write_text(
++                textwrap.dedent(
++                    """\
++                    from pathlib import Path
++                    from flaggems_vllm import runtime
++
++                    def test_call_passes_before_fault_surfaces():
++                        runtime.fault = True
++                        assert True
++
++                    def test_later_call_must_not_execute():
++                        Path("unexpected-later-call").touch()
++                    """
++                ),
++                encoding="utf-8",
++            )
++            env = {
++                **os.environ,
++                "PYTHONPATH": str(tmp),
++                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
++            }
++            proc = subprocess.run(
++                [sys.executable, "-m", "pytest", "-q", str(tests_dir)],
++                cwd=tmp,
++                env=env,
++                text=True,
++                capture_output=True,
++                check=False,
++            )
++            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
++            self.assertIn("device context poisoned", proc.stdout)
++            self.assertIn("1 passed", proc.stdout)
++            self.assertIn("1 skipped", proc.stdout)
++            self.assertFalse((tmp / "unexpected-later-call").exists())
++            results = json.loads((tmp / "accuracy_result.json").read_text())
++            first = next(v for k, v in results.items() if "test_call_passes" in k)
++            later = next(v for k, v in results.items() if "test_later_call" in k)
++            self.assertEqual(first["result"], "failed")
++            self.assertIn("device context poisoned", first["reason"])
++            self.assertEqual(later["result"], "skipped")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

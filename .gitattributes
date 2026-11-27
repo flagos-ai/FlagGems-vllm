@@ -1,0 +1,4 @@
+*.gz -text
+*.json -text
+*.patch -text
+*.md text eol=lf

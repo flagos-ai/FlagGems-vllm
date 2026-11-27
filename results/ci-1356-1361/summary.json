@@ -1,0 +1,152 @@
+{
+  "commit": "1a6138780c359e2ded226e352fe489c35c8975e8",
+  "tree": "a0aefee9de4c767461b54f0e24fedb84d7fd9eb0",
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "included_pr_heads": {
+    "1356": "7a733d1c035a9107edd54ea00acfabc785afcde6",
+    "1361": "6f9436c6d170af2e2bc1f3643bc793c9f58b8d95"
+  },
+  "cpu_only": true,
+  "source_proof": {
+    "commit": "1a6138780c359e2ded226e352fe489c35c8975e8",
+    "all_exported_git_blobs_matched": true,
+    "verified_files_and_symlinks": 1809,
+    "symlinks": 3,
+    "missing_git_files": [],
+    "mismatches": []
+  },
+  "tests": {
+    "ci_helpers": {
+      "passed": 97,
+      "failed": 0,
+      "skipped": 0,
+      "by_module": {
+        "test_ci_absolute_imports": 3,
+        "test_ci_backends": 27,
+        "test_ci_device_context": 6,
+        "test_ci_helpers": 61
+      }
+    },
+    "workflow_policy": {
+      "passed": 10,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "phases": [
+    {
+      "phase": "lint-dependencies",
+      "exit": 0
+    },
+    {
+      "phase": "all-ci-helpers",
+      "exit": 0
+    },
+    {
+      "phase": "workflow-policy",
+      "exit": 0
+    },
+    {
+      "phase": "workflow-policy-tests",
+      "exit": 0
+    },
+    {
+      "phase": "no-torch-fallback",
+      "exit": 0
+    },
+    {
+      "phase": "init-exports",
+      "exit": 0
+    },
+    {
+      "phase": "export-registry",
+      "exit": 0
+    },
+    {
+      "phase": "black",
+      "exit": 0
+    },
+    {
+      "phase": "isort",
+      "exit": 0
+    },
+    {
+      "phase": "flake8",
+      "exit": 0
+    },
+    {
+      "phase": "baseline-async-negative",
+      "exit": 0
+    }
+  ],
+  "negative_control": {
+    "baseline": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+    "expected_test_failure": true,
+    "matched_expected_failure": true,
+    "tests": 1,
+    "failures": 1,
+    "errors": 0
+  },
+  "runtime": {
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "packages": {
+      "pytest": "9.1.1",
+      "PyYAML": "6.0.3"
+    },
+    "gpu_test": false,
+    "scope": "CPU helpers, policy, style and a real pytest subprocess with a stub device backend"
+  },
+  "admission": {
+    "cid": "d6cdd907723f9b554aab1648d523e4f40c5584316165fd9a6c07b95891a6a113",
+    "label": "fgv-ci-cpu-final-v2",
+    "image": "sha256:bd8a5d7a8774800c92d714c0c226b32c1863f929150f36efd610aebcd12a335d",
+    "runtime": "runc",
+    "network": "none",
+    "readonly_root": true,
+    "cap_drop": [
+      "ALL"
+    ],
+    "devices": [],
+    "device_requests": null,
+    "privileged": false,
+    "mounts": [
+      {
+        "target": "/wheels",
+        "rw": false
+      },
+      {
+        "target": "/run-cpu.py",
+        "rw": false
+      },
+      {
+        "target": "/negative-control.py",
+        "rw": false
+      },
+      {
+        "target": "/baseline-conftest.py",
+        "rw": false
+      },
+      {
+        "target": "/results",
+        "rw": true
+      },
+      {
+        "target": "/source",
+        "rw": false
+      }
+    ]
+  },
+  "cleanup": {
+    "cid": "d6cdd907723f9b554aab1648d523e4f40c5584316165fd9a6c07b95891a6a113",
+    "positive_absence": true,
+    "natural_exit": true,
+    "exit": 0
+  },
+  "raw_archive": "D:\\Codex\\work\\fgv-revalidation-20261127\\ci\\ci-cpu-final-v2-raw.tar.gz",
+  "raw_sha256": "be7951b63d38aeeddec82b2ec8cd1448718ef44121a1eeb1d6bdeb2e6c0a5825",
+  "not_claimed": [
+    "No original PR required CI status is replaced by this combined local commit",
+    "No GPU numerical/performance or platform inference Gate executed",
+    "No branch pushed or PR merged"
+  ]
+}
