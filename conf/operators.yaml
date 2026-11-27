@@ -1122,6 +1122,7 @@ ops:
     Fuse MQA query RoPE and FP8 packing with indexer query RoPE,
     UE8M0 quantization, and index-weight scaling. Includes H20 scheduling.
     Includes an Ascend specialization for the full BF16 workload, validated on 910B4-1.
+    Includes a T-Head PPU specialization with software E4M3FN encoding.
   for:
     - vllm.models.deepseek_v32.common.kernels.fused_q
   labels:
