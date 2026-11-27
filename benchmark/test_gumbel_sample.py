@@ -2,15 +2,14 @@
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
 """Standard JSON and private JSONL timing for the immutable Gumbel workload.
 
-CUDA-compatible backends use the collector's no-Graph do_bench protocol.
-All backends use runtime device events through their Triton implementation.
+All backends use no-Graph do_bench with runtime device events through Triton.
 Native device failures terminate the process even when the runner omits -x.
+Ascend numerical reference failures are retained as warnings and may be timed.
 """
 
-import hashlib
 import json
+import math
 import os
-from pathlib import Path
 
 import pytest
 import torch
@@ -21,7 +20,6 @@ from baseline import gumbel_sample as workload
 from flaggems_vllm.runtime import torch_device_fn
 
 from . import base, conftest
-from .gumbel_baseline import normalize_case
 
 pytestmark = pytest.mark.gumbel_sample
 _DETAIL = None
@@ -62,8 +60,8 @@ def _record(row, metric, native_reason):
 class GumbelSampleBenchmark(base.Benchmark):
     """Per-case adapter for the frozen sampler measurement protocol.
 
-    Keep the dedicated run loop: the generic loop uses a different Ascend timer,
-    normalization fallback and native-failure policy. Pytest owns the 16-case grid.
+    Keep the dedicated run loop: the generic loop uses a different Ascend timer
+    and native-failure policy. Pytest owns the 16-case grid.
     """
 
     def __init__(self, binding, request):
@@ -87,6 +85,8 @@ class GumbelSampleBenchmark(base.Benchmark):
 
     def _measure(self, op, args, kwargs):
         latency_ms = self.get_latency(op, *args, **kwargs)
+        if not math.isfinite(latency_ms) or latency_ms <= 0:
+            raise ValueError(f"invalid gumbel latency: {latency_ms!r}")
         return {
             "median_us": latency_ms * 1000,
             "latency_ms": latency_ms,
@@ -109,37 +109,11 @@ class GumbelSampleBenchmark(base.Benchmark):
         candidate = self._measure(self.gems_op, args, kwargs)
         workload.assert_output(binding, self.gems_op(*args, **kwargs))
         cfg = workload.config(binding, torch.float32)
-        base_path = request.config.getoption("--base-data")
-        source = None
-        if base_path:
-            path = Path(base_path)
-            source = {"path": str(path.resolve())}
-            if path.is_file():
-                source["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-        compared = normalize_case(
-            conftest.Config.base_data,
-            workload.key_shape(binding),
-            "torch.float32",
-            cfg,
-            candidate["latency_ms"],
-            flaggems_vllm.vendor_name,
-            _chip_name(),
-            base_data_source=source,
-            timing_protocol=candidate["timing_protocol"],
+        native = self.torch_op = workload.native(
+            device=args[0].device, vendor=flaggems_vllm.vendor_name
         )
-        native_reason = None
-        native = None
-        identity = {"status": "unavailable"}
-        if flaggems_vllm.vendor_name == "nvidia":
-            native = self.torch_op = workload.native()
-            identity = workload.native_identity()
-            native_reason = workload.NATIVE_UNAVAILABLE_REASON
-        else:
-            native_reason = (
-                "pinned provider device qualification covers NVIDIA only; "
-                "no qualified on-device native for this backend"
-            )
-            identity["reason"] = native_reason
+        identity = workload.native_identity()
+        native_reason = workload.NATIVE_UNAVAILABLE_REASON
         metric = {
             "shape_detail": workload.key_shape(binding),
             "latency": candidate["latency_ms"],
@@ -148,7 +122,8 @@ class GumbelSampleBenchmark(base.Benchmark):
             "timing_protocol": candidate["timing_protocol"],
             "workload_config": cfg,
             "native_identity": identity,
-            **compared,
+            "baseline_kind": "unavailable",
+            "native_baseline_skip_reason": native_reason,
         }
         row = {
             "vendor": flaggems_vllm.vendor_name,
@@ -166,27 +141,77 @@ class GumbelSampleBenchmark(base.Benchmark):
             "candidate": candidate,
             "native_identity": identity,
             "baseline_kind": "unavailable",
+            "native_baseline_skip_reason": native_reason,
             "native_ratio": None,
-            "normalized_ratio": compared["compared_speedup"],
-            "normalization": compared,
         }
-        if native is not None:
+        if native is not None or flaggems_vllm.vendor_name == "ascend":
             try:
-                qualification = workload.qualify_native(binding, args, kwargs, native)
-                native_time = self._measure(native, args, kwargs)
-                workload.qualify_native(binding, args, kwargs, native)
-                metric["native_qualification"] = qualification
+                if native is None:
+                    raise RuntimeError(
+                        f"Ascend native resolution failed: {native_reason}"
+                    )
+                policy = (
+                    {"allow_accuracy_warning": True}
+                    if flaggems_vllm.vendor_name == "ascend"
+                    else {}
+                )
+                qualifications = {}
+                for stage in ("pre_timing", "post_timing"):
+                    receipt = workload.qualify_native(
+                        binding, args, kwargs, native, **policy
+                    )
+                    qualifications[stage] = receipt
+                    # Persist the pre-timing evidence even if timing or the
+                    # post-timing hard checks subsequently terminate this case.
+                    qualification = {
+                        **receipt,
+                        **qualifications,
+                        "status": (
+                            "accuracy_warning"
+                            if any(
+                                item["status"] == "accuracy_warning"
+                                for item in qualifications.values()
+                            )
+                            else "passed"
+                        ),
+                    }
+                    if qualification["status"] == "accuracy_warning":
+                        qualification["accuracy_status"] = "failed"
+                        qualification["accuracy_failures"] = list(
+                            dict.fromkeys(
+                                reason
+                                for item in qualifications.values()
+                                for reason in item.get("accuracy_failures", [])
+                            )
+                        )
+                    metric["native_qualification"] = qualification
+                    row["native_qualification"] = qualification
+                    if receipt["status"] == "accuracy_warning":
+                        print(
+                            f"WARNING gumbel native accuracy case={workload.key_shape(binding)} "
+                            f"stage={stage}: " + json.dumps(receipt, sort_keys=True)
+                        )
+                    if stage == "pre_timing":
+                        native_time = self._measure(native, args, kwargs)
+                baseline_kind = (
+                    "native_vllm_accuracy_warning"
+                    if qualification["status"] == "accuracy_warning"
+                    else "native_vllm"
+                )
+                metric["baseline_kind"] = baseline_kind
                 metric["latency_base"] = native_time["latency_ms"]
                 metric["speedup"] = native_time["latency_ms"] / candidate["latency_ms"]
                 row.update(
                     native=native_time,
                     native_ratio=metric["speedup"],
-                    baseline_kind="native_vllm",
+                    baseline_kind=baseline_kind,
                     native_qualification=qualification,
                 )
             except Exception as exc:
                 native_reason = f"native qualification/execution failed: {type(exc).__name__}: {exc}"
                 metric["error_msg"] = native_reason
+                metric["native_baseline_skip_reason"] = native_reason
+                row["native_baseline_skip_reason"] = native_reason
                 row["native_error"] = native_reason
                 _record(row, metric, native_reason)
                 # Central runners do not all pass -x. A failed native call may

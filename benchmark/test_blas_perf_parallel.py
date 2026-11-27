@@ -1384,9 +1384,26 @@ def test_addmv_benchmark(op_name, torch_op, input_fn):
 
 @pytest.mark.vdot
 def test_vdot_benchmark():
+    complex_real_dtype = {
+        torch.complex32: torch.float16,
+        torch.complex64: torch.float32,
+        torch.complex128: torch.float64,
+    }
+
+    def randn_vendor_safe(m, cur_dtype, device):
+        # torch_gcu's native randn aborts on complex dtypes: the vendor
+        # normal_ kernel rejects complex output (TOPSATEN_STATUS_BAD_PARAM
+        # -> terminate). Generate in the underlying real dtype and view as
+        # complex instead, mirroring flag_gems.ops.randn.
+        if cur_dtype.is_complex and flaggems_vllm.vendor_name == "enflame":
+            real_dtype = complex_real_dtype[cur_dtype]
+            flat = torch.randn([2 * m], dtype=real_dtype, device=device)
+            return flat.view(cur_dtype)
+        return torch.randn([m], dtype=cur_dtype, device=device)
+
     def vdot_input_fn(m, cur_dtype, device):
-        inp1 = torch.randn([m], dtype=cur_dtype, device=device)
-        inp2 = torch.randn([m], dtype=cur_dtype, device=device)
+        inp1 = randn_vendor_safe(m, cur_dtype, device)
+        inp2 = randn_vendor_safe(m, cur_dtype, device)
         yield inp1, inp2
 
     bench = ParallelVdotBenchmark(

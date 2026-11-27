@@ -474,6 +474,10 @@ QuantLightningIndexerVllmAscendBenchmark:
     - [16]
   shape_desc: "(tokens), heads=64, head_dim=128, TopK=32"
 
+# Shapes come from baseline.lora_expand.grid().
+lora_expand:
+  shape_desc: "LoRA expand workload key from baseline.lora_expand"
+
 # the default shapes info
 Benchmark:
   shapes:

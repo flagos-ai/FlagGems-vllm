@@ -52,8 +52,11 @@ from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F
 from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.ihc_pre import ihc_pre, triton_ihc_pre
 from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._hygon.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.runtime.backend._hygon.ops.megamoe import megamoe_int8
+from flaggems_vllm.runtime.backend._hygon.ops.mhc_pre_broadcast import mhc_pre_broadcast
 from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -61,6 +64,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.runtime.backend._hygon.ops.persistent_topk import (  # noqa: F401
     persistent_topk,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.ple_conv import ple_conv
 from flaggems_vllm.runtime.backend._hygon.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
@@ -89,12 +93,16 @@ __all__ = [
     "gdn_w8a16",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
+    "ihc_pre",
     "inplace_fused_experts",
     "int8_einsum",
+    "mamba_mixer",
     "megamoe_int8",
+    "mhc_pre_broadcast",
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "ple_conv",
     "ple_state_scatter_",
     "qsa_prepare",
     "quantize_gdn_state_int8",
@@ -105,6 +113,7 @@ __all__ = [
     "scaled_int8_quant",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
+    "triton_ihc_pre",
     "triton_scaled_mm",
     "w8a8_block_int8_bmm",
     "w8a8_block_matmul",
