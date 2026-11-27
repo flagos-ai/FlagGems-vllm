@@ -15,6 +15,7 @@
 import functools
 import logging
 import os
+import weakref
 from enum import Enum
 from typing import Any, Optional
 
@@ -2107,6 +2108,26 @@ def _fused_experts_impl(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if (
+        hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and hidden_states.size(0) >= 4096
+        and w1.size(1) >= 512
+        and w1.size(1) % 128 == 0
+        and hidden_states.size(1) % 64 == 0
+        and w2.size(2) % 64 == 0
+        and activation == "silu"
+        and not apply_router_weight_on_input
+        and not use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and ocp_mx_scheme is None
+        and w1_bias is None
+        and w2_bias is None
+        and expert_map is None
+    ):
+        return _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids)
+
     if _can_use_nopad_fp8_moe(
         hidden_states,
         w1,
@@ -2567,13 +2588,38 @@ _NOPAD_CFG = {
     "num_stages": 2,
 }
 
+# I>=256: one 128x128 GEMM over 2*I (single accumulator), then SiLU*up.
+_NOPAD_SPLIT_CFG = {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 32,
+    "GROUP_M": 8,
+    "num_warps": 4,
+    "num_stages": 3,
+    "SPLIT_ACT": True,
+}
 
-def _histogram_kernel(topk_ids_ptr, counts_ptr, numel, BLOCK: tl.constexpr):
+
+@triton.jit
+def _histogram_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    numel,
+    NEXP: tl.constexpr,
+    NBINS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < numel
     e = tl.load(topk_ids_ptr + offs, mask=mask, other=0)
-    tl.atomic_add(counts_ptr + e, 1, mask=mask)
+    # One atomic per bin per program instead of one per element: the flat form
+    # costs 4.4x more on MUSA (137 us -> 31 us at numel=131072).
+    hist = tl.histogram(e, NBINS)
+    tail = BLOCK - tl.sum(mask.to(tl.int32))
+    bins = tl.arange(0, NBINS)
+    hist = hist - tl.where(bins == 0, tail, 0)
+    tl.atomic_add(counts_ptr + bins, hist, mask=bins < NEXP)
 
 
 @triton.jit
@@ -2610,6 +2656,29 @@ def _assign_kernel(
     j = offs % topk
     tl.store(sorted_ids_ptr + pos, t, mask=mask)
     tl.store(inv_perm_ptr + t * topk + j, pos, mask=mask)
+
+
+@triton.jit
+def _silu_mul_kernel(
+    src_ptr,
+    dst_ptr,
+    total,
+    n_inter: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    row = offs // n_inter
+    col = offs % n_inter
+    gate = tl.load(src_ptr + row * (2 * n_inter) + col, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    up = tl.load(
+        src_ptr + row * (2 * n_inter) + n_inter + col, mask=mask, other=0.0
+    ).to(tl.float32)
+    y = gate * tl.sigmoid(gate) * up
+    tl.store(dst_ptr + offs, y.to(dst_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -2714,7 +2783,7 @@ def _nopad_fused_moe_kernel(
 
     b_ptrs = (
         b_ptr
-        + expert * stride_be
+        + expert.to(tl.int64) * stride_be
         + offs_k[:, None] * stride_bk
         + offs_n[None, :] * stride_bn
     )
@@ -2791,27 +2860,97 @@ _META_CACHE = {}
 _DATA_CACHE = {}
 
 
+def _prune_dead_entries(cache):
+    """Drop cached transposes whose owner weight has already been released."""
+    for key, entry in list(cache.items()):
+        if entry[0]() is None:
+            del cache[key]
+
+
+def _release_transposes_under_pressure():
+    """Drop cached weight transposes when the device is short on memory.
+
+    A caller can hold the weights of two MoE implementations at once (the
+    benchmark measures ours and the vendor entry on the same inputs). Keeping a
+    private transposed copy of every slab then leaves no room for the second
+    implementation on the widest shard, so give the cache up when the device is
+    close to full. Recomputation only costs one copy per call.
+    """
+    try:
+        free, total = torch.musa.mem_get_info()
+    except Exception:  # pragma: no cover - non-MUSA builds
+        return
+    # Keep the cache only while the device could still hold a second copy of
+    # the largest slab, which is what a caller comparing implementations, or
+    # a pipeline holding two weight sets, actually needs.
+    held = max(
+        [
+            t.numel() * t.element_size()
+            for cache in (_W1T_CACHE, _W2T_CACHE, _DENSE_TW_DENSE_CACHE)
+            for _, t in cache.values()
+        ]
+        or [0]
+    )
+    if held == 0 or free >= 2 * held:
+        return
+    _W1T_CACHE.clear()
+    _W2T_CACHE.clear()
+    _DENSE_TW_DENSE_CACHE.clear()
+
+
+def _evict_with_owner(owner, cache, key):
+    """Release the cached copy as soon as the owner tensor is collected.
+
+    A dead entry normally lingers until the next shape happens to call
+    _prune_dead_entries, which is too late when a caller walks many shapes:
+    the retained copy of the previous shape is what pushes the next one into
+    OOM (285B: 26 GiB of transposes held after the weights are gone).
+    """
+
+    # Do not capture the cached tensor here: a finalizer keeps its arguments
+    # alive until it runs, which would pin the copy even after the cache is
+    # cleared. Dropping by key can at worst evict a fresh entry (a recompute),
+    # never return a stale one, because every hit re-checks the owner.
+    def _drop(cache=cache, key=key):
+        cache.pop(key, None)
+
+    weakref.finalize(owner, _drop)
+
+
 def _transposed(w, cache):
     """Cache the k-major transpose (E, K, N) of a (E, N, K) weight."""
     key = (w.data_ptr(), w.shape, w.dtype)
     entry = cache.get(key)
     if entry is not None and entry[0]() is w:
         return entry[1]
-    t = w.permute(0, 2, 1).contiguous()
-    cache[key] = (__import__("weakref").ref(w), t)
+    _prune_dead_entries(cache)
+    experts, n, k = w.shape
+    t = torch.empty((experts, k, n), dtype=w.dtype, device=w.device)
+    # See _dense_transpose_weights: one multi-GiB permute().contiguous() copy
+    # is unreliable on MUSA, bounded chunks are not.
+    step = max(1, (1 << 30) // (n * k))
+    for start in range(0, experts, step):
+        t[start : start + step] = w[start : start + step].permute(0, 2, 1)
+    cache[key] = (weakref.ref(w), t)
+    _evict_with_owner(w, cache, key)
     return t
 
 
-def _get_buffers(M, E, H, n_inter, topk, device, dtype):
+def _get_buffers(M, E, H, n_inter, topk, device, dtype, need_gate_up=False):
     """Reusable meta/data buffers (keyed by shape); only counts/counters cleared."""
     numel = M * topk
     key = (M, E, H, n_inter, topk, device, dtype)
     if key not in _META_CACHE:
+        # One entry serves every layer in a step, so keep only the current
+        # shape: a long shape sweep must not pile up working buffers.
+        _META_CACHE.clear()
+        _DATA_CACHE.clear()
         meta = torch.zeros(
             3 * E + 1 + 2 * numel + M * topk, dtype=torch.int32, device=device
         )
         _META_CACHE[key] = meta
-        data = torch.empty(2 * numel * n_inter + numel * H, dtype=dtype, device=device)
+        data_numel = (3 if need_gate_up else 1) * numel * n_inter + numel * H
+        data = torch.empty(data_numel, dtype=dtype, device=device)
         _DATA_CACHE[key] = data
     else:
         meta = _META_CACHE[key]
@@ -2824,7 +2963,552 @@ def _get_buffers(M, E, H, n_inter, topk, device, dtype):
     inv_perm = meta[3 * E + 1 + 2 * numel :].view(M, topk)
     gate = data[: numel * n_inter].view(numel, n_inter)
     cache3 = data[numel * n_inter : numel * n_inter + numel * H].view(numel, H)
-    return counts, start, counters, sorted_ids, inv_perm, gate, cache3
+    gate_up = None
+    if need_gate_up:
+        gate_up = data[
+            numel * n_inter
+            + numel * H : numel * n_inter
+            + numel * H
+            + 2 * numel * n_inter
+        ].view(numel, 2 * n_inter)
+    return (
+        counts,
+        start,
+        counters,
+        sorted_ids,
+        inv_perm,
+        gate,
+        cache3,
+        gate_up,
+    )
+
+
+# --- Dense grouped MoE path (inlined from fused_moe_dense.py) ---
+
+
+@triton.jit
+def _padded_offsets_kernel(
+    counts_ptr,
+    offsets_ptr,
+    E: tl.constexpr,
+    BM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # A serial walk over E experts costs 38 us of pure latency; a block-wide
+    # cumsum of the same values costs 4 us.
+    offs = tl.arange(0, BLOCK)
+    mask = offs < E
+    c = tl.load(counts_ptr + offs, mask=mask, other=0)
+    n = tl.cdiv(c, BM) * BM
+    s = tl.cumsum(n, axis=0) - n
+    tl.store(offsets_ptr + offs, s, mask=mask)
+    tl.store(offsets_ptr + E, tl.sum(n, axis=0))
+
+
+@triton.jit
+def _fill_m_indices_kernel(
+    offsets_ptr,
+    counts_ptr,
+    m_indices_ptr,
+    E: tl.constexpr,
+    BM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    e = tl.program_id(0)
+    base = tl.load(offsets_ptr + e)
+    c = tl.load(counts_ptr + e)
+    n = tl.cdiv(c, BM) * BM
+    for start in range(0, n, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < n
+        tl.store(m_indices_ptr + base + offs, e, mask=mask)
+
+
+@triton.jit
+def _fill_neg_kernel(ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    tl.store(ptr + offs, -1, mask=offs < n)
+
+
+@triton.jit
+def _assign_padded_kernel(
+    ids_ptr,
+    offsets_ptr,
+    counters_ptr,
+    inv_perm_ptr,
+    row_token_ptr,
+    numel,
+    topk: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    e = tl.load(ids_ptr + offs, mask=mask, other=0)
+    base = tl.load(offsets_ptr + e, mask=mask, other=0)
+    local = tl.atomic_add(counters_ptr + e, 1, mask=mask)
+    pos = base + local
+    token = offs // topk
+    j = offs % topk
+    tl.store(inv_perm_ptr + token * topk + j, pos, mask=mask)
+    tl.store(row_token_ptr + pos, token, mask=mask)
+
+
+@triton.jit
+def _compact_padded_kernel(
+    src_ptr,
+    dst_ptr,
+    row_token_ptr,
+    total,
+    hidden,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    row_mask = rows < total
+    col_mask = cols < hidden
+    token = tl.load(row_token_ptr + rows, mask=row_mask, other=-1)
+    valid = (token >= 0) & row_mask
+    x = tl.load(
+        src_ptr + token[:, None] * hidden + cols[None, :],
+        mask=valid[:, None] & col_mask[None, :],
+        other=0.0,
+    )
+    tl.store(
+        dst_ptr + rows[:, None] * hidden + cols[None, :],
+        x,
+        mask=row_mask[:, None] & col_mask[None, :],
+    )
+
+
+@triton.jit
+def _compact_scatter_kernel(
+    src_ptr,
+    dst_ptr,
+    inv_perm_ptr,
+    hidden,
+    TOPK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    # Row-centric compaction: the source row is read once and stored into the
+    # TOPK padded rows its routing slots own. Reading each row once halves the
+    # traffic of the gather form (which re-reads every row TOPK times from the
+    # padded side); the padded rows that no token owns keep their zeros.
+    token = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    cols = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    col_mask = cols < hidden
+    x = tl.load(src_ptr + token * hidden + cols, mask=col_mask, other=0.0)
+    for j in tl.static_range(TOPK):
+        pos = tl.load(inv_perm_ptr + token * TOPK + j)
+        tl.store(dst_ptr + pos * hidden + cols, x, mask=col_mask)
+
+
+@triton.jit
+def _grouped_gemm_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    m_indices_ptr,
+    M,
+    N,
+    K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(N, BN)
+    pm = pid // num_n
+    pn = pid % num_n
+    expert = tl.load(m_indices_ptr + pm * BM)
+
+    offs_m = pm * BM + tl.arange(0, BM)
+    offs_n = pn * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    # E*K*N easily passes 2**31 on wide shards (e.g. 256 experts x 7168 x
+    # 4096), so the per-expert base must be 64-bit or the pointer wraps.
+    expert_base = expert.to(tl.int64) * K * N
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + expert_base + offs_k[:, None] * N + offs_n[None, :]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BK)):
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BK
+        b_ptrs += BK * N
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty))
+
+
+try:
+    import triton.experimental.tle.language as tle
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _HAS_TLE = True
+except ImportError:  # pragma: no cover - older FlagTree builds
+    tle = None
+    TensorDescriptor = None
+    _HAS_TLE = False
+
+
+@triton.jit
+def _tle_gemm_producer(
+    writer,
+    A,
+    B,
+    pm,
+    pn,
+    expert,
+    N,
+    K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    TK: tl.constexpr,
+):
+    brow = expert * N + pn * BN
+    for it in tl.range(0, tl.cdiv(K, TK), num_stages=1):
+        slot = writer.acquire(it)
+        tle.gpu.copy(A, slot.a, (BM, TK), (pm * BM, it * TK))
+        tle.gpu.copy(B, slot.b, (BN, TK), (brow, it * TK))
+        writer.commit(it)
+
+
+@triton.jit
+def _tle_gemm_consumer(
+    reader, C, pm, pn, N, K, BM: tl.constexpr, BN: tl.constexpr, TK: tl.constexpr
+):
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for it in tl.range(0, tl.cdiv(K, TK), num_stages=1):
+        wait = reader.wait(it)
+        partial = tle.gpu.wgmma(wait.slot.a, wait.slot.b, trans_b=True)
+        partial = tle.gpu.wgmma_wait(0, partial)
+        reader.release(it)
+        acc += partial
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(C.dtype.element_ty))
+
+
+@triton.jit
+def _tle_grouped_gemm_kernel(
+    A,
+    B,
+    C,
+    mi_ptr,
+    N,
+    K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    TK: tl.constexpr,
+    STAGES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(N, BN)
+    pm = pid // num_n
+    pn = pid % num_n
+    expert = tl.load(mi_ptr + pm * BM)
+    a = tle.gpu.alloc(
+        (STAGES, BM, TK), tl.bfloat16, scope=tle.gpu.smem, nv_mma_shared_layout=True
+    )
+    b = tle.gpu.alloc(
+        (STAGES, BN, TK), tl.bfloat16, scope=tle.gpu.smem, nv_mma_shared_layout=True
+    )
+    pipe = tle.pipe(capacity=STAGES, scope="cta", name="moetle", a=a, b=b)
+    tle.gpu.warp_specialize(
+        [
+            (_tle_gemm_consumer, (pipe.reader(), C, pm, pn, N, K, BM, BN, TK)),
+            (
+                _tle_gemm_producer,
+                (pipe.writer(), A, B, pm, pn, expert, N, K, BM, BN, TK),
+            ),
+        ],
+        worker_num_warps=[4],
+        worker_num_regs=[24],
+    )
+
+
+def _tle_desc(t, block):
+    # Built per call: caching by data_ptr would alias a recycled allocation of
+    # a freed weight and silently compute with the wrong tensor.
+    return TensorDescriptor.from_tensor(t, list(block))
+
+
+def _tle_ready(w1, w2, total, H, n_inter):
+    # FlagTree miscompiles multi-stage TLE pipes when the MUSA backend compiles
+    # with TRITON_MUSA_ENABLE_LLC_OPT=1, which flaggems_vllm.ops.mhc sets
+    # process-wide at import: the kernel then reports "MUSA error: out of
+    # bound" after a few hundred launches. Export
+    # TRITON_MUSA_ENABLE_LLC_OPT=0 until that is fixed upstream.
+    if not _HAS_TLE:
+        return False
+    if not (w1.is_contiguous() and w2.is_contiguous()):
+        return False
+    if w1.dtype is not torch.bfloat16:
+        return False
+    if total % 128 or H % 128 or (2 * n_inter) % 128:
+        return False
+    # TME descriptors address the flattened [E * N, K] view; beyond 2**20 rows
+    # the hardware descriptor no longer covers the tensor and the copy silently
+    # reads the wrong rows (observed on the M=8192 / N=8192 shape).
+    if w1.size(0) * (2 * n_inter) > (1 << 20) or w2.size(0) * H > (1 << 20):
+        return False
+    return True
+
+
+def _tle_gemm(a_buf, w, out, m_indices, E, total, N, K, STAGES, BN=128, NUM_WARPS=4):
+    b2 = w.view(E * N, K)
+    A = _tle_desc(a_buf, (128, 64))
+    B = _tle_desc(b2, (BN, 64))
+    grid = ((total // 128) * triton.cdiv(N, BN),)
+    _tle_grouped_gemm_kernel[grid](
+        A,
+        B,
+        out,
+        m_indices,
+        N,
+        K,
+        BM=128,
+        BN=BN,
+        TK=64,
+        STAGES=STAGES,
+        num_warps=NUM_WARPS,
+    )
+
+
+_DENSE_TW_DENSE_CACHE = {}
+
+
+def _dense_transpose_weights(w):
+    key = (w.data_ptr(), w.shape, w.dtype)
+    entry = _DENSE_TW_DENSE_CACHE.get(key)
+    if entry is not None and entry[0]() is w:
+        return entry[1]
+    _prune_dead_entries(_DENSE_TW_DENSE_CACHE)
+    experts, n, k = w.shape
+    t = torch.empty((experts, k, n), dtype=w.dtype, device=w.device)
+    # A single permute().contiguous() over a multi-GiB slab comes back wrong on
+    # MUSA (256 x 4096 x 7168: even expert 0 mismatches), while the same copy
+    # done in bounded chunks is correct. Keep each copy under 2**30 elements.
+    step = max(1, (1 << 30) // (n * k))
+    for start in range(0, experts, step):
+        t[start : start + step] = w[start : start + step].permute(0, 2, 1)
+    _DENSE_TW_DENSE_CACHE[key] = (weakref.ref(w), t)
+    _evict_with_owner(w, _DENSE_TW_DENSE_CACHE, key)
+    return t
+
+
+_DENSE_CACHE = {}
+
+
+def _dense_get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens):
+    key = (M, E, H, n_inter, topk, str(device), dtype)
+    entry = _DENSE_CACHE.get(key)
+    if entry is not None:
+        return entry
+    if _DENSE_CACHE:
+        # Do not empty_cache() here: on MUSA it can invalidate buffers that
+        # are still referenced by an earlier launch while switching shapes.
+        _DENSE_CACHE.clear()
+    meta = torch.zeros(3 * E + 1, dtype=torch.int32, device=device)
+    row_token = torch.empty(max_tokens, dtype=torch.int32, device=device)
+    inv_perm = torch.empty(M * topk, dtype=torch.int32, device=device)
+    m_indices = torch.empty(max_tokens, dtype=torch.int32, device=device)
+    # The compaction kernel only writes rows that a token owns; the per-expert
+    # padding rows must already be zero, so this buffer is zero-initialised
+    # once per shape instead of being patched on every call.
+    hidden_perm = torch.zeros(max_tokens, H, dtype=dtype, device=device)
+    gate_up = torch.empty(max_tokens, 2 * n_inter, dtype=dtype, device=device)
+    act = torch.empty(max_tokens, n_inter, dtype=dtype, device=device)
+    # GEMM2 output: cached like the rest so a repeated call does not allocate
+    # and free ~268 MiB on every launch (MUSA turns that churn into an
+    # "out of bound" after roughly a hundred calls).
+    mm2 = torch.empty(max_tokens, H, dtype=dtype, device=device)
+    entry = (
+        meta,
+        row_token,
+        inv_perm,
+        m_indices,
+        hidden_perm,
+        gate_up,
+        act,
+        mm2,
+    )
+    _DENSE_CACHE[key] = entry
+    return entry
+
+
+def _dense_fused_moe(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Run the dense grouped (padded-contiguous) BF16/fp16 path."""
+    M, H = hidden_states.shape
+    E, N, K = w1.shape
+    n_inter = N // 2
+    if n_inter < 256 or N % 128 or H % 64 or n_inter % 64:
+        raise NotImplementedError(
+            "dense grouped MoE requires n_inter>=256 and 64/128 alignment"
+        )
+    topk = topk_ids.size(1)
+    numel = M * topk
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+    BM = 128
+    max_tokens = ((numel + E * (BM - 1) + BM - 1) // BM) * BM
+    (
+        meta,
+        row_token,
+        inv_perm,
+        m_indices,
+        hidden_perm,
+        gate_up,
+        act,
+        mm2,
+    ) = _dense_get_buffers(M, E, H, n_inter, topk, device, dtype, max_tokens)
+    counts = meta[:E]
+    offsets = meta[E : 2 * E + 1]
+    counters = meta[2 * E + 1 :]
+    meta.zero_()
+
+    _histogram_kernel[(triton.cdiv(numel, 2048),)](
+        topk_ids.reshape(-1),
+        counts,
+        numel,
+        NEXP=E,
+        NBINS=triton.next_power_of_2(E),
+        BLOCK=2048,
+    )
+    _padded_offsets_kernel[(1,)](
+        counts, offsets, E=E, BM=BM, BLOCK=triton.next_power_of_2(E)
+    )
+    total = int(offsets[E].item())
+
+    _fill_m_indices_kernel[(E,)](offsets, counts, m_indices, E=E, BM=BM, BLOCK=256)
+    _fill_neg_kernel[(triton.cdiv(total, 1024),)](row_token, total, BLOCK=1024)
+    _assign_padded_kernel[(triton.cdiv(numel, 1024),)](
+        topk_ids.reshape(-1),
+        offsets,
+        counters,
+        inv_perm,
+        row_token,
+        numel,
+        topk=topk,
+        BLOCK=1024,
+    )
+    _compact_scatter_kernel[(M, triton.cdiv(H, 256))](
+        hidden_states,
+        hidden_perm,
+        inv_perm,
+        H,
+        TOPK=topk,
+        BLOCK_H=256,
+        num_warps=4,
+    )
+
+    use_tle = _tle_ready(w1, w2, total, H, n_inter)
+    if use_tle:
+        # The consumer of the TLE pipeline is the default warp-specialize
+        # partition, so its warp count comes from the launch, not from
+        # worker_num_warps. A 128x256 tile at 8 warps keeps the accumulator at
+        # 128 registers per thread and is ~1.3x faster than 128x128 at 4 warps;
+        # it needs N % 256 == 0, and 3 stages already use 144 of the 192 KiB
+        # of shared memory.
+        # Keep the wide tile on the N range it is verified for; a Mixtral-like
+        # shard (E=8, N=28672) has not been re-checked since the LLC miscompile
+        # above was found, so N > 4096 stays on the narrow tile for now.
+        wide = (2 * n_inter) % 256 == 0 and 2 * n_inter <= 4096
+        _tle_gemm(
+            hidden_perm,
+            w1,
+            gate_up,
+            m_indices,
+            E,
+            total,
+            2 * n_inter,
+            H,
+            STAGES=3,
+            BN=256 if wide else 128,
+            NUM_WARPS=8 if wide else 4,
+        )
+    else:
+        w1t = _dense_transpose_weights(w1)
+        g1 = (total // BM) * triton.cdiv(2 * n_inter, 128)
+        _grouped_gemm_kernel[(g1,)](
+            hidden_perm,
+            w1t,
+            gate_up,
+            m_indices,
+            total,
+            2 * n_inter,
+            H,
+            BM=128,
+            BN=128,
+            BK=64,
+            num_warps=4,
+            num_stages=2,
+        )
+    _silu_mul_kernel[(triton.cdiv(total * n_inter, 1024),)](
+        gate_up,
+        act,
+        total * n_inter,
+        n_inter=n_inter,
+        BLOCK=1024,
+        num_warps=4,
+    )
+    # GEMM2 must not write back into hidden_perm: that buffer is consumed by
+    # GEMM1, and reusing it here triggers an IMA on MUSA/Triton. It writes to
+    # the cached mm2 buffer instead.
+    if use_tle:
+        # GEMM2 gets the same treatment: a 128x256 tile keeps the accumulator at
+        # 128 registers per thread once the consumer has 8 warps, and the K-loop
+        # is short (K = intermediate size), so two stages suffice.
+        wide2 = H % 256 == 0
+        _tle_gemm(
+            act,
+            w2,
+            mm2,
+            m_indices,
+            E,
+            total,
+            H,
+            n_inter,
+            STAGES=2,
+            BN=256 if wide2 else 128,
+            NUM_WARPS=8 if wide2 else 4,
+        )
+    else:
+        w2t = _dense_transpose_weights(w2)
+        g2 = (total // BM) * triton.cdiv(H, 128)
+        _grouped_gemm_kernel[(g2,)](
+            act,
+            w2t,
+            mm2,
+            m_indices,
+            total,
+            H,
+            n_inter,
+            BM=128,
+            BN=128,
+            BK=64,
+            num_warps=4,
+            num_stages=2,
+        )
+    out = torch.empty((M, H), dtype=dtype, device=device)
+    _unpermute_kernel[(M, triton.cdiv(H, 512))](
+        mm2,
+        out,
+        inv_perm,
+        topk_weights,
+        M,
+        H,
+        topk=topk,
+        BLOCK=512,
+    )
+    _release_transposes_under_pressure()
+    return out
 
 
 def nopad_fused_moe(
@@ -2849,19 +3533,32 @@ def nopad_fused_moe(
     numel = M * topk
     device = hidden_states.device
 
+    split_shape = n_inter >= 256
     if cfg_g1 is None:
-        cfg_g1 = dict(_NOPAD_CFG)
+        cfg_g1 = dict(_NOPAD_SPLIT_CFG if split_shape else _NOPAD_CFG)
     if cfg_g2 is None:
-        cfg_g2 = dict(_NOPAD_CFG)
+        cfg_g2 = dict(_NOPAD_SPLIT_CFG if split_shape else _NOPAD_CFG)
 
-    counts, start, counters, sorted_ids, inv_perm, gate, cache3 = _get_buffers(
-        M, E, H, n_inter, topk, device, dtype
-    )
+    (
+        counts,
+        start,
+        counters,
+        sorted_ids,
+        inv_perm,
+        gate,
+        cache3,
+        gate_up,
+    ) = _get_buffers(M, E, H, n_inter, topk, device, dtype, need_gate_up=split_shape)
     out = torch.empty((M, H), device=device, dtype=dtype)
 
     ti_flat = topk_ids.reshape(-1)
     _histogram_kernel[(triton.cdiv(numel, _HIST_BLOCK),)](
-        ti_flat, counts, numel, BLOCK=_HIST_BLOCK
+        ti_flat,
+        counts,
+        numel,
+        NEXP=E,
+        NBINS=triton.next_power_of_2(E),
+        BLOCK=_HIST_BLOCK,
     )
     _exclusive_cumsum_kernel[(1,)](counts, start, E, BLOCK=triton.next_power_of_2(E))
     _assign_kernel[(triton.cdiv(numel, _ASSIGN_BLOCK),)](
@@ -2898,11 +3595,14 @@ def nopad_fused_moe(
     # output = activated intermediate written to `gate`). Kernel N argument is
     # the full 2*I so n_out = N//2 = I inside.
     nmt = triton.cdiv(cnt_max, cfg_g1["BLOCK_M"])
-    grid1 = (E * triton.cdiv(n_inter, cfg_g1["BLOCK_N"]) * nmt,)
+    split_act = bool(cfg_g1.get("SPLIT_ACT", False)) and not fp8_quant
+    g1_out_n = 2 * n_inter if split_act else n_inter
+    g1_out = gate_up if split_act else gate
+    grid1 = (E * triton.cdiv(g1_out_n, cfg_g1["BLOCK_N"]) * nmt,)
     _nopad_fused_moe_kernel[grid1](
         a_quant,
         w1T,
-        gate,
+        g1_out,
         start,
         counts,
         None,
@@ -2923,12 +3623,12 @@ def nopad_fused_moe(
         w1T.stride(0),
         w1T.stride(1),
         w1T.stride(2),
-        gate.stride(0),
-        gate.stride(1),
+        g1_out.stride(0),
+        g1_out.stride(1),
         GATHER=True,
         NUM_M_TILES=nmt,
         top_k=topk,
-        FUSE_SILU=True,
+        FUSE_SILU=not split_act,
         FP8_QUANT=fp8_quant,
         BLOCK_M=cfg_g1["BLOCK_M"],
         BLOCK_N=cfg_g1["BLOCK_N"],
@@ -2937,6 +3637,16 @@ def nopad_fused_moe(
         num_warps=cfg_g1["num_warps"],
         num_stages=cfg_g1["num_stages"],
     )
+
+    if split_act:
+        _silu_mul_kernel[(triton.cdiv(numel * n_inter, 1024),)](
+            gate_up,
+            gate,
+            numel * n_inter,
+            n_inter=n_inter,
+            BLOCK=1024,
+            num_warps=4,
+        )
 
     # GEMM2: contiguous a (activated gate), single pass
     if fp8_quant:
@@ -2994,4 +3704,5 @@ def nopad_fused_moe(
     _unpermute_kernel[(M, triton.cdiv(H, _REDUCE_BLOCK))](
         cache3, out, inv_perm, topk_weights, M, H, topk=topk, BLOCK=_REDUCE_BLOCK
     )
+    _release_transposes_under_pressure()
     return out
