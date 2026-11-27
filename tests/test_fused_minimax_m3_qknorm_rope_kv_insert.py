@@ -5,10 +5,7 @@ import torch
 
 import flaggems_vllm
 
-pytestmark = [
-    pytest.mark.fused_minimax_m3_qknorm_rope_kv_insert,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-]
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def literal_norm_rope(x, weight, cs, positions, rotary):
@@ -25,6 +22,7 @@ def literal_norm_rope(x, weight, cs, positions, rotary):
 @pytest.mark.parametrize("rotary", [8, 64, 128])
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("gather", [False, True])
+@pytest.mark.fused_minimax_m3_qknorm_rope_kv_insert
 def test_fused_minimax_m3_cache(tokens, rotary, fp8, gather):
     torch.manual_seed(37)
     nq, nkv, niq = 4, 2, 2
@@ -120,6 +118,7 @@ def test_fused_minimax_m3_cache(tokens, rotary, fp8, gather):
     assert bool((cache[3] == 11).all()) and bool((index[63] == 11).all())
 
 
+@pytest.mark.fused_minimax_m3_qknorm_rope_kv_insert
 def test_fused_minimax_m3_norm_only_graph():
     x = torch.randn((3, 8 * 128), device="cuda", dtype=torch.bfloat16)
     original = x.clone()
@@ -154,6 +153,7 @@ def test_fused_minimax_m3_norm_only_graph():
 @pytest.mark.parametrize("rotary", [32, 64, 128])
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.fused_minimax_m3_qknorm_rope_kv_insert
 def test_fused_minimax_m3_native_bitwise(tokens, rotary, fp8, hnd):
     pytest.importorskip("vllm._C_stable_libtorch")
     native = getattr(torch.ops._C, "fused_minimax_m3_qknorm_rope_kv_insert", None)

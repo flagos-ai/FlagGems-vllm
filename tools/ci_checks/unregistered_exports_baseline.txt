@@ -15,7 +15,6 @@ fp32_router_gemm
 fp8_fp4_paged_mqa_logits_graph
 fused_allreduce_rms_norm
 fused_marlin_moe
-fused_minimax_m3_qknorm_rope_kv_insert
 fused_recurrent_gated_delta_rule_fwd
 fwht128_quant_fp8
 gather_rows

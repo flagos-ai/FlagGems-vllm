@@ -1105,6 +1105,20 @@ ops:
   - Distributed
   stages:
   - alpha: '5.4'
+- id: fused_minimax_m3_qknorm_rope_kv_insert
+  description: >-
+    MiniMax M3 packed BF16 Gemma Q/K RMSNorm and partial NeoX RoPE.
+    Ascend supports the main Q/K heads and optional gathered Q output.
+    CUDA also supports index heads and paged KV insertion.
+  for:
+  - vllm.models.minimax_m3
+  labels:
+  - fused
+  - Normalization
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: fused_moe
   description: The generic interface for fused MoE.
   for:
