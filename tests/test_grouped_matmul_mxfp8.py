@@ -161,6 +161,7 @@ def max_absdiff(actual, expected):
     return (actual.float() - expected.float()).abs().max().item()
 
 
+@pytest.mark.grouped_matmul_mxfp8
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 @pytest.mark.parametrize("layout", ["ND", "NZ"])
 def test_bitwise_equal_to_vendor(shape, layout):
@@ -184,6 +185,7 @@ def test_bitwise_equal_to_vendor(shape, layout):
     )
 
 
+@pytest.mark.grouped_matmul_mxfp8
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_nd_and_nz_agree(shape):
     """Both layouts read the same bytes, so the outputs must be identical."""
@@ -195,6 +197,7 @@ def test_nd_and_nz_agree(shape):
     assert bad == 0, f"{cfg['name']}: ND and NZ differ in {bad}/{nd.numel()} elements"
 
 
+@pytest.mark.grouped_matmul_mxfp8
 def test_matches_torch_fp32_reference_within_vendor_error():
     """Deviation from fp32 must not exceed the vendor baseline's own error.
 
@@ -241,6 +244,7 @@ def run_edge_case(M, K, N, sizes, group_list_type, **kwargs):
     )
 
 
+@pytest.mark.grouped_matmul_mxfp8
 @pytest.mark.parametrize(
     "sizes",
     [
@@ -253,6 +257,7 @@ def test_empty_and_uneven_groups(sizes):
     run_edge_case(64, 3072, 6144, sizes, 1, **TUNED)
 
 
+@pytest.mark.grouped_matmul_mxfp8
 @pytest.mark.parametrize(
     "sizes",
     [
@@ -264,6 +269,7 @@ def test_cumulative_group_list(sizes):
     run_edge_case(64, 3072, 6144, sizes, 0, **TUNED)
 
 
+@pytest.mark.grouped_matmul_mxfp8
 @pytest.mark.parametrize(
     "M,sizes",
     [
@@ -278,6 +284,7 @@ def test_unaligned_m_and_group_starts(M, sizes):
     run_edge_case(M, 3072, 6144, sizes, 1, **TUNED)
 
 
+@pytest.mark.grouped_matmul_mxfp8
 @pytest.mark.parametrize(
     "K,N,block_n,block_k",
     [
@@ -292,12 +299,14 @@ def test_other_k_n_alignments(K, N, block_n, block_k):
     run_edge_case(32, K, N, [8] * 4, 1, block_n=block_n, block_k=block_k)
 
 
+@pytest.mark.grouped_matmul_mxfp8
 @pytest.mark.parametrize("M,sizes", [(64, [4] * 16), (17, [1, 2, 3, 4, 7])])
 def test_default_tiling(M, sizes):
     """No tuning parameters: exercises the production default configuration."""
     run_edge_case(M, 3072, 6144, sizes, 1)
 
 
+@pytest.mark.grouped_matmul_mxfp8
 def test_fp16_output_dtype():
     cfg = SHAPES["qwen"]
     x, w, sb, sa, gl = build_inputs(cfg["M"], cfg["K"], cfg["N"], cfg["E"])
@@ -312,6 +321,7 @@ def test_fp16_output_dtype():
     assert max_absdiff(out, reference) / peak <= 8e-3
 
 
+@pytest.mark.grouped_matmul_mxfp8
 def test_unsupported_and_invalid_inputs():
     x, w, sb, sa, gl = build_inputs(16, 512, 2048, 128)
     with pytest.raises(NotImplementedError, match="output_dtype"):
