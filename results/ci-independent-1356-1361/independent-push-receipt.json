@@ -1,0 +1,513 @@
+[
+  {
+    "pr": 1356,
+    "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+    "path": "D:\\Codex\\workspaces\\FlagGems-vllm-ci-1356-sync-20261127",
+    "branch": "codex/fgv-ci-1356-sync-20261127",
+    "head": "317282b1b2db9647fc4f4267b0ea8288de1d5984",
+    "tree": "33f390daa4d5634979b9c3b2545b5f97dcae776d",
+    "files": [
+      "tools/test_ci_helpers.py",
+      "tools/select_tests.py"
+    ],
+    "original_head": "7a733d1c035a9107edd54ea00acfabc785afcde6",
+    "normal_fast_forward_from_original": true,
+    "pushed": true,
+    "raw_blob_count": 1808,
+    "all_raw_git_blobs_matched": true,
+    "source_archive_sha256": "1a526209f8c2ede4c404a61edded539c6af9913aad5ff2642731370e34806e83",
+    "counts": {
+      "all-ci-helpers": 90,
+      "workflow-policy-tests": 10
+    },
+    "phases": [
+      {
+        "phase": "lint-dependencies",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "pip",
+          "install",
+          "--no-index",
+          "--no-deps",
+          "--target",
+          "/tmp/ci-lint",
+          "/wheels/black-24.8.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl",
+          "/wheels/click-8.5.1-py3-none-any.whl",
+          "/wheels/flake8-7.1.0-py2.py3-none-any.whl",
+          "/wheels/isort-5.12.0-py3-none-any.whl",
+          "/wheels/mccabe-0.7.0-py2.py3-none-any.whl",
+          "/wheels/mypy_extensions-1.2.0-py3-none-any.whl",
+          "/wheels/packaging-26.4-py3-none-any.whl",
+          "/wheels/pathspec-1.1.1-py3-none-any.whl",
+          "/wheels/platformdirs-4.14.8-py3-none-any.whl",
+          "/wheels/pycodestyle-2.12.1-py2.py3-none-any.whl",
+          "/wheels/pyflakes-3.2.0-py2.py3-none-any.whl"
+        ],
+        "exit": 0,
+        "bytes": 1346,
+        "sha256": "d0dbf01456344b71762c799c96a1b0b60e90b05e37fe915b90b1d0f7263ebfec"
+      },
+      {
+        "phase": "all-ci-helpers",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tools",
+          "-p",
+          "test_ci_*.py",
+          "-v"
+        ],
+        "exit": 0,
+        "bytes": 13139,
+        "sha256": "8595426a790c5011682c216b5f0e60de5bdb3abfd7413c178465a1c189268670"
+      },
+      {
+        "phase": "workflow-policy",
+        "argv": [
+          "/usr/bin/python3",
+          "tools/ci_checks/check_workflow_policy.py"
+        ],
+        "exit": 0,
+        "bytes": 20,
+        "sha256": "e15baa69c0681983b8738a786b3f78903f655aa7ae590c81243e5fec2be8c556"
+      },
+      {
+        "phase": "workflow-policy-tests",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tools/ci_checks",
+          "-p",
+          "test_check_workflow_policy.py",
+          "-v"
+        ],
+        "exit": 0,
+        "bytes": 1321,
+        "sha256": "f73a7e4f5fb3c1fd90507ce1b6a07063448b8fa72c0e0ac8cf8e9824ff2bde96"
+      },
+      {
+        "phase": "no-torch-fallback",
+        "argv": [
+          "/usr/bin/python3",
+          "tools/ci_checks/check_no_torch_fallback.py",
+          "tools/test_ci_helpers.py",
+          "tools/select_tests.py"
+        ],
+        "exit": 0,
+        "bytes": 32,
+        "sha256": "81ac98e2a7dad0375ff4be40a2090526a4ff78f9af574f9138a5c168965212de"
+      },
+      {
+        "phase": "init-exports",
+        "argv": [
+          "/usr/bin/python3",
+          "tools/ci_checks/check_init_exports.py"
+        ],
+        "exit": 0,
+        "bytes": 2562,
+        "sha256": "1e35fcd2ff767b61692c30a4b9079f53d490aa1f0c6c23444ea26c4fbdfc0383"
+      },
+      {
+        "phase": "export-registry",
+        "argv": [
+          "/usr/bin/python3",
+          "tools/ci_checks/check_exported_ops_registered.py"
+        ],
+        "exit": 0,
+        "bytes": 71,
+        "sha256": "4ee484a98971ae10d23378351160aebf10e599932d78e4281a331a1377b226d4"
+      },
+      {
+        "phase": "black",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "black",
+          "--check",
+          "--diff",
+          "tools/test_ci_helpers.py",
+          "tools/select_tests.py"
+        ],
+        "exit": 0,
+        "bytes": 56,
+        "sha256": "b9cf511501d306d2bd8355ccb165c8ddc0a6fdd62d7c72c4a7b1795cf8934c8c"
+      },
+      {
+        "phase": "isort",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "isort",
+          "--check-only",
+          "--diff",
+          "--profile",
+          "black",
+          "tools/test_ci_helpers.py",
+          "tools/select_tests.py"
+        ],
+        "exit": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "phase": "flake8",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "flake8",
+          "--ignore=F405,E731,W503,E203,E704",
+          "--max-line-length=120",
+          "tools/test_ci_helpers.py",
+          "tools/select_tests.py"
+        ],
+        "exit": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "phase": "baseline-selector-negative",
+        "argv": [
+          "/usr/bin/python3",
+          "/negative-control.py"
+        ],
+        "exit": 0,
+        "bytes": 2144,
+        "sha256": "3bf90156cffbbe548a403c72e8bc0f039d0eb6f7d4da063634d212476377fad8"
+      }
+    ],
+    "admission": {
+      "cid": "b439afdf4795a035206258dae125d99a514eb12516dec9a06da04b7cd0727050",
+      "label": "fgv-ci-independent-1356-v1",
+      "image": "sha256:bd8a5d7a8774800c92d714c0c226b32c1863f929150f36efd610aebcd12a335d",
+      "runtime": "runc",
+      "network": "none",
+      "readonly_root": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "devices": [],
+      "device_requests": null,
+      "privileged": false,
+      "mounts": [
+        {
+          "target": "/source-manifest.json",
+          "rw": false
+        },
+        {
+          "target": "/wheels",
+          "rw": false
+        },
+        {
+          "target": "/run-cpu.py",
+          "rw": false
+        },
+        {
+          "target": "/negative-control.py",
+          "rw": false
+        },
+        {
+          "target": "/baseline-conftest.py",
+          "rw": false
+        },
+        {
+          "target": "/source",
+          "rw": false
+        },
+        {
+          "target": "/verify-source.py",
+          "rw": false
+        },
+        {
+          "target": "/baseline-selector.py",
+          "rw": false
+        },
+        {
+          "target": "/results",
+          "rw": true
+        }
+      ]
+    },
+    "cleanup": {
+      "cid": "b439afdf4795a035206258dae125d99a514eb12516dec9a06da04b7cd0727050",
+      "positive_absence": true,
+      "natural_exit": true,
+      "exit": 0
+    },
+    "source_before": {
+      "source": "/source",
+      "files": 1808,
+      "passed": true
+    },
+    "source_after": {
+      "source": "/source",
+      "files": 1808,
+      "passed": true
+    },
+    "remote_ref_verified": true
+  },
+  {
+    "pr": 1361,
+    "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+    "path": "D:\\Codex\\workspaces\\FlagGems-vllm-ci-1361-sync-20261127",
+    "branch": "codex/fgv-ci-1361-sync-20261127",
+    "head": "f9268b77c8e1c3ccfdf86a080f3e656a38083a99",
+    "tree": "170ccb3d94d7b40fc39e327f77bf5657491e7f16",
+    "files": [
+      "tools/test_ci_helpers.py",
+      "tools/test_ci_device_context.py",
+      "tests/conftest.py"
+    ],
+    "original_head": "6f9436c6d170af2e2bc1f3643bc793c9f58b8d95",
+    "normal_fast_forward_from_original": true,
+    "pushed": true,
+    "raw_blob_count": 1809,
+    "all_raw_git_blobs_matched": true,
+    "source_archive_sha256": "ff33c3aa9f45cb8625a608f6af5b0b6c7d1df2482ded4e06c3c4eb20fd2ddedf",
+    "counts": {
+      "all-ci-helpers": 94,
+      "workflow-policy-tests": 10
+    },
+    "phases": [
+      {
+        "phase": "lint-dependencies",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "pip",
+          "install",
+          "--no-index",
+          "--no-deps",
+          "--target",
+          "/tmp/ci-lint",
+          "/wheels/black-24.8.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl",
+          "/wheels/click-8.5.1-py3-none-any.whl",
+          "/wheels/flake8-7.1.0-py2.py3-none-any.whl",
+          "/wheels/isort-5.12.0-py3-none-any.whl",
+          "/wheels/mccabe-0.7.0-py2.py3-none-any.whl",
+          "/wheels/mypy_extensions-1.2.0-py3-none-any.whl",
+          "/wheels/packaging-26.4-py3-none-any.whl",
+          "/wheels/pathspec-1.1.1-py3-none-any.whl",
+          "/wheels/platformdirs-4.14.8-py3-none-any.whl",
+          "/wheels/pycodestyle-2.12.1-py2.py3-none-any.whl",
+          "/wheels/pyflakes-3.2.0-py2.py3-none-any.whl"
+        ],
+        "exit": 0,
+        "bytes": 1346,
+        "sha256": "d0dbf01456344b71762c799c96a1b0b60e90b05e37fe915b90b1d0f7263ebfec"
+      },
+      {
+        "phase": "all-ci-helpers",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tools",
+          "-p",
+          "test_ci_*.py",
+          "-v"
+        ],
+        "exit": 0,
+        "bytes": 13787,
+        "sha256": "9c203520c104ce80d2d3e9e2775cc50eab68918d387901f0f485f2015b28bc1e"
+      },
+      {
+        "phase": "workflow-policy",
+        "argv": [
+          "/usr/bin/python3",
+          "tools/ci_checks/check_workflow_policy.py"
+        ],
+        "exit": 0,
+        "bytes": 20,
+        "sha256": "e15baa69c0681983b8738a786b3f78903f655aa7ae590c81243e5fec2be8c556"
+      },
+      {
+        "phase": "workflow-policy-tests",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tools/ci_checks",
+          "-p",
+          "test_check_workflow_policy.py",
+          "-v"
+        ],
+        "exit": 0,
+        "bytes": 1321,
+        "sha256": "f73a7e4f5fb3c1fd90507ce1b6a07063448b8fa72c0e0ac8cf8e9824ff2bde96"
+      },
+      {
+        "phase": "no-torch-fallback",
+        "argv": [
+          "/usr/bin/python3",
+          "tools/ci_checks/check_no_torch_fallback.py",
+          "tools/test_ci_helpers.py",
+          "tools/test_ci_device_context.py",
+          "tests/conftest.py"
+        ],
+        "exit": 0,
+        "bytes": 32,
+        "sha256": "81ac98e2a7dad0375ff4be40a2090526a4ff78f9af574f9138a5c168965212de"
+      },
+      {
+        "phase": "init-exports",
+        "argv": [
+          "/usr/bin/python3",
+          "tools/ci_checks/check_init_exports.py"
+        ],
+        "exit": 0,
+        "bytes": 2562,
+        "sha256": "1e35fcd2ff767b61692c30a4b9079f53d490aa1f0c6c23444ea26c4fbdfc0383"
+      },
+      {
+        "phase": "export-registry",
+        "argv": [
+          "/usr/bin/python3",
+          "tools/ci_checks/check_exported_ops_registered.py"
+        ],
+        "exit": 0,
+        "bytes": 71,
+        "sha256": "4ee484a98971ae10d23378351160aebf10e599932d78e4281a331a1377b226d4"
+      },
+      {
+        "phase": "black",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "black",
+          "--check",
+          "--diff",
+          "tools/test_ci_helpers.py",
+          "tools/test_ci_device_context.py",
+          "tests/conftest.py"
+        ],
+        "exit": 0,
+        "bytes": 56,
+        "sha256": "45a468fa6205768496f23f1716ebb7575e9b723449d2099b88bf2afef60b721f"
+      },
+      {
+        "phase": "isort",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "isort",
+          "--check-only",
+          "--diff",
+          "--profile",
+          "black",
+          "tools/test_ci_helpers.py",
+          "tools/test_ci_device_context.py",
+          "tests/conftest.py"
+        ],
+        "exit": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "phase": "flake8",
+        "argv": [
+          "/usr/bin/python3",
+          "-m",
+          "flake8",
+          "--ignore=F405,E731,W503,E203,E704",
+          "--max-line-length=120",
+          "tools/test_ci_helpers.py",
+          "tools/test_ci_device_context.py",
+          "tests/conftest.py"
+        ],
+        "exit": 0,
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "phase": "baseline-async-negative",
+        "argv": [
+          "/usr/bin/python3",
+          "/negative-control.py"
+        ],
+        "exit": 0,
+        "bytes": 947,
+        "sha256": "38ab59130000decb39e6b709a282a99041e19d7aea7e112b89a7ac418d269889"
+      }
+    ],
+    "admission": {
+      "cid": "ea7d574d9c2e552886dafbfa1c3ae65145f21cf404dd926e1caab755e06a8bd5",
+      "label": "fgv-ci-independent-1361-v1",
+      "image": "sha256:bd8a5d7a8774800c92d714c0c226b32c1863f929150f36efd610aebcd12a335d",
+      "runtime": "runc",
+      "network": "none",
+      "readonly_root": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "devices": [],
+      "device_requests": null,
+      "privileged": false,
+      "mounts": [
+        {
+          "target": "/verify-source.py",
+          "rw": false
+        },
+        {
+          "target": "/baseline-selector.py",
+          "rw": false
+        },
+        {
+          "target": "/run-cpu.py",
+          "rw": false
+        },
+        {
+          "target": "/negative-control.py",
+          "rw": false
+        },
+        {
+          "target": "/results",
+          "rw": true
+        },
+        {
+          "target": "/source",
+          "rw": false
+        },
+        {
+          "target": "/wheels",
+          "rw": false
+        },
+        {
+          "target": "/baseline-conftest.py",
+          "rw": false
+        },
+        {
+          "target": "/source-manifest.json",
+          "rw": false
+        }
+      ]
+    },
+    "cleanup": {
+      "cid": "ea7d574d9c2e552886dafbfa1c3ae65145f21cf404dd926e1caab755e06a8bd5",
+      "positive_absence": true,
+      "natural_exit": true,
+      "exit": 0
+    },
+    "source_before": {
+      "source": "/source",
+      "files": 1809,
+      "passed": true
+    },
+    "source_after": {
+      "source": "/source",
+      "files": 1809,
+      "passed": true
+    },
+    "remote_ref_verified": true
+  }
+]

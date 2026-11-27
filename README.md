@@ -11,3 +11,5 @@ These results use current-main `12210ab628e0b8f5beed55791958e3bd57accb2b` with t
 NVIDIA target: H20-3e, Torch2.13.0+cu130, vLLM0.32.0, FlagTree0.7.0/Triton3.6.0, FlagGems5.4.0, FlagCX0.14.1+cuda13.3; MegaMoE uses real Clang22.1.8 and two-way P2P. Source/stack paths, original outputs, timings and cleanup records are retained. Separate original setup failures remain in the local task archive and are not counted as successful numerical runs. Every qualified GPU/container exited naturally and selected devices were released.
 
 Source PRs: https://github.com/flagos-ai/FlagGems-vllm/pull/1349, https://github.com/flagos-ai/FlagGems-vllm/pull/1351, https://github.com/flagos-ai/FlagGems-vllm/pull/1356, https://github.com/flagos-ai/FlagGems-vllm/pull/1361.
+
+Independent final-source #1356 and #1361 Linux CPU validation is in `results/ci-independent-1356-1361`: respectively 100 and104 positive tests, all validators/style checks and unchanged-main negative controls passed; original PR branches were synchronized by normal push. GitHub final-head required CI remains a separate condition.
