@@ -174,10 +174,15 @@ def test_topk_value_and_score_semantics(
     assert torch.unique(ids).numel() == k
     torch.testing.assert_close(result.logprob_token_ids[:, 0], sampled)
     selected_values = logits.gather(1, ids)
-    expected_values = torch.topk(logits, k, dim=1).values
-    torch.testing.assert_close(
-        selected_values, expected_values, rtol=0, atol=0, equal_nan=True
-    )
+    if scenario == "ties" and k == vocab_size:
+        # A full-vocabulary result is correct if it is a permutation in descending order.
+        # Some device topk implementations do not sort this large tied input.
+        assert bool((selected_values[:, :-1] >= selected_values[:, 1:]).all())
+    else:
+        expected_values = torch.topk(logits, k, dim=1).values
+        torch.testing.assert_close(
+            selected_values, expected_values, rtol=0, atol=0, equal_nan=True
+        )
     expected_scores = (
         logits.float() if logits_mode else torch.log_softmax(logits.float(), dim=-1)
     ).gather(1, result.logprob_token_ids)
