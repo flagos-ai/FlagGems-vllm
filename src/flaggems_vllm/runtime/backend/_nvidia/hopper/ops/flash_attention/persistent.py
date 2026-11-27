@@ -1005,6 +1005,7 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
     ping_to_c0,
     ping_to_c1,
     o_store_ready,
+    UNIFORM_Q: tl.constexpr,
     scheduler_state,
     scheduler_empty,
     scheduler_full,
@@ -1091,9 +1092,13 @@ def _flash_varlen_fwd_v3_tle_persistent_consumer(
         )
         work_valid = tile_idx < total_tiles
     while work_valid:
-        q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
-        q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
-        q_len = q_eos - q_bos
+        if UNIFORM_Q:
+            q_bos = bid * seqlen_q
+            q_len = seqlen_q
+        else:
+            q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
+            q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
+            q_len = q_eos - q_bos
         o_offset = q_bos * o_row_stride
         lse_offset = q_bos
         if is_seqused_k:
@@ -2093,6 +2098,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         ping_to_c0,
                         ping_to_c1,
                         o_store_ready,
+                        STAGED_KV,
                         scheduler_state,
                         scheduler_empty,
                         scheduler_full,
@@ -2170,6 +2176,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         ping_to_c0,
                         ping_to_c1,
                         o_store_ready,
+                        STAGED_KV,
                         scheduler_state,
                         scheduler_empty,
                         scheduler_full,
@@ -2324,6 +2331,7 @@ def flash_varlen_fwd_v3_tle_kernel(
                         ping_to_c0,
                         ping_to_c1,
                         o_store_ready,
+                        STAGED_KV,
                         scheduler_state,
                         scheduler_empty,
                         scheduler_full,

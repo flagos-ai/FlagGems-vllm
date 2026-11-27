@@ -501,6 +501,17 @@ def launch_attention(
         + (batch_size - 1 if ragged_scheduler else 0)
     ) * tile_groups
     dynamic_scheduler = (is_causal or is_local) and work_items > num_sms
+    if staged_kv:
+        # A static CTA advances num_sms tiles at a time. When that stride
+        # advances just a few query tiles modulo a head, one cycle covers
+        # both short and long causal prefixes without a global work queue.
+        m_tiles = _ceil_div(tile_rows, 128)
+        stride = num_sms % m_tiles
+        if 0 < stride <= 4 and m_tiles % stride == 0:
+            cycle_tiles = num_sms * (m_tiles // stride)
+            remainder = (-work_items) % cycle_tiles
+            if remainder * 16 <= work_items:
+                dynamic_scheduler = False
     split_kv = persistent_num_splits > 1
     if split_kv:
         dynamic_scheduler = population != "single"
