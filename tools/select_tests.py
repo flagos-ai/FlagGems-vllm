@@ -88,14 +88,8 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
-THEAD_MARLIN_SOURCES = tuple(
-    f"src/flaggems_vllm/runtime/backend/_thead/fused/{module}.py"
-    for module in (
-        "marlin_dense",
-        "marlin_fragments",
-        "marlin_quantized",
-        "marlin_tiles",
-    )
+THEAD_MARLIN_SOURCE = (
+    "src/flaggems_vllm/runtime/backend/_thead/fused/fused_marlin_moe.py"
 )
 
 EXPLICIT_SOURCE_TO_TESTS = {
@@ -267,7 +261,7 @@ EXPLICIT_SOURCE_TO_TESTS = {
     ],
     "src/flaggems_vllm/ops/rotary_embedding.py": ["tests/test_apply_rotary_pos_emb.py"],
     "src/flaggems_vllm/ops/fused_moe.py": ["tests/test_fused_experts_impl.py"],
-    **{path: ["tests/test_fused_marlin_moe.py"] for path in THEAD_MARLIN_SOURCES},
+    THEAD_MARLIN_SOURCE: ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": ["tests/test_fused_marlin_moe.py"],
     "src/flaggems_vllm/ops/sparse_attention.py": ["tests/test_flash_attention.py"],
     "src/flaggems_vllm/ops/quant.py": ["tests/test_quant.py"],
@@ -454,15 +448,12 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_fused_moe_int8_w8a16.py",
         "benchmark/test_fused_moe_w8a16.py",
     ],
-    **{
-        path: [
-            "benchmark/test_fused_marlin_moe_w4a16_int4.py",
-            "benchmark/test_fused_marlin_moe_w4a16_mxfp4.py",
-            "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
-            "benchmark/test_fused_marlin_moe_w8a16_int8.py",
-        ]
-        for path in THEAD_MARLIN_SOURCES
-    },
+    THEAD_MARLIN_SOURCE: [
+        "benchmark/test_fused_marlin_moe_w4a16_int4.py",
+        "benchmark/test_fused_marlin_moe_w4a16_mxfp4.py",
+        "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
+    ],
     "src/flaggems_vllm/ops/fused_marlin_moe.py": [
         "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
         "benchmark/test_fused_marlin_moe_w8a16_int8.py",
