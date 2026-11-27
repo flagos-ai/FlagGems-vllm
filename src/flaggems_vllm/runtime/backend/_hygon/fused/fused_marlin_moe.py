@@ -98,6 +98,9 @@ def _group_scale(
         scale = (sb << 23).to(tl.float32, bitcast=True)
         scale = tl.where(sb == 0, 5.877471754111438e-39, scale)
         s = tl.where(sb == 255, float("nan"), scale)
+    if Q == 2:
+        # Canonicalize NaN once per scale group before broadcasting to weights.
+        s = tl.where(s == s, s, float("nan"))
     return s.to(tl.float32)
 
 
@@ -116,6 +119,9 @@ def _decode_scaled(
     Q: tl.constexpr,
     DTYPE: tl.constexpr,
     EXACT: tl.constexpr = False,
+    SCALE_CANONICAL: tl.constexpr = False,
+    FOLD_SCALE: tl.constexpr = False,
+    FP8X4: tl.constexpr = False,
 ):
     """Decode a weight tile against an already loaded per-column scale."""
     # Cast before stride multiplication: multi-expert weights can exceed 2 GiB.
@@ -131,11 +137,75 @@ def _decode_scaled(
         ).to(tl.int32)
     if Q == 0 or Q == 6:
         q = (q >> (4 * (k % 2))) & 15
-    return _scale_weight_codes(q, s, Q, DTYPE)
+    value = _scale_weight_codes(q, s, Q, DTYPE, SCALE_CANONICAL, FOLD_SCALE, FP8X4)
+    if not EXACT:
+        # A padded zero code can decode to NaN against an infinite scale.
+        value = tl.where((n < N) & (k < K), value, 0.0)
+    return value
 
 
 @triton.jit
-def _scale_weight_codes(q, s, Q: tl.constexpr, DTYPE: tl.constexpr):
+def _round_bfloat16(value):
+    # Callers preserve canonical NaNs or payloads originating from BF16.
+    bits = value.to(tl.uint32, bitcast=True)
+    rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+    return rounded.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
+def _scale_weight_codes(
+    q,
+    s,
+    Q: tl.constexpr,
+    DTYPE: tl.constexpr,
+    SCALE_CANONICAL: tl.constexpr = False,
+    FOLD_SCALE: tl.constexpr = False,
+    FP8X4: tl.constexpr = False,
+):
+    # Leave products visible so gfx936 retains paired FP32 multiplies.
+    if Q == 2 and DTYPE == tl.bfloat16 and SCALE_CANONICAL and FP8X4:
+        # The second result reserves scratch registers for the byte decode.
+        decoded, _ = tl.inline_asm_elementwise(
+            """
+            v_bfe_u32 $0, $6, 0, 7;
+            v_cmp_eq_u32_e32 vcc, 127, $0;
+            v_lshlrev_b32_e32 $0, 20, $0;
+            v_lshlrev_b32_e32 $4, 24, $6;
+            v_and_or_b32 $0, $4, $11, $0;
+            v_cndmask_b32_e32 $0, $0, $7, vcc;
+            v_bfe_u32 $1, $6, 8, 7;
+            v_cmp_eq_u32_e32 vcc, 127, $1;
+            v_lshlrev_b32_e32 $1, 20, $1;
+            v_lshlrev_b32_e32 $4, 16, $6;
+            v_and_or_b32 $1, $4, $11, $1;
+            v_cndmask_b32_e32 $1, $1, $8, vcc;
+            v_bfe_u32 $2, $6, 16, 7;
+            v_cmp_eq_u32_e32 vcc, 127, $2;
+            v_lshlrev_b32_e32 $2, 20, $2;
+            v_lshlrev_b32_e32 $4, 8, $6;
+            v_and_or_b32 $2, $4, $11, $2;
+            v_cndmask_b32_e32 $2, $2, $9, vcc;
+            v_bfe_u32 $3, $6, 24, 7;
+            v_cmp_eq_u32_e32 vcc, 127, $3;
+            v_lshlrev_b32_e32 $3, 20, $3;
+            v_and_or_b32 $3, $6, $11, $3;
+            v_cndmask_b32_e32 $3, $3, $10, vcc;
+            """,
+            constraints="=&v,=&v,=&v,=&v,=&v,=&v,v,v,v,v,v,s,s,s,s,~{vcc}",
+            args=[
+                q.to(tl.uint8),
+                tl.full((), 0x7FC00000, tl.uint32).to(tl.float32, bitcast=True),
+                tl.full((), 0x80000000, tl.uint32),
+            ],
+            dtype=(tl.float32, tl.bfloat16),
+            is_pure=True,
+            pack=4,
+        )
+        if FOLD_SCALE:
+            s = s * 1.329227995784916e36
+        else:
+            decoded = decoded * 1.329227995784916e36
+        return _round_bfloat16(decoded * s)
     if Q == 0:
         v = (q - 8).to(tl.float32)
     elif Q == 1:
@@ -147,12 +217,19 @@ def _scale_weight_codes(q, s, Q: tl.constexpr, DTYPE: tl.constexpr):
         v = bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32) * 16384.0
     else:
         bits = ((q & 127) << 20) | ((q & 128) << 24)
-        v = bits.to(tl.float32, bitcast=True) * 1.329227995784916e36
+        v = bits.to(tl.float32, bitcast=True)
+        if not FOLD_SCALE:
+            v = v * 1.329227995784916e36
         v = tl.where((q & 127) == 127, float("nan"), v)
+    if Q == 2 and FOLD_SCALE:
+        s = s * 1.329227995784916e36
     if DTYPE == tl.bfloat16 and Q == 6:
         # E2M1 times an E8M0 scale is exact in BF16, including subnormals.
         bits = (v * s).to(tl.uint32, bitcast=True)
         return (bits >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    if Q == 2 and DTYPE == tl.bfloat16 and SCALE_CANONICAL:
+        # Canonical NaNs stay NaN under integer round-to-nearest-even.
+        return _round_bfloat16(v * s)
     value = (v * s).to(DTYPE)
     if Q == 6 and DTYPE == tl.float16:
         # Preserve E2M1 negative zero through the FP16 conversion.
@@ -210,6 +287,7 @@ def _load_gemm_weight(
     BK: tl.constexpr,
     EXACT: tl.constexpr,
     WEIGHT_KN: tl.constexpr,
+    FOLD_SCALE: tl.constexpr = False,
 ):
     if WEIGHT_KN:
         k = (base + tl.arange(0, BK))[:, None]
@@ -220,7 +298,22 @@ def _load_gemm_weight(
                 S, expert, n, group, (n < N) & (base < K), SE, SN, SG, Q, EXACT
             )
             return _decode_scaled(
-                W, scale, expert, n, k, N, K, WE, WN, WK, Q, DTYPE, EXACT
+                W,
+                scale,
+                expert,
+                n,
+                k,
+                N,
+                K,
+                WE,
+                WN,
+                WK,
+                Q,
+                DTYPE,
+                EXACT,
+                True,
+                FOLD_SCALE,
+                Q == 2 and DTYPE == tl.bfloat16 and N >= 2048 and K == 256 and BK == 64,
             )
         return _decode(
             W,
@@ -276,7 +369,10 @@ def _load_gemm_weight(
             scale = _group_scale(
                 S, expert, n, g, (n < N) & (base < K), SE, SN, SG, Q, EXACT
             )
-            return _scale_weight_codes(q, scale, Q, DTYPE)
+            value = _scale_weight_codes(q, scale, Q, DTYPE, True, FOLD_SCALE)
+            if not EXACT:
+                value = tl.where((n < N) & (k[None, :] < K), value, 0.0)
+            return value
         else:
             num_groups: tl.constexpr = BK // GROUP
             groups = base // GROUP + tl.arange(0, num_groups)
@@ -293,8 +389,13 @@ def _load_gemm_weight(
                 EXACT,
             )
             grouped_codes = tl.reshape(q, (BN, num_groups, GROUP))
-            value = _scale_weight_codes(grouped_codes, scale[:, :, None], Q, DTYPE)
-            return tl.reshape(value, (BN, BK))
+            value = _scale_weight_codes(
+                grouped_codes, scale[:, :, None], Q, DTYPE, True, FOLD_SCALE
+            )
+            value = tl.reshape(value, (BN, BK))
+            if not EXACT:
+                value = tl.where((n < N) & (k[None, :] < K), value, 0.0)
+            return value
 
 
 @triton.jit
@@ -349,6 +450,14 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
         and bm == 16
     )
     dense_narrow = single_k and narrow and bm >= 128
+    dense_fp8 = dense_narrow and q == QUANT_TYPE_FP8_E4M3
+    middle_fp8 = (
+        single_k
+        and narrow
+        and q == QUANT_TYPE_FP8_E4M3
+        and bm in (32, 64)
+        and not named_args["ROUTER_INPUT"]
+    )
 
     dot_layouts = {0}
     if (
@@ -361,6 +470,8 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
         and (q == QUANT_TYPE_UINT8B128 or (narrow and (w8 or mxfp4)))
     ):
         dot_layouts.add(1)
+    if (dense_fp8 or middle_fp8) and first:
+        dot_layouts.add(1)
     if (
         wide_fp8
         or wide_mxfp4
@@ -369,8 +480,19 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
         or (mxfp4 and not first and (short_down or dense_narrow))
     ):
         dot_layouts.add(2)
-    if wide_w8 or (short_down and w8):
+    if wide_w8 or (short_down and w8) or ((dense_fp8 or middle_fp8) and not first):
         dot_layouts.add(3)
+    if (
+        q == QUANT_TYPE_FP8_E4M3
+        and bf16
+        and first
+        and bm == 16
+        and narrow
+        and k >= 4096
+        and (r <= 6 or 192 < r <= 256)
+        and not named_args["ROUTER_INPUT"]
+    ):
+        dot_layouts.add(1)
     multi_stage = (
         wide_fp8
         or wide_mxfp4
@@ -380,7 +502,31 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
         config
         for config in configs
         if config.kwargs.get("DOT_LAYOUT", 0) in dot_layouts
+        and (
+            kwargs.get("KPACK", 1) == 1
+            or (
+                config.kwargs.get("DOT_LAYOUT", 0) == (1 if first else 3)
+                and config.kwargs["BK"] == 64
+                and config.num_warps == 4
+                and config.num_stages == 1
+            )
+        )
         and (multi_stage or config.num_stages == 1)
+        and (
+            config.kwargs["BN"] <= 128
+            or (
+                not first
+                and (
+                    dense_fp8 or middle_fp8 or (short_down and q == QUANT_TYPE_FP8_E4M3)
+                )
+            )
+        )
+        and (
+            config.kwargs.get("DOT_LAYOUT", 0) != 1
+            or config.kwargs["BN"] <= 32
+            or dense_fp8
+            or middle_fp8
+        )
         and (
             (
                 config.kwargs.get("DOT_LAYOUT", 0),
@@ -424,7 +570,20 @@ def _accumulate_gemm(
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("hygon_marlin_gemm"),
-    key=["N", "K", "R", "E", "Q", "FIRST", "DIRECT", "SHARED_ROUTING", "SPLIT_K", "BM"],
+    key=[
+        "N",
+        "K",
+        "R",
+        "E",
+        "Q",
+        "GROUP",
+        "KPACK",
+        "FIRST",
+        "DIRECT",
+        "SHARED_ROUTING",
+        "SPLIT_K",
+        "BM",
+    ],
     prune_configs_by={"early_config_prune": _prune_gemm_configs},
 )
 @triton.jit
@@ -460,7 +619,10 @@ def _gemm(
     BN: tl.constexpr,
     BK: tl.constexpr,
     DOT_LAYOUT: tl.constexpr = 0,
+    KPACK: tl.constexpr = 1,
 ):
+    # The dot K fragment must hold every packed BF16 value.
+    tl.static_assert(BK >= 16 * KPACK)
     block = tl.program_id(1)
     n = tl.program_id(0) * BN + tl.arange(0, BN)
     if DIRECT:
@@ -516,69 +678,120 @@ def _gemm(
     # Weight bounds depend on N and K, even when routing uses a wide M tile.
     WEIGHT_EXACT: tl.constexpr = N % BN == 0 and K % (BK * SPLIT_K) == 0
     EXACT: tl.constexpr = BM <= 32 and WEIGHT_EXACT
+    LOAD_EXACT: tl.constexpr = WEIGHT_EXACT and (not WEIGHT_KN or Q == 2 or BM <= 32)
     arow = route // TOPK if FIRST else route
-    for step in range(tiles):
-        base = (split * tiles + step) * BK
-        k = base + tl.arange(0, BK)
-        a = tl.load(
-            A + arow[:, None] * K + k[None, :],
-            valid[:, None] if EXACT else valid[:, None] & (k[None, :] < K),
+    unroll: tl.constexpr = (
+        (8 if FIRST else 4)
+        if Q == 2
+        and dtype == tl.bfloat16
+        and BM == 16
+        and (DOT_LAYOUT == 1 or DOT_LAYOUT == 3)
+        else 1
+    )
+    # Folding 2**120 into finite scales with abs(scale) <= 128 is exact.
+    # Check each tile once so the K loop keeps a single weight multiply.
+    CHECK_ROWS: tl.constexpr = 2 * BN if FIRST else BN
+    CHECK_GROUPS: tl.constexpr = triton.next_power_of_2(triton.cdiv(K, 128))
+    CAN_FOLD: tl.constexpr = (
+        FIRST
+        and Q == 2
+        and dtype == tl.bfloat16
+        and GROUP == 128
+        and BK <= 128
+        and K % 128 == 0
+        and SPLIT_K == 1
+        and R >= 256
+        and CHECK_ROWS * CHECK_GROUPS <= 8192
+    )
+    if CAN_FOLD:
+        rr = tl.arange(0, CHECK_ROWS)
+        cn = tl.program_id(0) * BN + rr % BN + (rr // BN) * N
+        gg = tl.arange(0, CHECK_GROUPS)
+        sv = tl.load(
+            S
+            + expert.to(tl.int64) * SE
+            + cn[:, None].to(tl.int64) * SN
+            + gg[None, :].to(tl.int64) * SG,
+            (tl.program_id(0) * BN + (rr % BN)[:, None] < N) & (gg[None, :] < K // 128),
             other=0,
         )
-        a_t = a if ROW_MAJOR_ACC else tl.trans(a)
-        if dtype == tl.float16:
-            a_t = a_t.to(tl.float32)
-        w_t = _load_gemm_weight(
-            W,
-            S,
-            expert,
-            weight_n,
-            base,
-            WEIGHT_N,
-            K,
-            WE,
-            WN,
-            WK,
-            SE,
-            SN,
-            SG,
-            Q,
-            GROUP,
-            dtype,
-            WEIGHT_BN,
-            BK,
-            EXACT if WEIGHT_KN else WEIGHT_EXACT,
-            WEIGHT_KN,
-        )
-        acc_t = _accumulate_gemm(
-            a_t, w_t, acc_t, ROW_MAJOR_ACC, WEIGHT_KN, dtype == tl.float16
-        )
-        if FIRST and not PAIRED:
-            wu_t = _load_gemm_weight(
-                W,
-                S,
-                expert,
-                n + N,
-                base,
-                2 * N,
-                K,
-                WE,
-                WN,
-                WK,
-                SE,
-                SN,
-                SG,
-                Q,
-                GROUP,
-                dtype,
-                BN,
-                BK,
-                EXACT if WEIGHT_KN else WEIGHT_EXACT,
-                WEIGHT_KN,
+        if S.dtype.element_ty == tl.float32:
+            magnitude = sv.to(tl.uint32, bitcast=True) & 0x7FFFFFFF
+            limit: tl.constexpr = 0x43000000
+        else:
+            magnitude = sv.to(tl.uint16, bitcast=True) & 0x7FFF
+            limit: tl.constexpr = (
+                0x4300 if S.dtype.element_ty == tl.bfloat16 else 0x5800
             )
-            up_t = _accumulate_gemm(
-                a_t, wu_t, up_t, STANDARD, WEIGHT_KN, dtype == tl.float16
-            )
+        can_fold = tl.max(magnitude) <= limit
+    else:
+        can_fold = False
+    for fold in tl.static_range(2):
+        if can_fold == (fold == 0):
+            for step in tl.range(tiles, loop_unroll_factor=unroll):
+                base = (split * tiles + step) * BK
+                k = base + tl.arange(0, BK)
+                a = tl.load(
+                    A + arow[:, None] * K + k[None, :],
+                    valid[:, None] if EXACT else valid[:, None] & (k[None, :] < K),
+                    other=0,
+                )
+                a_t = a if ROW_MAJOR_ACC else tl.trans(a)
+                if dtype == tl.float16:
+                    a_t = a_t.to(tl.float32)
+                w_t = _load_gemm_weight(
+                    W,
+                    S,
+                    expert,
+                    weight_n,
+                    base,
+                    WEIGHT_N,
+                    K,
+                    WE,
+                    WN,
+                    WK,
+                    SE,
+                    SN,
+                    SG,
+                    Q,
+                    GROUP,
+                    dtype,
+                    WEIGHT_BN,
+                    BK,
+                    LOAD_EXACT,
+                    WEIGHT_KN,
+                    fold == 0,
+                )
+                acc_t = _accumulate_gemm(
+                    a_t, w_t, acc_t, ROW_MAJOR_ACC, WEIGHT_KN, dtype == tl.float16
+                )
+                if FIRST and not PAIRED:
+                    wu_t = _load_gemm_weight(
+                        W,
+                        S,
+                        expert,
+                        n + N,
+                        base,
+                        2 * N,
+                        K,
+                        WE,
+                        WN,
+                        WK,
+                        SE,
+                        SN,
+                        SG,
+                        Q,
+                        GROUP,
+                        dtype,
+                        BN,
+                        BK,
+                        LOAD_EXACT,
+                        WEIGHT_KN,
+                        fold == 0,
+                    )
+                    up_t = _accumulate_gemm(
+                        a_t, wu_t, up_t, STANDARD, WEIGHT_KN, dtype == tl.float16
+                    )
     if PAIRED:
         # Keep gate/up in the caller's two separate weight banks and share the dot.
         if PAIRED_ROW_MAJOR:
@@ -599,13 +812,21 @@ def _gemm(
     else:
         if (FIRST and ROUTER_INPUT) or (not FIRST and not ROUTER_INPUT):
             rw = tl.load(Tw + route, valid, other=0).to(tl.float32)
+            if Q == 2 and dtype == tl.bfloat16 and BM >= 32:
+                rw = tl.where(rw == rw, rw, float("nan"))
             acc *= rw[:, None]
             if FIRST:
                 up *= rw[:, None]
         if FIRST:
-            gate = acc.to(dtype).to(tl.float32)
-            up = up.to(dtype).to(tl.float32)
+            if Q == 2 and dtype == tl.bfloat16 and BM >= 32:
+                gate = _round_bfloat16(acc).to(tl.float32)
+                up = _round_bfloat16(up).to(tl.float32)
+            else:
+                gate = acc.to(dtype).to(tl.float32)
+                up = up.to(dtype).to(tl.float32)
             acc = gate / (1.0 + tl.exp(-gate)) * up
+        if Q == 2 and dtype == tl.bfloat16 and BM >= 32:
+            acc = _round_bfloat16(acc)
         tl.store(
             C + route[:, None] * N + n[None, :],
             acc,
@@ -1009,6 +1230,18 @@ def _run_moe_batch(
                 if split_k > 1
                 else c
             )
+            packed_k = (
+                4
+                if quant_type_id == QUANT_TYPE_FP8_E4M3
+                and hidden_states.dtype == torch.bfloat16
+                and not apply_router_weight_on_input
+                and e >= 128
+                and k >= 4096
+                and n == 256
+                and split_k == 1
+                and (bm >= 128 or (not first and bm >= 16 and r >= 512))
+                else 1
+            )
             _gemm[lambda meta: (triton.cdiv(nk, meta["BN"]), blocks, split_k)](
                 a,
                 w,
@@ -1034,6 +1267,8 @@ def _run_moe_batch(
                 shared_routing,
                 split_k,
                 bm,
+                KPACK=packed_k,
+                kpack=packed_k,
             )
             if split_k > 1:
                 _finish_split[(r, triton.cdiv(nk, 256))](

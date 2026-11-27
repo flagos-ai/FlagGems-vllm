@@ -1876,7 +1876,8 @@ def test_fused_marlin_moe_mxfp4_alignment_ppu(hidden_size, intermediate_size):
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+    flaggems_vllm.vendor_name not in ("thead", "hygon"),
+    reason="T-Head or Hygon E4M3 byte decoding",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 33])
@@ -1906,12 +1907,14 @@ def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens, num_expe
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+    flaggems_vllm.vendor_name not in ("thead", "hygon"),
+    reason="T-Head or Hygon E4M3 byte decoding",
 )
 @pytest.mark.parametrize("num_tokens,num_experts", [(1, 2), (33, 2), (1, 16), (4, 16)])
-@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "special", ["weight_nan", "scale_inf", "scale_nan", "scale_large"]
+    "special",
+    ["weight_nan", "scale_inf", "scale_nan", "scale_nan_payload", "scale_large"],
 )
 def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
     num_tokens, num_experts, scale_dtype, special
@@ -1926,11 +1929,18 @@ def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
     s1 = s1.to(scale_dtype)
     if special == "weight_nan":
         w1.view(torch.uint8)[0, 0, 0] = 127
+    elif special == "scale_nan_payload":
+        if scale_dtype == torch.float32:
+            s1.view(torch.int32).fill_(0x7FFFFFFF)
+        else:
+            s1.view(torch.int16).fill_(0x7FFF)
     else:
         s1.fill_(
-            {"scale_inf": float("inf"), "scale_nan": float("nan"), "scale_large": 1e20}[
-                special
-            ]
+            {
+                "scale_inf": float("inf"),
+                "scale_nan": float("nan"),
+                "scale_large": min(1e20, torch.finfo(scale_dtype).max),
+            }[special]
         )
     w1_ref = (w1.float() * s1.expand(w1.shape)).to(hs.dtype)
     w2_ref = (w2.float() * s2.expand(w2.shape)).to(hs.dtype)
