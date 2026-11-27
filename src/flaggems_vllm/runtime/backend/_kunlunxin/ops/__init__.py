@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.runtime.backend._kunlunxin.ops.bf16_paged_mqa_logits import (
     bf16_paged_mqa_logits,
 )
@@ -21,4 +22,9 @@ from flaggems_vllm.runtime.backend._kunlunxin.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
 
-__all__ = ["bf16_paged_mqa_logits", "mhc_pre", "scaled_int8_quant"]
+__all__ = [
+    "bf16_paged_mqa_logits",
+    "concat_and_cache_mla",
+    "mhc_pre",
+    "scaled_int8_quant",
+]
