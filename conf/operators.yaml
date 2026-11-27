@@ -1751,7 +1751,11 @@ ops:
 
     multi-token long-K varlen queries and merges them through a Stage2
 
-    merge tree, emitting the final topk indices.
+    merge tree, emitting the final topk indices. The generic Triton implementation
+
+    and Hygon Triton/TLE backend support TND queries with PA_BSND or TND keys,
+
+    sparse modes 0 and 3, and optional output scores for TND keys.
 
     '
   for:

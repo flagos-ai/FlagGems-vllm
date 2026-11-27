@@ -54,6 +54,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
 )
 from flaggems_vllm.runtime.backend._hygon.ops.ihc_pre import ihc_pre, triton_ihc_pre
 from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
+from flaggems_vllm.runtime.backend._hygon.ops.lightning_indexer import lightning_indexer
 from flaggems_vllm.runtime.backend._hygon.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.runtime.backend._hygon.ops.megamoe import megamoe_int8
 from flaggems_vllm.runtime.backend._hygon.ops.mhc_pre_broadcast import mhc_pre_broadcast
@@ -96,6 +97,7 @@ __all__ = [
     "ihc_pre",
     "inplace_fused_experts",
     "int8_einsum",
+    "lightning_indexer",
     "mamba_mixer",
     "megamoe_int8",
     "mhc_pre_broadcast",
