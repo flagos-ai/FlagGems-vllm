@@ -1663,6 +1663,74 @@ def test_fused_marlin_moe_w8a16_inference_updates(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
+def test_fused_marlin_moe_w8a16_dense_stage_blocks_ppu(monkeypatch):
+    kernels = importlib.import_module(
+        "flaggems_vllm.runtime.backend._thead.ops.fused_moe"
+    )
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w8a16_int8(
+        4096, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    args = (hs, w1, w2, None, None, s1, s2, tw, ti, QUANT_TYPE_UINT8B128)
+    reference = flaggems_vllm.fused_marlin_moe(*args)
+    get_config = kernels.get_default_config
+
+    def tuned_config(*args, gemm_stage):
+        config = get_config(*args, gemm_stage=gemm_stage)
+        return dict(config, BLOCK_SIZE_M=32) if gemm_stage == "gemm2" else config
+
+    monkeypatch.setattr(kernels, "get_default_config", tuned_config)
+    gems_assert_equal(flaggems_vllm.fused_marlin_moe(*args), reference)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
+def test_fused_marlin_moe_w8a16_shifted_chunk_output_ppu(monkeypatch):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w8a16_int8(
+        4096, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    storage = hs.new_full((hs.size(0) + 1, hs.size(1)), 7)
+    monkeypatch.setattr(backend, "_PPU_DENSE_MAX_WORKSPACE_BYTES", 4 << 20)
+    with pytest.raises(ValueError, match="partially overlap"):
+        flaggems_vllm.fused_marlin_moe(
+            storage[:-1],
+            w1,
+            w2,
+            None,
+            None,
+            s1,
+            s2,
+            tw,
+            ti,
+            QUANT_TYPE_UINT8B128,
+            output=storage[1:],
+        )
+    gems_assert_equal(storage, torch.full_like(storage, 7))
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head scale layouts")
+def test_fused_marlin_moe_w8a16_output_in_scale_padding_ppu():
+    hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_w8a16_int8(
+        1, 4, 256, 128, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    storage = s1.new_empty((*s1.shape[:2], s1.size(2) + hs.numel()))
+    scales = storage[..., : s1.size(2)]
+    scales.copy_(s1)
+    args = (hs, w1, w2, None, None, scales, s2, tw, ti, QUANT_TYPE_UINT8B128)
+    reference = flaggems_vllm.fused_marlin_moe(*args)
+    output = storage[0, 0, s1.size(2) :].view_as(hs)
+    flaggems_vllm.fused_marlin_moe(*args, output=output)
+    gems_assert_equal(output, reference)
+    # Shift by one element so the output now includes a live scale.
+    with pytest.raises(ValueError, match="overlap"):
+        flaggems_vllm.fused_marlin_moe(
+            *args, output=storage[0, 0, 1 : 1 + hs.numel()].view_as(hs)
+        )
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head dense path")
 @pytest.mark.parametrize("precision", ["int8", "fp8"])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
@@ -1705,6 +1773,46 @@ def test_fused_marlin_moe_w8a16_workspace_chunks_ppu(
         torch.cuda.max_memory_allocated() - initial_bytes <= (13 << 20) + output_bytes
     )
     gems_assert_equal(actual, reference)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 overlap")
+def test_fused_marlin_moe_fp8_overlap_chunks_ppu(monkeypatch):
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_fp8_weight(
+        24000, 128, 4096, 256, 6, torch.bfloat16, flaggems_vllm.device
+    )
+    args = (hs, w1, w2, None, None, s1, s2, tw, ti, QUANT_TYPE_FP8_E4M3)
+    budget = 440 << 20
+    # 11444-token overlap chunks reuse one workspace; the 1112-token tail is ordinary.
+    monkeypatch.setattr(backend, "_PPU_DENSE_MAX_WORKSPACE_BYTES", budget)
+    overlap = backend.run_fp8_ordered_overlap
+    overlap_chunks = []
+
+    def count_overlap(*overlap_args):
+        overlap_chunks.append(overlap_args[0].size(0))
+        return overlap(*overlap_args)
+
+    monkeypatch.setattr(backend, "run_fp8_ordered_overlap", count_overlap)
+    # Exclude one-time kernel tuning from the steady-state workspace bound.
+    flaggems_vllm.fused_marlin_moe(*args)
+    torch_device_fn.synchronize()
+    overlap_chunks.clear()
+    initial_bytes = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual = flaggems_vllm.fused_marlin_moe(*args)
+    torch_device_fn.synchronize()
+    peak_bytes = torch.cuda.max_memory_allocated() - initial_bytes
+    assert overlap_chunks == [11444, 11444]
+    assert peak_bytes <= budget + hs.numel() * hs.element_size()
+    reference = _reference_w8a16_grouped(hs, ref1, ref2, tw, ti)
+    gems_assert_close(
+        actual,
+        reference.to(hs.dtype),
+        hs.dtype,
+        atol=0.02 * reference.abs().max().item(),
+        rtol=0,
+    )
 
 
 @pytest.mark.fused_marlin_moe_w8a16
@@ -1764,6 +1872,30 @@ def test_fused_marlin_moe_w8a16_dense_large_scale_ppu(
         (4096, 4, 128, 256, 2),
         torch.bfloat16,
         apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 down projection"
+)
+def test_fused_marlin_moe_fp8_mixed_expert_tiles_ppu():
+    hs, w1, w2, ref1, ref2, weights, ids, s1, s2 = _make_inputs_fp8_weight(
+        24, 8, 4096, 256, 4, torch.bfloat16, flaggems_vllm.device
+    )
+    # Experts 0..3 each have a full 16-row tile and a one-row tail; 4..7 have seven rows.
+    ids[:] = torch.arange(4, device=hs.device)
+    ids[17:] += 4
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, weights, ids, QUANT_TYPE_FP8_E4M3
+    )
+    reference = _reference_w8a16_grouped(hs, ref1, ref2, weights, ids)
+    gems_assert_close(
+        actual,
+        reference.to(hs.dtype),
+        hs.dtype,
+        atol=0.02 * reference.abs().max().item(),
+        rtol=0,
     )
 
 
