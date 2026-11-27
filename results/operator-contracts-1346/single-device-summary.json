@@ -1,0 +1,330 @@
+{
+  "case": "1346",
+  "source": {
+    "commit": "40941ef9145b2749714d4358c9e14e0394d3c4d7",
+    "tree": "4aae57a750c926de27e24d6c73d6677463232bfb",
+    "files": 1808,
+    "symlinks": 3,
+    "all_raw_git_blobs_matched": true,
+    "source_sha256": "1a885f8a0c04b649de3e8873487b809c50ec25adfcfc7cfc71a424a5ded9c720"
+  },
+  "raw_sha256": "05f9c332679531011c599d917aeb6428c3747b308c6a3df26ede5f2c5b1f701e",
+  "runtime": {
+    "torch": "2.13.0+cu130",
+    "triton": "3.6.0",
+    "vllm": "0.32.0",
+    "packages": {
+      "flag-gems": "5.4.0",
+      "flagtree": "0.7.0",
+      "flagcx": "0.14.1+cuda13.3"
+    },
+    "origins": {
+      "torch": "/usr/local/lib/python3.12/dist-packages/torch/__init__.py",
+      "triton": "/compiler/triton/__init__.py",
+      "flagtree": "/compiler/flagtree/__init__.py",
+      "flag_gems": "/legacy-deps/flag_gems/__init__.py",
+      "flagcx": "/deps/flagcx/__init__.py",
+      "vllm": "/usr/local/lib/python3.12/dist-packages/vllm/__init__.py",
+      "flaggems_vllm": "/candidate/src/flaggems_vllm/__init__.py"
+    },
+    "gpu": "NVIDIA H20-3e",
+    "device_count": 1,
+    "native_reference": "installed vllm0.32",
+    "public_recurrent_is_FLA": true,
+    "use_gems_export": false,
+    "cache": {
+      "FLAGGEMS_CACHE_DIR": "/results/cache/preflight/gems",
+      "TRITON_CACHE_DIR": "/results/cache/preflight/triton",
+      "XDG_CACHE_HOME": "/results/cache/preflight/xdg"
+    }
+  },
+  "cid": "59e441cd3bf3a5dddda01533249e25e2f2a510a2861cdd5d2a0f0eb2c2547ffa",
+  "state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-11-27T10:49:15.89495721Z",
+    "FinishedAt": "2026-11-27T10:55:28.81011792Z"
+  },
+  "exit": 0,
+  "source_before": {
+    "source": "/candidate",
+    "files": 1808,
+    "passed": true
+  },
+  "source_after": {
+    "source": "/candidate",
+    "files": 1808,
+    "passed": true
+  },
+  "phases": {
+    "bincount": {
+      "original": {
+        "total": 90,
+        "passed": 90,
+        "skipped": 0,
+        "failed": 0,
+        "skip_reasons": [],
+        "failures": []
+      },
+      "new_namespace_regressions": {
+        "total": 0,
+        "passed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "skip_reasons": [],
+        "failures": []
+      }
+    },
+    "bounded": {
+      "original": {
+        "total": 40,
+        "passed": 40,
+        "skipped": 0,
+        "failed": 0,
+        "skip_reasons": [],
+        "failures": []
+      },
+      "new_namespace_regressions": {
+        "total": 9,
+        "passed": 9,
+        "skipped": 0,
+        "failed": 0,
+        "skip_reasons": [],
+        "failures": []
+      }
+    },
+    "concat": {
+      "original": {
+        "total": 70,
+        "passed": 58,
+        "skipped": 12,
+        "failed": 0,
+        "skip_reasons": [
+          "requires at least two CUDA GPUs"
+        ],
+        "failures": []
+      },
+      "new_namespace_regressions": {
+        "total": 0,
+        "passed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "skip_reasons": [],
+        "failures": []
+      }
+    },
+    "tle": {
+      "original": {
+        "total": 37,
+        "passed": 37,
+        "skipped": 0,
+        "failed": 0,
+        "skip_reasons": [],
+        "failures": []
+      },
+      "new_namespace_regressions": {
+        "total": 0,
+        "passed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "skip_reasons": [],
+        "failures": []
+      }
+    }
+  },
+  "contexts": {
+    "bincount-context": {
+      "conftest": "/candidate/tests/conftest.py",
+      "device_context_poisoned": false,
+      "pytest_exitstatus": 0
+    },
+    "bounded-context": {
+      "conftest": "/candidate/tests/conftest.py",
+      "device_context_poisoned": false,
+      "pytest_exitstatus": 0
+    },
+    "concat-context": {
+      "conftest": "/candidate/tests/conftest.py",
+      "device_context_poisoned": false,
+      "pytest_exitstatus": 0
+    },
+    "tle-context": {
+      "conftest": "/candidate/tests/conftest.py",
+      "device_context_poisoned": false,
+      "pytest_exitstatus": 0
+    }
+  },
+  "natural_exit": true,
+  "exact_cid_positive_absence": true,
+  "gpu_after": "0, GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 125734, 0\n1, GPU-9c294908-d614-e327-f065-4d73d0c784ec, 125818, 0\n2, GPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 125818, 0\n3, GPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 125338, 0\n4, GPU-c7430ed7-2cb0-e6f8-11c9-515d0c13f44b, 0, 0\n5, GPU-09e798f6-daed-4a79-839f-6b1b610d5ada, 0, 0\n6, GPU-48d06395-bc23-9c46-9bff-a17af3cc7705, 0, 0\n7, GPU-0bb114ec-d5f7-9394-12d1-7da68f93aa6e, 0, 0\n",
+  "pids_after": "GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 3305965, 125724 MiB\nGPU-9c294908-d614-e327-f065-4d73d0c784ec, 3305966, 125808 MiB\nGPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 3305967, 125808 MiB\nGPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 3305968, 125328 MiB\n",
+  "bounded_core_g1": {
+    "prefill_available": true,
+    "recurrent_available": true,
+    "prefill_arg_names": [
+      [
+        "q",
+        "k",
+        "g",
+        "beta",
+        "A",
+        "Aqk",
+        "scale",
+        "cu_seqlens",
+        "chunk_indices",
+        "T",
+        "H",
+        "K",
+        "BT",
+        "BC",
+        "BK",
+        "NC",
+        "IS_VARLEN"
+      ],
+      [
+        "q",
+        "k",
+        "g",
+        "beta",
+        "A",
+        "Aqk",
+        "scale",
+        "cu_seqlens",
+        "chunk_indices",
+        "T",
+        "H",
+        "K",
+        "BT",
+        "BC",
+        "BK",
+        "IS_VARLEN"
+      ],
+      [
+        "A",
+        "Ai",
+        "cu_seqlens",
+        "chunk_indices",
+        "T",
+        "H",
+        "BT",
+        "USE_TMA",
+        "IS_VARLEN",
+        "DOT_PRECISION"
+      ],
+      [
+        "q",
+        "k",
+        "qg",
+        "kg",
+        "v",
+        "beta",
+        "w",
+        "u",
+        "A",
+        "gk",
+        "cu_seqlens",
+        "chunk_indices",
+        "T",
+        "H",
+        "K",
+        "V",
+        "BT",
+        "BK",
+        "BV",
+        "STORE_QG",
+        "STORE_KG",
+        "IS_VARLEN",
+        "DOT_PRECISION"
+      ],
+      [
+        "k",
+        "v",
+        "w",
+        "v_new",
+        "g",
+        "gk",
+        "h",
+        "h0",
+        "ht",
+        "cu_seqlens",
+        "chunk_offsets",
+        "T",
+        "H",
+        "Hg",
+        "K",
+        "V",
+        "BT",
+        "BV",
+        "USE_G",
+        "USE_GK",
+        "USE_INITIAL_STATE",
+        "STORE_FINAL_STATE",
+        "SAVE_NEW_VALUE",
+        "IS_VARLEN",
+        "USE_EXP2"
+      ],
+      [
+        "q",
+        "v",
+        "g",
+        "h",
+        "o",
+        "A",
+        "cu_seqlens",
+        "chunk_indices",
+        "scale",
+        "T",
+        "H",
+        "K",
+        "V",
+        "BT",
+        "BK",
+        "BV",
+        "IS_VARLEN"
+      ]
+    ],
+    "recurrent_arg_names": [
+      "q",
+      "k",
+      "v",
+      "g",
+      "beta",
+      "o",
+      "h0",
+      "ht",
+      "cu_seqlens",
+      "ssm_state_indices",
+      "num_accepted_tokens",
+      "scale",
+      "N",
+      "T",
+      "B",
+      "H",
+      "HV",
+      "K",
+      "V",
+      "BK",
+      "BV",
+      "stride_init_state_token",
+      "stride_final_state_token",
+      "stride_indices_seq",
+      "stride_indices_tok",
+      "USE_INITIAL_STATE",
+      "INPLACE_FINAL_STATE",
+      "IS_BETA_HEADWISE",
+      "USE_QK_L2NORM_IN_KERNEL",
+      "IS_VARLEN",
+      "IS_CONTINUOUS_BATCHING",
+      "IS_SPEC_DECODING",
+      "IS_KDA"
+    ],
+    "native_kda_module": "/usr/local/lib/python3.12/dist-packages/vllm/third_party/flash_linear_attention/ops/kda.py"
+  }
+}

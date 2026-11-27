@@ -1,0 +1,10 @@
+{
+  "pr": 1346,
+  "pushed_head": "bb3551f4a89fbdd1570ddd9ca3f151db3f958ff4",
+  "tree": "96cf040c47e2493af2150bb07bf16b1171b22c14",
+  "integration_tested_head": "40941ef9145b2749714d4358c9e14e0394d3c4d7",
+  "integration_not_pushed": true,
+  "dependency_pr": 1345,
+  "normal_push": true,
+  "remote_ref_verified": true
+}

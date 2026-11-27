@@ -15,3 +15,5 @@ Source PRs: https://github.com/flagos-ai/FlagGems-vllm/pull/1349, https://github
 Independent final-source #1356 and #1361 Linux CPU validation is in `results/ci-independent-1356-1361`: respectively 100 and104 positive tests, all validators/style checks and unchanged-main negative controls passed; original PR branches were synchronized by normal push. GitHub final-head required CI remains a separate condition.
 
 Additional current-main evidence: `mhc-1350` passes original G5 and12/12 native G6; `kda-1345` fixes the proven main namespace failure and passes original functional contracts; `badwords-1343` passes6 accuracy and45 native benchmarks on0.32; `kunlunxin-native-1248` preserves three native compiler failures and no accepted timing. See each folder for exact boundaries.
+
+Follow-up evidence: `operator-contracts-1346` fills the12 dual-device cases (237 unique original cases plus9 inherited resolver regressions, integration only); `ascend-1234-environment` records zero UTs and a device-admission/access blocker; `marlin-1347-diagnostics` records the original unit-contract failure and failed9/14 native performance Gate.

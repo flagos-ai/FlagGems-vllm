@@ -1,0 +1,275 @@
+{
+  "summary": "Ascend prerequisite G1 blocked before provider import, tensor allocation or original UT execution. Four bounded isolated profiles all device_count=0. This is not a numerical test failure or pass.",
+  "archive_sha256": "1b7ea373707f0288b024059da1240be1171000c54134750e9b9b0af7e3d08a9b",
+  "original_ut_executed": 0,
+  "results": [
+    {
+      "report": {
+        "phase": "device_identity_only",
+        "tensor_allocation_called": false,
+        "mode": "defaultcaps",
+        "compute_nodes": [
+          "davinci0"
+        ],
+        "groups": [
+          0,
+          1000
+        ],
+        "process_security": {
+          "CapEff": "00000000a80425fb",
+          "Seccomp": "2"
+        },
+        "ASCEND_VISIBLE_DEVICES": "0",
+        "ASCEND_RT_VISIBLE_DEVICES": "0",
+        "torch": "2.10.0+cpu",
+        "count": 0,
+        "provider_imported": false,
+        "mapped_sdk_libraries": {
+          "/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libascendcl.so": "94edd165d95210c2a46c52f77f0215cb64e78c42176a451f8e118daccfa912fe",
+          "/usr/local/Ascend/driver/lib64/driver/libascend_hal.so": "12de70257ec2fcfcd0407c02bae769aa50c1e384b3e79f2dc7ad0a27c84a064a"
+        },
+        "passed": false,
+        "error": {
+          "type": "AssertionError",
+          "message": "0",
+          "traceback": "Traceback (most recent call last):\n  File \"/task/npu-g1-probe.py\", line 34, in <module>\n    assert report['count']==1,report['count']\n           ^^^^^^^^^^^^^^^^^^\nAssertionError: 0\n"
+        }
+      },
+      "started.utc": "2026-11-27T10:12:52+00:00",
+      "finished.utc": "2026-11-27T10:13:02+00:00",
+      "results/container.cid": "ed8d71e47e221239c798d73b7e4f361386569eed00b558f778b2a282f8641e74",
+      "results/attach.exit": "1",
+      "results/owned-cid-absent": "true",
+      "state": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 1,
+        "Error": "",
+        "StartedAt": "2026-11-27T10:12:53.35860185Z",
+        "FinishedAt": "2026-11-27T10:12:59.05070834Z"
+      },
+      "post_resources": {
+        "vendor": "ascend",
+        "selected": {
+          "0": {
+            "util": 0,
+            "memory_MiB": 3170
+          },
+          "1": {
+            "util": 0,
+            "memory_MiB": 2893
+          }
+        },
+        "no_processes": true,
+        "passed": true
+      },
+      "native_log_sha256": "f8a84e2651890821960b764be096390b49857938e788da3058ab62b31c234577"
+    },
+    {
+      "report": {
+        "phase": "device_identity_only",
+        "tensor_allocation_called": false,
+        "mode": "defaultcaps-unconfined",
+        "compute_nodes": [
+          "davinci0"
+        ],
+        "groups": [
+          0,
+          1000
+        ],
+        "process_security": {
+          "CapEff": "00000000a80425fb",
+          "Seccomp": "0"
+        },
+        "ASCEND_VISIBLE_DEVICES": "0",
+        "ASCEND_RT_VISIBLE_DEVICES": "0",
+        "torch": "2.10.0+cpu",
+        "count": 0,
+        "provider_imported": false,
+        "mapped_sdk_libraries": {
+          "/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libascendcl.so": "94edd165d95210c2a46c52f77f0215cb64e78c42176a451f8e118daccfa912fe",
+          "/usr/local/Ascend/driver/lib64/driver/libascend_hal.so": "12de70257ec2fcfcd0407c02bae769aa50c1e384b3e79f2dc7ad0a27c84a064a"
+        },
+        "passed": false,
+        "error": {
+          "type": "AssertionError",
+          "message": "0",
+          "traceback": "Traceback (most recent call last):\n  File \"/task/npu-g1-probe.py\", line 34, in <module>\n    assert report['count']==1,report['count']\n           ^^^^^^^^^^^^^^^^^^\nAssertionError: 0\n"
+        }
+      },
+      "started.utc": "2026-11-27T10:14:20+00:00",
+      "finished.utc": "2026-11-27T10:14:30+00:00",
+      "results/container.cid": "00c29348bdfaa3b53dcb3374246563c1a045c3abd1d540c6d771c005a2aab48c",
+      "results/attach.exit": "1",
+      "results/owned-cid-absent": "true",
+      "state": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 1,
+        "Error": "",
+        "StartedAt": "2026-11-27T10:14:21.68343658Z",
+        "FinishedAt": "2026-11-27T10:14:27.13252912Z"
+      },
+      "post_resources": {
+        "vendor": "ascend",
+        "selected": {
+          "0": {
+            "util": 0,
+            "memory_MiB": 3170
+          },
+          "1": {
+            "util": 0,
+            "memory_MiB": 2893
+          }
+        },
+        "no_processes": true,
+        "passed": true
+      },
+      "native_log_sha256": "90fd8e3c30fd266fc0cc208442d73b5a2f3899c1da77628d4083ea648d09b631"
+    },
+    {
+      "report": {
+        "phase": "device_identity_only",
+        "tensor_allocation_called": false,
+        "mode": "defaultcaps-unconfined-autodevices",
+        "compute_nodes": [
+          "davinci0"
+        ],
+        "groups": [
+          0,
+          1000
+        ],
+        "process_security": {
+          "CapEff": "00000000a80425fb",
+          "Seccomp": "0"
+        },
+        "ASCEND_VISIBLE_DEVICES": "0",
+        "ASCEND_RT_VISIBLE_DEVICES": "0",
+        "torch": "2.10.0+cpu",
+        "count": 0,
+        "provider_imported": false,
+        "mapped_sdk_libraries": {
+          "/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libascendcl.so": "94edd165d95210c2a46c52f77f0215cb64e78c42176a451f8e118daccfa912fe",
+          "/usr/local/Ascend/driver/lib64/driver/libascend_hal.so": "12de70257ec2fcfcd0407c02bae769aa50c1e384b3e79f2dc7ad0a27c84a064a"
+        },
+        "passed": false,
+        "error": {
+          "type": "AssertionError",
+          "message": "0",
+          "traceback": "Traceback (most recent call last):\n  File \"/task/npu-g1-probe.py\", line 34, in <module>\n    assert report['count']==1,report['count']\n           ^^^^^^^^^^^^^^^^^^\nAssertionError: 0\n"
+        }
+      },
+      "started.utc": "2026-11-27T10:33:58+00:00",
+      "finished.utc": "2026-11-27T10:34:07+00:00",
+      "results/container.cid": "16c60cdd1f4ba43c716792ff9edbf1659c5489be36991d54a3bd54de7b069ef6",
+      "results/attach.exit": "1",
+      "results/owned-cid-absent": "true",
+      "state": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 1,
+        "Error": "",
+        "StartedAt": "2026-11-27T10:33:59.44735214Z",
+        "FinishedAt": "2026-11-27T10:34:04.58351774Z"
+      },
+      "post_resources": {
+        "vendor": "ascend",
+        "selected": {
+          "0": {
+            "util": 0,
+            "memory_MiB": 3172
+          },
+          "1": {
+            "util": 0,
+            "memory_MiB": 2893
+          }
+        },
+        "no_processes": true,
+        "passed": true
+      },
+      "native_log_sha256": "fcf06d97eabd7ce5d912a90eb8389976185e8f45a9083f85e58024abfd47113c"
+    },
+    {
+      "report": {
+        "phase": "device_identity_only",
+        "tensor_allocation_called": false,
+        "mode": "known-working-profile",
+        "compute_nodes": [
+          "davinci0"
+        ],
+        "groups": [
+          0,
+          1000
+        ],
+        "process_security": {
+          "CapEff": "00000000a80425fb",
+          "Seccomp": "0"
+        },
+        "ASCEND_VISIBLE_DEVICES": "0",
+        "ASCEND_RT_VISIBLE_DEVICES": "0",
+        "torch": "2.10.0+cpu",
+        "count": 0,
+        "provider_imported": false,
+        "mapped_sdk_libraries": {
+          "/usr/local/Ascend/cann-9.0.0/aarch64-linux/lib64/libascendcl.so": "94edd165d95210c2a46c52f77f0215cb64e78c42176a451f8e118daccfa912fe",
+          "/usr/local/Ascend/driver/lib64/driver/libascend_hal.so": "12de70257ec2fcfcd0407c02bae769aa50c1e384b3e79f2dc7ad0a27c84a064a"
+        },
+        "passed": false,
+        "error": {
+          "type": "AssertionError",
+          "message": "0",
+          "traceback": "Traceback (most recent call last):\n  File \"/task/npu-g1-probe.py\", line 34, in <module>\n    assert report['count']==1,report['count']\n           ^^^^^^^^^^^^^^^^^^\nAssertionError: 0\n"
+        }
+      },
+      "started.utc": "2026-11-27T10:35:19+00:00",
+      "finished.utc": "2026-11-27T10:35:29+00:00",
+      "results/container.cid": "95533ba8e870d6d852090d4c6ab9d4d944b1411993421c7bae19fc1915fd9aa7",
+      "results/attach.exit": "1",
+      "results/owned-cid-absent": "true",
+      "state": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 1,
+        "Error": "",
+        "StartedAt": "2026-11-27T10:35:20.52492341Z",
+        "FinishedAt": "2026-11-27T10:35:25.93712027Z"
+      },
+      "post_resources": {
+        "vendor": "ascend",
+        "selected": {
+          "0": {
+            "util": 0,
+            "memory_MiB": 3170
+          },
+          "1": {
+            "util": 0,
+            "memory_MiB": 2893
+          }
+        },
+        "no_processes": true,
+        "passed": true
+      },
+      "native_log_sha256": "82480eeee90785966979d58d888cf7db414c253b916155dd338bc87e52c4f256"
+    }
+  ]
+}

@@ -1,0 +1,265 @@
+{
+  "status": "G6_PERFORMANCE_FAIL",
+  "scope": "original14 complete diagnostic; original fullG5 unit-contract1F preserved; later test-only fix separately fullG5",
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "PRhead": "e5c1a998ff233a0e5ab09f861fcb150ce4c11f7a",
+  "tree": "050e080f22fba4713aa550800ff5291562827ebc",
+  "physicalGPU": 6,
+  "cases": [
+    {
+      "precision": "int8",
+      "shape": [
+        1,
+        4,
+        512,
+        512,
+        2
+      ],
+      "max_diff": 0.007614371366798878,
+      "ratio": 1.086820397283484,
+      "performance_passed": true
+    },
+    {
+      "precision": "int8",
+      "shape": [
+        1,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.004793734289705753,
+      "ratio": 0.8042486040603465,
+      "performance_passed": false
+    },
+    {
+      "precision": "int8",
+      "shape": [
+        4,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.004344399552792311,
+      "ratio": 0.3285421523945955,
+      "performance_passed": false
+    },
+    {
+      "precision": "int8",
+      "shape": [
+        16,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.003019393654540181,
+      "ratio": 0.7599109996110296,
+      "performance_passed": false
+    },
+    {
+      "precision": "int8",
+      "shape": [
+        64,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.003048928454518318,
+      "ratio": 1.0688689018541748,
+      "performance_passed": true
+    },
+    {
+      "precision": "int8",
+      "shape": [
+        256,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.004416962619870901,
+      "ratio": 1.4598916246015996,
+      "performance_passed": true
+    },
+    {
+      "precision": "int8",
+      "shape": [
+        1024,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.00445219362154603,
+      "ratio": 1.6077937900498958,
+      "performance_passed": true
+    },
+    {
+      "precision": "fp8",
+      "shape": [
+        1,
+        4,
+        512,
+        512,
+        2
+      ],
+      "max_diff": 0.007833655923604965,
+      "ratio": 1.0932161930436097,
+      "performance_passed": true
+    },
+    {
+      "precision": "fp8",
+      "shape": [
+        1,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.03145935758948326,
+      "ratio": 0.5656432762038354,
+      "performance_passed": false
+    },
+    {
+      "precision": "fp8",
+      "shape": [
+        4,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.005031808279454708,
+      "ratio": 0.8188939260010096,
+      "performance_passed": false
+    },
+    {
+      "precision": "fp8",
+      "shape": [
+        16,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.005176147911697626,
+      "ratio": 0.9385904424941335,
+      "performance_passed": true
+    },
+    {
+      "precision": "fp8",
+      "shape": [
+        64,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.005181437358260155,
+      "ratio": 1.2923279833815233,
+      "performance_passed": true
+    },
+    {
+      "precision": "fp8",
+      "shape": [
+        256,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.005145757459104061,
+      "ratio": 1.5760156516588442,
+      "performance_passed": true
+    },
+    {
+      "precision": "fp8",
+      "shape": [
+        1024,
+        8,
+        4096,
+        14336,
+        2
+      ],
+      "max_diff": 0.004910493269562721,
+      "ratio": 1.4422465277561136,
+      "performance_passed": true
+    }
+  ],
+  "numerical_passed": 14,
+  "performance_passed": 9,
+  "threshold": 0.9,
+  "minimum": 0.3285421523945955,
+  "ratio_protocol": "median of original3 alternating per-pair native/candidate ratios",
+  "all154_frozen_tensor_identities_match": true,
+  "native_provenance": [
+    {
+      "precision": "int8",
+      "native": "vllm.model_executor.layers.fused_moe.experts.marlin_moe.fused_marlin_moe",
+      "source_path": "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
+      "source_sha256": "e048731e130ecc3100be0ab4a168777a7697131b41538f9d9b6a73c4f66e14ff",
+      "adapter": "_vllm_baseline_int8",
+      "torch_replacement": false
+    },
+    {
+      "precision": "fp8",
+      "native": "vllm.model_executor.layers.fused_moe.experts.marlin_moe.fused_marlin_moe",
+      "source_path": "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
+      "source_sha256": "e048731e130ecc3100be0ab4a168777a7697131b41538f9d9b6a73c4f66e14ff",
+      "adapter": "_vllm_baseline_fp8",
+      "torch_replacement": false
+    }
+  ],
+  "independent_container_validation": {
+    "cases": 14,
+    "numerical_passed": 14,
+    "performance_passed": 9,
+    "minimum": 0.3285421523945955,
+    "ratios": [
+      1.086820397283484,
+      0.8042486040603465,
+      0.3285421523945955,
+      0.7599109996110296,
+      1.0688689018541748,
+      1.4598916246015996,
+      1.6077937900498958,
+      1.0932161930436097,
+      0.5656432762038354,
+      0.8188939260010096,
+      0.9385904424941335,
+      1.2923279833815233,
+      1.5760156516588442,
+      1.4422465277561136
+    ],
+    "threshold": 0.9,
+    "accepted": false,
+    "all_frozen_input_identities_match": true
+  },
+  "state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 1,
+    "Error": "",
+    "StartedAt": "2026-11-27T10:57:45.443521792Z",
+    "FinishedAt": "2026-11-27T11:00:47.012833766Z"
+  },
+  "natural_exit": true,
+  "source_after_host": {
+    "source": "/data/codex/fgv-revalidation-20261127/nvidia-marlin-g5-v1/sources/marlin",
+    "files": 1808,
+    "passed": true
+  },
+  "positive_CID_absence": true,
+  "afterGPUidle_noPID": true,
+  "raw_archive": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\marlin-g6-complete-raw-v1.tar.gz",
+  "raw_sha256": "2e5164f4e583d3f132f688f752fbe987ea577448a86e7bd88c85a107ebe6535f",
+  "raw_bytes": 117861
+}

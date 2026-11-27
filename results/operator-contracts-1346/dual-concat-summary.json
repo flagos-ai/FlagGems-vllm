@@ -1,0 +1,150 @@
+{
+  "version": "v3",
+  "source": {
+    "commit": "40941ef9145b2749714d4358c9e14e0394d3c4d7",
+    "tree": "4aae57a750c926de27e24d6c73d6677463232bfb",
+    "files": 1808,
+    "symlinks": 3,
+    "all_raw_git_blobs_matched": true,
+    "source_sha256": "1a885f8a0c04b649de3e8873487b809c50ec25adfcfc7cfc71a424a5ded9c720"
+  },
+  "raw_sha256": "05805da957c046d3b4943eb89576149e7be95118f69c2d2d4c28742b8bb73a8d",
+  "cid": "48e09442aa43af2e4861628b3c13e170b0c1d653f423307c210bfa9bde0c119f",
+  "state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-11-27T11:05:20.794751309Z",
+    "FinishedAt": "2026-11-27T11:05:57.520869255Z"
+  },
+  "exit": 0,
+  "source_before": {
+    "source": "/candidate",
+    "files": 1808,
+    "passed": true
+  },
+  "source_after": {
+    "source": "/candidate",
+    "files": 1808,
+    "passed": true
+  },
+  "runtime": {
+    "torch": "2.13.0+cu130",
+    "triton": "3.6.0",
+    "vllm": "0.32.0",
+    "packages": {
+      "flag-gems": "5.4.0",
+      "flagtree": "0.7.0",
+      "flagcx": "0.14.1+cuda13.3"
+    },
+    "origins": {
+      "torch": "/usr/local/lib/python3.12/dist-packages/torch/__init__.py",
+      "triton": "/compiler/triton/__init__.py",
+      "flagtree": "/compiler/flagtree/__init__.py",
+      "flag_gems": "/legacy-deps/flag_gems/__init__.py",
+      "flagcx": "/deps/flagcx/__init__.py",
+      "vllm": "/usr/local/lib/python3.12/dist-packages/vllm/__init__.py",
+      "flaggems_vllm": "/candidate/src/flaggems_vllm/__init__.py"
+    },
+    "gpu": "NVIDIA H20-3e",
+    "device_count": 2,
+    "native_reference": "installed vllm0.32",
+    "public_recurrent_is_FLA": true,
+    "use_gems_export": false,
+    "cache": {
+      "FLAGGEMS_CACHE_DIR": "/results/cache/preflight/gems",
+      "TRITON_CACHE_DIR": "/results/cache/preflight/triton",
+      "XDG_CACHE_HOME": "/results/cache/preflight/xdg"
+    }
+  },
+  "dual_admission": {
+    "selected": {
+      "4": [
+        "4",
+        " GPU-c7430ed7-2cb0-e6f8-11c9-515d0c13f44b",
+        " 0",
+        " 0"
+      ],
+      "5": [
+        "5",
+        " GPU-09e798f6-daed-4a79-839f-6b1b610d5ada",
+        " 0",
+        " 0"
+      ]
+    },
+    "both_idle_no_compute_pid": true
+  },
+  "dual_retirement": {
+    "selected": {
+      "4": [
+        "4",
+        " GPU-c7430ed7-2cb0-e6f8-11c9-515d0c13f44b",
+        " 0",
+        " 0"
+      ],
+      "5": [
+        "5",
+        " GPU-09e798f6-daed-4a79-839f-6b1b610d5ada",
+        " 0",
+        " 0"
+      ]
+    },
+    "both_idle_no_compute_pid": true
+  },
+  "natural_exit": true,
+  "exact_cid_positive_absence": true,
+  "gpu_after": "0, GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 125734, 0\n1, GPU-9c294908-d614-e327-f065-4d73d0c784ec, 125818, 0\n2, GPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 125818, 0\n3, GPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 125338, 0\n4, GPU-c7430ed7-2cb0-e6f8-11c9-515d0c13f44b, 0, 0\n5, GPU-09e798f6-daed-4a79-839f-6b1b610d5ada, 0, 0\n6, GPU-48d06395-bc23-9c46-9bff-a17af3cc7705, 1039, 90\n7, GPU-0bb114ec-d5f7-9394-12d1-7da68f93aa6e, 0, 0\n",
+  "pids_after": "GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 3305965, 125724 MiB\nGPU-9c294908-d614-e327-f065-4d73d0c784ec, 3305966, 125808 MiB\nGPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 3305967, 125808 MiB\nGPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 3305968, 125328 MiB\nGPU-48d06395-bc23-9c46-9bff-a17af3cc7705, 3379213, 1030 MiB\n",
+  "dual_device_g1": {
+    "device_count": 2,
+    "uuids": [
+      "c7430ed7-2cb0-e6f8-11c9-515d0c13f44b",
+      "09e798f6-daed-4a79-839f-6b1b610d5ada"
+    ],
+    "bidirectional_peer_access": {
+      "0_to_1": true,
+      "1_to_0": true
+    }
+  },
+  "concat": {
+    "total": 70,
+    "failed": 0,
+    "skipped": 0,
+    "passed": 70
+  },
+  "context": {
+    "conftest": "/candidate/tests/conftest.py",
+    "device_context_poisoned": false,
+    "pytest_exitstatus": 0
+  },
+  "completeness": {
+    "original_full_module_cases": 70,
+    "passed": 70,
+    "skipped": 0,
+    "original_dual_device_cases_executed": 12
+  },
+  "docker_device_requests": [
+    {
+      "Driver": "",
+      "Count": 0,
+      "DeviceIDs": [
+        "4",
+        "5"
+      ],
+      "Capabilities": [
+        [
+          "gpu"
+        ]
+      ],
+      "Options": {}
+    }
+  ],
+  "concat_git_blob": "9143f1cfb8e1925fd2476fcb7ae4d1621ff9d97d",
+  "concat_byte_identical_to_main12210": true
+}

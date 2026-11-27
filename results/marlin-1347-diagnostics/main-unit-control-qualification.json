@@ -1,0 +1,42 @@
+{
+  "status": "CONTROL_PASS",
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "control_commit": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "tree": "97f1cb0b5df88953faeacc47671a5cdb8ff645fa",
+  "physicalGPU": 6,
+  "collected": 1,
+  "passed": 1,
+  "failed": 0,
+  "skipped": 0,
+  "skips_by_reason": {},
+  "failures": [],
+  "context": {
+    "conftest": "/candidate/tests/conftest.py",
+    "device_context_poisoned": false,
+    "pytest_exitstatus": 0
+  },
+  "state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-11-27T10:56:09.950591378Z",
+    "FinishedAt": "2026-11-27T10:56:35.045367511Z"
+  },
+  "natural_exit": true,
+  "source_after_host": {
+    "source": "sources/main",
+    "files": 1808,
+    "passed": true
+  },
+  "positive_CID_absence": true,
+  "afterGPUidle_noPID": true,
+  "raw_archive": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\marlin-control-complete-raw-v1.tar.gz",
+  "raw_sha256": "38c2af0ef27ab6fe369e4ed59376b5a66b98847614f0d449d642ef7ad4e9dda3",
+  "raw_bytes": 94542
+}

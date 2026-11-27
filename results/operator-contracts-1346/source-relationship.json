@@ -1,0 +1,24 @@
+{
+  "independent": {
+    "head": "bb3551f4a89fbdd1570ddd9ca3f151db3f958ff4",
+    "tree": "96cf040c47e2493af2150bb07bf16b1171b22c14",
+    "path": "D:/Codex/workspaces/FlagGems-vllm-public-1346-20261127",
+    "original_pr_head": "404a1ec54aabddd0a50fa21dce9c09dd6a1d0bbe",
+    "fast_forward_from_original": true,
+    "pushed": false
+  },
+  "integration": {
+    "head": "40941ef9145b2749714d4358c9e14e0394d3c4d7",
+    "tree": "4aae57a750c926de27e24d6c73d6677463232bfb",
+    "path": "D:\\Codex\\workspaces\\FlagGems-vllm-public-1346-integration-20261127",
+    "parents": [
+      "bb3551f4a89fbdd1570ddd9ca3f151db3f958ff4",
+      "1dac29044ec44e0064f83baaf022cf2199a164dc"
+    ],
+    "conflicts": [
+      "tests/test_kda_bounded.py: three prefill_reference call sites"
+    ],
+    "resolution": "keep original 1346 prefill_reference capability checks, use 1345 _fla_module inside that helper; all test asserts/tolerances preserved",
+    "not_for_push": true
+  }
+}
