@@ -87,7 +87,7 @@ def _update_prior_contexts_ascend(
 
 @libentry()
 @triton.jit
-def _repeated_context_mask_ascend_kernel(
+def _repeated_context_mask_kernel(
     output_ptr,
     tokens_ptr,
     tokens_stride,
@@ -172,7 +172,7 @@ def draft_watermarking_mask(
     output = torch.empty(contexts.shape[0], device=contexts.device, dtype=torch.bool)
     if contexts.shape[0] == 0:
         return output
-    _repeated_context_mask_ascend_kernel[(contexts.shape[0],)](
+    _repeated_context_mask_kernel[(contexts.shape[0],)](
         output,
         all_token_ids,
         all_token_ids.stride(0),
