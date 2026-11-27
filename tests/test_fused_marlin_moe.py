@@ -1433,6 +1433,80 @@ def _minimal_args(device=flaggems_vllm.device, dtype=torch.bfloat16):
     return _make_inputs_w4a16_int4(M, E, K, N, topk, dtype, device)
 
 
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "hygon", reason="Hygon output alias checks"
+)
+@pytest.mark.parametrize(
+    "input_name",
+    [
+        "w1",
+        "w2",
+        "w1_scale",
+        "w2_scale",
+        "topk_weights",
+        "topk_ids",
+        "w1_strided",
+        "w2_strided",
+    ],
+)
+@pytest.mark.parametrize(
+    "placement", ["before", "after", "overlap_begin", "overlap_end"]
+)
+def test_fused_marlin_moe_hygon_output_overlap(input_name, placement):
+    hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _minimal_args()
+    kwargs = dict(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=s1,
+        w2_scale=s2,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_UINT4B8,
+    )
+    strided = input_name.endswith("_strided")
+    name = input_name[:-8] if strided else input_name
+    original = kwargs[name]
+    strides = tuple(stride * (2 if strided else 1) for stride in original.stride())
+    span = (
+        1 + sum((size - 1) * stride for size, stride in zip(original.shape, strides))
+    ) * original.element_size()
+    output_bytes = hs.numel() * hs.element_size()
+    shared = torch.empty(
+        span + output_bytes + hs.element_size(), device=hs.device, dtype=torch.uint8
+    )
+    input_start = output_bytes if placement == "before" else 0
+    output_start = {
+        "before": 0,
+        "after": span + hs.element_size() - 1,
+        "overlap_begin": 0,
+        "overlap_end": span - hs.element_size(),
+    }[placement]
+    # Keep the output aligned when a uint8 weight view has an odd byte span.
+    output_start -= output_start % hs.element_size()
+    view = (
+        shared[input_start : input_start + span]
+        .view(original.dtype)
+        .as_strided(original.shape, strides)
+    )
+    view.copy_(original)
+    kwargs[name] = view
+    kwargs["output"] = (
+        shared[output_start : output_start + output_bytes].view(hs.dtype).view_as(hs)
+    )
+    if placement.startswith("overlap"):
+        with pytest.raises(ValueError, match="Output must not alias"):
+            flaggems_vllm.fused_marlin_moe(**kwargs)
+    else:
+        result = flaggems_vllm.fused_marlin_moe(**kwargs)
+        assert result is kwargs["output"]
+        reference = _reference_swiglu_moe(hs, ref1, ref2, tw, ti)
+        assert compute_max_diff(result.float(), reference.float()) < 0.04
+
+
 def test_rejects_unsupported_quant_type():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     with pytest.raises(NotImplementedError, match="quant_type_id"):

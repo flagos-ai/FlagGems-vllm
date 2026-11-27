@@ -1405,12 +1405,21 @@ def _validate_inputs(
     # is safe, but weights/scales/routing remain live during GEMM2.
     target = a if inplace else output
     if target is not None and target.numel():
+        output_begin = target.data_ptr()
+        output_end = output_begin + target.numel() * target.element_size()
         for tensor in (w1, w2, s1, s2, tw, ids):
-            if (
-                tensor.numel()
-                and target.untyped_storage().data_ptr()
-                == tensor.untyped_storage().data_ptr()
-            ):
+            if not tensor.numel():
+                continue
+            input_begin = tensor.data_ptr()
+            # Weight and scale views may have padding between rows/groups.
+            input_end = input_begin + tensor.element_size() * (
+                1
+                + sum(
+                    (size - 1) * stride
+                    for size, stride in zip(tensor.shape, tensor.stride())
+                )
+            )
+            if output_begin < input_end and input_begin < output_end:
                 raise ValueError("Output must not alias weights, scales or routing")
     return m, k, n, e, ids.shape[1]
 
