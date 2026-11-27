@@ -24,21 +24,18 @@ and writes a CSV with a fixed schema.
 The grid is 240 cases per supported head dim, so 480 by default. Use
 `--filter-dim` to take one dim at a time.
 
-Named `bench_` rather than `test_`: it sits in the same directory as the pytest
-suite now, where a `test_` prefix would both collide with that file's basename
-and make pytest try to collect this CLI as a test module.
+The ``bench_`` prefix keeps this standalone CLI out of pytest collection.
 
 This is a measurement tool, not a pytest accuracy gate (that lives in
-`test_flash_attention_bnsd.py` beside this file). Run it on an idle card, from
-the repo root so `PYTHONPATH=src` resolves:
+``tests/test_flash_attention_bnsd.py``). Run it on an idle card, from
+the repo root so ``PYTHONPATH=src`` resolves:
 
     ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src python \
-        src/flaggems_vllm/runtime/backend/_ascend/a5/tests/bench_flash_attention_bnsd.py \
-        --csv 20261114_fa_clc_480.csv
+        benchmark/bench_flash_attention_bnsd.py --csv 20261114_fa_clc_480.csv
 
     # a quick subset while iterating:
     ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src python \
-        src/flaggems_vllm/runtime/backend/_ascend/a5/tests/bench_flash_attention_bnsd.py \
+        benchmark/bench_flash_attention_bnsd.py \
         --filter-dim 128 --filter-batch 1,4 --filter-seqlen 2048,4096
 
 `--csv` is written next to this file (see `_HERE`), so the result CSV lands in
