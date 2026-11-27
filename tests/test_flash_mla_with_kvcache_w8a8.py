@@ -40,8 +40,10 @@ SUPPORTED = (
 )
 
 
-def quantize_dense_fp8(x, *, dequantize=True):
+def quantize_dense_fp8(x, *, dequantize=True, power_of_two=False):
     scale = x[..., :512].float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448.0
+    if power_of_two:
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
     nope = (x[..., :512].float() / scale).to(torch.float8_e4m3fn)
     rope = (x[..., 512:].float() / scale).to(torch.bfloat16)
     if dequantize:
