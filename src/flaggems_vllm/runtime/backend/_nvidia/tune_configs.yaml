@@ -1535,6 +1535,14 @@ triton_reshape_and_cache_flash:
     num_warps: 8
     num_stages: 1
 
+rejection_sample:
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_SIZE: 1024}
+    num_warps: 8
+    num_stages: 2
+
 triton_reshape_and_cache_flash_per_token_head_quant:
   - META: {INDEPENDENT_TILES: false}
     num_warps: 4
