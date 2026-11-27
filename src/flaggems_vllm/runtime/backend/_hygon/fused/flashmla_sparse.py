@@ -39,6 +39,7 @@ wave64, ``mmac_f32_16x16x16bf16``) actually allows:
   results are recombined by a second kernel.
 """
 
+import collections
 import functools
 from typing import Optional, Tuple
 
@@ -407,10 +408,10 @@ def _backend_launch_options(dqk: int, split: bool, single: bool) -> dict:
     hoists the ds_reads of the PV operand away from the mmacs that consume
     them; most of the inner loop's ``s_waitcnt lgkmcnt(0)`` barrier pairs sit
     immediately before an mmac without this hint, and with only 3 work groups
-    per CU there is no other wave to cover that latency. How far to go depends on how much loop
-    there is to hoist across: the multi-block loop wants ``ds80`` (1.05-1.09x
-    over ``ds32``), while the peeled single-block body has nothing to hide
-    behind and the same value costs it 2-4%.
+    per CU there is no other wave to cover that latency. The useful depth
+    depends on how far the reads can be hoisted: the multi-block loop wants
+    ``ds80`` (1.05-1.09x over ``ds32``), while the peeled single-block body has
+    nothing to hide behind and the same value costs it 2-4%.
 
     ``waves_per_eu_exact`` makes ``waves_per_eu`` actually pin the register
     budget, which this kernel needs: without it the allocator keeps sizing for
@@ -520,14 +521,25 @@ def _spec_bits(tensors):
 # and the per-shape views are cached, so a steady-state call is a dict lookup.
 # Keying on the stream keeps concurrent callers from sharing an accumulator;
 # within one stream the launches are ordered, so reuse is safe.
-_WORKSPACE = {}
+#
+# The entry count is bounded because the stream is not stable in every caller:
+# a harness that captures each measurement on a fresh stream would otherwise
+# add a buffer per capture and never drop one, since the dict holds the only
+# reference. Past `_MAX_WORKSPACE_STREAMS` the least recently used stream is
+# dropped and reallocates if it comes back.
+_WORKSPACE = collections.OrderedDict()
+_MAX_WORKSPACE_STREAMS = 8
 
 
 def _split_workspace(device, stream, rows, dv):
-    state = _WORKSPACE.get((device, stream))
+    key = (device, stream)
+    state = _WORKSPACE.get(key)
     if state is None:
-        state = _WORKSPACE[(device, stream)] = [None, None, {}]
+        state = _WORKSPACE[key] = [None, None, {}]
+        while len(_WORKSPACE) > _MAX_WORKSPACE_STREAMS:
+            _WORKSPACE.popitem(last=False)
     else:
+        _WORKSPACE.move_to_end(key)
         pair = state[2].get(rows)
         if pair is not None:
             return pair
