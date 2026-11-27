@@ -27,6 +27,9 @@ from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_mxfp8 import (
 from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_swiglu_quant_v2 import (
     grouped_matmul_swiglu_quant_v2,
 )
+from flaggems_vllm.runtime.backend._ascend.a5.ops.quant_batch_matmul_mxfp8 import (
+    quant_batch_matmul_mxfp8,
+)
 from flaggems_vllm.runtime.backend._ascend.a5.ops.swiglu_group_quant import (
     swiglu_group_quant,
 )
@@ -38,4 +41,5 @@ __all__ = [
     "swiglu_group_quant",
     "grouped_matmul_mxfp8",
     "grouped_matmul_swiglu_quant_v2",
+    "quant_batch_matmul_mxfp8",
 ]

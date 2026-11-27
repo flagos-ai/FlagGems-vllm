@@ -2215,6 +2215,36 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.5'
+- id: quant_batch_matmul_mxfp8
+  description: 'MX-FP8 quantized matmul for Ascend 950DT (A5 / arch35), replacing the
+
+    CANN QuantBatchMatmulV3 call behind vllm-ascend''s
+
+    `AscendW8A8MXFP8LinearMethod.apply`. The implementation lives under
+
+    `runtime/backend/_ascend/a5/ops/` and takes FP8_E4M3FN x and weight with
+
+    E8M0 per-32 micro-scales on both sides, optional FP32 bias and BF16/FP16
+
+    output. ND and FRACTAL_NZ weights are both supported and the layout is
+
+    detected from the ACL descriptor, so callers pass no extra argument.
+
+    Parallelism for the decode shapes (M=1..8) comes from split-K; the
+
+    hardware MX-MAC path is bit-exact with CANN while split-K is off.
+
+    '
+  for:
+  - torch_npu.npu_quant_matmul
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  kind:
+  - BLAS
+  stages:
+  - beta: '0.3'
 - id: quant_lightning_indexer
   description: 'Ascend paged C4 logical top-k indexer with explicit request positions
 
