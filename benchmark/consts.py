@@ -486,18 +486,47 @@ def lookup_base_record(base_data, op_name, dtype, shape_detail, variant=None):
     return rec
 
 
+def _normalized_chip_name(name):
+    """Lowercase, separator-free chip/device name ("MTT-S5000" -> "mtts5000")."""
+    return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+
 def _detect_self_chip():
     """Best-effort name of the chip this benchmark runs on, e.g. "NVIDIA H800".
 
     Used to pick the right scaling factor when one vendor has several chips
     (H800 vs H100) and to recognize when we're running on the baseline's own
-    reference chip. Returns "" when the device name can't be read; callers then
-    fall back to vendor-only matching.
+    reference chip. Every torch device namespace a vendor backend may own is
+    tried -- NVIDIA/MetaX/Hygon patch ``torch.cuda``, MUSA adds ``torch.musa``,
+    Ascend adds ``torch.npu``, Kunlunxin ``torch.xpu`` -- because
+    ``torch.cuda.get_device_name()`` raises on a backend that does not patch it
+    (``"Invalid device id"`` on MUSA). Returns "" when no namespace answers;
+    callers then fall back to vendor-only matching.
     """
-    try:
-        return torch.cuda.get_device_name()
-    except Exception:
-        return ""
+    for backend in ("cuda", "musa", "npu", "xpu"):
+        getter = getattr(getattr(torch, backend, None), "get_device_name", None)
+        if getter is None:
+            continue
+        try:
+            name = getter()
+        except TypeError:
+            try:
+                name = getter(0)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if name:
+            return name
+    return ""
+
+
+# Device-level achievable bandwidth ratio vs the baseline reference, measured
+# with the same 512 MiB copy kernel on both chips (do_bench, 2026-11-20):
+# C550 1396.4 GB/s, H800-class H100 3001.4 GB/s.  The peak-to-peak ratio
+# (0.4725) describes the memory system's theoretical gap; this one describes
+# what a streaming workload actually reaches, and wins for mem records.
+_ACHIEVABLE_BW_RATIO = {"metax C550": 0.46525}
 
 
 # Cache the device name once; it doesn't change within a run.
@@ -506,11 +535,17 @@ _SELF_CHIP = _detect_self_chip()
 
 def _chip_matches(chip_name, device_name):
     """True if a spec's chip name (e.g. "H800") identifies this device
-    (e.g. "NVIDIA H800 80GB"). Case-insensitive substring match, which tolerates
-    the vendor prefix / memory suffix that get_device_name() adds."""
+    (e.g. "NVIDIA H800 80GB").
+
+    Case- and separator-insensitive substring match: spec files spell SKUs like
+    "MTT-S5000" while the device reports "MTT S5000", and the match must survive
+    that difference as well as the vendor prefix / memory suffix that
+    get_device_name() adds.
+    """
     if not chip_name or not device_name:
         return False
-    return chip_name.lower() in device_name.lower()
+    chip = _normalized_chip_name(chip_name)
+    return bool(chip) and chip in _normalized_chip_name(device_name)
 
 
 def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=None):
@@ -520,7 +555,9 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
     Factor comes from base_data["_scaling_factors"] (written by the collector
     into the same file as the latencies). Matching is by vendor AND concrete
     chip model, so that e.g. nvidia H800 and H100 don't collide. Prefers
-    measured over nominal. Returns None when the vendor / chip / resource /
+    measured-achievable over nominal. A chip entry may also carry an
+    ``achievable`` block with device-level measurements (e.g. a copy
+    kernel's streaming bandwidth), which is consulted first. Returns None when the vendor / chip / resource /
     dtype isn't covered, so the caller falls back to the raw latency ratio.
 
     The reference chip (e.g. the H800 the baseline was collected on) is itself
@@ -546,7 +583,11 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
             chip = candidates[0] if len(candidates) == 1 else None
         if chip is None:
             return None
-        for prefer in ("measured", "nominal"):
+        if resource == "bandwidth_gbps":
+            key = f"{chip.get('vendor')} {chip.get('chip')}"
+            if key in _ACHIEVABLE_BW_RATIO:
+                return _ACHIEVABLE_BW_RATIO[key]
+        for prefer in ("achievable", "measured", "nominal"):
             block = chip.get(prefer)
             if not block:
                 continue

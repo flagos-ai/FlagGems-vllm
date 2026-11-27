@@ -14,6 +14,7 @@
 
 import dataclasses
 import inspect
+import math
 import random
 from typing import List, Optional, Tuple
 
@@ -476,6 +477,61 @@ def test_flash_mla_sparse_flashmla(param: Flashmla_Sparse_Test_Param):
     torch.testing.assert_close(
         your_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536, equal_nan=False
     )
+
+
+@pytest.mark.flash_mla_sparse_fwd
+def test_flash_mla_sparse_large_kv_offset(monkeypatch):
+    if flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available():
+        pytest.skip("Requires an NVIDIA CUDA device")
+    device = torch.device(flaggems_vllm.device)
+    if torch.cuda.get_device_capability(device)[0] < 8:
+        pytest.skip("Requires native BF16 support")
+    if torch.cuda.mem_get_info(device)[0] < 5 * 1024**3:
+        pytest.skip("Requires 5 GiB of free device memory")
+
+    monkeypatch.setenv("FLAGGEMS_FLASHMLA_SPARSE_TLE", "0")
+    width = 576
+    topk = 128
+    high_row = torch.iinfo(torch.int32).max // width + 1
+    kv = torch.empty((high_row + 1, 1, width), device=device, dtype=torch.bfloat16)
+    q = torch.zeros((2, 64, width), device=device, dtype=torch.bfloat16)
+    indices = torch.empty((2, 1, topk), device=device, dtype=torch.int32)
+
+    # Only the selected rows need to be initialized. Repeated indices make
+    # the output equal to the selected V row and give an analytical LSE.
+    q[..., -1] = 1
+    kv[0].fill_(-0.5)
+    kv[0, 0, -1] = 1
+    kv[high_row].fill_(0.25)
+    kv[high_row, 0, -1] = 2
+    indices[0].fill_(0)
+    indices[1].fill_(high_row)
+
+    def check(results, swapped=False):
+        out, max_logits, lse = results
+        values = (0.25, -0.5) if swapped else (-0.5, 0.25)
+        maxima = (1.0, 0.5) if swapped else (0.5, 1.0)
+        for row, (value, maximum) in enumerate(zip(values, maxima)):
+            torch.testing.assert_close(out[row], torch.full_like(out[row], value))
+            torch.testing.assert_close(
+                max_logits[row], torch.full_like(max_logits[row], maximum)
+            )
+            torch.testing.assert_close(
+                lse[row], torch.full_like(lse[row], maximum + math.log(topk))
+            )
+
+    op = flaggems_vllm.flash_mla_sparse_fwd
+    check(op(q, kv, indices, 0.5))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = op(q, kv, indices, 0.5)
+    for swapped in (False, True, False):
+        indices[0].fill_(high_row if swapped else 0)
+        indices[1].fill_(0 if swapped else high_row)
+        for result in outputs:
+            result.fill_(float("nan"))
+        graph.replay()
+        check(outputs, swapped)
 
 
 @pytest.mark.flash_mla_sparse_fwd

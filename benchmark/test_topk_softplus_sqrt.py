@@ -62,6 +62,92 @@ except ImportError:
     HAS_VLLM = False
     _vllm_topk_softplus_sqrt = None
 
+# HAS_VLLM only says the Python wrapper imported successfully; it does not
+# guarantee the CUDA custom op it calls has been compiled into the current
+# vllm install. Probe for the op at runtime so the benchmark doesn't pick a
+# baseline that will blow up when actually invoked.
+HAS_VLLM_TOPK_KERNEL = False
+if HAS_VLLM:
+    try:
+        HAS_VLLM_TOPK_KERNEL = hasattr(torch.ops._moe_C, "topk_softplus_sqrt")
+    except Exception:
+        HAS_VLLM_TOPK_KERNEL = False
+
+
+# ---------------------------------------------------------------------------
+# Ascend baseline: vllm-ascend exposes the same sqrt-softplus gating math as a
+# CANN custom kernel (``moe_gating_top_k_hash`` with ``norm_type=2``, i.e.
+# softplus -> sqrt).  vLLM's CUDA ``_moe_C.topk_softplus_sqrt`` does not exist
+# on NPU, so on Ascend this is the native operator to compare against.
+# ---------------------------------------------------------------------------
+_ascend_gating = None
+if vendor == "ascend":
+    try:
+        from vllm_ascend.utils import enable_custom_op
+
+        enable_custom_op()
+        _ascend_gating = torch.ops._C_ascend.moe_gating_top_k_hash
+    except (ImportError, AttributeError, RuntimeError):
+        _ascend_gating = None
+
+HAS_ASCEND_GATING = _ascend_gating is not None
+
+_TEI_TEMPLATE_CACHE = {}
+
+
+def _tei_template(num_tokens, topk, device):
+    """Cached ``token_expert_indices`` range tensor.
+
+    vLLM's fused kernel writes this range inside the kernel; the CANN op does
+    not have that output, so build the template once and copy it per call.  It
+    must not be rebuilt with ``arange`` on every timed call or the baseline
+    would be charged for several extra launches.
+    """
+    key = (num_tokens, topk, str(device))
+    template = _TEI_TEMPLATE_CACHE.get(key)
+    if template is None:
+        template = (
+            torch.arange(num_tokens, device=device).unsqueeze(1) * topk
+            + torch.arange(topk, device=device).unsqueeze(0)
+        ).to(torch.int32)
+        _TEI_TEMPLATE_CACHE[key] = template
+    return template
+
+
+def _vllm_ascend_topk_softplus_sqrt_wrapper(
+    topk_weights,
+    topk_indices,
+    token_expert_indices,
+    gating_output,
+    renormalize,
+    routed_scaling_factor,
+    correction_bias=None,
+    input_ids=None,
+    tid2eid=None,
+):
+    """vllm-ascend CANN kernel baseline (sqrt-softplus gating)."""
+    num_tokens, topk = topk_weights.shape
+    bias = (
+        correction_bias.to(gating_output.dtype) if correction_bias is not None else None
+    )
+    y, eidx, _ = _ascend_gating(
+        gating_output,
+        k=topk,
+        bias=bias,
+        input_ids=input_ids,
+        tid2eid=tid2eid,
+        k_group=1,
+        group_count=1,
+        routed_scaling_factor=routed_scaling_factor,
+        eps=1e-20,
+        group_select_mode=0,
+        renorm=0,
+        norm_type=2,
+    )
+    topk_weights.copy_(y)
+    topk_indices.copy_(eidx)
+    token_expert_indices.copy_(_tei_template(num_tokens, topk, gating_output.device))
+
 
 def _vllm_topk_softplus_sqrt_wrapper(
     topk_weights,
@@ -130,7 +216,13 @@ def _torch_topk_softplus_sqrt_ref(
 
 
 _baseline_op = (
-    _vllm_topk_softplus_sqrt_wrapper if HAS_VLLM else _torch_topk_softplus_sqrt_ref
+    _vllm_ascend_topk_softplus_sqrt_wrapper
+    if HAS_ASCEND_GATING
+    else (
+        _vllm_topk_softplus_sqrt_wrapper
+        if HAS_VLLM_TOPK_KERNEL
+        else _torch_topk_softplus_sqrt_ref
+    )
 )
 
 
