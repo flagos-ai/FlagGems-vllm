@@ -38,8 +38,12 @@ if triton.__version__.startswith("3.6."):
     __all__.append(fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert.__name__)
 
 if _triton_version_utils.has_triton_tle(3, 6, 0):
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megamhc import (  # noqa: F401
+        create_mega_mhc_context,
+        mega_mhc,
+    )
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megamoe import (  # noqa: F401
         megamoe_fp8,
     )
 
-    __all__.append("megamoe_fp8")
+    __all__ += ["create_mega_mhc_context", "mega_mhc", "megamoe_fp8"]
