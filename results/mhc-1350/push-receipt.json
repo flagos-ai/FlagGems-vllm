@@ -1,0 +1,13 @@
+{
+  "pr": 1350,
+  "head": "cd1e5146538b0287221f6f3e529fc2a49889a37f",
+  "tree": "615c4205e53c2ed977b38fbb97d0d1c2a7205b50",
+  "original_head": "aa3e24a894988f2631bd14f4f75107956c55347f",
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "branch": "codex/fgv-mhc-sync-20261127",
+  "normal_fast_forward": true,
+  "source_bytes_unchanged_from_tested_tree": true,
+  "pushed": true,
+  "remote_ref_verified": true,
+  "remote_branch": "codex/mhc-rms-launch-ci-20261119"
+}

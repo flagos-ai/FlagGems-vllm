@@ -1,0 +1,9 @@
+{
+  "pr": 1345,
+  "original_head": "7971748f5ecdaae36170f0a71653f4341663ed21",
+  "new_head": "1dac29044ec44e0064f83baaf022cf2199a164dc",
+  "tree": "fb49b38f7f1c69a544b7da1970198695bdd38993",
+  "remote_branch": "codex/fix-public-kda-export-20261119",
+  "normal_push": true,
+  "remote_ref_verified": true
+}

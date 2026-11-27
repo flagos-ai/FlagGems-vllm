@@ -1,0 +1,194 @@
+{
+  "archive_sha256": "769ac41bc2e29c6f25a1d59d97dc28e8eab7caf9376e5778673b894987a25d94",
+  "summary": "All three original native operator modes fail compiler preflight; no timing or full performance Gate. Each fresh mode attempted once.",
+  "result": [
+    {
+      "op": "grammar",
+      "native_only": true,
+      "timing_run": false,
+      "cases": [],
+      "passed": false,
+      "executing_contract": null,
+      "native_callable": {
+        "module": "vllm.v1.worker.gpu.structured_outputs",
+        "source": "/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/structured_outputs.py",
+        "source_sha256": "9e212ac51c603e9b95bbc8dceec4510d96b764e49eafa7c10a581ac1e6535297",
+        "name": "_apply_grammar_bitmask_kernel"
+      },
+      "package_metadata": {
+        "flagcx": "0.14.1+xre5.37.1",
+        "flagtree": "0.7.0+xpu3.6",
+        "vllm": "0.32.0+flagos",
+        "torch": "2.9.0+cu129",
+        "flag-gems": "5.4.0",
+        "flaggems_vllm": "0.1.0"
+      },
+      "compiler_sha256": "d9195421dc671ef40d423a827d712f4ff68e94f88fce745cdeb0874db996031d",
+      "error": {
+        "type": "OutOfResources",
+        "message": "out of resource: uni_sram PassManager::run failed: loc(\"/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/structured_outputs.py\":162:0): Failures have been detected while processing an MLIR pass pipeline\n  note: Pipeline failed while executing [`ConvertTritonToTritonXPU` on 'builtin.module' operation]: reproducer generated at `std::errs, please share the reproducer above with Triton project.`, Required: 0, Hardware limit: 0. Reducing block sizes or `num_stages` may help."
+      },
+      "started.utc": "2026-11-27T10:38:56+00:00",
+      "finished.utc": "2026-11-27T10:39:03+00:00",
+      "results/container.cid": "7346ea868716aaa6f7e8700743eb6d75957b3f05848bed78969dce6e3ad15e86",
+      "results/attach.exit": "1",
+      "results/owned-cid-absent": "true",
+      "state": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 1,
+        "Error": "",
+        "StartedAt": "2026-11-27T10:38:57.069495987Z",
+        "FinishedAt": "2026-11-27T10:39:03.472502009Z"
+      },
+      "post_resources": {
+        "vendor": "kunlunxin",
+        "selected": {
+          "4": {
+            "util": 0,
+            "memory_MiB": 0
+          },
+          "6": {
+            "util": 0,
+            "memory_MiB": 0
+          }
+        },
+        "no_processes": true,
+        "passed": true
+      },
+      "preflight_json_sha256": "fc3418f535b8665415f74209b6fb1b8d896bbf71fda0a73b106a18626c9fae41"
+    },
+    {
+      "op": "penalties",
+      "native_only": true,
+      "timing_run": false,
+      "cases": [],
+      "passed": false,
+      "executing_contract": null,
+      "native_callable": {
+        "module": "vllm.v1.worker.gpu.sample.penalties",
+        "source": "/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/sample/penalties.py",
+        "source_sha256": "a5e99c71e6ac50ef025b8a7b0b903a1d2679738d8319af9c98bb200389388b29",
+        "name": "apply_penalties"
+      },
+      "package_metadata": {
+        "flagcx": "0.14.1+xre5.37.1",
+        "flagtree": "0.7.0+xpu3.6",
+        "vllm": "0.32.0+flagos",
+        "torch": "2.9.0+cu129",
+        "flag-gems": "5.4.0",
+        "flaggems_vllm": "0.1.0"
+      },
+      "compiler_sha256": "d9195421dc671ef40d423a827d712f4ff68e94f88fce745cdeb0874db996031d",
+      "error": {
+        "type": "OutOfResources",
+        "message": "out of resource: uni_sram PassManager::run failed: loc(\"/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/sample/penalties.py\":105:0): Failures have been detected while processing an MLIR pass pipeline\n  note: Pipeline failed while executing [`ConvertTritonToTritonXPU` on 'builtin.module' operation]: reproducer generated at `std::errs, please share the reproducer above with Triton project.`, Required: 0, Hardware limit: 0. Reducing block sizes or `num_stages` may help."
+      },
+      "started.utc": "2026-11-27T10:39:03+00:00",
+      "finished.utc": "2026-11-27T10:39:13+00:00",
+      "results/container.cid": "7eb69d7709c30d647fd511613dc68f409082fb442cb1ece675d984f493bedbbb",
+      "results/attach.exit": "1",
+      "results/owned-cid-absent": "true",
+      "state": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 1,
+        "Error": "",
+        "StartedAt": "2026-11-27T10:39:03.933273762Z",
+        "FinishedAt": "2026-11-27T10:39:12.917249096Z"
+      },
+      "post_resources": {
+        "vendor": "kunlunxin",
+        "selected": {
+          "4": {
+            "util": 0,
+            "memory_MiB": 0
+          },
+          "6": {
+            "util": 0,
+            "memory_MiB": 0
+          }
+        },
+        "no_processes": true,
+        "passed": true
+      },
+      "preflight_json_sha256": "4e47d1e7eac9bbc42f680a1df8d6b6a3e7bd9ce6f8127db156a31668a9011a5c"
+    },
+    {
+      "op": "bincount",
+      "native_only": true,
+      "timing_run": false,
+      "cases": [],
+      "passed": false,
+      "executing_contract": {
+        "vocab": 167,
+        "max_prefill_len": 185,
+        "seed": 147,
+        "native_BLOCK_SIZE": 1024
+      },
+      "native_callable": {
+        "module": "vllm.v1.worker.gpu.sample.penalties",
+        "source": "/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/sample/penalties.py",
+        "source_sha256": "a5e99c71e6ac50ef025b8a7b0b903a1d2679738d8319af9c98bb200389388b29",
+        "name": "bincount"
+      },
+      "package_metadata": {
+        "flagcx": "0.14.1+xre5.37.1",
+        "flagtree": "0.7.0+xpu3.6",
+        "vllm": "0.32.0+flagos",
+        "torch": "2.9.0+cu129",
+        "flag-gems": "5.4.0",
+        "flaggems_vllm": "0.1.0"
+      },
+      "compiler_sha256": "d9195421dc671ef40d423a827d712f4ff68e94f88fce745cdeb0874db996031d",
+      "error": {
+        "type": "OutOfResources",
+        "message": "out of resource: uni_sram PassManager::run failed: loc(\"idx\"(\"/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/sample/penalties.py\":244:31)): 'arith.divsi' op requires the same type for all operands and results\nloc(\"/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/sample/penalties.py\":217:0): Failures have been detected while processing an MLIR pass pipeline\n  note: Pipeline failed while executing [`TritonXPULegalize` on 'builtin.module' operation]: reproducer generated at `std::errs, please share the reproducer above with Triton project.`, Required: 0, Hardware limit: 0. Reducing block sizes or `num_stages` may help."
+      },
+      "started.utc": "2026-11-27T10:39:13+00:00",
+      "finished.utc": "2026-11-27T10:39:22+00:00",
+      "results/container.cid": "cb2a373bc36d7b851ecf5ecb911346970a090a594fd920717b0ab9eff87cda2a",
+      "results/attach.exit": "1",
+      "results/owned-cid-absent": "true",
+      "state": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 1,
+        "Error": "",
+        "StartedAt": "2026-11-27T10:39:13.411696503Z",
+        "FinishedAt": "2026-11-27T10:39:22.225706753Z"
+      },
+      "post_resources": {
+        "vendor": "kunlunxin",
+        "selected": {
+          "4": {
+            "util": 0,
+            "memory_MiB": 0
+          },
+          "6": {
+            "util": 0,
+            "memory_MiB": 0
+          }
+        },
+        "no_processes": true,
+        "passed": true
+      },
+      "preflight_json_sha256": "fc28bcd22402f0d3d7c303d1c44b4dab29424fa42598021db35389f02276f2a6"
+    }
+  ]
+}

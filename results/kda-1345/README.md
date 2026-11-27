@@ -1,0 +1,5 @@
+# Public KDA #1345 namespace fix and original contracts
+
+Main12210ab6 and the initial public-export candidate reproduced exactly the same28 bounded failures:27 old FLA namespace imports and one resulting capability failure; no poisoned context. vLLM0.32 moved FLA to third_party.flash_linear_attention. The narrow resolver prefers this current namespace, falls back only for a genuinely absent namespace, and preserves internal import failures. Actual native kernel objects, argument names and re-export identities were verified.
+
+Synchronized published head1dac2904/treefb49b38f passed the complete recurrent module:186 passed/24 original native-output K=V limitations. The original bounded40/40 passed with zero skips, plus9 new real-function resolver regression cases passed. No numerical assertion, tolerance or input was relaxed. The old skip message hard-codes0.24; actual runtime was vLLM0.32/Torch2.13+cu130/FlagTree0.7. All1808 raw source members matched before/after, actual contexts were not poisoned, the container exited naturally and GPU4 was released. This is functional validation; no new KDA performance claim or final-head required-CI/approval claim is made.

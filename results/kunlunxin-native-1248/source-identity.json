@@ -1,0 +1,16 @@
+{
+  "image": "562f5a483b37b5dc6b143cbb5df5ef7707e72ddc2dc6f3603605f2829e0a026c",
+  "native_files": {
+    "v1/worker/gpu/sample/penalties.py": {
+      "path": "/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/sample/penalties.py",
+      "sha256": "a5e99c71e6ac50ef025b8a7b0b903a1d2679738d8319af9c98bb200389388b29",
+      "bytes": 10665
+    },
+    "v1/worker/gpu/structured_outputs.py": {
+      "path": "/flagos/lib/python3.10/site-packages/vllm/v1/worker/gpu/structured_outputs.py",
+      "sha256": "9e212ac51c603e9b95bbc8dceec4510d96b764e49eafa7c10a581ac1e6535297",
+      "bytes": 7398
+    }
+  },
+  "owned_cid_absent": true
+}

@@ -1,0 +1,66 @@
+{
+  "status": "G5_PASS_G6_PENDING",
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "PRhead": "aa3e24a894988f2631bd14f4f75107956c55347f",
+  "resolved_tree": "615c4205e53c2ed977b38fbb97d0d1c2a7205b50",
+  "source1808_rawGit_exact": true,
+  "physicalGPU": 5,
+  "phases": {
+    "norm-cold": {
+      "tests": 26,
+      "skipped": 0,
+      "passed": 26,
+      "context": {
+        "conftest": "/candidate/tests/conftest.py",
+        "device_context_poisoned": false,
+        "pytest_exitstatus": 0
+      }
+    },
+    "norm-warm": {
+      "tests": 26,
+      "skipped": 0,
+      "passed": 26,
+      "context": {
+        "conftest": "/candidate/tests/conftest.py",
+        "device_context_poisoned": false,
+        "pytest_exitstatus": 0
+      }
+    },
+    "nearby": {
+      "tests": 215,
+      "skipped": 33,
+      "passed": 182,
+      "context": {
+        "conftest": "/candidate/tests/conftest.py",
+        "device_context_poisoned": false,
+        "pytest_exitstatus": 0
+      }
+    }
+  },
+  "strong": {
+    "rows": 180,
+    "repeats_per_row": 3,
+    "numeric_checks": 540,
+    "all_passed": true,
+    "configuration_override_scope": "exhaustive correctness validation only; G6 separate process automatic"
+  },
+  "state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-11-27T10:14:10.863545462Z",
+    "FinishedAt": "2026-11-27T10:29:41.165376319Z"
+  },
+  "natural_exit": true,
+  "positive_CID_absence": true,
+  "afterGPUidle_noPID": true,
+  "raw_archive": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\mhc-g5-complete-raw-v1.tar.gz",
+  "raw_sha256": "89884ea086445091bad070ac34538e23ce1d4145edfa26f4568d511d119c0e00",
+  "raw_bytes": 109835
+}

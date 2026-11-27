@@ -1,0 +1,541 @@
+{
+  "1345": {
+    "cid": "ce944ffca33f0d9aa430754247b58e763817fb0edfea0e023bc1a896a88a995e",
+    "state": {
+      "Status": "exited",
+      "Running": false,
+      "Paused": false,
+      "Restarting": false,
+      "OOMKilled": false,
+      "Dead": false,
+      "Pid": 0,
+      "ExitCode": 1,
+      "Error": "",
+      "StartedAt": "2026-11-27T10:10:55.526595543Z",
+      "FinishedAt": "2026-11-27T10:12:35.503140178Z"
+    },
+    "phases": {
+      "bounded": {
+        "total": 40,
+        "passed": 12,
+        "failed": 28,
+        "skipped": 0,
+        "failure_groups": {
+          "old_fla_namespace_missing": 27,
+          "assert False\n +  where False = <functools._lru_cache_wrapper object at 0xADDR>()\n +    where <functools._lru_cache_wrapper object at 0xADDR> = <function chunk_kda_with_safe_gate at 0xADDR>._is_available\n +      where <function chunk_kda_with_safe_gate at 0xADDR> = bounded.chunk_kda_with_safe_gate": 1
+        },
+        "skip_reasons": {}
+      },
+      "recurrent": {
+        "total": 210,
+        "passed": 186,
+        "failed": 0,
+        "skipped": 24,
+        "failure_groups": {},
+        "skip_reasons": {
+          "vendor API does not express this case: Native vLLM 0.24.0 allocates output as empty_like(k), requiring K=V": 24
+        }
+      }
+    },
+    "checks": {
+      "natural_exit": true,
+      "cid_absent": true,
+      "source_before": {
+        "source": "/candidate",
+        "files": 1808,
+        "passed": true
+      },
+      "source_after": {
+        "source": "/candidate",
+        "files": 1808,
+        "passed": true
+      },
+      "contexts": {
+        "bounded-context": {
+          "conftest": "/candidate/tests/conftest.py",
+          "device_context_poisoned": false,
+          "pytest_exitstatus": 1
+        },
+        "recurrent-context": {
+          "conftest": "/candidate/tests/conftest.py",
+          "device_context_poisoned": false,
+          "pytest_exitstatus": 0
+        }
+      },
+      "exit": "1",
+      "gpu_after": "0, GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 125732, 0\n1, GPU-9c294908-d614-e327-f065-4d73d0c784ec, 125816, 0\n2, GPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 125816, 0\n3, GPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 125336, 0\n4, GPU-c7430ed7-2cb0-e6f8-11c9-515d0c13f44b, 0, 0\n5, GPU-09e798f6-daed-4a79-839f-6b1b610d5ada, 0, 0\n6, GPU-48d06395-bc23-9c46-9bff-a17af3cc7705, 4, 0\n7, GPU-0bb114ec-d5f7-9394-12d1-7da68f93aa6e, 21109, 42\n",
+      "pids_after": "GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 3275242, 125722 MiB\nGPU-9c294908-d614-e327-f065-4d73d0c784ec, 3275243, 125806 MiB\nGPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 3275244, 125806 MiB\nGPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 3275245, 125326 MiB\nGPU-0bb114ec-d5f7-9394-12d1-7da68f93aa6e, 2531774, 21100 MiB\n"
+    }
+  },
+  "1346": {
+    "cid": "8317c0b5abe16a92162e2d061b2c9d05281fb8af4d4bec569d1e4cfad6cd7e58",
+    "state": {
+      "Status": "exited",
+      "Running": false,
+      "Paused": false,
+      "Restarting": false,
+      "OOMKilled": false,
+      "Dead": false,
+      "Pid": 0,
+      "ExitCode": 1,
+      "Error": "",
+      "StartedAt": "2026-11-27T10:14:40.586315849Z",
+      "FinishedAt": "2026-11-27T10:16:05.373807991Z"
+    },
+    "phases": {
+      "bincount": {
+        "total": 90,
+        "passed": 90,
+        "failed": 0,
+        "skipped": 0,
+        "failure_groups": {},
+        "skip_reasons": {}
+      },
+      "bounded": {
+        "total": 40,
+        "passed": 14,
+        "failed": 26,
+        "skipped": 0,
+        "failure_groups": {
+          "old_fla_namespace_missing": 26
+        },
+        "skip_reasons": {}
+      },
+      "concat": {
+        "total": 70,
+        "passed": 58,
+        "failed": 0,
+        "skipped": 12,
+        "failure_groups": {},
+        "skip_reasons": {
+          "requires at least two CUDA GPUs": 12
+        }
+      }
+    },
+    "checks": {
+      "natural_exit": true,
+      "cid_absent": true,
+      "source_before": {
+        "source": "/candidate",
+        "files": 1808,
+        "passed": true
+      },
+      "source_after": {
+        "source": "/candidate",
+        "files": 1808,
+        "passed": true
+      },
+      "contexts": {
+        "bincount-context": {
+          "conftest": "/candidate/tests/conftest.py",
+          "device_context_poisoned": false,
+          "pytest_exitstatus": 0
+        },
+        "bounded-context": {
+          "conftest": "/candidate/tests/conftest.py",
+          "device_context_poisoned": false,
+          "pytest_exitstatus": 1
+        },
+        "concat-context": {
+          "conftest": "/candidate/tests/conftest.py",
+          "device_context_poisoned": false,
+          "pytest_exitstatus": 0
+        }
+      },
+      "exit": "1",
+      "gpu_after": "0, GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 125732, 0\n1, GPU-9c294908-d614-e327-f065-4d73d0c784ec, 125816, 0\n2, GPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 125816, 0\n3, GPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 125336, 0\n4, GPU-c7430ed7-2cb0-e6f8-11c9-515d0c13f44b, 0, 0\n5, GPU-09e798f6-daed-4a79-839f-6b1b610d5ada, 971, 0\n6, GPU-48d06395-bc23-9c46-9bff-a17af3cc7705, 4, 0\n7, GPU-0bb114ec-d5f7-9394-12d1-7da68f93aa6e, 21109, 48\n",
+      "pids_after": "GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 3275242, 125722 MiB\nGPU-9c294908-d614-e327-f065-4d73d0c784ec, 3275243, 125806 MiB\nGPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 3275244, 125806 MiB\nGPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 3275245, 125326 MiB\nGPU-09e798f6-daed-4a79-839f-6b1b610d5ada, 3293721, 962 MiB\nGPU-0bb114ec-d5f7-9394-12d1-7da68f93aa6e, 2531774, 21100 MiB\n"
+    }
+  },
+  "base122": {
+    "cid": "5d37b69566e46ce4d9a9ea2479b6b24d77f2c7cbe7821528becb62e415455188",
+    "state": {
+      "Status": "exited",
+      "Running": false,
+      "Paused": false,
+      "Restarting": false,
+      "OOMKilled": false,
+      "Dead": false,
+      "Pid": 0,
+      "ExitCode": 1,
+      "Error": "",
+      "StartedAt": "2026-11-27T10:16:26.092702065Z",
+      "FinishedAt": "2026-11-27T10:17:09.353371784Z"
+    },
+    "phases": {
+      "bounded": {
+        "total": 40,
+        "passed": 12,
+        "failed": 28,
+        "skipped": 0,
+        "failure_groups": {
+          "old_fla_namespace_missing": 27,
+          "assert False\n +  where False = <functools._lru_cache_wrapper object at 0xADDR>()\n +    where <functools._lru_cache_wrapper object at 0xADDR> = <function chunk_kda_with_safe_gate at 0xADDR>._is_available\n +      where <function chunk_kda_with_safe_gate at 0xADDR> = bounded.chunk_kda_with_safe_gate": 1
+        },
+        "skip_reasons": {}
+      }
+    },
+    "checks": {
+      "natural_exit": true,
+      "cid_absent": true,
+      "source_before": {
+        "source": "/candidate",
+        "files": 1808,
+        "passed": true
+      },
+      "source_after": {
+        "source": "/candidate",
+        "files": 1808,
+        "passed": true
+      },
+      "contexts": {
+        "bounded-context": {
+          "conftest": "/candidate/tests/conftest.py",
+          "device_context_poisoned": false,
+          "pytest_exitstatus": 1
+        }
+      },
+      "exit": "1",
+      "gpu_after": "0, GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 125732, 0\n1, GPU-9c294908-d614-e327-f065-4d73d0c784ec, 125816, 0\n2, GPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 125816, 0\n3, GPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 125336, 0\n4, GPU-c7430ed7-2cb0-e6f8-11c9-515d0c13f44b, 0, 0\n5, GPU-09e798f6-daed-4a79-839f-6b1b610d5ada, 1469, 95\n6, GPU-48d06395-bc23-9c46-9bff-a17af3cc7705, 4, 0\n7, GPU-0bb114ec-d5f7-9394-12d1-7da68f93aa6e, 21109, 41\n",
+      "pids_after": "GPU-35be2f2e-5eb9-a7c2-28d0-b0da7738ab7f, 3275242, 125722 MiB\nGPU-9c294908-d614-e327-f065-4d73d0c784ec, 3275243, 125806 MiB\nGPU-8acfcb80-a9cb-b0cb-9542-347494a21871, 3275244, 125806 MiB\nGPU-a817eec3-4189-d9d5-95b8-e2a865620db4, 3275245, 125326 MiB\nGPU-09e798f6-daed-4a79-839f-6b1b610d5ada, 3298246, 1460 MiB\nGPU-0bb114ec-d5f7-9394-12d1-7da68f93aa6e, 2531774, 21100 MiB\n"
+    }
+  },
+  "1345_matches_base122_failure_nodes_and_messages": true,
+  "failure_records": {
+    "1345": {
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[1-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[1-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[63-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[63-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[64-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[64-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[65-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[65-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[129-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[129-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_varlen_keeps_activated_beta_and_vk_state[0.0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_varlen_keeps_activated_beta_and_vk_state[1.0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_execution_error_propagates": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_model_head_dimension_128": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_model_head_dimension_128": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_model_decode_one_token_requests_preserve_1d_slots": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_preserves_padded_mamba_cache_slot_stride": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_materializes_padded_initial_state_like_original": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_public_core_capabilities_are_available_in_validation_environment": {
+        "type": null,
+        "message": "assert False\n +  where False = <functools._lru_cache_wrapper object at 0xADDR>()\n +    where <functools._lru_cache_wrapper object at 0xADDR> = <function chunk_kda_with_safe_gate at 0xADDR>._is_available\n +      where <function chunk_kda_with_safe_gate at 0xADDR> = bounded.chunk_kda_with_safe_gate"
+      }
+    },
+    "1346": {
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[1-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[1-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[63-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[63-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[64-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[64-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[65-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[65-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[129-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[129-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_varlen_keeps_activated_beta_and_vk_state[0.0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_varlen_keeps_activated_beta_and_vk_state[1.0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_model_head_dimension_128": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_model_head_dimension_128": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_model_decode_one_token_requests_preserve_1d_slots": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_preserves_padded_mamba_cache_slot_stride": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_materializes_padded_initial_state_like_original": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      }
+    },
+    "base122": {
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_gate_cumsum_preserves_original_dot_order[True-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[1-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[1-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[63-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[63-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[64-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[64-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[65-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[65-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[129-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_matches_original_64_core[129-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_varlen_keeps_activated_beta_and_vk_state[0.0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_varlen_keeps_activated_beta_and_vk_state[1.0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[False-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype0]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype1]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_matches_vllm_vk_state_slots[True-dtype2]": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_execution_error_propagates": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_model_head_dimension_128": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_model_head_dimension_128": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_model_decode_one_token_requests_preserve_1d_slots": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_decode_preserves_padded_mamba_cache_slot_stride": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_prefill_materializes_padded_initial_state_like_original": {
+        "type": null,
+        "message": "ModuleNotFoundError: No module named 'vllm.model_executor.layers.fla'"
+      },
+      "tests.test_kda_bounded::test_public_core_capabilities_are_available_in_validation_environment": {
+        "type": null,
+        "message": "assert False\n +  where False = <functools._lru_cache_wrapper object at 0xADDR>()\n +    where <functools._lru_cache_wrapper object at 0xADDR> = <function chunk_kda_with_safe_gate at 0xADDR>._is_available\n +      where <function chunk_kda_with_safe_gate at 0xADDR> = bounded.chunk_kda_with_safe_gate"
+      }
+    }
+  },
+  "raw_archive_sha256": "4049b5380b74c988482eada05dacbd170fcce8ca4334c53502087be5225c2982"
+}

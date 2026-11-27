@@ -1,0 +1,5 @@
+# Bad-words #1343 current native0.32 benchmark validation
+
+Main12210ab6 + PR head e655b413, tree3dd88c72, passed all6 original functional cases and all45 original native benchmark workloads (no quick/selection filtering). All native/candidate latencies were finite and positive;45/45 ratios>=0.9, minimum0.966507. Original independent expected-mask checks, native contract probe,25ms warmup and100ms repetitions were preserved. Actual installed vLLM0.32 bad_words.apply_bad_words was the benchmark reference, identity/source SHA verified.
+
+The source1808 members matched raw Git and before/after; the accuracy observer recorded actual context not poisoned; benchmark uses its own original conftest and does not invent such a flag. Container exited naturally and GPU4 was released. The supported but disabled CUDA128/vLLM0.20 lane has no fresh matched-environment result this round; previous results remain historical. Current0.32 success does not substitute for that separate profile or final GitHub CI/approval.

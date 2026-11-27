@@ -13,3 +13,5 @@ NVIDIA target: H20-3e, Torch2.13.0+cu130, vLLM0.32.0, FlagTree0.7.0/Triton3.6.0,
 Source PRs: https://github.com/flagos-ai/FlagGems-vllm/pull/1349, https://github.com/flagos-ai/FlagGems-vllm/pull/1351, https://github.com/flagos-ai/FlagGems-vllm/pull/1356, https://github.com/flagos-ai/FlagGems-vllm/pull/1361.
 
 Independent final-source #1356 and #1361 Linux CPU validation is in `results/ci-independent-1356-1361`: respectively 100 and104 positive tests, all validators/style checks and unchanged-main negative controls passed; original PR branches were synchronized by normal push. GitHub final-head required CI remains a separate condition.
+
+Additional current-main evidence: `mhc-1350` passes original G5 and12/12 native G6; `kda-1345` fixes the proven main namespace failure and passes original functional contracts; `badwords-1343` passes6 accuracy and45 native benchmarks on0.32; `kunlunxin-native-1248` preserves three native compiler failures and no accepted timing. See each folder for exact boundaries.
