@@ -131,3 +131,19 @@ def test_replay_reads_live_metadata(decode):
     out.fill_(float("nan"))
     graph.replay()
     assert torch.count_nonzero(out.cpu()).item() == 0
+
+
+@pytest.mark.minimax_m3_sparse_attn
+def test_empty_batch_clears_padded_rows():
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("Requires an Ascend NPU")
+    q = torch.ones(2, 1, 128, device="npu", dtype=torch.bfloat16)
+    kv = torch.empty(0, 128, 1, 128, device=q.device, dtype=q.dtype)
+    ids = torch.empty(1, 2, 0, device=q.device, dtype=torch.int32)
+    lens = torch.empty(0, device=q.device, dtype=torch.int32)
+    offsets = torch.zeros(1, device=q.device, dtype=torch.int32)
+    out = torch.full_like(q, float("nan"))
+    flaggems_vllm.minimax_m3_sparse_attn(
+        q, (kv, kv), ids, lens.view(0, 1), offsets, lens, lens, 0, 1, 1.0, out
+    )
+    assert torch.count_nonzero(out.cpu()).item() == 0

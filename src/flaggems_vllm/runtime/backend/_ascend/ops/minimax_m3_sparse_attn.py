@@ -43,6 +43,10 @@ def _sparse_gqa(
 ):
     row = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
+    d = tl.arange(0, BD)
+    if B == 0 or LIMIT == 0:
+        tl.store(Out + row * OS[0] + head * OS[1] + d * OS[2], 0.0, d < D)
+        return
     kh = head // G
     if DECODE:
         req = row // LIMIT
@@ -59,7 +63,6 @@ def _sparse_gqa(
         last = tl.minimum(
             tl.load(Prefix + req * PS) + local, tl.load(Seq + req * SS) - 1
         )
-    d = tl.arange(0, BD)
     q = tl.load(Q + row * QS[0] + head * QS[1] + d * QS[2], d < D, 0).to(tl.float32)
     acc = tl.full((BD,), 0, tl.float32)
     denom = 0.0
@@ -146,9 +149,6 @@ def separate_kv_attention(
     ):
         raise ValueError("Expected inference-only BF16 data on the query device")
     if rows and heads:
-        if not batch or not limit:
-            out.zero_()
-            return
         with torch.npu.device(q.device):
             _sparse_gqa[(rows, heads)](
                 q,
