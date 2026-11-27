@@ -2020,3 +2020,14 @@ flash_mla_sparse_fwd:
   - META: {BK: 64, BH: 64}
     num_warps: 8
     num_stages: 4
+
+hy4_flash_engram_row:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+  - META: {}
+    num_warps: 16
+    num_stages: 1

@@ -1524,6 +1524,116 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: hy4_flash_engram_gate
+  description: Compute the Engram key-query gate on normalized rows.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_engram_lookup_norm
+  description: Dequantize and normalize Engram lookup rows with invalid-hash masking.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_engram_residual
+  description: Normalize the Engram value signal and accumulate the gated residual.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_fwht_quant_fp8
+  description: Hadamard-transform 128-channel rows and quantize with FP32 power-of-two scales.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_gated_pool
+  description: Pool IndexPool rows with per-channel softmax weights and FP32 RMS normalization.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_gather_groups
+  description: Gather group members from prepared source rows in key and tail buffers.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_rotate_indexer
+  description: Apply RoPE to the trailing dimensions of 128-channel IndexPool rows.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_select_groups
+  description: Select the highest-scoring live IndexPool groups and return ascending group IDs.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_write_pool
+  description: Write active E4M3FN rows and FP32 scales into paged IndexPool cache storage.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
+- id: hy4_flash_write_tails
+  description: Write key and rotary-position rows into prepared tail cache slots.
+  for:
+  - Hy4Flash
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '0.3'
 - id: indexer_epilogue
   description: 'Fused post-topk epilogue for the GLM lightning indexer: expands the
 
