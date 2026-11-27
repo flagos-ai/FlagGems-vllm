@@ -99,8 +99,8 @@ FP8_NARROW_TIERS = (
     ),
     (
         64,
-        MoeTile(64, 128, 128, 4, 2, "cpasync", "unroll"),
-        MoeTile(64, 128, 64, 4, 3, "cpasync"),
+        MoeTile(64, 128, 128, 4, 4, "cpasync", "unroll"),
+        MoeTile(64, 128, 64, 4, 4, "cpasync"),
     ),
     # Dense batches whose w1 copy would exceed FP8_DEQUANT_MAX_BYTES.
     (
@@ -170,11 +170,13 @@ def decode_fp8_e4m3_words(
     ROWS: tl.constexpr,
     COLS: tl.constexpr,
     compute_type: tl.constexpr,
+    PROPAGATE_NAN: tl.constexpr = False,
 ):
     """int32 words of four K-consecutive E4M3FN bytes to [ROWS, COLS] values.
 
     Finite codes are exact; 0x7f / 0xff map to +/-480 (BF16) or +/-1.875 (FP16)
-    and are propagated to NaN by the caller via fold_fp8_nan_words.
+    unless PROPAGATE_NAN handles them during FP16 unpacking. Other paths use
+    fold_fp8_nan_words to propagate NaNs.
     """
     if compute_type == tl.bfloat16:
         # Arithmetic shifts; 0x87F00000 keeps sign and magnitude without rebias.
@@ -187,6 +189,10 @@ def decode_fp8_e4m3_words(
         sign_even = (word & 0x00800080) << 8
         even = ((word & 0x007F007F) << 7) | sign_even
         odd = ((word >> 1) & 0x3F803F80) | sign_odd
+        if PROPAGATE_NAN:
+            # For each FP16 halfword only E4M3FN magnitude 0x7f carries into bit 14.
+            even |= (even + 0x00800080) & 0x40004000
+            odd |= (odd + 0x00800080) & 0x40004000
         byte0 = even.to(tl.int16).to(compute_type, bitcast=True)
         byte2 = (even >> 16).to(tl.int16).to(compute_type, bitcast=True)
         byte1 = odd.to(tl.int16).to(compute_type, bitcast=True)
@@ -319,6 +325,7 @@ def moe_gemm_kernel(
     top_k: tl.constexpr,
     WEIGHT_BITS: tl.constexpr,
     PRESUM: tl.constexpr,
+    SORTED_ROW_GROUP: tl.constexpr = 0,
 ):
     """B is UINT4B8 or E4M3FN viewed as int32 words. Routes are padded per
     expert to ALIGN_BLOCK_M, a multiple of BLOCK_SIZE_M."""
@@ -326,6 +333,12 @@ def moe_gemm_kernel(
     pid = tl.program_id(axis=0)
     pid_m = pid // (N // (BLOCK_SIZE_N * N_TILES))
     pid_n = pid % (N // (BLOCK_SIZE_N * N_TILES))
+    if SORTED_ROW_GROUP:
+        # Adjacent row blocks reuse the same expert's W2 columns.
+        column_tiles: tl.constexpr = N // BLOCK_SIZE_N
+        group = pid // (SORTED_ROW_GROUP * column_tiles)
+        pid_m = group * SORTED_ROW_GROUP + pid % SORTED_ROW_GROUP
+        pid_n = (pid // SORTED_ROW_GROUP) % column_tiles
     if pid_m * BLOCK_SIZE_M >= tl.load(num_tokens_post_padded_ptr):
         return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -336,6 +349,14 @@ def moe_gemm_kernel(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_token[:, None] // top_k) * stride_am + offs_k[None, :]
+    if SORTED_ROW_GROUP:
+        a_ptrs = (
+            a_ptr
+            + (offs_token_id // 64)[:, None] * (64 * K)
+            + (offs_token_id % 64)[:, None] * BLOCK_SIZE_K
+            + offs_k[None, :]
+        )
+        c_ptrs = c_ptr + offs_token_id[:, None] * stride_cm + tl.arange(0, BLOCK_SIZE_N)
     # PRESUM: a_sum_ptr holds [rows, K // BLOCK_SIZE_K] activation sums.
     a_sum_ptrs = a_sum_ptr + (offs_token // top_k) * (K // BLOCK_SIZE_K)
     words_k: tl.constexpr = BLOCK_SIZE_K * WEIGHT_BITS // 32
@@ -344,7 +365,10 @@ def moe_gemm_kernel(
     b_ptrs = b_ptr + expert * stride_be + tl.arange(0, words_k)[None, :]
     scale_ptrs = b_scale_ptr + expert * stride_bse
     if MUL_ROUTED_WEIGHT:
-        route = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
+        if SORTED_ROW_GROUP:
+            route = tl.load(topk_weights_ptr + offs_token_id)
+        else:
+            route = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
     num_k_tiles: tl.constexpr = K // BLOCK_SIZE_K
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     if N_TILES == 1:
@@ -355,7 +379,10 @@ def moe_gemm_kernel(
         if WEIGHT_BITS == 8:
             nan_acc = tl.zeros((BLOCK_SIZE_N, nan_cols), dtype=tl.int32)
         for tile in tl.range(num_k_tiles):
-            activation = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            if SORTED_ROW_GROUP:
+                activation = tl.load(a_ptrs)
+            else:
+                activation = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
             scale = tl.load(scale_ptrs + tile * BLOCK_SIZE_K // GROUP_SIZE)
             word = tl.load(b_ptrs)
             if WEIGHT_BITS == 8:
@@ -375,7 +402,7 @@ def moe_gemm_kernel(
                 compute_type,
                 WEIGHT_BITS,
             )
-            a_ptrs += BLOCK_SIZE_K
+            a_ptrs += BLOCK_SIZE_K * (64 if SORTED_ROW_GROUP else 1)
             b_ptrs += words_k
         if WEIGHT_BITS == 8:
             col_has_nan = (
@@ -384,6 +411,9 @@ def moe_gemm_kernel(
             accumulator = tl.where(col_has_nan[None, :], float("nan"), accumulator)
         if MUL_ROUTED_WEIGHT:
             accumulator = accumulator * route[:, None]
+        if SORTED_ROW_GROUP:
+            tl.store(c_ptrs + pid_n * BLOCK_SIZE_N, accumulator.to(compute_type))
+            return
         tl.store(
             c_ptrs + pid_n * BLOCK_SIZE_N,
             accumulator.to(compute_type),
@@ -443,7 +473,7 @@ def moe_gemm_kernel(
             )
         if WEIGHT_BITS == 8:
             if tl.sum(((nan_any & -0x7F7F7F80) != 0).to(tl.int32)) != 0:
-                tl.store(nan_flag_ptr, 1)
+                tl.atomic_or(nan_flag_ptr, 1, sem="relaxed", scope="gpu")
         return
     if WEIGHT_BITS == 8:
         nan_any = tl.zeros((BLOCK_SIZE_N, nan_cols), dtype=tl.int32)
@@ -483,7 +513,7 @@ def moe_gemm_kernel(
             )
     if WEIGHT_BITS == 8:
         if tl.sum(((nan_any & -0x7F7F7F80) != 0).to(tl.int32)) != 0:
-            tl.store(nan_flag_ptr, 1)
+            tl.atomic_or(nan_flag_ptr, 1, sem="relaxed", scope="gpu")
 
 
 @triton.jit
@@ -576,6 +606,7 @@ def moe_gemv_kernel(
     FIRST: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     WEIGHT_BITS: tl.constexpr,
+    SPLIT_K: tl.constexpr = 1,
 ):
     """FIRST: SiLU(gate) * up of one route. Otherwise the sum of one token's
     top-k down projections, which replaces moe_sum. Both INT4 and FP8 weights
@@ -598,7 +629,13 @@ def moe_gemv_kernel(
         a_ptrs = a_ptr + (row // top_k if FIRST else route) * K + offs_k
         acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
         up = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-        for tile in tl.range(K // BLOCK_SIZE_K):
+        if SPLIT_K > 1:
+            split = tl.program_id(2)
+            first_k = split * (K // SPLIT_K)
+            a_ptrs += first_k
+            w_ptrs += first_k // 4
+            scale_ptrs += first_k // GROUP_SIZE
+        for tile in tl.range(K // (SPLIT_K * BLOCK_SIZE_K)):
             group = tile * BLOCK_SIZE_K // GROUP_SIZE
             a = tl.load(a_ptrs).to(tl.float32)[None, :]
             scale = tl.load(scale_ptrs + group).to(tl.float32)
@@ -627,6 +664,12 @@ def moe_gemv_kernel(
         if WEIGHT_BITS == 8:
             acc *= FP8_DECODE_SCALE
             up *= FP8_DECODE_SCALE
+        if SPLIT_K > 1:
+            has_nan = tl.sum(((nan_acc & -0x7F7F7F80) != 0).to(tl.int32), axis=1) != 0
+            base = out_ptr + (row * SPLIT_K + split) * (2 * N) + offs_n
+            tl.store(base, tl.where(has_nan, float("nan"), acc))
+            tl.store(base + N, up)
+            return
         if MUL_ROUTED_WEIGHT:
             route_weight = tl.load(topk_weights_ptr + route).to(tl.float32)
             acc *= route_weight
@@ -642,6 +685,27 @@ def moe_gemv_kernel(
         has_nan = tl.sum(((nan_acc & -0x7F7F7F80) != 0).to(tl.int32), axis=1) != 0
         total = tl.where(has_nan, float("nan"), total)
     tl.store(out_ptr + row * N + offs_n, total.to(compute_type))
+
+
+@triton.jit
+def combine_fp8_gemv_gate_up(
+    partial_ptr, weights_ptr, out_ptr, N: tl.constexpr, SPLIT_K: tl.constexpr,
+    BLOCK_N: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    split = tl.arange(0, SPLIT_K)
+    base = partial_ptr + (row * SPLIT_K + split[:, None]) * (2 * N) + col[None, :]
+    gate = tl.sum(tl.load(base), axis=0)
+    up = tl.sum(tl.load(base + N), axis=0)
+    if MUL_ROUTED_WEIGHT:
+        route = tl.load(weights_ptr + row)
+        gate *= route
+        up *= route
+    dtype: tl.constexpr = out_ptr.dtype.element_ty
+    gate = gate.to(dtype).to(tl.float32)
+    up = up.to(dtype).to(tl.float32)
+    tl.store(out_ptr + row * N + col, gate / (1.0 + tl.exp(-gate)) * up)
 
 
 @triton.jit
@@ -676,45 +740,89 @@ def dequantize_fp8_kernel(
 
 
 @triton.jit
-def dense_fp8_gate_up_chunk_kernel(
+def pack_fp8_gate_up_kernel(
+    weight_ptr,
+    scale_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    FUSE_SORTED: tl.constexpr = False,
+    PACK_WORDS: tl.constexpr = False,
+):
+    """Decode a live expert slice into contiguous GEMM tiles."""
+    pid = tl.program_id(0)
+    expert = tl.program_id(1).to(tl.int64)
+    n = (pid // (K // COLS)) * ROWS + tl.arange(0, ROWS)
+    k_start = (pid % (K // COLS)) * COLS
+    k = k_start + tl.arange(0, COLS)
+    source_n = n
+    if PACK_WORDS and FUSE_SORTED:
+        # Traverse the packed destination in order and read its gate/up partner.
+        half: tl.constexpr = TILE_N // 2
+        source_n = n // TILE_N * half + n % half + (n % TILE_N // half) * (N // 2)
+    row = expert * N + source_n
+    scale = tl.load(scale_ptr + row * (K // GROUP_SIZE) + k_start // GROUP_SIZE)
+    raw = tl.load(weight_ptr + row[:, None] * K + k[None, :])
+    if PACK_WORDS:
+        # E4M3FN has 128 magnitude codes. Decode this constant vector once
+        # per program, then use its entries for every row of the weight tile.
+        index = tl.arange(0, 128)
+        normal = ((index << 20) + 0x3c000000).to(tl.float32, bitcast=True)
+        table = tl.where(index < 8, index.to(tl.float32) * (2.0 ** -9), normal)
+        table = tl.where(index == 127, float("nan"), table)
+        magnitude = tl.reshape((raw & 127).to(tl.int32), (ROWS * COLS,))
+        decoded = tl.reshape(tl.gather(table, magnitude, axis=0), (ROWS, COLS))
+
+        scale32 = scale.to(tl.float32)
+        scale_hi = (scale32.to(tl.uint32, bitcast=True) >> 16).to(tl.uint16)
+        sign = ((raw.to(tl.uint16) << 8) ^ scale_hi[:, None]) & 0x8000
+        scale_mag = tl.where(scale32 != scale32, float("nan"), tl.abs(scale32))
+        bits = (decoded * scale_mag[:, None]).to(tl.uint32, bitcast=True)
+        rounded = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16).to(tl.uint16)
+        values = (rounded | sign).to(tl.bfloat16, bitcast=True)
+    else:
+        code = decode_fp8_e4m3(raw)
+        values = code.to(tl.float32) * (scale.to(tl.float32) * FP8_DECODE_SCALE)[:, None]
+    if FUSE_SORTED and not PACK_WORDS:
+        # Place the matching gate and up columns in the two halves of one tile.
+        half: tl.constexpr = TILE_N // 2
+        channel = n % (N // 2)
+        n = channel // half * TILE_N + (n // (N // 2)) * half + channel % half
+    tile = (n // TILE_N)[:, None] * (K // TILE_K) + (k // TILE_K)[None, :]
+    within = (n % TILE_N)[:, None] * TILE_K + (k % TILE_K)[None, :]
+    tl.store(out_ptr + expert * N * K + tile * TILE_N * TILE_K + within, values)
+
+
+@triton.jit
+def dense_fp8_gate_up_tile(
     a_ptr,
     b_ptr,
     c_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
-    num_tokens_post_padded_ptr,
+    pid_m,
+    pid_n,
     N: tl.constexpr,
     K: tl.constexpr,
     num_valid_tokens,
     stride_am,
     stride_be,
-    stride_bn,
     stride_cm,
     e_start,
-    e_end,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
     top_k: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    FUSE_SORTED: tl.constexpr = False,
 ):
-    """Dense BF16/FP16 gate/up GEMM for an expert slice [e_start, e_end)."""
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(tl.load(num_tokens_post_padded_ptr), BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    if pid >= num_pid_m * num_pid_n:
-        return
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
     expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if expert < e_start or expert >= e_end:
-        return
     local_e = expert - e_start
     offs_token = tl.load(
         sorted_token_ids_ptr
@@ -725,19 +833,177 @@ def dense_fp8_gate_up_chunk_kernel(
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_token[:, None] // top_k) * stride_am + offs_k[None, :]
-    b_ptrs = b_ptr + local_e * stride_be + offs_n[:, None] * stride_bn + offs_k[None, :]
+    b_ptrs = (
+        b_ptr
+        + local_e * stride_be
+        + pid_n * BLOCK_SIZE_N * K
+        + tl.arange(0, BLOCK_SIZE_N)[:, None] * BLOCK_SIZE_K
+        + offs_k[None, :]
+    )
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in tl.range(K // BLOCK_SIZE_K):
         act = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
         weight = tl.load(b_ptrs)
-        acc += tl.dot(act, tl.trans(weight), allow_tf32=False)
+        acc = tl.dot(act, tl.trans(weight), acc, allow_tf32=False)
         a_ptrs += BLOCK_SIZE_K
-        b_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_N * BLOCK_SIZE_K
     if MUL_ROUTED_WEIGHT:
         route = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         acc *= route[:, None]
+    if FUSE_SORTED:
+        half: tl.constexpr = BLOCK_SIZE_N // 2
+        pair = tl.permute(tl.reshape(acc, (BLOCK_SIZE_M, 2, half)), (0, 2, 1))
+        gate, up = tl.split(pair)
+        gate = gate.to(a_ptr.dtype.element_ty).to(tl.float32)
+        up = up.to(a_ptr.dtype.element_ty).to(tl.float32)
+        activated = tl.fdiv(gate, 1.0 + tl.exp(-gate)) * up
+        row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        # W2 consumes contiguous tiles of 64 routes by 64 input channels.
+        offset = (
+            (row // 64)[:, None] * (64 * stride_cm)
+            + pid_n * (64 * half)
+            + (row % 64)[:, None] * half
+            + tl.arange(0, half)[None, :]
+        )
+        tl.store(c_ptr + offset, activated)
+        return
     c_ptrs = c_ptr + offs_token[:, None] * stride_cm + offs_n[None, :]
     tl.store(c_ptrs, acc.to(a_ptr.dtype.element_ty), mask=token_mask[:, None])
+
+
+@triton.jit
+def dense_fp8_gate_up_chunk_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    expert_offsets_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    num_valid_tokens,
+    stride_am,
+    stride_be,
+    stride_cm,
+    e_start,
+    e_end,
+    START_TILE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    top_k: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    FUSE_SORTED: tl.constexpr = False,
+    ROW_GROUP: tl.constexpr = 1,
+):
+    """Dense BF16/FP16 gate/up GEMM for an expert slice [e_start, e_end)."""
+    first = tl.load(expert_offsets_ptr + e_start) // BLOCK_SIZE_M
+    end = tl.load(expert_offsets_ptr + e_end) // BLOCK_SIZE_M
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    tile = START_TILE + tl.program_id(0)
+    if ROW_GROUP > 1:
+        group_start = tile // (ROW_GROUP * num_pid_n) * ROW_GROUP
+        row_tile = group_start + tile % ROW_GROUP
+        col_tile = tile // ROW_GROUP % num_pid_n
+        tile = row_tile * num_pid_n + col_tile
+    limit = (end - first) * num_pid_n
+    if tile >= limit:
+        return
+    if START_TILE == 0:
+        dense_fp8_gate_up_tile(
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            topk_weights_ptr,
+            sorted_token_ids_ptr,
+            expert_ids_ptr,
+            first + tile // num_pid_n,
+            tile % num_pid_n,
+            N,
+            K,
+            num_valid_tokens,
+            stride_am,
+            stride_be,
+            stride_cm,
+            e_start,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            top_k,
+            MUL_ROUTED_WEIGHT,
+            FUSE_SORTED,
+        )
+    else:
+        while tile < limit:
+            dense_fp8_gate_up_tile(
+                a_ptr,
+                b_ptr,
+                c_ptr,
+                topk_weights_ptr,
+                sorted_token_ids_ptr,
+                expert_ids_ptr,
+                first + tile // num_pid_n,
+                tile % num_pid_n,
+                N,
+                K,
+                num_valid_tokens,
+                stride_am,
+                stride_be,
+                stride_cm,
+                e_start,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                top_k,
+                MUL_ROUTED_WEIGHT,
+                FUSE_SORTED,
+            )
+            tile += tl.num_programs(0)
+
+
+@triton.jit
+def packed_sorted_down_kernel(
+    activated, weight, routed, sorted_weights, experts, total,
+    WIDTH: tl.constexpr, HIDDEN: tl.constexpr, K: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+):
+    """Multiply sorted 64x64 activation panels by packed BF16 expert weights."""
+    pid = tl.program_id(0)
+    pid_m = pid // (WIDTH // BN)
+    pid_n = pid % (WIDTH // BN)
+    if pid_m * BM >= tl.load(total):
+        return
+    expert = tl.load(experts + pid_m)
+    row = pid_m * BM + tl.arange(0, BM)
+    col = pid_n * BN + tl.arange(0, BN)
+    k = tl.arange(0, BK)
+    a = activated + (row // 64)[:, None] * (64 * K) + (row % 64)[:, None] * BK + k[None, :]
+    b = weight + expert * (HIDDEN * K) + pid_n * (BN * K)
+    b += tl.arange(0, BN)[:, None] * BK + k[None, :]
+    acc = tl.full((BM, BN), 0, tl.float32)
+    for _ in tl.range(K // BK):
+        act = tl.load(a)
+        w = tl.load(b)
+        acc = tl.dot(act, tl.trans(w), acc)
+        a += 64 * BK
+        b += BN * BK
+    if MUL_ROUTED_WEIGHT:
+        acc *= tl.load(sorted_weights + row)[:, None]
+    tl.store(routed + row[:, None] * WIDTH + col[None, :], acc)
+
+
+@triton.jit
+def index_sorted_routes_kernel(
+    ids, total, inverse, weights, sorted_weights, num_routes, BLOCK_SIZE: tl.constexpr,
+):
+    pos = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = pos < tl.load(total)
+    route = tl.load(ids + pos, mask=valid, other=num_routes)
+    tl.store(inverse + route, pos, mask=route < num_routes)
+    weight = tl.load(weights + route, mask=route < num_routes, other=0.0)
+    tl.store(sorted_weights + pos, weight, mask=valid)
 
 
 @triton.jit
@@ -748,6 +1014,7 @@ def strided_sum_routes_kernel(
     output_stride_m,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    inverse=None,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     offs = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -755,7 +1022,12 @@ def strided_sum_routes_kernel(
     base = routed_ptr + token_idx * TOPK * width + offs
     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
     for slot in tl.static_range(0, TOPK):
-        acc += tl.load(base + slot * width, mask=mask, other=0.0).to(tl.float32)
+        if inverse is None:
+            src = base + slot * width
+        else:
+            row = tl.load(inverse + token_idx * TOPK + slot)
+            src = routed_ptr + row * width + offs
+        acc += tl.load(src, mask=mask, other=0.0).to(tl.float32)
     tl.store(
         output_ptr + token_idx * output_stride_m + offs,
         acc.to(output_ptr.dtype.element_ty),
@@ -822,15 +1094,21 @@ def align_routes(
         and num_experts <= MAX_GROUPED_ALIGN_EXPERTS
     ):
         return atomic_align_routes(topk_ids, block_m, num_experts)
+    alignment, _ = align_routes_with_offsets(topk_ids, block_m, num_experts)
+    return alignment
+
+
+def align_routes_with_offsets(topk_ids, block_m, num_experts):
     # Zero the aligner's cumsum and count buffers with Triton, not Torch.
     workspace = topk_ids.new_empty(((num_experts + 1) ** 2,), dtype=torch.int32)
     zero_workspace_kernel[(triton.cdiv(workspace.numel(), 1024),)](
         workspace, workspace.numel(), BLOCK=1024
     )
     cumsum, counts = workspace.split([num_experts + 1, num_experts * (num_experts + 1)])
-    return moe_align_block_size_no_tle(
+    alignment = moe_align_block_size_no_tle(
         topk_ids, block_m, num_experts, workspace=(cumsum, counts)
     )
+    return alignment, cumsum
 
 
 @triton.jit
@@ -922,6 +1200,7 @@ def launch_gemm(
     mul_routed_weight,
     top_k,
     group_size,
+    sorted_weights=None,
 ):
     out_features, reduction = weight.shape[1], activation.shape[1]
     num_routes = topk_weights.numel()
@@ -949,9 +1228,11 @@ def launch_gemm(
             nan_flag = activation.new_zeros((1,), dtype=torch.int32)
     else:
         nan_flag = alignment[2]
-    num_programs = triton.cdiv(problem_m, tile.block_m) * (
-        out_features // (tile.block_n * n_tiles)
-    )
+    row_tiles = triton.cdiv(problem_m, tile.block_m)
+    sorted_row_group = 8 if sorted_weights is not None else 0
+    if sorted_row_group:
+        row_tiles = triton.cdiv(row_tiles, sorted_row_group) * sorted_row_group
+    num_programs = row_tiles * (out_features // (tile.block_n * n_tiles))
     weight_words = weight.view(torch.int32)
     moe_gemm_kernel[(num_programs,)](
         activation,
@@ -959,7 +1240,7 @@ def launch_gemm(
         output,
         scale,
         activation_sums,
-        topk_weights,
+        topk_weights if sorted_weights is None else sorted_weights,
         *alignment,
         nan_flag,
         out_features,
@@ -981,6 +1262,7 @@ def launch_gemm(
         top_k=top_k,
         WEIGHT_BITS=4 if is_int4 else 8,
         PRESUM=presum,
+        SORTED_ROW_GROUP=sorted_row_group,
         num_warps=tile.num_warps,
         num_stages=tile.num_stages,
         pipeline=tile.pipeline,
@@ -1021,14 +1303,26 @@ def launch_gemv(activation, weight, scale, topk_ids, topk_weights, output, **kw)
             block_n = 32
         else:
             block_n = 16
+    # A handful of routes leaves the long gate/up reduction underoccupied.
+    split_k = 1
+    if (
+        not is_int4 and kw["FIRST"] and activation.dtype == torch.bfloat16
+        and activation.shape[0] <= 4 and activation.shape[1] == 4096
+        and width == 256 and kw["top_k"] == 6 and kw["GROUP_SIZE"] == 128
+    ):
+        split_k = 4
+    partial = (
+        output.new_empty((num_rows, split_k, 2, width), dtype=torch.float32)
+        if split_k > 1 else output
+    )
     weight = weight.view(torch.int32)
-    moe_gemv_kernel[(num_rows, width // block_n)](
+    moe_gemv_kernel[(num_rows, width // block_n, split_k)](
         activation,
         weight,
         scale,
         topk_ids,
         topk_weights,
-        output,
+        partial,
         width,
         activation.shape[1],
         weight.stride(0),
@@ -1039,8 +1333,13 @@ def launch_gemv(activation, weight, scale, topk_ids, topk_weights, output, **kw)
         BLOCK_SIZE_K=GEMV_BLOCK_K,
         WEIGHT_BITS=4 if is_int4 else 8,
         num_warps=4,
+        SPLIT_K=split_k,
         **kw,
     )
+    if split_k > 1:
+        combine_fp8_gemv_gate_up[(num_rows, width // block_n)](
+            partial, topk_weights, output, width, split_k, block_n, kw["MUL_ROUTED_WEIGHT"]
+        )
 
 
 def choose_balanced_tile(total_cols, max_cols, align):
@@ -1081,10 +1380,12 @@ def run_dense_fp8_gate_up(
     topk_weights,
     alignment,
     *,
+    expert_offsets,
     w1_experts,
     group_size,
     top_k,
     router_on_input,
+    fuse_sorted=False,
 ):
     num_tokens, hidden_size = hs.shape
     num_experts, fused_intermediate, _ = w1.shape
@@ -1111,41 +1412,73 @@ def run_dense_fp8_gate_up(
     block_m = FP8_DENSE_GATE_UP["BLOCK_SIZE_M"]
     block_n = FP8_DENSE_GATE_UP["BLOCK_SIZE_N"]
     block_k = FP8_DENSE_GATE_UP["BLOCK_SIZE_K"]
-    grid = (
-        triton.cdiv(alignment[0].shape[0], block_m) * (fused_intermediate // block_n),
-    )
+    column_tiles = fused_intermediate // block_n
+    if fuse_sorted:
+        # Each expert half can receive all routes when a captured graph replays.
+        # Schedule four adjacent row tiles per column to reuse expert weights.
+        row_group = 4 if num_tokens == 16384 else 1
+        row_tiles = triton.cdiv(alignment[1].numel(), row_group) * row_group
+        launches = ((0, row_tiles * column_tiles),)
+    else:
+        main_tiles = (
+            triton.cdiv(alignment[1].numel(), triton.cdiv(num_experts, w1_experts))
+            * column_tiles
+        )
+        launches = ((0, main_tiles), (main_tiles, min(main_tiles, 256)))
+    # Load a full quantization segment per row for the common group-128 path.
+    pack_rows, pack_cols = 64, 128
     for e_start in range(0, num_experts, w1_experts):
         e_end = min(e_start + w1_experts, num_experts)
         chunk_e = e_end - e_start
         w1_buf = w1_scratch[: chunk_e * fused_intermediate * hidden_size].view(
             chunk_e, fused_intermediate, hidden_size
         )
-        dequantize_fp8(w1[e_start:e_end], s1[e_start:e_end], group_size, w1_buf)
-        dense_fp8_gate_up_chunk_kernel[grid](
-            hs,
+        pack_fp8_gate_up_kernel[
+            ((fused_intermediate // pack_rows) * (hidden_size // pack_cols), chunk_e)
+        ](
+            w1[e_start:e_end].view(torch.uint8),
+            s1[e_start:e_end],
             w1_buf,
-            gate_up,
-            topk_weights,
-            *alignment,
             fused_intermediate,
             hidden_size,
-            num_routes,
-            hs.stride(0),
-            w1_buf.stride(0),
-            w1_buf.stride(1),
-            gate_up.stride(0),
-            e_start,
-            e_end,
-            BLOCK_SIZE_M=block_m,
-            BLOCK_SIZE_N=block_n,
-            BLOCK_SIZE_K=block_k,
-            GROUP_SIZE_M=FP8_DENSE_GATE_UP["GROUP_SIZE_M"],
-            top_k=top_k,
-            MUL_ROUTED_WEIGHT=router_on_input,
-            num_warps=FP8_DENSE_GATE_UP["num_warps"],
-            num_stages=FP8_DENSE_GATE_UP["num_stages"],
-            pipeline=FP8_DENSE_GATE_UP["pipeline"],
+            group_size,
+            block_n,
+            block_k,
+            FUSE_SORTED=fuse_sorted,
+            ROWS=pack_rows,
+            COLS=pack_cols,
+            PACK_WORDS=fuse_sorted and num_tokens == 16384,
+            num_warps=4,
         )
+        for start_tile, workers in launches:
+            dense_fp8_gate_up_chunk_kernel[(workers,)](
+                hs,
+                w1_buf,
+                gate_up,
+                topk_weights,
+                alignment[0],
+                alignment[1],
+                expert_offsets,
+                fused_intermediate,
+                hidden_size,
+                num_routes,
+                hs.stride(0),
+                w1_buf.stride(0),
+                gate_up.stride(0),
+                e_start,
+                e_end,
+                FUSE_SORTED=fuse_sorted,
+                START_TILE=start_tile,
+                ROW_GROUP=row_group if fuse_sorted else 1,
+                BLOCK_SIZE_M=block_m,
+                BLOCK_SIZE_N=block_n,
+                BLOCK_SIZE_K=block_k,
+                top_k=top_k,
+                MUL_ROUTED_WEIGHT=router_on_input,
+                num_warps=FP8_DENSE_GATE_UP["num_warps"],
+                num_stages=FP8_DENSE_GATE_UP["num_stages"],
+                pipeline=FP8_DENSE_GATE_UP["pipeline"],
+            )
 
 
 def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options):
@@ -1227,10 +1560,30 @@ def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options)
             tier for tier in tiers if routes_per_expert <= tier[0]
         )
         align_block_m = max(gate_up_tile.block_m, down_tile_cfg.block_m)
-    alignment = align_routes(
-        topk_ids, align_block_m, num_experts, use_atomic=not is_int4
+    expert_offsets = None
+    if 0 < w1_experts < num_experts:
+        alignment, expert_offsets = align_routes_with_offsets(
+            topk_ids, align_block_m, num_experts
+        )
+    else:
+        alignment = align_routes(
+            topk_ids, align_block_m, num_experts, use_atomic=not is_int4
+        )
+    fuse_sorted = (
+        hs.dtype == torch.bfloat16
+        and num_tokens in (13021, 16384)
+        and (num_experts, hidden_size, fused_intermediate, top_k) == (256, 4096, 512, 6)
+        and group_size == 128
+        and w1_experts == 128
+        and FP8_DENSE_GATE_UP["BLOCK_SIZE_N"] // 2 == down_tile_cfg.block_k == 64
+        and down_tile_cfg.n_tiles == 1
     )
-    gate_up = hs.new_empty((num_routes, fused_intermediate))
+    if fuse_sorted:
+        route_rows = alignment[1].numel() * align_block_m
+        gate_up = hs.new_empty((route_rows, intermediate_size))
+    else:
+        route_rows = num_routes
+        gate_up = hs.new_empty((route_rows, fused_intermediate))
     common = dict(top_k=top_k, align_block_m=align_block_m, group_size=group_size)
     if w1_experts > 0:
         run_dense_fp8_gate_up(
@@ -1240,7 +1593,9 @@ def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options)
             gate_up,
             topk_weights,
             alignment,
+            expert_offsets=expert_offsets,
             w1_experts=w1_experts,
+            fuse_sorted=fuse_sorted,
             group_size=group_size,
             top_k=top_k,
             router_on_input=router_on_input,
@@ -1259,10 +1614,23 @@ def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options)
         )
     # Allocate activated after stage 1 frees any w1 scratch, then free gate_up
     # before allocating the down-projection routing buffer.
-    activated = hs.new_empty((num_routes, intermediate_size))
-    silu_and_mul_out(*gate_up.chunk(2, dim=-1), activated)
+    inverse = None
+    sorted_weights = None
+    if fuse_sorted:
+        activated = gate_up
+        inverse = topk_ids.new_empty((num_routes,), dtype=torch.int32)
+        sorted_weights = topk_weights.new_empty((route_rows,))
+        index_sorted_routes_kernel[(triton.cdiv(route_rows, 256),)](
+            alignment[0], alignment[2], inverse, topk_weights, sorted_weights,
+            num_routes, BLOCK_SIZE=256,
+        )
+    else:
+        activated = hs.new_empty((num_routes, intermediate_size))
+        silu_and_mul_out(*gate_up.chunk(2, dim=-1), activated)
     del gate_up
-    activated_bytes = num_routes * intermediate_size * elem_size
+    activated_bytes = route_rows * intermediate_size * elem_size
+    if inverse is not None:
+        activated_bytes += num_routes * 4 + route_rows * sorted_weights.element_size()
     down_budget = DOWN_ROUTE_MAX_BYTES
     if w1_experts > 0:
         down_budget = min(
@@ -1275,30 +1643,59 @@ def run_quant_moe(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, **options)
                 - align_bytes,
             ),
         )
-    route_col_bytes = num_routes * elem_size
+    route_col_bytes = route_rows * elem_size
     down_cols = choose_balanced_tile(
         hidden_size, down_budget // route_col_bytes, down_tile_cfg.block_n
     )
     if down_cols == 0:
         down_cols = down_tile_cfg.block_n
-    routed_scratch = hs.new_empty((num_routes * down_cols,))
+    packed_w2 = None
+    packed_bytes = w2.numel() * elem_size
+    if (
+        fuse_sorted and num_tokens == 16384
+        and output_bytes + activated_bytes + align_bytes + route_col_bytes * down_cols
+        + packed_bytes <= FP8_DENSE_MAX_WORKSPACE_BYTES
+    ):
+        packed_w2 = hs.new_empty((w2.numel(),))
+        pack_fp8_gate_up_kernel[((hidden_size // 64) * (intermediate_size // 128), num_experts)](
+            w2.view(torch.uint8), s2, packed_w2, hidden_size, intermediate_size,
+            group_size, 128, 64, ROWS=64, COLS=128, PACK_WORDS=True, num_warps=4,
+        )
+    routed_scratch = hs.new_empty((route_rows * down_cols,))
     common["top_k"] = 1
     for col in range(0, hidden_size, down_cols):
         stop = min(col + down_cols, hidden_size)
         width = stop - col
-        routed = routed_scratch[: num_routes * width].view(num_tokens, top_k, width)
-        launch_gemm(
-            activated,
-            w2[:, col:stop],
-            s2[:, col:stop],
-            routed,
-            topk_weights,
-            alignment,
-            tile=down_tile_cfg,
-            mul_routed_weight=not router_on_input,
-            **common,
-        )
-        sum_routes(routed, output if width == hidden_size else output[:, col:stop])
+        # launch_gemm obtains the route stride from the penultimate dimension.
+        routed = routed_scratch[: route_rows * width].view(route_rows, 1, width)
+        if packed_w2 is not None:
+            packed_sorted_down_kernel[(alignment[1].numel() * (width // 128),)](
+                activated, packed_w2[col * intermediate_size:], routed, sorted_weights,
+                alignment[1], alignment[2], width, hidden_size, intermediate_size,
+                128, 128, 64, not router_on_input,
+                num_warps=4, num_stages=4, pipeline="cpasync", scenario="outerStage2;unroll",
+            )
+        else:
+            launch_gemm(
+                activated,
+                w2[:, col:stop],
+                s2[:, col:stop],
+                routed,
+                topk_weights,
+                alignment,
+                tile=down_tile_cfg,
+                sorted_weights=sorted_weights,
+                mul_routed_weight=not router_on_input,
+                **common,
+            )
+        output_slice = output if width == hidden_size else output[:, col:stop]
+        if fuse_sorted:
+            strided_sum_routes_kernel[(num_tokens, triton.cdiv(width, 1024))](
+                routed, output_slice, width, output.stride(0), top_k, 1024,
+                inverse, num_warps=4,
+            )
+        else:
+            sum_routes(routed.view(num_tokens, top_k, width), output_slice)
     return output
 
 
@@ -1348,6 +1745,16 @@ def check_inputs(hs, w1, w2, s1, s2, topk_weights, topk_ids, output, group_size,
             raise ValueError("output must match hidden_states shape and dtype")
     if any(t.device != hs.device or not t.is_contiguous() for t in tensors):
         raise ValueError("MoE tensors must be contiguous and on one device")
+    # Gate/up consumes all activations before any output write, so hs may alias.
+    if (
+        output is not None
+        and output.numel()
+        and any(
+            metax_fused_moe._overlaps(output, tensor)
+            for tensor in (w1, w2, s1, s2, topk_weights, topk_ids)
+        )
+    ):
+        raise ValueError("output overlaps a weight, scale or routing tensor")
     if any(w.storage_offset() % 4 or w.data_ptr() % 4 for w in (w1, w2)):
         raise ValueError("weight tensors must be 4-byte aligned")
 
@@ -1389,7 +1796,13 @@ def fused_marlin_moe(
     clamp_limit: Optional[float] = None,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """UINT4B8 or FP8 E4M3 SwiGLU MoE with A16 activations."""
+    """UINT4B8 or FP8 E4M3 SwiGLU MoE with A16 activations.
+
+    Weights use [E, N, K / pack] and scales use [E, N, K / group_size].
+    group_size is a positive multiple of 128 dividing both projection K sizes.
+    workspace, intermediate_cache13 and intermediate_cache2 are compatibility
+    arguments. This backend allocates its own temporary buffers.
+    """
     if quant_type_id not in (QUANT_TYPE_UINT4B8, QUANT_TYPE_FP8_E4M3):
         raise NotImplementedError(
             f"MetaX does not support quant_type_id {quant_type_id}"
@@ -1469,6 +1882,7 @@ def fused_marlin_moe_w4a16_int4(
     inplace=False,
     swap_ab=True,
 ):
+    """Run INT4 MoE. MetaX chooses its layout internally and ignores swap_ab."""
     return fused_marlin_moe(
         hidden_states,
         w1,
