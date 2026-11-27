@@ -34,12 +34,16 @@ from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention.config imp
 )
 from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention.decode import (
     _zero_decode_split_counters,
+    launch_decode_page_tiles,
 )
 from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention.direct import (
     launch_direct,
 )
 from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention.persistent import (
     launch_persistent,
+)
+from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention.prefill import (
+    pack_prefill_pages,
 )
 from flaggems_vllm.runtime.backend._nvidia.hopper.ops.flash_attention.scheduling import (
     MIN_EXPLICIT_SPLIT_K,
@@ -244,6 +248,35 @@ def launch_attention(
             and out.device == q.device
             and out.stride(-1) == 1
         )
+
+    # Reuse each staged KV page across many causal query tiles. Limit the
+    # temporary K/V pair to 64 MiB and the prefix reduction to a small batch.
+    if (
+        is_paged
+        and q.dtype == torch.bfloat16
+        and causal
+        and head_dim == 128
+        and num_heads == 4 * num_heads_k
+        and k.size(1) == 16
+        and k.is_contiguous()
+        and 1 <= batch_size <= 16
+        and total_q == batch_size * max_seqlen_q
+        and 1024 <= max_seqlen_q == max_seqlen_k
+        and batch_size * max_seqlen_k * num_heads_k * head_dim * 4 <= 64 * 1024**2
+        and requested_window[0] < 0
+        and requested_window[1] < 0
+        and num_splits == 0
+        and softcap == 0
+        and alibi_slopes is None
+        and s_aux is None
+        and _tma_strides_are_aligned(q)
+        and (out is None or _tma_strides_are_aligned(out))
+    ):
+        with torch_device_fn.device(q.device):
+            k, v, cu_seqlens_k = pack_prefill_pages(
+                k, v, block_table, seqused_k, max_seqlen_k
+            )
+        block_table, seqused_k, is_paged = None, None, False
 
     # The seqused-K specialization never reads cu_seqlens_k.  Reuse the always
     # valid Q prefix tensor instead of allocating a device-side ABI placeholder.
@@ -515,6 +548,39 @@ def launch_attention(
             # Every kernel reads this pointer behind STORE_LSE.  A valid existing
             # tensor avoids allocating an output that the public API will discard.
             lse_ptr = q
+
+        # At one 128-token tile per split there is no online loop. Uniform
+        # single-token Q also makes its prefix sums implicit in the batch ID.
+        if (
+            is_paged
+            and gqa_decode
+            and total_q == batch_size
+            and num_splits == 0
+            and q.dtype == torch.bfloat16
+            and head_dim == 128
+            and plain_scores
+            and not is_s_aux
+            and adjusted_scale_softmax > 0
+            and gqa_ratio == 4
+            and 1 < direct_num_splits <= 16
+            and direct_num_splits == _ceil_div(max_seqlen_k, 128)
+        ):
+            launch_decode_page_tiles(
+                q,
+                k,
+                v,
+                page_table,
+                seqused_k,
+                out,
+                lse,
+                _get_decode_split_counter(
+                    out, direct_num_splits, batch_size * num_heads_k
+                ),
+                direct_num_splits,
+                adjusted_scale_softmax,
+                not (can_use_int32_index(k) and can_use_int32_index(v)),
+            )
+            return (out, lse) if return_softmax_lse else out
 
         # Keep one compact FA3 ABI shared by the direct and persistent kernels.
         # K/V matching strides are validated during input preparation, so the
