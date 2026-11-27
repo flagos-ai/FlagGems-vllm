@@ -71,6 +71,8 @@ def _get_supported_dtypes():
     if VENDOR == "thead":
         # The PPU DeepGEMM expert path only accepts bfloat16 weights.
         return [torch.bfloat16]
+    if VENDOR == "mthreads":
+        return [torch.bfloat16]
     return [torch.bfloat16, torch.float16]
 
 
@@ -363,31 +365,35 @@ def mthreads_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
     topk = topk_ids.shape[1]
     # Production passes int32 routing ids; the DeepGEMM gate rejects int64.
     topk_ids = topk_ids.to(torch.int32)
-    key = (
-        hidden_states.shape[0],
+    struct_key = (
+        num_experts,
         hidden_size,
         intermediate_size,
-        num_experts,
         topk,
         hidden_states.dtype,
-        w1.data_ptr(),
-        w2.data_ptr(),
     )
-    if key != _CACHE["key"]:
+    # Reuse the layer for every token count sharing the same expert geometry;
+    # rebuilding it per shape retains too much vLLM workspace on MUSA.
+    if struct_key != _CACHE.get("mthreads_struct"):
         _CACHE["layer"] = None
+        torch.musa.empty_cache()
         _build_layer(
             num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
         )
-        _CACHE["key"] = key
-        experts = _CACHE["experts"]
+        _CACHE["mthreads_struct"] = struct_key
+        _CACHE["mthreads_weight_key"] = None
+
+    experts = _CACHE["experts"]
+    weight_key = (w1.data_ptr(), w2.data_ptr(), hidden_states.dtype)
+    if weight_key != _CACHE.get("mthreads_weight_key"):
         with set_current_vllm_config(_CACHE["ctx"]):
-            experts.w13_weight.data.copy_(w1)
-            experts.w2_weight.data.copy_(w2)
+            experts.w13_weight.data = w1
+            experts.w2_weight.data = w2
             experts.quant_method.process_weights_after_loading(experts)
             if hasattr(experts, "ensure_moe_quant_config_init"):
                 experts.ensure_moe_quant_config_init()
+        _CACHE["mthreads_weight_key"] = weight_key
 
-    experts = _CACHE["experts"]
     ctx = _CACHE["ctx"]
     with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
         return experts.quant_method.forward_oot(
