@@ -1735,6 +1735,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: lora_shrink
+  description: Project hidden states into each token's LoRA rank space and write the scaled results in place.
+  for:
+  - vllm.lora.ops.triton_ops.lora_shrink_op.lora_shrink
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - BLAS
+  stages:
+  - beta: '0.3'
 - id: mamba_mixer
   description: Triton implementation of the Mamba mixer operator for vLLM inference.
   for:

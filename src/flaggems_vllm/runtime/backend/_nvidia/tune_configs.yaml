@@ -2087,3 +2087,41 @@ fused_kimi_k3_mla_decode_q_concat_kv_cache_insert:
   - META: {}
     num_warps: 4
     num_stages: 1
+
+lora_shrink_zero:
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
+lora_shrink_gemv:
+  - META: {BLOCK_R: 4, BLOCK_K: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_R: 1, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_R: 4, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+
+lora_shrink_grouped:
+  - META: {BLOCK_M: 16, BLOCK_R: 16, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16, BLOCK_R: 16, BLOCK_K: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_R: 32, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 3
+
+lora_shrink_reduce:
+  - META: {BLOCK_M: 8, BLOCK_R: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16, BLOCK_R: 32}
+    num_warps: 4
+    num_stages: 1
