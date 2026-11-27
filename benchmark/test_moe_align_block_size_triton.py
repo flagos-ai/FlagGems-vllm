@@ -84,6 +84,10 @@ class MoeAlignBlockSizeBenchmark(base.GenericBenchmark4DOnly):
 
 @pytest.mark.moe_align_block_size_triton
 @pytest.mark.skipif(not HAS_VLLM, reason="vllm not installed")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "enflame",
+    reason="vLLM native ref is unsupported on enflame",
+)
 def test_moe_align_block_size_triton():
     gems_op = flaggems_vllm.moe_align_block_size_triton
     bench = MoeAlignBlockSizeBenchmark(

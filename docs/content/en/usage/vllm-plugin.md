@@ -30,7 +30,7 @@ Install all three components in order:
 
 ```bash
 # 1. FlagGems (general operators, version 5.4.0)
-pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 
 # 2. FlagGems-vllm (vLLM operators)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git

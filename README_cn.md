@@ -53,7 +53,7 @@ vLLM
 ```shell
 python -m pip install -U "setuptools>=64,<82" wheel packaging
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 python -m pip install --no-build-isolation -e .
 ```
 

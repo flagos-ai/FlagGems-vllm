@@ -40,3 +40,48 @@ def test_moe_sum(shape, dtype):
     flaggems_vllm.moe_sum(inp1, res_out)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
+
+
+@pytest.mark.moe_sum
+@pytest.mark.parametrize("mapped", [False, True])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_moe_sum_excludes_invalid_routes(mapped, index_dtype):
+    if flaggems_vllm.vendor_name != "nvidia":
+        pytest.skip("CUDA routed reduction test")
+    device = flaggems_vllm.device
+    values = torch.ones((2, 4, 13), dtype=torch.bfloat16, device=device)
+    output = torch.empty((2, 13), dtype=values.dtype, device=device)
+    ids = torch.empty((2, 8), dtype=index_dtype, device=device)[:, ::2]
+    expert_map = torch.tensor([-1, 1, 0], dtype=torch.int32, device=device)
+    active_map = expert_map if mapped else None
+
+    def prepare(state):
+        rows = ((-1, 0, 1, 2), (-1, -1, -1, -1))
+        if state:
+            rows = ((-1, -1, -1, -1), (2, 1, -1, 0))
+        ids.copy_(torch.tensor(rows, dtype=index_dtype, device=device))
+        valid = ids >= 0
+        if mapped:
+            valid &= ids != 0
+        values.copy_(torch.where(valid[..., None], 2.0, float("nan")))
+        output.fill_(float("nan"))
+        return (2 * valid.sum(-1, keepdim=True)).expand_as(output).to(output.dtype)
+
+    expected = prepare(False)
+    flaggems_vllm.moe_sum(values, output, ids, active_map)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    if (
+        hasattr(torch.ops._moe_C, "moe_sum")
+        and len(torch.ops._moe_C.moe_sum.default._schema.arguments) == 4
+    ):
+        native = torch.empty_like(output)
+        torch.ops._moe_C.moe_sum(values, native, ids, active_map)
+        torch.testing.assert_close(native, expected, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flaggems_vllm.moe_sum(values, output, ids, active_map)
+    for state in (False, True, False):
+        expected = prepare(state)
+        graph.replay()
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)

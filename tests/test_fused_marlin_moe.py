@@ -458,7 +458,14 @@ def _quantize_mxfp4(w_2d, group_size):
     wn = wg / scale
     sign = wn < 0
     a = wn.abs().clamp(max=_E2M1_MAX)
-    mag = torch.bucketize(a, torch.tensor(_E2M1_MID, device=device))  # 0..7
+    boundaries = torch.tensor(_E2M1_MID, device=device)
+    if flaggems_vllm.vendor_name == "enflame":
+        # torch_gcu topsaten bucketize rejects the default int64 output with a
+        # hard process abort (P21); counting the strictly-lower boundaries in
+        # int32 is bit-identical for this sorted boundary list.
+        mag = (a.unsqueeze(-1) > boundaries).sum(dim=-1, dtype=torch.int32)
+    else:
+        mag = torch.bucketize(a, boundaries)  # 0..7
     q = torch.tensor(_E2M1_POS, device=device)[mag]
     ref = torch.where(sign, -q, q) * scale
     nibbles = (sign.to(torch.uint8) * 8 + mag.to(torch.uint8)).reshape(out_dim, in_dim)
@@ -1177,6 +1184,58 @@ def test_fused_marlin_moe_w8a16_library_tuning():
         assert isinstance(kernel.fn, LibTuner)
         assert kernel.fn.configs
         assert all(config.maxnreg is None for config in kernel.fn.configs)
+
+
+def test_fused_marlin_moe_w8a16_fp8_down_prune():
+    """Few tokens and a short K loop drop the deeper pipelines; others keep all."""
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    prune = module._prune_w8a16_fp8_down_configs
+    # Exercise every stage independently of the backend production table.
+    configs = [
+        triton.Config(
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": block_k},
+            num_warps=4,
+            num_stages=stages,
+        )
+        for block_k in (64, 128)
+        for stages in (1, 2, 3)
+    ]
+    assert {config.num_stages for config in configs} == {1, 2, 3}
+
+    def kept(num_tokens, intermediate):
+        return prune(configs, {"T": num_tokens, "I": intermediate})
+
+    # I=256 gives at most four K iterations: only one-stage candidates stay.
+    assert kept(16, 256)
+    assert {config.num_stages for config in kept(16, 256)} == {1}
+    assert kept(16, 256) == [config for config in configs if config.num_stages == 1]
+    # More tokens, or a longer K loop, keep every candidate.
+    assert kept(17, 256) == configs
+    assert kept(16, 768) == configs
+
+
+def test_fused_marlin_moe_w8a16_fp8_down_stage_table():
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    configs = list(module._fused_moe_kernel_w8a16_down_fp8.fn.configs)
+    assert configs
+    if module._IS_HOPPER_ARCH:
+        assert {config.num_stages for config in configs} == {1}
+    else:
+        assert any(config.num_stages > 1 for config in configs)
+
+
+def test_fused_marlin_moe_w8a16_fp8_down_cache_version():
+    """The down kernel's pruning rule only runs on a cache miss.
+
+    A table written before the rule existed keeps serving its three-stage
+    results unless the kernel names a new table. The mechanism itself is
+    covered in test_libentry.py; this pins the kernel that depends on it.
+    """
+    module = importlib.import_module("flaggems_vllm.ops.fused_marlin_moe")
+    down = module._fused_moe_kernel_w8a16_down_fp8.fn
+
+    assert down.early_config_prune is module._prune_w8a16_fp8_down_configs
+    assert down.cache_version is not None
 
 
 @pytest.mark.parametrize("blocks", [(64, 128), (128, 64)])

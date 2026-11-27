@@ -124,7 +124,7 @@ def _fused_inv_rope_fp8_quant_kernel(
         ).to(tl.float32)
         absmax_i = tl.maximum(tl.max(tl.abs(xi), axis=1), eps)
         if TMA_ALIGNED_SCALES:
-            ki = _pow2_ue8m0_exponent(tl.maximum(absmax_i, eps * fp8_max))
+            ki = _pow2_ue8m0_exponent(tl.maximum(absmax_i, 1e-10 * fp8_max))
             rscale_i = ((127 - ki) << 23).to(tl.float32, bitcast=True)
             scale_bits_i = (127 + ki) << 23
             byte_i = (scale_bits_i >> 23) & 0xFF
@@ -179,7 +179,7 @@ def _fused_inv_rope_fp8_quant_kernel(
         tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi_rot), axis=1)), eps
     )
     if TMA_ALIGNED_SCALES:
-        k_last = _pow2_ue8m0_exponent(tl.maximum(absmax_last, eps * fp8_max))
+        k_last = _pow2_ue8m0_exponent(tl.maximum(absmax_last, 1e-10 * fp8_max))
         rscale_last = ((127 - k_last) << 23).to(tl.float32, bitcast=True)
         scale_bits_last = (127 + k_last) << 23
         byte_last = (scale_bits_last >> 23) & 0xFF
@@ -209,6 +209,101 @@ def _fused_inv_rope_fp8_quant_kernel(
         ).to(fp8_ptr.dtype.element_ty, bitcast=True),
         mask=mask2d,
     )
+
+
+@triton.jit
+def _fused_inv_rope_fp8_quant_small_kernel(
+    o_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    fp8_ptr,
+    scale_ptr,
+    num_tokens,
+    heads_per_group: tl.constexpr,
+    o_stride_token,
+    o_stride_head,
+    cache_stride_pos,
+    fp8_stride_group,
+    fp8_stride_token,
+    scale_stride_group,
+    scale_stride_k,
+    fp8_max: tl.constexpr,
+    eps: tl.constexpr,
+    QUANT_GROUP_SIZE: tl.constexpr,
+    CHUNKS_PER_HEAD: tl.constexpr,
+    ROPE_START: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    TMA_ALIGNED_SCALES: tl.constexpr,
+):
+    # Reduce all quantization blocks together to shorten the decode dependency chain.
+    head = tl.program_id(0).to(tl.int64)
+    rows = tl.program_id(1).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)
+    chunks = tl.arange(0, CHUNKS_PER_HEAD)
+    lanes = tl.arange(0, QUANT_GROUP_SIZE)
+    offsets = chunks[:, None] * QUANT_GROUP_SIZE + lanes[None, :]
+    valid = rows < num_tokens
+    input_base = o_ptr + head * o_stride_head.to(tl.int64)
+    input_rows = input_base + rows[:, None, None] * o_stride_token.to(tl.int64)
+    values = tl.load(input_rows + offsets[None, :, :], valid[:, None, None], 0).to(
+        tl.float32
+    )
+    rope_offsets = offsets - ((CHUNKS_PER_HEAD - 1) * QUANT_GROUP_SIZE + ROPE_START)
+    is_rope = rope_offsets >= 0
+    partners = tl.load(
+        input_rows + (offsets ^ 1)[None, :, :],
+        valid[:, None, None] & is_rope[None, :, :],
+        0,
+    ).to(tl.float32)
+    positions = tl.load(positions_ptr + rows, valid, 0)
+    cache_offsets = (
+        positions[:, None, None] * cache_stride_pos.to(tl.int64)
+        + tl.maximum(rope_offsets >> 1, 0)[None, :, :]
+    )
+    cos_values = tl.load(
+        cos_sin_cache_ptr + cache_offsets, valid[:, None, None] & is_rope[None, :, :], 1
+    )
+    sin_values = tl.load(
+        cos_sin_cache_ptr + HALF_ROPE + cache_offsets,
+        valid[:, None, None] & is_rope[None, :, :],
+        0,
+    )
+    added = values * cos_values + partners * sin_values
+    subtracted = values * cos_values - partners * sin_values
+    rotated = tl.where((offsets & 1)[None, :, :] == 0, added, subtracted)
+    values = tl.where(is_rope[None, :, :], rotated, values)
+    maximum = tl.maximum(tl.max(tl.abs(values), axis=2), eps)
+    if TMA_ALIGNED_SCALES:
+        exponent = _pow2_ue8m0_exponent(tl.maximum(maximum, 1e-10 * fp8_max))
+        inverse_scale = ((127 - exponent) << 23).to(tl.float32, bitcast=True)
+        scale_bytes = tl.where(valid[:, None], exponent + 127, 0)
+        scales = tl.sum(scale_bytes << (chunks[None, :] * 8), axis=1)
+        scale_offsets = (
+            head // heads_per_group * scale_stride_group.to(tl.int64)
+            + rows
+            + head % heads_per_group * scale_stride_k.to(tl.int64)
+        )
+        tl.store(scale_ptr + scale_offsets, scales)
+    else:
+        inverse_scale = fp8_max / maximum
+        scales = maximum * (1.0 / fp8_max)
+        scale_offsets = (
+            head // heads_per_group * scale_stride_group.to(tl.int64)
+            + rows[:, None]
+            + (head % heads_per_group * CHUNKS_PER_HEAD + chunks[None, :])
+            * scale_stride_k.to(tl.int64)
+        )
+        tl.store(scale_ptr + scale_offsets, tl.where(valid[:, None], scales, 0))
+    quantized = _f32_to_fp8_e4m3fn(
+        tl.clamp(values * inverse_scale[:, :, None], -fp8_max, fp8_max)
+    ).to(fp8_ptr.dtype.element_ty, bitcast=True)
+    output_offsets = (
+        head // heads_per_group * fp8_stride_group.to(tl.int64)
+        + rows[:, None, None] * fp8_stride_token.to(tl.int64)
+        + head % heads_per_group * CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
+        + offsets[None, :, :]
+    )
+    tl.store(fp8_ptr + output_offsets, quantized, valid[:, None, None])
 
 
 def fused_inv_rope_fp8_quant(
@@ -301,12 +396,21 @@ def fused_inv_rope_fp8_quant(
         (scale_inner * tma_aligned_t, 1, tma_aligned_t),
     )
 
-    # Static dispatch: 4 tokens per program saturates bandwidth once the
-    # device has enough programs in flight (winning across all sweep shapes
-    # with >=64 tokens); tiny batches are launch-bound and prefer 2.
-    block_t = 2 if tma_aligned_t < 64 else 4
+    if (
+        head_dim == 512
+        and quant_group_size == 128
+        and num_tokens <= 128
+        and (not tma_aligned_scales or num_tokens <= 8)
+    ):
+        kernel = _fused_inv_rope_fp8_quant_small_kernel
+        block_t = 1 if num_tokens <= 32 else 4
+        num_warps = 4 if num_tokens <= 2 or num_tokens > 32 else 1
+    else:
+        kernel = _fused_inv_rope_fp8_quant_kernel
+        block_t = 2 if tma_aligned_t < 64 else 4
+        num_warps = 1
     grid = (n_groups * heads_per_group, triton.cdiv(tma_aligned_t, block_t))
-    _fused_inv_rope_fp8_quant_kernel[grid](
+    kernel[grid](
         o,
         positions,
         cos_sin_cache,
@@ -329,7 +433,7 @@ def fused_inv_rope_fp8_quant(
         HALF_ROPE=rope_dim // 2,
         BLOCK_T=block_t,
         TMA_ALIGNED_SCALES=tma_aligned_scales,
-        num_warps=1,
+        num_warps=num_warps,
         num_stages=1,
     )
 

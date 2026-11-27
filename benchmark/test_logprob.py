@@ -16,9 +16,7 @@
 
 import importlib
 import importlib.util
-from contextlib import redirect_stdout
 from dataclasses import dataclass
-from io import StringIO
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +25,7 @@ import torch
 import flaggems_vllm
 from flaggems_vllm import runtime
 
-from . import base, conftest, consts
+from . import base
 
 try:
     from vllm.v1.worker.gpu.sample import logprob as baseline_logprob
@@ -72,7 +70,12 @@ CASES = (
     Case("full-vocab-logits", 1, 32000, 32000, logits_mode=True),
     Case("full-vocab-logits-b64", 64, 32000, 32000, logits_mode=True),
 )
-RESULTS = []
+
+
+@pytest.fixture(scope="module", autouse=True)
+def report_baseline_unavailable():
+    if baseline_logprob is None:
+        print("vLLM baseline unavailable; baseline latency and speedup are N/A.")
 
 
 @pytest.fixture(scope="module")
@@ -82,7 +85,7 @@ def device() -> torch.device:
 
 @pytest.fixture(scope="module")
 def candidate_logprob():
-    return importlib.import_module("flaggems_vllm.ops.logprob")
+    return importlib.import_module(flaggems_vllm.compute_topk_scores.__module__)
 
 
 def _make_inputs(candidate, case: Case, device: torch.device, dtype: torch.dtype):
@@ -114,7 +117,6 @@ class LogprobBenchmark(base.Benchmark):
     def __init__(self, case, candidate, torch_op, device):
         self.case = case
         self.candidate = candidate
-        self._latencies = {}
         super().__init__(
             op_name="compute_topk_scores",
             torch_op=torch_op,
@@ -148,78 +150,6 @@ class LogprobBenchmark(base.Benchmark):
             "logits_mode": case.logits_mode,
         }
 
-    def get_latency(self, op, *args, **kwargs):
-        latency = super().get_latency(op, *args, **kwargs)
-        self._latencies[op] = latency
-        return latency
-
-
-def _print_summary():
-    if not RESULTS:
-        return
-    has_baseline = any("vllm" in timings for _, _, timings in RESULTS)
-    headers = (
-        "Case",
-        "B",
-        "V",
-        "K",
-        "Custom",
-        "Mode",
-        "Dtype",
-        "FlagGems (us)",
-    )
-    if has_baseline:
-        headers += ("vLLM (us)", "Speedup")
-    rows = [headers]
-    for case, dtype, timings in RESULTS:
-        candidate_us = timings["candidate"] * 1000
-        row = (
-            case.name,
-            str(case.batch_size),
-            str(case.vocab_size),
-            str(case.k),
-            str(case.custom_count),
-            "logits" if case.logits_mode else "logprob",
-            str(dtype).split(".", 1)[-1],
-            f"{candidate_us:.2f}",
-        )
-        if has_baseline and "vllm" in timings:
-            baseline_us = timings["vllm"] * 1000
-            row += (f"{baseline_us:.2f}", f"{baseline_us / candidate_us:.3f}x")
-        elif has_baseline:
-            row += ("N/A", "N/A")
-        rows.append(row)
-
-    widths = [max(len(row[i]) for row in rows) for i in range(len(headers))]
-    separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
-
-    def format_row(row):
-        return (
-            "| "
-            + " | ".join(value.ljust(widths[i]) for i, value in enumerate(row))
-            + " |"
-        )
-
-    print("\ncompute_topk_scores performance")
-    print(f"Device: {flaggems_vllm.device}")
-    config = conftest.Config
-    timer = f"Mode: {config.mode.value}"
-    if config.mode == consts.BenchMode.KERNEL:
-        timer += f"; warmup: {config.warm_up} ms; rep: {config.repetition} ms"
-    print(timer + ("; speedup = vLLM / FlagGems" if has_baseline else ""))
-    print(separator)
-    print(format_row(rows[0]))
-    print(separator)
-    for row in rows[1:]:
-        print(format_row(row))
-    print(separator)
-
-
-@pytest.fixture(scope="module", autouse=True)
-def report_performance_results():
-    yield
-    _print_summary()
-
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 @pytest.mark.compute_topk_scores
@@ -233,11 +163,4 @@ def test_compute_topk_scores_perf(candidate_logprob, device, case):
         baseline_logprob.compute_topk_scores if baseline_logprob is not None else None,
         device,
     )
-    with redirect_stdout(StringIO()):
-        benchmark.run()
-    if not benchmark._latencies:
-        return
-    timings = {"candidate": benchmark._latencies[benchmark.gems_op]}
-    if benchmark.torch_op in benchmark._latencies:
-        timings["vllm"] = benchmark._latencies[benchmark.torch_op]
-    RESULTS.append((case, dtype, timings))
+    benchmark.run()
