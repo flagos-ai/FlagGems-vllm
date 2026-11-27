@@ -24,6 +24,12 @@ from flaggems_vllm.runtime.backend._metax.ops.cp_gather_indexer_k_quant_cache im
 from flaggems_vllm.runtime.backend._metax.ops.deep_gemm_fp8_o_proj import (
     deep_gemm_fp8_o_proj,
 )
+from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8,
+)
+from flaggems_vllm.runtime.backend._metax.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_fwd_w8a8_int8 as flash_mla_with_kvcache_w8a8,
+)
 from flaggems_vllm.runtime.backend._metax.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,
 )
@@ -67,6 +73,8 @@ else:
 __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "deep_gemm_fp8_o_proj",
+    "flash_mla_with_kvcache_fwd_w8a8_int8",
+    "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_recurrent_gated_delta_rule_fwd",
