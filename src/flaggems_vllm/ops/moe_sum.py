@@ -173,6 +173,13 @@ def _moe_sum_general_kernel(
     input_stride_hidden,
     output_stride_token,
     output_stride_hidden,
+    route_ids,
+    expert_map,
+    route_stride_token,
+    route_stride_topk,
+    NUM_EXPERTS: tl.constexpr,
+    MASKED: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ELEM_SIZE: tl.constexpr,
 ):
@@ -189,9 +196,22 @@ def _moe_sum_general_kernel(
         + hidden_offsets * input_stride_hidden
     )
     for expert_idx in range(topk):
+        mask = hidden_mask
+        if MASKED:
+            route = tl.load(
+                route_ids
+                + token_idx * route_stride_token
+                + expert_idx * route_stride_topk
+            )
+            valid = route >= 0
+            if HAS_EXPERT_MAP:
+                valid &= route < NUM_EXPERTS
+                local = tl.load(expert_map + route, mask=valid, other=-1)
+                valid &= local >= 0
+            mask &= valid
         expert_data = tl.load(
             input_base + expert_idx * input_stride_topk,
-            mask=hidden_mask,
+            mask=mask,
             other=0.0,
         )
         acc += expert_data.to(tl.float32)
@@ -250,10 +270,29 @@ def _min_vec_elems(dtype: torch.dtype, vec_bytes: int = 16) -> int:
 def moe_sum(
     input: torch.Tensor,
     output: torch.Tensor,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
 ):
+    """Sum routed outputs, optionally excluding padding and nonlocal experts."""
     logger.debug("GEMS MOE SUM")
     _check_moe_sum_inputs(input, output)
     num_tokens, topk, hidden_size = input.shape
+    if topk_ids is not None and (
+        topk_ids.shape != (num_tokens, topk)
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+        or topk_ids.device != input.device
+    ):
+        raise ValueError("moe_sum requires one int32/int64 expert ID per routed slot")
+    if expert_map is not None and (
+        topk_ids is None
+        or expert_map.ndim != 1
+        or expert_map.dtype != torch.int32
+        or expert_map.device != input.device
+        or not expert_map.is_contiguous()
+    ):
+        raise ValueError("moe_sum requires a contiguous int32 expert map and topk_ids")
+    if num_tokens == 0 or hidden_size == 0:
+        return
 
     input_stride = input.stride()
     output_stride = output.stride()
@@ -262,7 +301,7 @@ def moe_sum(
     vec_ok = hidden_size % _min_vec_elems(input.dtype, vec_bytes=16) == 0
     contiguous = input.is_contiguous() and output.is_contiguous()
 
-    if contiguous and topk <= 16 and num_tokens >= 128 and vec_ok:
+    if topk_ids is None and contiguous and topk <= 16 and num_tokens >= 128 and vec_ok:
         grid = lambda meta: (
             triton.cdiv(hidden_size, meta["BLOCK_H"]),
             triton.cdiv(num_tokens, meta["TOKENS"]),
@@ -279,7 +318,7 @@ def moe_sum(
             topk,
             ELEM_SIZE=elem_size,
         )
-    elif contiguous and topk <= 16 and num_tokens < 128:
+    elif topk_ids is None and contiguous and topk <= 16 and num_tokens < 128:
         grid = lambda meta: (num_tokens, triton.cdiv(hidden_size, meta["BLOCK_SIZE"]))
         _moe_sum_pair_kernel[grid](
             input,
@@ -293,7 +332,7 @@ def moe_sum(
             ELEM_SIZE=elem_size,
         )
     else:
-        # topk > 16 or non-contiguous input/output (fully stride-aware path).
+        # Masked routes or layouts outside the contiguous fast paths.
         grid = lambda meta: (num_tokens, triton.cdiv(hidden_size, meta["BLOCK_SIZE"]))
         _moe_sum_general_kernel[grid](
             input,
@@ -306,5 +345,12 @@ def moe_sum(
             input_stride[2],
             output_stride[0],
             output_stride[1],
+            topk_ids,
+            expert_map,
+            0 if topk_ids is None else topk_ids.stride(0),
+            0 if topk_ids is None else topk_ids.stride(1),
+            expert_map.numel() if expert_map is not None else 0,
+            topk_ids is not None,
+            expert_map is not None,
             ELEM_SIZE=elem_size,
         )

@@ -40,9 +40,16 @@ Two-stage design:
           pre-gated channel sum y[n, :] = sum_i pre[n, i] * x[n, i, :].
 """
 
+import logging
+from numbers import Real
+
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm import runtime
+
+logger = logging.getLogger(__name__)
 
 # stage1 (w-projection + sqrsum) tile; stage2 (gates + channel sum) tile.
 _BLOCK_K = 128
@@ -174,6 +181,7 @@ def _ihc_pre_stage1_decode(
     partial_ptr,
     K_TOTAL: tl.constexpr,
     TWO_HC: tl.constexpr,
+    TWO_HC_POW2: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     PARTIAL_STRIDE: tl.constexpr,
@@ -193,17 +201,18 @@ def _ihc_pre_stage1_decode(
 
     # All 2*hc weight rows as one tile, so the projection is a single reduction
     # along K instead of one pass per row.
-    mix_idx = tl.arange(0, TWO_HC)
+    mix_idx = tl.arange(0, TWO_HC_POW2)
+    mix_mask = mix_idx < TWO_HC
     weight = tl.load(
         weight_ptr + mix_idx[:, None] * K_TOTAL + k_off[None, :],
-        mask=k_mask[None, :],
+        mask=mix_mask[:, None] & k_mask[None, :],
         other=0.0,
     )
     mixes = tl.sum(weight * x[None, :], axis=1)
 
     partial = partial_ptr + (token_idx * NUM_SPLITS + split_idx) * PARTIAL_STRIDE
     tl.store(partial, sum_squares)
-    tl.store(partial + 1 + mix_idx, mixes)
+    tl.store(partial + 1 + mix_idx, mixes, mask=mix_mask)
 
 
 # stage2 reduces the per-split slots stage1 wrote, forms the pre / post sigmoid
@@ -249,13 +258,13 @@ def _ihc_pre_stage2(
         axis=0,
     )
 
-    mix_idx = tl.arange(0, TWO_HC)
+    mix_idx = tl.arange(0, 2 * HC_POW2)
     mix_parts = tl.load(
         mix_slot_ptr
         + split_idx[:, None] * N * TWO_HC
         + token_idx * TWO_HC
         + mix_idx[None, :],
-        mask=split_mask[:, None],
+        mask=split_mask[:, None] & (mix_idx[None, :] < TWO_HC),
         other=0.0,
     )
     mixes = tl.sum(mix_parts, axis=0)
@@ -344,9 +353,13 @@ def _ihc_pre_stage2_decode(
     sqrsum_parts = tl.load(slot_ptrs, mask=split_mask, other=0.0)
     sum_squares = tl.sum(sqrsum_parts, axis=0)
 
-    mix_idx = tl.arange(0, TWO_HC)
+    mix_idx = tl.arange(0, 2 * HC_POW2)
     mix_ptrs = slot_ptrs[:, None] + 1 + mix_idx[None, :]
-    mix_parts = tl.load(mix_ptrs, mask=split_mask[:, None], other=0.0)
+    mix_parts = tl.load(
+        mix_ptrs,
+        mask=split_mask[:, None] & (mix_idx[None, :] < TWO_HC),
+        other=0.0,
+    )
     mixes = tl.sum(mix_parts, axis=0)
 
     # Split the reduced row into the pre gates' logits (first hc entries) and
@@ -390,7 +403,7 @@ def _ihc_pre_stage2_decode(
     )
 
 
-def ihc_pre(
+def triton_ihc_pre(
     x: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -414,20 +427,96 @@ def ihc_pre(
         (y, post): y is [num_tokens, hidden_size] (x.dtype), post is
         [num_tokens, hc_mult] (float32).
     """
-    assert x.dim() == 3, "x must be [num_tokens, hc_mult, hidden_size]"
-    assert x.is_cuda and weight.is_cuda and scale.is_cuda and base.is_cuda
-    assert weight.dtype == torch.float32
-    assert scale.dtype == torch.float32 and base.dtype == torch.float32
+    logger.debug("GEMS TRITON_IHC_PRE")
+    return _ihc_pre(x, weight, scale, base, magnitude, hc_eps, norm_eps)
 
-    x = x.contiguous()
-    assert weight.is_contiguous()
-    scale = scale.contiguous()
-    base = base.contiguous()
+
+def ihc_pre(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    magnitude: float,
+    hc_eps: float,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compatibility entry for :func:`triton_ihc_pre`."""
+    logger.debug("GEMS IHC_PRE")
+    return _ihc_pre(x, weight, scale, base, magnitude, hc_eps, norm_eps)
+
+
+def _ihc_pre(
+    x,
+    weight,
+    scale,
+    base,
+    magnitude,
+    hc_eps,
+    norm_eps,
+    *,
+    _pipeline_stages=None,
+    _launcher=None,
+):
+    if not (
+        isinstance(x, torch.Tensor)
+        and isinstance(weight, torch.Tensor)
+        and isinstance(scale, torch.Tensor)
+        and isinstance(base, torch.Tensor)
+    ):
+        raise TypeError("x, weight, scale and base must be tensors")
+    if x.ndim != 3:
+        raise ValueError("x must be [num_tokens, hc_mult, hidden_size]")
+    num_tokens, hc_mult, hidden_size = x.shape
+    if hc_mult <= 0 or hidden_size <= 0:
+        raise ValueError("HC and D must be positive")
+    k_total = hc_mult * hidden_size
+    if weight.shape != (2 * hc_mult, k_total):
+        raise ValueError("weight must have shape [2*HC, HC*D]")
+    if scale.shape != (2,) or base.shape != (2 * hc_mult,):
+        raise ValueError("scale must have shape [2] and base shape [2*HC]")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("x must have dtype float16 or bfloat16")
+    if (
+        weight.dtype != torch.float32
+        or scale.dtype != torch.float32
+        or base.dtype != torch.float32
+    ):
+        raise TypeError("weight, scale and base must have dtype float32")
+    device = x.device
+    if weight.device != device or scale.device != device or base.device != device:
+        raise ValueError("all inputs must be on the same device")
+    if device.type != runtime.device.name or device.type == "cpu":
+        raise ValueError("inputs must be on the active accelerator device")
+    if not weight.is_contiguous():
+        raise ValueError("weight must be contiguous")
+    if not (
+        (type(magnitude) in (float, int) or isinstance(magnitude, Real))
+        and (type(hc_eps) in (float, int) or isinstance(hc_eps, Real))
+        and (type(norm_eps) in (float, int) or isinstance(norm_eps, Real))
+    ):
+        raise TypeError("magnitude, hc_eps and norm_eps must be real scalars")
+    magnitude, hc_eps, norm_eps = float(magnitude), float(hc_eps), float(norm_eps)
+
+    if _pipeline_stages is None:
+        # Direct family imports also preserve the legacy entry on Ascend.
+        _pipeline_stages = 1 if runtime.device.vendor_name == "ascend" else _NUM_STAGES
+
+    launch = _launch_ihc_pre if _launcher is None else _launcher
+    if runtime.torch_device_fn.current_device() == device.index:
+        return launch(
+            x, weight, scale, base, magnitude, hc_eps, norm_eps, _pipeline_stages
+        )
+    with runtime.torch_device_fn.device(device.index):
+        return launch(
+            x, weight, scale, base, magnitude, hc_eps, norm_eps, _pipeline_stages
+        )
+
+
+def _launch_ihc_pre(
+    x, weight, scale, base, magnitude, hc_eps, norm_eps, _pipeline_stages=_NUM_STAGES
+):
     num_tokens, hc_mult, hidden_size = x.shape
     k_total = hc_mult * hidden_size
-    assert weight.shape == (2 * hc_mult, k_total)
-    assert scale.shape == (2,)
-    assert base.shape == (2 * hc_mult,)
 
     if num_tokens == 0:
         return (
@@ -435,6 +524,20 @@ def ihc_pre(
             torch.empty((0, hc_mult), dtype=torch.float32, device=x.device),
         )
 
+    nvidia_cached = (
+        runtime.device.vendor_name == "nvidia" and triton.__version__.startswith("3.6.")
+    )
+    if nvidia_cached:
+        # Preserve the original copy path separately from normalized alignment.
+        layout_tag = (
+            int(not x.is_contiguous())
+            | (int(not scale.is_contiguous()) << 1)
+            | (int(not base.is_contiguous()) << 2)
+        )
+
+    x = x.contiguous()
+    scale = scale.contiguous()
+    base = base.contiguous()
     output = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=x.device)
     post = torch.empty((num_tokens, hc_mult), dtype=torch.float32, device=x.device)
     hc_pow2 = triton.next_power_of_2(hc_mult)
@@ -451,12 +554,38 @@ def ihc_pre(
             dtype=torch.float32,
             device=x.device,
         )
+        if nvidia_cached:
+            from flaggems_vllm.runtime.backend._nvidia.ops.ihc_pre import _launch_decode
+
+            _launch_decode(
+                x_flat,
+                weight,
+                partial,
+                scale,
+                base,
+                output,
+                post,
+                num_tokens,
+                hc_mult,
+                hidden_size,
+                hc_pow2,
+                block_k,
+                num_splits,
+                partial_stride,
+                _BLOCK_D,
+                magnitude,
+                norm_eps,
+                hc_eps,
+                layout_tag,
+            )
+            return output, post
         _ihc_pre_stage1_decode[(num_tokens, num_splits)](
             x_flat,
             weight,
             partial,
             K_TOTAL=k_total,
             TWO_HC=two_hc,
+            TWO_HC_POW2=2 * hc_pow2,
             NUM_SPLITS=num_splits,
             BLOCK_K=block_k,
             PARTIAL_STRIDE=partial_stride,
@@ -509,6 +638,35 @@ def ihc_pre(
     mix = torch.empty(
         nsplit * num_tokens * two_hc, dtype=torch.float32, device=x.device
     )
+    if nvidia_cached:
+        from flaggems_vllm.runtime.backend._nvidia.ops.ihc_pre import _launch_prefill
+
+        _launch_prefill(
+            x_flat,
+            weight,
+            sumsq,
+            mix,
+            scale,
+            base,
+            output,
+            post,
+            num_tokens,
+            hc_mult,
+            hidden_size,
+            hc_pow2,
+            grid_m,
+            nsplit,
+            _BLOCK_M,
+            _BLOCK_K,
+            _BLOCK_D,
+            _NUM_WARPS,
+            _pipeline_stages,
+            magnitude,
+            norm_eps,
+            hc_eps,
+            layout_tag,
+        )
+        return output, post
     _ihc_pre_stage1[(grid_m, nsplit)](
         x_flat,
         weight,
@@ -521,7 +679,7 @@ def ihc_pre(
         BLOCK_M=_BLOCK_M,
         BLOCK_K=_BLOCK_K,
         NSPLIT=nsplit,
-        NUM_STAGES=_NUM_STAGES,
+        NUM_STAGES=_pipeline_stages,
         num_warps=_NUM_WARPS,
         enable_fp_fusion=False,
     )
@@ -550,27 +708,3 @@ def ihc_pre(
         enable_fp_fusion=False,
     )
     return output, post
-
-
-def ihc_pre_ref(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    base: torch.Tensor,
-    magnitude: float,
-    hc_eps: float,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """PyTorch reference (test/benchmark only; never imported by production)."""
-    import torch.nn.functional as F
-
-    num_tokens, hc_mult, hidden_size = x.shape
-    x_flat = x.flatten(1).float()
-    reciprocal_rms = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + norm_eps)
-    mixes = F.linear(x_flat, weight) * reciprocal_rms
-    pre = torch.sigmoid(mixes[:, :hc_mult] * scale[0] + base[:hc_mult])
-    post = torch.sigmoid(mixes[:, hc_mult:] * scale[1] + base[hc_mult:])
-    pre = pre + hc_eps
-    post = magnitude * post + hc_eps
-    output = torch.sum(pre.unsqueeze(-1) * x.float(), dim=1)
-    return output.to(x.dtype).reshape(num_tokens, hidden_size), post

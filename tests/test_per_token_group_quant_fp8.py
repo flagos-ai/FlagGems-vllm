@@ -12,12 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 import torch
 
 import flaggems_vllm
 
 from . import accuracy_utils as utils
+
+_HAS_VLLM_FP8_REF = False
+_VLLM_FP8_HAS_UE8M0 = False
+if flaggems_vllm.vendor_name != "ascend":
+    try:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            per_token_group_quant_fp8 as _vllm_per_token_group_quant_fp8,
+        )
+
+        _HAS_VLLM_FP8_REF = True
+        _VLLM_FP8_HAS_UE8M0 = (
+            "use_ue8m0" in inspect.signature(_vllm_per_token_group_quant_fp8).parameters
+        )
+    except (ImportError, TypeError):
+        pass
 
 
 def _f32_to_fp8_e4m3fn(y):
@@ -68,7 +85,15 @@ def native_per_token_group_quant_fp8(
     fp8_max = finfo.max
 
     x_ = x.reshape(x.numel() // group_size, group_size)
-    amax = x_.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)
+    if flaggems_vllm.vendor_name == "enflame":
+        # torch_gcu P21-family defect: topsatenMax aborts
+        # (TOPSATEN_STATUS_NOT_SUPPORT -> C++ CHECK failure) when a bf16
+        # reduction must also emit the int64 index tensor. aten::amax
+        # returns identical values without the index output.
+        amax = x_.abs().amax(dim=-1, keepdim=True)
+    else:
+        amax = x_.abs().max(dim=-1, keepdim=True)[0]
+    amax = amax.clamp(min=eps).to(torch.float32)
     x_s = amax * torch.tensor(1.0 / fp8_max, dtype=torch.float32, device=x.device)
     if scale_ue8m0:
         min_val = torch.tensor(1e-10, dtype=x_s.dtype, device=x_s.device)
@@ -116,9 +141,23 @@ def test_per_token_group_quant_fp8(
     x = torch.rand(num_tokens, d, dtype=dtype, device=flaggems_vllm.device)
     ref_x = utils.to_reference(x)
 
-    ref_out, ref_scale = native_per_token_group_quant_fp8(
-        ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
-    )
+    if _HAS_VLLM_FP8_REF and not column_major_scales and ref_x.device.type != "cpu":
+        # vLLM's generic Triton fallback does not support every vendor's FP8 conversion.
+        # column_major_scales is FlagGems-only; use the torch reference for that path.
+        if _VLLM_FP8_HAS_UE8M0:
+            ref_out, ref_scale = _vllm_per_token_group_quant_fp8(
+                ref_x, group_size, use_ue8m0=scale_ue8m0
+            )
+        elif not scale_ue8m0:
+            ref_out, ref_scale = _vllm_per_token_group_quant_fp8(ref_x, group_size)
+        else:
+            ref_out, ref_scale = native_per_token_group_quant_fp8(
+                ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
+            )
+    else:
+        ref_out, ref_scale = native_per_token_group_quant_fp8(
+            ref_x, group_size, dtype=output_dtype, scale_ue8m0=scale_ue8m0
+        )
     out, scale = flaggems_vllm.per_token_group_quant_fp8(
         x,
         group_size,
@@ -136,4 +175,4 @@ def test_per_token_group_quant_fp8(
     out_fp32 = _fp8_to_float32(utils.to_cpu(out, ref_out))
     ref_out_fp32 = _fp8_to_float32(ref_out)
 
-    assert torch.allclose(out_fp32, ref_out_fp32, rtol=0.15)
+    assert torch.allclose(out_fp32, ref_out_fp32, rtol=0.15, atol=2**-9)

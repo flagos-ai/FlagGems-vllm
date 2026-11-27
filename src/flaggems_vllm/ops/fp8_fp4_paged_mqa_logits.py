@@ -115,6 +115,9 @@ def _mqa_logits_kernel(
         )
     else:
         ctx_len = tl.load(Ctx_lens_ptr + row_idx)
+    capacity = tl.minimum(max_ctx, max_model_len)
+    capacity = tl.minimum(capacity, max_blocks_per_seq * block_size)
+    ctx_len = tl.minimum(ctx_len, capacity)
     kv_start = kv_block * BLOCK_KV
     if kv_start >= ctx_len:
         return
@@ -173,6 +176,9 @@ def _mqa_logits_kernel(
             phys_block = tl.load(bt_row_base + lb)
             phys_block = tl.maximum(phys_block, 0)
             phys_block = tl.minimum(phys_block, num_phys_blocks - 1)
+            # The page stride includes vLLM's padding. A valid physical page
+            # can start beyond the signed 32-bit byte-offset range.
+            phys_block = phys_block.to(tl.int64)
             flat_base = phys_block * block_size
 
             # Coalesced KV load: [block_size, head_dim] as FP8

@@ -14,7 +14,7 @@
 
 # Keep gh-pages rebased onto main so the docs build (hugo-site.yaml)
 # always publishes from a dedicated branch instead of main directly.
-name: sync docs branch
+name: Sync docs branch
 
 on:
   push:
@@ -40,7 +40,7 @@ jobs:
     steps:
       - name: check out gh-pages
         id: checkout-gh-pages
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: gh-pages
           fetch-depth: 0
@@ -49,7 +49,7 @@ jobs:
       # First run: gh-pages does not exist yet. Create it from main.
       - name: create gh-pages from main
         if: steps.checkout-gh-pages.outcome == 'failure'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: main
           fetch-depth: 0

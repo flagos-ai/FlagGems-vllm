@@ -424,7 +424,7 @@ class IluvatarForkSelectionIntegrationTest(TemporaryRepositoryTestCase):
             "iluvatar",
         )
         approved = run_ci_targets.apply_policy(
-            # Normal pull requests pass --no-benchmarks in basic-ci.yml.
+            # Normal pull requests pass --no-benchmarks in unittest.yaml.
             {"tests": selected_tests, "benchmarks": []},
             policy,
         )
@@ -442,7 +442,7 @@ class BenchmarkWorkflowPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         repo_root = Path(__file__).resolve().parents[1]
-        cls.workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        cls.workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
 
@@ -548,8 +548,14 @@ class BackendTuneConfigTest(unittest.TestCase):
             {},
         )
 
-    def test_iluvatar_comment_only_tune_config_loads(self):
-        self.assertEqual(self.backend_utils.get_tune_config("iluvatar"), {})
+    def test_iluvatar_tune_config_loads(self):
+        import yaml
+
+        config_path = (
+            Path(self.backend_utils.__file__).parent / "_iluvatar/tune_configs.yaml"
+        )
+        expected = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        self.assertEqual(self.backend_utils.get_tune_config("iluvatar"), expected)
 
     def test_non_empty_tune_config_is_preserved(self):
         directory = self.write_config("mul:\n  BLOCK_SIZE: 128\n")
@@ -791,7 +797,7 @@ class SetupFlagGemsActionContractTest(unittest.TestCase):
 class CiWorkflowPolicyTest(unittest.TestCase):
     def test_backend_path_routing_uses_local_preflight_readiness(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         self.assertIn(
@@ -801,7 +807,7 @@ class CiWorkflowPolicyTest(unittest.TestCase):
 
     def test_all_backend_fanout_requires_an_explicit_request(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         all_enabled = workflow.split("ALL_ENABLED: >-", maxsplit=1)[1].split(
@@ -814,7 +820,7 @@ class CiWorkflowPolicyTest(unittest.TestCase):
 
     def test_forks_are_allowed_only_on_the_non_nvidia_lane(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         author_guard = "github.event.pull_request.user.login != 'dependabot[bot]'"
@@ -822,29 +828,42 @@ class CiWorkflowPolicyTest(unittest.TestCase):
             "github.event.pull_request.head.repo.full_name == github.repository"
         )
         nvidia_label_opt_in = (
-            "contains(github.event.pull_request.labels.*.name, 'ci/nvidia')"
+            "contains(fromJSON(needs.preprocess.outputs.labels), 'ci/nvidia')"
         )
-        nvidia_job = workflow.split("  nvidia-tests:", maxsplit=1)[1].split(
-            "  non-nvidia-tests:", maxsplit=1
+        nvidia_job = workflow.split("  python-op:", maxsplit=1)[1].split(
+            "  backend-tests:", maxsplit=1
         )[0]
-        non_nvidia_job = workflow.split("  non-nvidia-tests:", maxsplit=1)[1].split(
-            "  unittest-required:", maxsplit=1
+        non_nvidia_job = workflow.split("  backend-tests:", maxsplit=1)[1].split(
+            "  vendor-container-tests:", maxsplit=1
         )[0]
 
         self.assertIn(repository_guard, nvidia_job)
         self.assertIn(nvidia_label_opt_in, nvidia_job)
         self.assertNotIn(repository_guard, non_nvidia_job)
-        self.assertNotIn(nvidia_label_opt_in, non_nvidia_job)
+        self.assertNotIn("ci/nvidia", non_nvidia_job)
         self.assertIn(author_guard, nvidia_job)
         self.assertIn(author_guard, non_nvidia_job)
         self.assertNotIn("github.actor != 'dependabot[bot]'", workflow)
+
+    def test_labels_come_from_the_api_after_triage(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            workflow.index("id: wait-for-triage"), workflow.index("id: get-labels")
+        )
+        self.assertLess(
+            workflow.index("id: get-labels"), workflow.index("id: select-backends")
+        )
+        self.assertNotIn("github.event.pull_request.labels.*.name, '", workflow)
 
 
 class CiSummaryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         repo_root = Path(__file__).resolve().parents[1]
-        workflow = (repo_root / ".github/workflows/basic-ci.yml").read_text(
+        workflow = (repo_root / ".github/workflows/unittest.yaml").read_text(
             encoding="utf-8"
         )
         summary = workflow.split("  unittest-required:", maxsplit=1)[1]
@@ -854,7 +873,7 @@ class CiSummaryTest(unittest.TestCase):
 
     def run_summary(self, **overrides):
         values = {
-            "SELECT_TARGETS_RESULT": "success",
+            "PREPROCESS_RESULT": "success",
             "NVIDIA_RESULT": "skipped",
             "NON_NVIDIA_RESULT": "skipped",
             "SHOULD_RUN": "false",
@@ -872,7 +891,7 @@ class CiSummaryTest(unittest.TestCase):
             check=False,
         )
 
-    def test_expected_accelerator_results_succeed(self):
+    def test_expected_results_succeed(self):
         cases = {
             "trusted_nvidia_only": {
                 "SHOULD_RUN": "true",
@@ -913,7 +932,7 @@ class CiSummaryTest(unittest.TestCase):
 
     def test_missing_or_unexpected_results_fail(self):
         cases = {
-            "preparation_failed": {"SELECT_TARGETS_RESULT": "failure"},
+            "preparation_failed": {"PREPROCESS_RESULT": "failure"},
             "expected_nvidia_skipped": {
                 "SHOULD_RUN": "true",
                 "NVIDIA_RESULT": "skipped",
@@ -925,12 +944,211 @@ class CiSummaryTest(unittest.TestCase):
                 "NON_NVIDIA_RESULT": "failure",
             },
             "unexpected_backend_run": {"NON_NVIDIA_RESULT": "success"},
+            "unexpected_nvidia_run": {"NVIDIA_RESULT": "success"},
         }
 
         for name, values in cases.items():
             with self.subTest(name=name):
                 result = self.run_summary(**values)
                 self.assertNotEqual(result.returncode, 0)
+
+
+class ConftestDeviceProbeTest(unittest.TestCase):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    CONFTEST_PATH = REPO_ROOT / "tests" / "conftest.py"
+
+    def _load_conftest_with_stubs(self, synchronize_fn):
+        import types
+
+        stub_torch_device_fn = types.SimpleNamespace(
+            is_available=lambda: True,
+            synchronize=synchronize_fn,
+        )
+        stub_runtime = types.ModuleType("flaggems_vllm.runtime")
+        stub_runtime.device = types.SimpleNamespace(name="cuda", vendor_name="nvidia")
+        stub_runtime.torch_device_fn = stub_torch_device_fn
+
+        stub_flaggems = types.ModuleType("flaggems_vllm")
+        stub_flaggems.device = "cuda"
+        stub_flaggems.runtime = stub_runtime
+
+        stub_fcntl = types.ModuleType("fcntl")
+        stub_fcntl.LOCK_EX = 2
+        stub_fcntl.flock = lambda *args, **kwargs: None
+
+        stub_pytest = types.ModuleType("pytest")
+
+        def hookimpl(**kwargs):
+            def decorator(fn):
+                fn._hookimpl_kwargs = kwargs
+                return fn
+
+            return decorator
+
+        class Skipped(Exception):
+            pass
+
+        def skip(msg=""):
+            raise Skipped(msg)
+
+        stub_pytest.hookimpl = hookimpl
+        stub_pytest.skip = skip
+        stub_pytest.Skipped = Skipped
+
+        saved = {}
+        overrides = {
+            "fcntl": stub_fcntl,
+            "pytest": stub_pytest,
+            "flaggems_vllm": stub_flaggems,
+            "flaggems_vllm.runtime": stub_runtime,
+        }
+        for key, value in overrides.items():
+            saved[key] = sys.modules.get(key)
+            sys.modules[key] = value
+
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_test_conftest_probe", self.CONFTEST_PATH
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            for key, prev in saved.items():
+                if prev is None:
+                    sys.modules.pop(key, None)
+                else:
+                    sys.modules[key] = prev
+
+        return module, stub_flaggems, stub_pytest
+
+    def test_teardown_hook_is_hookwrapper_and_survives_stub_runtime(self):
+        import types
+
+        sync_calls = []
+        conftest, stub_flaggems, stub_pytest = self._load_conftest_with_stubs(
+            lambda: sync_calls.append("sync")
+        )
+
+        hook_kwargs = getattr(conftest.pytest_runtest_teardown, "_hookimpl_kwargs", {})
+        self.assertTrue(hook_kwargs.get("hookwrapper"))
+
+        # Simulate a test replacing flaggems_vllm.runtime without torch_device_fn
+        # (like tests/flagtune/test_offline_binding.py::runtime_binding).
+        real_runtime = stub_flaggems.runtime
+        stub_flaggems.runtime = types.ModuleType("flaggems_vllm.runtime")
+
+        item = types.SimpleNamespace(nodeid="tests/test_dummy.py::test_stub")
+        gen = conftest.pytest_runtest_teardown(item, None)
+        next(gen)
+        # No probe has happened before yield (fixture teardown happens during yield).
+        self.assertEqual(sync_calls, [])
+
+        # Even if runtime still lacks torch_device_fn after yield, probe falls back
+        # without raising AttributeError or poisoning _DEVICE_CONTEXT_DEAD.
+        with self.assertRaises(StopIteration):
+            next(gen)
+        self.assertEqual(sync_calls, ["sync"])
+        self.assertFalse(conftest._DEVICE_CONTEXT_DEAD)
+
+        stub_flaggems.runtime = real_runtime
+        conftest.pytest_runtest_setup(item)
+        self.assertNotIsInstance(stub_pytest.Skipped, type(None))
+
+    def test_device_fault_poisons_context_and_skips_next_test(self):
+        import types
+
+        def failing_sync():
+            raise RuntimeError("cudaErrorIllegalInstruction")
+
+        conftest, _, stub_pytest = self._load_conftest_with_stubs(failing_sync)
+        item = types.SimpleNamespace(nodeid="tests/test_fault.py::test_kernel")
+        gen = conftest.pytest_runtest_teardown(item, None)
+        next(gen)
+        with self.assertRaises(StopIteration):
+            next(gen)
+        self.assertTrue(conftest._DEVICE_CONTEXT_DEAD)
+        with self.assertRaises(stub_pytest.Skipped):
+            conftest.pytest_runtest_setup(item)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("pytest") is not None, "requires pytest"
+    )
+    def test_pytest_subprocess_teardown_after_runtime_monkeypatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pkg = tmp / "flaggems_vllm"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text(
+                textwrap.dedent(
+                    """\
+                    from types import SimpleNamespace
+                    from flaggems_vllm import runtime
+                    device = "cuda"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (pkg / "runtime.py").write_text(
+                textwrap.dedent(
+                    """\
+                    from types import SimpleNamespace
+                    device = SimpleNamespace(name="cuda", vendor_name="nvidia")
+                    class _Dev:
+                        @staticmethod
+                        def is_available():
+                            return True
+                        @staticmethod
+                        def synchronize():
+                            return None
+                    torch_device_fn = _Dev()
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (tmp / "fcntl.py").write_text(
+                "LOCK_EX = 2\ndef flock(*args, **kwargs):\n    return None\n",
+                encoding="utf-8",
+            )
+            tests_dir = tmp / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "conftest.py").write_text(
+                self.CONFTEST_PATH.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (tests_dir / "test_regression.py").write_text(
+                textwrap.dedent(
+                    """\
+                    import sys
+                    from types import ModuleType
+                    import flaggems_vllm
+
+                    def test_monkeypatch_runtime_without_torch_device_fn(monkeypatch):
+                        fake_runtime = ModuleType("flaggems_vllm.runtime")
+                        monkeypatch.setitem(sys.modules, "flaggems_vllm.runtime", fake_runtime)
+                        monkeypatch.setattr(flaggems_vllm, "runtime", fake_runtime, raising=False)
+                        assert not hasattr(flaggems_vllm.runtime, "torch_device_fn")
+
+                    def test_subsequent_test_runs_cleanly():
+                        assert hasattr(flaggems_vllm.runtime, "torch_device_fn")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(tmp),
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            }
+            proc = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", str(tests_dir)],
+                cwd=tmp,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("2 passed", proc.stdout)
 
 
 if __name__ == "__main__":

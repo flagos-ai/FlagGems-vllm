@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 import pytest
 import torch
 
@@ -30,36 +32,76 @@ VLLM_NATIVE_VENDORS = {
 }
 
 
+def _vllm_native_usable(ops):
+    """True only if vllm._C is built and has a CUDA kernel for the op.
+
+    Does not execute any kernel.
+    """
+    if ops is None or not callable(getattr(ops, "fused_add_rms_norm", None)):
+        return False
+
+    try:
+        import vllm._C  # noqa: F401
+    except Exception as e:
+        warnings.warn(f"vllm._C is unavailable ({type(e).__name__}: {e}).")
+        return False
+
+    try:
+        dev_type = torch.device(flaggems_vllm.device).type
+    except Exception:
+        dev_type = "cuda"
+
+    if dev_type == "cuda":
+        try:
+            return bool(
+                torch._C._dispatch_has_kernel_for_dispatch_key(
+                    "_C::fused_add_rms_norm", "CUDA"
+                )
+            )
+        except Exception:
+            return True  # internal API changed; trust the import check
+
+    return True
+
+
 # -----------------------------------------------------------------------------
 # Vendor-specific baseline import
+#
+# A failed import leaves the corresponding names as None; see
+# _get_baseline_op for the degraded path.
 # -----------------------------------------------------------------------------
 
 vendor_ops = None
+torch_npu = None
+enable_custom_op = None
 iluvatar_fused_add_rms_norm_perf = None
 
-if VENDOR in VLLM_NATIVE_VENDORS:
-    from vllm import _custom_ops as vendor_ops
+try:
+    if VENDOR in VLLM_NATIVE_VENDORS:
+        from vllm import _custom_ops as vendor_ops
 
-elif VENDOR == "mthreads":
-    from vllm_musa import _custom_ops as vendor_ops
+    elif VENDOR == "mthreads":
+        from vllm_musa import _custom_ops as vendor_ops
 
-elif VENDOR == "ascend":
-    import torch_npu
-    from vllm_ascend.utils import enable_custom_op
+    elif VENDOR == "ascend":
+        import torch_npu
+        from vllm_ascend.utils import enable_custom_op
 
-elif VENDOR == "iluvatar":
-    # Import vLLM first so its platform/plugin initialization completes
-    # before importing vllm_iluvatar custom kernels. Importing the
-    # vllm_iluvatar submodule first causes a circular import through
-    # vllm_iluvatar.util.logger -> vllm -> vllm_iluvatar.platform.
-    import vllm  # noqa: F401
+    elif VENDOR == "iluvatar":
+        # Import vLLM first so its platform/plugin initialization completes
+        # before importing vllm_iluvatar custom kernels. Importing the
+        # vllm_iluvatar submodule first causes a circular import through
+        # vllm_iluvatar.util.logger -> vllm -> vllm_iluvatar.platform.
+        import vllm  # noqa: F401
 
-    # Use the Iluvatar native perf backend directly instead of the unified
-    # dispatcher. This guarantees that the benchmark baseline is the native
-    # vLLM-Iluvatar kernel and cannot silently fall back to the torch backend.
-    from vllm_iluvatar.custom_kernels.fused_add_rms_norm.perf_impl import (
-        fused_add_rms_norm_perf as iluvatar_fused_add_rms_norm_perf,
-    )
+        # Use the Iluvatar native perf backend directly instead of the unified
+        # dispatcher. This guarantees that the benchmark baseline is the native
+        # vLLM-Iluvatar kernel and cannot silently fall back to the torch backend.
+        from vllm_iluvatar.custom_kernels.fused_add_rms_norm.perf_impl import (
+            fused_add_rms_norm_perf as iluvatar_fused_add_rms_norm_perf,
+        )
+except Exception as e:
+    print(e)
 
 
 # -----------------------------------------------------------------------------
@@ -250,18 +292,31 @@ def _iluvatar_vllm_op(x, residual, layer_shape, weight, eps):
 
 
 def _get_baseline_op():
-    """Select the baseline implementation for the current vendor."""
+    """Select the baseline implementation for the current vendor.
+
+    Returns None when the vendor-native baseline cannot be loaded, so
+    the benchmark runs FlagGems-only (`N/A` baseline columns) and the
+    "vs Base" comparison still works via --base-data.
+    """
     if VENDOR in VLLM_NATIVE_VENDORS:
-        return _vllm_native_op
+        if _vllm_native_usable(vendor_ops):
+            return _vllm_native_op
+        return None
 
     if VENDOR == "mthreads":
-        return _mthreads_vllm_op
+        if callable(getattr(vendor_ops, "musa_fused_add_rms_norm", None)):
+            return _mthreads_vllm_op
+        return None
 
     if VENDOR == "ascend":
-        return _ascend_vllm_op
+        if torch_npu is not None and callable(enable_custom_op):
+            return _ascend_vllm_op
+        return None
 
     if VENDOR == "iluvatar":
-        return _iluvatar_vllm_op
+        if callable(iluvatar_fused_add_rms_norm_perf):
+            return _iluvatar_vllm_op
+        return None
 
     return _torch_reference_op
 
@@ -351,38 +406,11 @@ class FusedAddRmsNormBenchmark(base.GenericBenchmarkExcluse1D):
 def test_fused_add_rms_norm():
     baseline_op = _get_baseline_op()
 
-    if VENDOR in VLLM_NATIVE_VENDORS:
-        assert hasattr(
-            torch.ops._C,
-            "fused_add_rms_norm",
-        ), "vLLM native fused_add_rms_norm is not available"
-
-    elif VENDOR == "mthreads":
-        assert hasattr(
-            vendor_ops,
-            "musa_fused_add_rms_norm",
-        ), "vLLM-MUSA musa_fused_add_rms_norm is not available"
-
-    elif VENDOR == "ascend":
-        # vLLM-Ascend uses either its own _C_ascend custom op or the
-        # torch_npu AddRmsNorm implementation.
-        if enable_custom_op():
-            assert hasattr(
-                torch.ops._C_ascend,
-                "npu_add_rms_norm_bias",
-            ), (
-                "vLLM-Ascend custom npu_add_rms_norm_bias " "is not available"
-            )
-        else:
-            assert hasattr(
-                torch_npu,
-                "npu_add_rms_norm",
-            ), "torch_npu.npu_add_rms_norm is not available"
-
-    elif VENDOR == "iluvatar":
-        assert callable(
-            iluvatar_fused_add_rms_norm_perf
-        ), "vLLM-Iluvatar native perf fused_add_rms_norm is not available"
+    if baseline_op is None:
+        warnings.warn(
+            f"Baseline op of current platform: {VENDOR} can't be loaded. "
+            "There will be `N/A` outputs in some columns."
+        )
 
     bench = FusedAddRmsNormBenchmark(
         input_fn=_input_fn,

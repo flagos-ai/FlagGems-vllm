@@ -1,0 +1,231 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
+"""Standard JSON and private JSONL timing for the immutable Gumbel workload.
+
+All backends use no-Graph do_bench with runtime device events through Triton.
+Native device failures terminate the process even when the runner omits -x.
+Ascend numerical reference failures are retained as warnings and may be timed.
+"""
+
+import json
+import math
+import os
+
+import pytest
+import torch
+import triton
+
+import flaggems_vllm
+from baseline import gumbel_sample as workload
+from flaggems_vllm.runtime import torch_device_fn
+
+from . import base, conftest
+
+pytestmark = pytest.mark.gumbel_sample
+_DETAIL = None
+_NATIVE_SKIP_REASONS = []
+
+
+def _chip_name():
+    try:
+        return torch_device_fn.get_device_name()
+    except Exception:
+        return None
+
+
+def _record(row, metric, native_reason):
+    """One dtype group and unique case keys preserve all 16 measurements."""
+    global _DETAIL
+    if _DETAIL is None:
+        _DETAIL = {
+            "op_name": "gumbel_sample",
+            "dtype": "torch.float32",
+            "mode": "kernel",
+            "level": conftest.Config.bench_level.value,
+            "result": [],
+        }
+        conftest.update_result("gumbel_sample", _DETAIL)
+    if native_reason and native_reason not in _NATIVE_SKIP_REASONS:
+        _NATIVE_SKIP_REASONS.append(native_reason)
+    if _NATIVE_SKIP_REASONS:
+        _DETAIL["native_baseline_skip_reason"] = "; ".join(_NATIVE_SKIP_REASONS)
+    _DETAIL["result"].append(metric)
+    print("GUMBEL_BENCH " + json.dumps(row, sort_keys=True))
+    output = os.environ.get("GUMBEL_BENCH_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+class GumbelSampleBenchmark(base.Benchmark):
+    """Per-case adapter for the frozen sampler measurement protocol.
+
+    Keep the dedicated run loop: the generic loop uses a different Ascend timer
+    and native-failure policy. Pytest owns the 16-case grid.
+    """
+
+    def __init__(self, binding, request):
+        super().__init__(
+            op_name=workload.OP_NAME,
+            torch_op=None,
+            gems_op=flaggems_vllm.gumbel_sample,
+            dtypes=workload.DTYPES,
+            is_inplace=workload.IS_INPLACE,
+        )
+        self.binding = binding
+        self.request = request
+
+    def get_latency(self, op, *args, **kwargs):
+        return triton.testing.do_bench(
+            lambda: op(*args, **kwargs),
+            warmup=25,
+            rep=100,
+            return_mode="median",
+        )
+
+    def _measure(self, op, args, kwargs):
+        latency_ms = self.get_latency(op, *args, **kwargs)
+        if not math.isfinite(latency_ms) or latency_ms <= 0:
+            raise ValueError(f"invalid gumbel latency: {latency_ms!r}")
+        return {
+            "median_us": latency_ms * 1000,
+            "latency_ms": latency_ms,
+            "timing_protocol": workload.TIMING_PROTOCOL,
+        }
+
+    def run(self):
+        binding, request = self.binding, self.request
+        if conftest.Config.mode.value != "kernel":
+            raise ValueError("gumbel supports only the frozen no-Graph kernel mode")
+        requested = conftest.Config.user_desired_dtypes
+        if requested and requested != [torch.float32]:
+            raise ValueError("gumbel performance coverage is FP32 only")
+        self.set_dtypes(requested)
+        args, kwargs = workload.build_inputs(
+            binding, torch.float32, flaggems_vllm.device, qualify=False
+        )
+        workload.assert_output(binding, self.gems_op(*args, **kwargs))
+        workload.assert_output(binding, self.gems_op(*args, **kwargs))
+        candidate = self._measure(self.gems_op, args, kwargs)
+        workload.assert_output(binding, self.gems_op(*args, **kwargs))
+        cfg = workload.config(binding, torch.float32)
+        native = self.torch_op = workload.native(
+            device=args[0].device, vendor=flaggems_vllm.vendor_name
+        )
+        identity = workload.native_identity()
+        native_reason = workload.NATIVE_UNAVAILABLE_REASON
+        metric = {
+            "shape_detail": workload.key_shape(binding),
+            "latency": candidate["latency_ms"],
+            "latency_base": None,
+            "speedup": None,
+            "timing_protocol": candidate["timing_protocol"],
+            "workload_config": cfg,
+            "native_identity": identity,
+            "baseline_kind": "unavailable",
+            "native_baseline_skip_reason": native_reason,
+        }
+        row = {
+            "vendor": flaggems_vllm.vendor_name,
+            "device": str(flaggems_vllm.device),
+            "chip": _chip_name(),
+            "shape": binding["shape"],
+            "case_key": workload.key_shape(binding),
+            "dtype": "float32",
+            "stride": args[0].stride(),
+            "temperature": binding["temperature"],
+            "graph": False,
+            "scope": cfg["timing"]["scope"],
+            "rng": cfg["rng"],
+            "timing_protocol": candidate["timing_protocol"],
+            "candidate": candidate,
+            "native_identity": identity,
+            "baseline_kind": "unavailable",
+            "native_baseline_skip_reason": native_reason,
+            "native_ratio": None,
+        }
+        if native is not None or flaggems_vllm.vendor_name == "ascend":
+            try:
+                if native is None:
+                    raise RuntimeError(
+                        f"Ascend native resolution failed: {native_reason}"
+                    )
+                policy = (
+                    {"allow_accuracy_warning": True}
+                    if flaggems_vllm.vendor_name == "ascend"
+                    else {}
+                )
+                qualifications = {}
+                for stage in ("pre_timing", "post_timing"):
+                    receipt = workload.qualify_native(
+                        binding, args, kwargs, native, **policy
+                    )
+                    qualifications[stage] = receipt
+                    # Persist the pre-timing evidence even if timing or the
+                    # post-timing hard checks subsequently terminate this case.
+                    qualification = {
+                        **receipt,
+                        **qualifications,
+                        "status": (
+                            "accuracy_warning"
+                            if any(
+                                item["status"] == "accuracy_warning"
+                                for item in qualifications.values()
+                            )
+                            else "passed"
+                        ),
+                    }
+                    if qualification["status"] == "accuracy_warning":
+                        qualification["accuracy_status"] = "failed"
+                        qualification["accuracy_failures"] = list(
+                            dict.fromkeys(
+                                reason
+                                for item in qualifications.values()
+                                for reason in item.get("accuracy_failures", [])
+                            )
+                        )
+                    metric["native_qualification"] = qualification
+                    row["native_qualification"] = qualification
+                    if receipt["status"] == "accuracy_warning":
+                        print(
+                            f"WARNING gumbel native accuracy case={workload.key_shape(binding)} "
+                            f"stage={stage}: " + json.dumps(receipt, sort_keys=True)
+                        )
+                    if stage == "pre_timing":
+                        native_time = self._measure(native, args, kwargs)
+                baseline_kind = (
+                    "native_vllm_accuracy_warning"
+                    if qualification["status"] == "accuracy_warning"
+                    else "native_vllm"
+                )
+                metric["baseline_kind"] = baseline_kind
+                metric["latency_base"] = native_time["latency_ms"]
+                metric["speedup"] = native_time["latency_ms"] / candidate["latency_ms"]
+                row.update(
+                    native=native_time,
+                    native_ratio=metric["speedup"],
+                    baseline_kind=baseline_kind,
+                    native_qualification=qualification,
+                )
+            except Exception as exc:
+                native_reason = f"native qualification/execution failed: {type(exc).__name__}: {exc}"
+                metric["error_msg"] = native_reason
+                metric["native_baseline_skip_reason"] = native_reason
+                row["native_baseline_skip_reason"] = native_reason
+                row["native_error"] = native_reason
+                _record(row, metric, native_reason)
+                # Central runners do not all pass -x. A failed native call may
+                # poison the device context, so stop before another case can run.
+                # pytest.exit need not emit a failed call report: persist it first.
+                conftest.TEST_RESULTS.setdefault("gumbel_sample", {}).update(
+                    result="failed", reason=native_reason, test_case=request.node.nodeid
+                )
+                pytest.exit(native_reason, returncode=1)
+        _record(row, metric, native_reason)
+        if metric["speedup"] is not None:
+            assert metric["speedup"] >= 0.9, row
+
+
+@pytest.mark.parametrize("binding", workload.grid(), ids=workload.key_shape)
+def test_gumbel_sample_benchmark(binding, request):
+    GumbelSampleBenchmark(binding, request).run()

@@ -179,12 +179,19 @@ def _ihc_post(x, residual, post):
         from flaggems_vllm.runtime.backend._metax.ops.ihc_post import (
             _ihc_post_kernel as kernel,
         )
-    elif runtime.device.vendor_name == "mthreads" and x.dtype == torch.float16:
+    elif runtime.device.vendor_name == "mthreads":
         from flaggems_vllm.runtime.backend._mthreads.ops.ihc_post import (
             _ihc_post_kernel as kernel,
         )
     # Keep the native FP32 multiply and addition separate, including rounding.
     with runtime.torch_device_fn.device(x.device):
+        if runtime.device.vendor_name == "ascend":
+            from flaggems_vllm.runtime.backend._ascend.ops.ihc_post import (
+                _launch_ihc_post,
+            )
+
+            _launch_ihc_post(x, residual, post, output)
+            return output
         if runtime.device.vendor_name in (
             "nvidia",
             "thead",

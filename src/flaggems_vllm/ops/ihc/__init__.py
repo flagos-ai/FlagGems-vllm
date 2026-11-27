@@ -19,12 +19,12 @@ residual channel has a single scalar sigmoid gate. See ihc_pre / ihc_post.
 """
 
 from flaggems_vllm.ops.ihc.ihc_post import ihc_post, ihc_post_ref, triton_ihc_post
-from flaggems_vllm.ops.ihc.ihc_pre import ihc_pre, ihc_pre_ref
+from flaggems_vllm.ops.ihc.ihc_pre import ihc_pre, triton_ihc_pre
 
 __all__ = [
     "ihc_post",
     "ihc_post_ref",
     "ihc_pre",
-    "ihc_pre_ref",
     "triton_ihc_post",
+    "triton_ihc_pre",
 ]
