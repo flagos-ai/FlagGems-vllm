@@ -3125,16 +3125,16 @@ def grouped_route_geometry(m, t, e, k, n, bits, dtype):
         or (n > 4096 and r >= e * 64)
         else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
     )
-    # Sparse routes need only a few aligned rows per expert. Skewed experts
-    # can occupy multiple consecutive tiles.
-    if (
-        bits == 8
-        and dtype == torch.float16
-        and k % 1024 == 0
-        and n % 1024 == 0
-        and r <= e
-    ):
-        bm = 4
+    if bits == 8 and dtype == torch.float16 and k % 1024 == 0 and n % 1024 == 0:
+        # Skewed experts can occupy several tiles. Shorter row tiles reduce
+        # padding for wide inputs until the average exceeds eight routes.
+        if r <= e:
+            bm = 4
+        elif k > 4096 and r <= 8 * e:
+            bm = 16
+        elif n > 4096 and 32 * e <= r <= 64 * e:
+            # Keep 512-column GEMM tiles when the intermediate is wide.
+            bm = 64
     use_small_m = (
         bits == 8
         and dtype == torch.float16
