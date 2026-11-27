@@ -26,24 +26,15 @@ def _pack_prefill_pages(
     Lengths,
     PackedK,
     PackedV,
-    Prefix,
     page_stride,
     table_stride,
-    BATCH: tl.constexpr,
-    BATCH_PAD: tl.constexpr,
+    CAPACITY: tl.constexpr,
     PAGE: tl.constexpr,
     ROW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     batch = tl.program_id(1)
-    seq = tl.arange(0, BATCH_PAD)
-    lengths = tl.load(Lengths + seq, seq < BATCH, other=0)
-    start = tl.sum(tl.where(seq < batch, lengths, 0), 0)
     length = tl.load(Lengths + batch)
-    if tl.program_id(0) == 0:
-        tl.store(Prefix + batch, start)
-        if batch == BATCH - 1:
-            tl.store(Prefix + BATCH, start + length)
     element = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row = element // ROW
     valid = row < length
@@ -51,9 +42,9 @@ def _pack_prefill_pages(
         Table + batch.to(tl.int64) * table_stride + row // PAGE, valid, other=0
     )
     src = page.to(tl.int64) * page_stride + (row % PAGE) * ROW + element % ROW
-    dst = start * ROW + element
-    tl.store(PackedK + dst, tl.load(K + src, valid, other=0), valid)
-    tl.store(PackedV + dst, tl.load(V + src, valid, other=0), valid)
+    dst = batch * CAPACITY * ROW + element
+    tl.store(PackedK + dst, tl.load(K + src, valid, other=0), row < CAPACITY)
+    tl.store(PackedV + dst, tl.load(V + src, valid, other=0), row < CAPACITY)
 
 
 def pack_prefill_pages(k, v, table, lengths, max_k):
@@ -61,7 +52,6 @@ def pack_prefill_pages(k, v, table, lengths, max_k):
     _, page, kv_heads, dim = k.shape
     shape = (batch * max_k, kv_heads, dim)
     packed_k, packed_v = k.new_empty(shape), v.new_empty(shape)
-    prefix = lengths.new_empty((batch + 1,))
     block = 2048
     _pack_prefill_pages[(triton.cdiv(max_k * kv_heads * dim, block), batch)](
         k,
@@ -70,13 +60,11 @@ def pack_prefill_pages(k, v, table, lengths, max_k):
         lengths,
         packed_k,
         packed_v,
-        prefix,
         k.stride(0),
         table.stride(0),
-        batch,
-        triton.next_power_of_2(batch),
+        max_k,
         page,
         kv_heads * dim,
         block,
     )
-    return packed_k, packed_v, prefix
+    return packed_k, packed_v

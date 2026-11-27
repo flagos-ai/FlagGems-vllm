@@ -249,8 +249,9 @@ def launch_attention(
             and out.stride(-1) == 1
         )
 
+    staged_kv = False
     # Reuse each staged KV page across many causal query tiles. Limit the
-    # temporary K/V pair to 64 MiB and the prefix reduction to a small batch.
+    # temporary K/V pair to 64 MiB and use fixed-capacity rows per sequence.
     if (
         is_paged
         and q.dtype == torch.bfloat16
@@ -273,10 +274,8 @@ def launch_attention(
         and (out is None or _tma_strides_are_aligned(out))
     ):
         with torch_device_fn.device(q.device):
-            k, v, cu_seqlens_k = pack_prefill_pages(
-                k, v, block_table, seqused_k, max_seqlen_k
-            )
-        block_table, seqused_k, is_paged = None, None, False
+            k, v = pack_prefill_pages(k, v, block_table, seqused_k, max_seqlen_k)
+        block_table, is_paged, staged_kv = None, False, True
 
     # The seqused-K specialization never reads cu_seqlens_k.  Reuse the always
     # valid Q prefix tensor instead of allocating a device-side ABI placeholder.
@@ -691,6 +690,15 @@ def launch_attention(
             launch_persistent(
                 args,
                 output=out,
+                staged_kv=staged_kv,
+                compact_prefill=staged_kv
+                or (
+                    is_paged
+                    and block_size == 16
+                    and is_causal
+                    and plain_scores
+                    and not is_s_aux
+                ),
                 total_q=total_q,
                 head_size=head_dim,
                 num_sms=num_sms,

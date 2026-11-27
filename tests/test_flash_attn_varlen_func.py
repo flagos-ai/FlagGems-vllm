@@ -728,7 +728,12 @@ def test_flash_attn_varlen_func_fa3_matches_fa2(
 @pytest.mark.skipif(not IS_HOPPER, reason="FA3 requires Hopper")
 @pytest.mark.parametrize(
     "query_length,capacity,kv_lengths",
-    [(1, 2048, [129, 0]), (1024, 1024, [1024, 1015, 1021])],
+    [
+        (1, 2048, [129, 0]),
+        (512, 512, [512, 493]),
+        (1024, 1024, [1024, 1015, 1021]),
+        (1040, 1040, [0, 217, 1040]),
+    ],
 )
 @torch.inference_mode()
 def test_flash_attn_varlen_func_fa3_paged_capacity(query_length, capacity, kv_lengths):

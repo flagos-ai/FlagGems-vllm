@@ -173,6 +173,11 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
     page_table_batch_stride: tl.constexpr,
     block_size: tl.constexpr,
     page_stride_rows,
+    host_q_desc,
+    host_k_desc,
+    host_v_desc,
+    STAGED_KV: tl.constexpr,
+    HOST_Q: tl.constexpr,
     q_smem,
     q_writer0,
     k_writer,
@@ -212,6 +217,9 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
     tile_idx = prog_id
     tile_count = 0
     accum_cnt_kv = 0
+    VECTOR_PAGES: tl.constexpr = (
+        HOST_Q and block_size == 16 and (ACTIVE_WGMMA_N == 64 or ACTIVE_WGMMA_N == 128)
+    )
     if SPLIT_KV:
         (
             m_block,
@@ -252,14 +260,18 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
         )
         work_valid = tile_idx < total_tiles
     while work_valid:
-        q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
-        q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
-        q_len = q_eos - q_bos
+        if HOST_Q:
+            q_bos = bid * seqlen_q
+            q_len = seqlen_q
+        else:
+            q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
+            q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
+            q_len = q_eos - q_bos
         q_offset = q_bos * q_row_stride
 
         if is_seqused_k:
             k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
-            k_bos = 0
+            k_bos = bid * seqlen_q if STAGED_KV else 0
         else:
             k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
             k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
@@ -314,7 +326,9 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                     v_base = v_ptr + k_row * v_row_stride + kv_head * v_head_stride
 
                 if USE_TMA_QO:
-                    if PACK_GQA:
+                    if HOST_Q:
+                        q_desc = host_q_desc
+                    elif PACK_GQA:
                         q_desc = tl.make_tensor_descriptor(
                             base=q_base,
                             shape=[q_len, h, d],
@@ -345,6 +359,9 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         strides=[page_stride_rows * v_row_stride, v_row_stride, 1],
                         block_shape=[1, ACTIVE_WGMMA_N, HEAD_DIM_PADDED],
                     )
+                elif STAGED_KV and ACTIVE_WGMMA_N == 128:
+                    k_desc = host_k_desc
+                    v_desc = host_v_desc
                 elif not is_paged:
                     k_desc = tl.make_tensor_descriptor(
                         base=k_base,
@@ -382,7 +399,8 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 HEAD_DIM_PADDED,
                             ],
                             [
-                                m_block * BLOCK_M // h_hk_ratio,
+                                (q_bos if HOST_Q else 0)
+                                + m_block * BLOCK_M // h_hk_ratio,
                                 kv_head * h_hk_ratio,
                                 0,
                             ],
@@ -466,6 +484,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         page_stride_rows,
                         ACTIVE_WGMMA_N,
                         True,
+                        VECTOR=VECTOR_PAGES,
                     )
                     if BM_SPLIT != 16:
                         _copy_paged_kv_tile_to_pipe(
@@ -479,6 +498,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             cache_state,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
+                            VECTOR=VECTOR_PAGES,
                         )
                     previous_cache_state = cache_state
                 elif BM_SPLIT != 16:
@@ -501,6 +521,9 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             kv_offset,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
+                            bid,
+                            kv_head,
+                            STAGED_KV and ACTIVE_WGMMA_N == 128,
                         )
 
                 if NUM_MMA_GROUPS == 2:
@@ -523,7 +546,8 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                     HEAD_DIM_PADDED,
                                 ],
                                 [
-                                    (m_block * BLOCK_M + BM_SPLIT) // h_hk_ratio,
+                                    (q_bos if HOST_Q else 0)
+                                    + (m_block * BLOCK_M + BM_SPLIT) // h_hk_ratio,
                                     kv_head * h_hk_ratio,
                                     0,
                                 ],
@@ -585,6 +609,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             cache_state,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
+                            VECTOR=VECTOR_PAGES,
                         )
                 elif is_paged:
                     _copy_paged_kv_tma_tile_to_pipe(
@@ -605,6 +630,9 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         kv_offset,
                         ACTIVE_WGMMA_N,
                         HEAD_DIM_PADDED,
+                        bid,
+                        kv_head,
+                        STAGED_KV and ACTIVE_WGMMA_N == 128,
                     )
                 accum_cnt_kv += 1
 
@@ -623,6 +651,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             page_stride_rows,
                             ACTIVE_WGMMA_N,
                             False,
+                            VECTOR=VECTOR_PAGES,
                         )
                         if BM_SPLIT != 16:
                             _copy_paged_kv_tile_to_pipe(
@@ -637,6 +666,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 ACTIVE_WGMMA_N,
                                 HEAD_DIM_PADDED,
                                 False,
+                                VECTOR=VECTOR_PAGES,
                             )
                         v_iteration = accum_cnt_kv
                         v_offset = kv_offset
@@ -658,6 +688,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
                             False,
+                            VECTOR=VECTOR_PAGES,
                         )
                         previous_cache_state = cache_state
                         accum_cnt_kv += 1
@@ -673,6 +704,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             page_stride_rows,
                             ACTIVE_WGMMA_N,
                             True,
+                            VECTOR=VECTOR_PAGES,
                         )
                         if BM_SPLIT != 16:
                             _copy_paged_kv_tile_to_pipe(
@@ -687,6 +719,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 ACTIVE_WGMMA_N,
                                 HEAD_DIM_PADDED,
                                 True,
+                                VECTOR=VECTOR_PAGES,
                             )
                         v_iteration = accum_cnt_kv
                         v_offset = kv_offset
@@ -708,6 +741,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
                             True,
+                            VECTOR=VECTOR_PAGES,
                         )
                         previous_cache_state = cache_state
                         accum_cnt_kv += 1
@@ -726,6 +760,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                         ACTIVE_WGMMA_N,
                         HEAD_DIM_PADDED,
                         True,
+                        VECTOR=VECTOR_PAGES,
                     )
 
                 remaining_n_block_start = n_block_min + 1
@@ -743,6 +778,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             page_stride_rows,
                             ACTIVE_WGMMA_N,
                             True,
+                            VECTOR=VECTOR_PAGES,
                         )
                         if BM_SPLIT != 16:
                             _copy_paged_kv_tile_to_pipe(
@@ -756,6 +792,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 cache_state,
                                 ACTIVE_WGMMA_N,
                                 HEAD_DIM_PADDED,
+                                VECTOR=VECTOR_PAGES,
                             )
                     elif BM_SPLIT != 16:
                         if is_paged:
@@ -777,6 +814,9 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                                 kv_offset,
                                 ACTIVE_WGMMA_N,
                                 HEAD_DIM_PADDED,
+                                bid,
+                                kv_head,
+                                STAGED_KV and ACTIVE_WGMMA_N == 128,
                             )
 
                     if is_paged and PAGED_KV_NON_TMA:
@@ -791,6 +831,7 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             cache_state,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
+                            VECTOR=VECTOR_PAGES,
                         )
                     elif is_paged:
                         _copy_paged_kv_tma_tile_to_pipe(
@@ -811,6 +852,9 @@ def _flash_varlen_fwd_v3_tle_persistent_producer(
                             kv_offset,
                             ACTIVE_WGMMA_N,
                             HEAD_DIM_PADDED,
+                            bid,
+                            kv_head,
+                            STAGED_KV and ACTIVE_WGMMA_N == 128,
                         )
                     accum_cnt_kv += 1
 
@@ -1720,6 +1764,11 @@ def flash_varlen_fwd_v3_tle_kernel(
     page_table_ptr,
     page_table_batch_stride: tl.constexpr,
     block_size: tl.constexpr,
+    host_q_desc,
+    host_k_desc,
+    host_v_desc,
+    STAGED_KV: tl.constexpr,
+    HOST_Q: tl.constexpr,
     o_desc,
     scheduler_counter_ptr,
     partial_out_ptr,
@@ -1958,6 +2007,11 @@ def flash_varlen_fwd_v3_tle_kernel(
                         page_table_batch_stride,
                         block_size,
                         page_stride_rows,
+                        host_q_desc,
+                        host_k_desc,
+                        host_v_desc,
+                        STAGED_KV,
+                        HOST_Q,
                         q_smem,
                         q_writer0,
                         k_pipe.writer(),
@@ -2184,6 +2238,11 @@ def flash_varlen_fwd_v3_tle_kernel(
                         page_table_batch_stride,
                         block_size,
                         page_stride_rows,
+                        host_q_desc,
+                        host_k_desc,
+                        host_v_desc,
+                        STAGED_KV,
+                        HOST_Q,
                         q_smem,
                         q_writer0,
                         k_pipe.writer(),
@@ -2301,6 +2360,8 @@ def launch_persistent(
     fwd_args,
     *,
     output,
+    staged_kv=False,
+    compact_prefill=False,
     total_q,
     head_size,
     num_sms,
@@ -2358,6 +2419,36 @@ def launch_persistent(
             padded_head_dim(head_size),
         ],
     )
+    host_q = (
+        compact_prefill
+        and not ragged_scheduler
+        and pack_gqa
+        and head_size == 128
+        and output.dtype == torch.bfloat16
+        and not split_kv
+        and effective_max_q >= 256 * pack_factor
+        and effective_max_q * batch_size == total_q * pack_factor
+        and effective_max_q % block_m == 0
+        and pack_factor == 4
+    )
+    if host_q:
+        query = fwd_args[0]
+        q_desc = TensorDescriptor(
+            query,
+            list(query.shape),
+            list(query.stride()),
+            [o_block_rows, o_block_heads, padded_head_dim(head_size)],
+        )
+    else:
+        q_desc = o_desc
+    if staged_kv:
+        k, v = fwd_args[1:3]
+        shape = [batch_size, max_seqlen_k, num_heads_k * head_size]
+        strides = [max_seqlen_k * num_heads_k * head_size, num_heads_k * head_size, 1]
+        k_desc = TensorDescriptor(k, shape, strides, [1, 128, head_size])
+        v_desc = TensorDescriptor(v, shape, strides, [1, 128, head_size])
+    else:
+        k_desc = v_desc = o_desc
     if scheduler_counter is None:
         scheduler_counter = torch.empty((1,), dtype=torch.int32, device=output.device)
     # Split-KV supplies a cached counter reset by its preceding combine.
@@ -2378,6 +2469,11 @@ def launch_persistent(
     )
     return flash_varlen_fwd_v3_tle_kernel[grid](
         *fwd_args,
+        q_desc,
+        k_desc,
+        v_desc,
+        staged_kv,
+        host_q,
         o_desc,
         scheduler_counter,
         partial_out,
