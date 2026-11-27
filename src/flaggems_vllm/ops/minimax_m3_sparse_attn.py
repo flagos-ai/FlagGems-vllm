@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax M3 block-sparse GQA attention over a paged KV cache.
 
-This module is a thin dispatch layer over FlagAttention's
+The CUDA path is a thin dispatch layer over FlagAttention's
 ``flag_attn.minimax_sparse_attention`` implementation, which owns the Triton
 kernels (TMA/TLE prefill, kv-outer CSR reuse, split-K decode plus LSE merge).
 Keeping a single implementation there avoids a second copy of the kernels
@@ -166,7 +166,8 @@ def minimax_m3_sparse_attn(
 ):
     """Block-sparse GQA prefill attention over the selected blocks.
 
-    Writes into ``output`` and returns it. ``block_size_q == 1``: every query
+    Ascend accepts a BF16 pair of K/V views [pages, 128, KV heads, head dim],
+    writes into output and returns None. CUDA writes into output and returns it. ``block_size_q == 1``: every query
     token carries its own selected-block list. FlagAttention picks the kernel
     (q-outer TMA/TLE, or the kv-outer CSR path on long BF16 prompts).
 
@@ -188,6 +189,29 @@ def minimax_m3_sparse_attn(
         NotImplementedError: unsupported dtype/layout/device, or FlagAttention
             is not installed. There is no torch compute fallback.
     """
+    if q.device.type == "npu":
+        from flaggems_vllm.runtime.backend._ascend.ops.minimax_m3_sparse_attn import (
+            separate_kv_attention,
+        )
+
+        if k_scale is not None or v_scale is not None:
+            raise NotImplementedError(
+                "Ascend MiniMax sparse attention supports BF16 KV only"
+            )
+        return separate_kv_attention(
+            q,
+            kv_cache,
+            topk_idx,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            num_kv_heads,
+            sm_scale,
+            output,
+            decode=False,
+        )
     _check_common(q, kv_cache, topk_idx, block_table, output, num_kv_heads, sm_scale)
     _check_scales(q, k_scale, v_scale)
     if isinstance(max_query_len, bool) or not isinstance(max_query_len, int):
@@ -249,7 +273,8 @@ def minimax_m3_sparse_attn_decode(
 ):
     """Block-sparse GQA decode attention (split-K over the selected blocks).
 
-    Writes into ``output`` and returns it. Decode parallelizes over the
+    Ascend accepts a BF16 pair of K/V views [pages, 128, KV heads, head dim],
+    writes into output and returns None. CUDA writes into output and returns it. Decode parallelizes over the
     selected-block dimension instead of the query dimension, since one query
     token per request leaves the prefill kernels idle. FlagAttention chooses
     the chunk count and whether the LSE merge is needed.
@@ -271,6 +296,29 @@ def minimax_m3_sparse_attn_decode(
         NotImplementedError: unsupported dtype/layout/device, or FlagAttention
             is not installed. There is no torch compute fallback.
     """
+    if q.device.type == "npu":
+        from flaggems_vllm.runtime.backend._ascend.ops.minimax_m3_sparse_attn import (
+            separate_kv_attention,
+        )
+
+        if k_scale is not None or v_scale is not None:
+            raise NotImplementedError(
+                "Ascend MiniMax sparse attention supports BF16 KV only"
+            )
+        return separate_kv_attention(
+            q,
+            kv_cache,
+            topk_idx,
+            block_table,
+            seq_lens,
+            seq_lens,
+            seq_lens,
+            decode_query_len,
+            num_kv_heads,
+            sm_scale,
+            output,
+            decode=True,
+        )
     _check_common(q, kv_cache, topk_idx, block_table, output, num_kv_heads, sm_scale)
     _check_scales(q, k_scale, v_scale)
     if isinstance(decode_query_len, bool) or not isinstance(decode_query_len, int):
