@@ -1853,6 +1853,17 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: minimax_qknorm_rope_cache
+  description: Fuse MiniMax-M3 query/key normalization, rotary encoding, and KV/index-cache writes on Atlas A5.
+  for:
+  - minimax_qknorm_rope_cache
+  labels:
+  - non-aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: moe_align_block_size_triton
   description: 'Aligns the token distribution across experts to be compatible with
     block size
