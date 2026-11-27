@@ -91,7 +91,7 @@ runtime_deps:
 aliases:
   nvidia: nvidia-cuda133
   ascend: ascend-cann900
-  hygon: hygon-dtk2604
+  hygon: hygon-dtk2610
   metax: metax-maca3810
   iluvatar: iluvatar-corex450
   mthreads: mthreads-musa520
@@ -189,6 +189,29 @@ backends:
   # ---------------------------------------------------------------------------
   # Hygon DCU
   # ---------------------------------------------------------------------------
+  hygon-dtk2610:
+    vendor: hygon
+    python: "3.12"
+    triton: triton==3.6.0+dtk2610.torch2110.2611240931.gcdb77f
+    flagtree: flagtree==0.7.1a1+hcu3.6
+    vllm:
+      - vllm==0.28.1+dtk2610.torch2110.2610191943.g29071f
+    env_source:
+      - /opt/dtk/env.sh
+    env:
+      FLAGTREE_BACKEND: hcu
+      VLLM_PLUGINS: hcu
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      ROCM_PATH: /opt/dtk
+    deps:
+      - torch==2.11.0+dtk2610.2611121723.gc86da8
+      - torchvision==0.26.0+dtk2610.torch2110.2610231707.gd9d99a
+      - torchaudio==2.11.0+dtk2610.torch2110.2610262102.g1da530
+      - flash_attn==2.8.4+dtk2610.torch2110.2610092228.g50fdfe
+      - apex==1.7.0+dtk2610.torch2110.2610271839.gfa848d
+      - lightop==0.6.0+dtk2610.torch2110.2610222215.gdf8246
+      - aiter==0.1.7+dtk2610.torch2110.2610102002.g61e581
+
   hygon-dtk2604:
     vendor: hygon
     python: "3.10"

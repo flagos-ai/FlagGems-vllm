@@ -24,9 +24,9 @@ import time
 import zipfile
 
 NAME = "vllm-musa"
-VERSION = "0.1.24"
+VERSION = "0.1.32"
 REPOSITORY = "https://github.com/MooreThreads/vllm-musa"
-REVISION = "9992297d59ebca36132ed6c59a2d3fb736f7a410"
+REVISION = "61ecc0b1cb4d5431c20f6b02819603f8a7a0d6a2"
 REQUIRES = (
     "click==8.2.0",
     "einops",
@@ -41,9 +41,11 @@ CHECKOUT = pathlib.Path("~/.cache/flaggems/src/vllm-musa").expanduser()
 # the index is passed to that single install instead of being declared globally
 # where it would capture the package for every other vendor.
 VENDOR_INDEX = "https://dl.mthreads.com/repo/api/pypi/pypi/simple"
+SETUPTOOLS_VERSION = "80.10.2"
+
 BUILD_PREREQS = {
     "torchada": ("torchada>=0.1.76", None),
-    "tvm_ffi": ("apache-tvm-ffi==0.1.9.post3+musa.1", VENDOR_INDEX),
+    "tvm_ffi": ("apache-tvm-ffi==0.1.11.post1+musa.1", VENDOR_INDEX),
 }
 
 
@@ -199,11 +201,85 @@ def _ensure_build_prereqs() -> None:
         _run([*command, requirement])
 
 
-def _vendor_wheel() -> pathlib.Path:
+def _ensure_setuptools() -> None:
+    """Pin the setuptools build used by the vendored extension build."""
+    import importlib.metadata
+
+    try:
+        current = importlib.metadata.version("setuptools")
+    except importlib.metadata.PackageNotFoundError:
+        current = ""
+    if current == SETUPTOOLS_VERSION:
+        return
+    _log(f"installing setuptools=={SETUPTOOLS_VERSION} (found {current or '<none>'})")
+    _run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            f"setuptools=={SETUPTOOLS_VERSION}",
+        ]
+    )
+
+
+def _ensure_vllm_runtime_deps(source: pathlib.Path) -> None:
+    """Install vllm-musa's portable runtime requirements.
+
+    The vLLM tree is cloned later by the vendored build.  This file is the
+    vendor-owned dependency list (including numpy==1.26) and is available as
+    soon as the vllm-musa source tree has been checked out.
+    """
+    requirements = source / "requirements" / "common.txt"
+    if not requirements.is_file():
+        _log(
+            f"no vllm-musa requirements at {requirements}; skipping dependency install"
+        )
+        return
+    # The MUSA image and optest's mthreads.sh own NumPy and torchada.  In
+    # particular, reinstalling torchada after mthreads.sh would overwrite the
+    # patched torchada_stable_box.h and reintroduce the CUB device-new error.
+    # Keep the remaining requirements in a temporary file.
+    filtered = []
+    for line in requirements.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith(("numpy", "torchada")):
+            continue
+        filtered.append(line)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix="-requirements.txt", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write("\n".join(filtered) + "\n")
+        filtered_path = pathlib.Path(handle.name)
+    try:
+        _log(f"installing vllm-musa runtime dependencies from {requirements}")
+        _run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--upgrade-strategy",
+                "only-if-needed",
+                "-r",
+                str(filtered_path),
+            ]
+        )
+    finally:
+        filtered_path.unlink(missing_ok=True)
+
+
+def _vendor_wheel() -> tuple[pathlib.Path, pathlib.Path]:
+    _ensure_setuptools()
     _ensure_build_prereqs()
     source = _source_tree()
+    _ensure_vllm_runtime_deps(source)
     output = pathlib.Path(tempfile.mkdtemp(prefix="vllm-musa-wheel-"))
     env = dict(os.environ)
+    env["VLLM_TARGET_DEVICE"] = "empty"
+    env["VLLM_VERSION_OVERRIDE"] = "0.32.0"
+    env["SETUPTOOLS_SCM_PRETEND_VERSION"] = "0.32.0"
     # The vendored setup.py reads torch.musa, which only exists once the image's
     # torch autoloads torch_musa, so that switch is left alone.
     _cxx_toolchain_env(env)
@@ -227,7 +303,7 @@ def _vendor_wheel() -> pathlib.Path:
     wheels = sorted(output.glob("*.whl"))
     if not wheels:
         raise RuntimeError(f"no wheel produced in {output}")
-    return wheels[0]
+    return wheels[0], source
 
 
 def _metadata() -> str:
@@ -250,6 +326,14 @@ def _wheel(tags: list[str]) -> str:
     ]
     lines.extend(f"Tag: {tag}" for tag in tags)
     return "\n".join(lines) + "\n"
+
+
+ENTRY_POINTS = """[vllm.platform_plugins]
+musa = vllm_musa:musa_platform_plugin
+
+[vllm.general_plugins]
+musa_custom_ops = vllm_musa:register_custom_ops
+"""
 
 
 def _dist_info() -> str:
@@ -292,12 +376,13 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "METADATA").write_text(_metadata(), encoding="utf-8")
     (directory / "WHEEL").write_text(_wheel(["py3-none-any"]), encoding="utf-8")
+    (directory / "entry_points.txt").write_text(ENTRY_POINTS, encoding="utf-8")
     return _dist_info()
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _log("hook: build_wheel")
-    vendor = _vendor_wheel()
+    vendor, source = _vendor_wheel()
     tags = _vendor_tags(vendor)
     target = (
         pathlib.Path(wheel_directory)
@@ -307,18 +392,36 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     record = io.StringIO()
     writer = csv.writer(record, lineterminator="\n")
     with (
-        zipfile.ZipFile(vendor) as source,
+        zipfile.ZipFile(vendor) as archive,
         zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out,
     ):
-        for member in source.infolist():
+        existing = set()
+        for member in archive.infolist():
             if ".dist-info/" in member.filename:
                 continue
-            data = source.read(member)
+            existing.add(member.filename)
+            data = archive.read(member)
             out.writestr(member, data)
             writer.writerow(_record_row(member.filename, data))
+
+        # The vendor wheel's package-data rules do not include every JIT
+        # header.  Repack the source tree's complete jit_kernel directory so
+        # the installed plugin does not depend on the build cache.
+        jit_root = source / "vllm_musa" / "jit_kernel"
+        if jit_root.is_dir():
+            for path in sorted(jit_root.rglob("*")):
+                if not path.is_file():
+                    continue
+                arcname = str(path.relative_to(source))
+                if arcname in existing:
+                    continue
+                data = path.read_bytes()
+                out.writestr(arcname, data)
+                writer.writerow(_record_row(arcname, data))
         for name, text in (
             ("METADATA", _metadata()),
             ("WHEEL", _wheel(tags)),
+            ("entry_points.txt", ENTRY_POINTS),
             ("INSTALLER", "uv\n"),
         ):
             data = text.encode("utf-8")
