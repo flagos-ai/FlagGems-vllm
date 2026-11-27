@@ -50,6 +50,7 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
         globals()[_alias] = globals()[_target]
 
 __all__ = [
+    "minimax_qknorm_rope_cache",
     "disable_symm_mem",
     "enable_symm_mem",
     "SUPPORTED_FP8_DTYPE",
