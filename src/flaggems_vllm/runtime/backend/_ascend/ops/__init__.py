@@ -86,6 +86,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.indexer_gemm_score import (
 from flaggems_vllm.runtime.backend._ascend.ops.indexer_k_quant_and_cache import (
     indexer_k_quant_and_cache,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.insert_context_kv import (
+    insert_context_kv,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
 )
@@ -183,6 +186,7 @@ __all__ = [
     "indexer_gemm_score",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
+    "insert_context_kv",
     "kda_gate_cumsum_triton",
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",

@@ -1589,6 +1589,18 @@ ops:
   stages:
   - beta: '5.0'
   - stable: '5.3'
+- id: insert_context_kv
+  description: Apply GPT-J RoPE to normalized DeepSeek DSpark KV and write the
+    requested rows into the paged sliding-window cache in place.
+  for:
+  - vllm.models.deepseek_v41.nvidia.dspark._insert_context_kv
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
 - id: instance_norm
   description: 'Apply Instance Normalization independently for each channel in every
     data sample within a batch.
