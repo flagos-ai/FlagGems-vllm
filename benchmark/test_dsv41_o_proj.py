@@ -12,250 +12,547 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""dsv41_o_proj (wo_a part) against each vendor's native path.
-
-Hopper: vLLM ``deep_gemm_fp8_o_proj``. Both sides run inverse RoPE + FP8 quant +
-grouped FP8 GEMM; wo_b is an identity callback on the vLLM side, so only the wo_a
-stage is timed. Small batches take one kernel launch and large ones two; see
-``dsv41_o_proj``.
-
-Hygon: no matching native path. vllm_hcu (HYGON-AI/vllm-plugin-das) runs this
-projection in BF16 without quantization, and its FP8 branch is unreachable on the
-ROCm-type HCU platform. The baseline therefore comes from ``--base-data``; inputs
-are the same FP8 tensors as on Hopper, so the shapes match that baseline.
-
-Also run ``--mode operator``: it counts the CPU launch time the default mode partly
-hides.
-"""
-
-import importlib
-import inspect
-import math
-import types
+import warnings
 
 import pytest
 import torch
-import triton
 
 import flaggems_vllm
 
-from . import base
+from . import base, consts
 
-FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-QUANT_BLOCK = 128
-NOPE_DIM, ROPE_DIM = 448, 64
-HEAD_DIM = NOPE_DIM + ROPE_DIM
-MAX_POSITION = 8192
+VENDOR = flaggems_vllm.vendor_name
 
+MODEL_TOP_K_HIDDEN = [
+    (6, 4096),
+    (8, 6144),
+    (4, 6144),
+    (16, 7168),
+]
 
-def is_hopper():
-    if flaggems_vllm.vendor_name != "nvidia" or not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability()[0] == 9
-
-
-HOPPER = is_hopper()
-
-try:
-    from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
-
-    HAS_VLLM = is_deep_gemm_supported()
-except ImportError:
-    HAS_VLLM = False
+NUM_TOKENS = [512, 2048, 8192, 16384]
 
 
-def _make_cos_sin_cache(device):
-    inv_freq = 1.0 / (
-        10000.0 ** (torch.arange(0, ROPE_DIM, 2, dtype=torch.float32) / ROPE_DIM)
-    )
-    freqs = torch.outer(torch.arange(MAX_POSITION, dtype=torch.float32), inv_freq)
-    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(device)
+# Benchmark shapes: (num_tokens, topk, hidden_size).
+MOE_SUM_SHAPES = [
+    (num_tokens, topk, hidden_size)
+    for topk, hidden_size in MODEL_TOP_K_HIDDEN
+    for num_tokens in NUM_TOKENS
+]
 
 
-def _per_block_cast_to_fp8(w):
-    n, k = w.shape
-    wb = w.float().view(n // QUANT_BLOCK, QUANT_BLOCK, k // QUANT_BLOCK, QUANT_BLOCK)
-    scale = wb.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-4) / FP8_MAX
-    q = (wb / scale).to(torch.float8_e4m3fn).view(n, k)
-    return q, scale.view(n // QUANT_BLOCK, k // QUANT_BLOCK)
+# -----------------------------------------------------------------------------
+# Vendor-specific baseline import
+# -----------------------------------------------------------------------------
+
+# A platform build may ship FlagGems without the vendor-native vocabulary
+# package (e.g. lightop on Hygon). A failed import leaves the handle None and
+# degrades the run to latency-only mode instead of failing collection.
+vendor_ops = None
+torch_npu = None
+hygon_op = None
+iluvatar_moe_reduce_sum = None
+maybe_fast_moe_sum = None
+_BASELINE_IMPORT_ERROR = None
+# Set when the mthreads fast path is importable but rejects every dtype at
+# runtime (JIT build failure or guard rejection); the run then demotes to the
+# latency-only + --base-data fallback, same route as a missing library.
+_BASELINE_PROBE_REJECTED = False
+_MUSA_PROBE_RESULT = None
+
+if VENDOR == "nvidia":
+    try:
+        from vllm import _custom_ops as vendor_ops
+    except ImportError as exc:
+        _BASELINE_IMPORT_ERROR = exc
+
+elif VENDOR == "ascend":
+    try:
+        import torch_npu
+    except ImportError as exc:
+        _BASELINE_IMPORT_ERROR = exc
+
+elif VENDOR == "hygon":
+    try:
+        from lightop import op as hygon_op
+    except ImportError as exc:
+        _BASELINE_IMPORT_ERROR = exc
+
+elif VENDOR == "iluvatar":
+    try:
+        from ixformer.inference.functions.moe import (
+            moe_output_reduce_sum as iluvatar_moe_reduce_sum,
+        )
+    except ImportError as exc:
+        _BASELINE_IMPORT_ERROR = exc
+
+elif VENDOR == "mthreads":
+    try:
+        from vllm_musa.jit_kernel.csrc.moe import maybe_fast_moe_sum
+    except ImportError as exc:
+        _BASELINE_IMPORT_ERROR = exc
 
 
-def _make_inputs(num_tokens, n_groups, hpg, rank, device, seed=0):
-    torch.manual_seed(seed)
-    k = hpg * HEAD_DIM
-    attn_out = torch.randn(
-        num_tokens, n_groups * hpg, HEAD_DIM, dtype=torch.bfloat16, device=device
-    )
-    pos = torch.randint(0, MAX_POSITION, (num_tokens,), device=device)
-    csc = _make_cos_sin_cache(device)
-    w, ws = _per_block_cast_to_fp8(
-        torch.randn(n_groups * rank, k, device=device) / math.sqrt(k)
-    )
-    return (
-        attn_out,
-        pos,
-        csc,
-        w.view(n_groups, rank, k),
-        ws.view(n_groups, rank // QUANT_BLOCK, k // QUANT_BLOCK),
-    )
+# -----------------------------------------------------------------------------
+# Vendor capabilities
+# -----------------------------------------------------------------------------
 
 
-class Dsv41OProjBenchmark(base.Benchmark):
-    """Shape = (num_tokens, n_groups, heads_per_group, o_lora_rank)."""
+def _normalized_shape(shape):
+    """Normalize a benchmark shape to (num_tokens, topk, hidden_size).
 
-    DEFAULT_METRICS = base.consts.DEFAULT_METRICS[:] + ["tflops"]
-
-    def set_more_shapes(self):
-        tokens = (1, 4, 8, 16, 32, 64, 96, 128, 512, 2048, 8192, 16384)
-        groups = ((8, 8, 1024), (16, 8, 1024), (2, 8, 1024))
-        return [(t, g, h, r) for (g, h, r) in groups for t in tokens]
-
-    def get_input_iter(self, cur_dtype):
-        del cur_dtype
-        device = flaggems_vllm.device
-        for t, g, h, r in self.shapes:
-            inputs = _make_inputs(t, g, h, r, device)
-            # Compile / tune outside the timed region.
-            _vllm_wrapper(*inputs)
-            _gems_wrapper(*inputs)
-            torch.cuda.synchronize()
-            yield inputs
-
-    def get_tflops(self, op, *args, **kwargs):
-        attn_out, _, _, w3, _ = args
-        g, n, k = w3.shape
-        return 2.0 * attn_out.shape[0] * g * n * k
-
-
-def _vllm_wrapper(attn_out, pos, csc, w3, ws3):
-    g, rank, k = w3.shape
-    wo_a = types.SimpleNamespace(weight=w3, weight_scale_inv=ws3)
-    # Identity wo_b: both sides allocate and return z, nothing else is timed.
-    return deep_gemm_fp8_o_proj(
-        attn_out,
-        pos,
-        csc,
-        wo_a,
-        lambda flat: flat,
-        n_groups=g,
-        heads_per_group=k // HEAD_DIM,
-        nope_dim=NOPE_DIM,
-        rope_dim=ROPE_DIM,
-        o_lora_rank=rank,
-        einsum_recipe=(1, 128, 128),
-        tma_aligned_scales=False,
-    )
-
-
-def _gems_wrapper(attn_out, pos, csc, w3, ws3):
-    g, rank, k = w3.shape
-    return flaggems_vllm.dsv41_o_proj(
-        attn_out,
-        pos,
-        csc,
-        w3,
-        ws3,
-        n_groups=g,
-        heads_per_group=k // HEAD_DIM,
-        o_lora_rank=rank,
-    )
-
-
-def _default_vllm_launch_pdl(monkeypatch):
-    """Give vLLM's quant kernel a ``launch_pdl`` default so it can always launch.
-
-    ``_fused_inv_rope_fp8_quant_per_head`` declares ``launch_pdl: tl.constexpr``
-    with no default, and vLLM passes it only when
-    ``current_platform.is_arch_support_pdl()`` is true -- a live CUDA context is
-    needed for that check and every exception in it becomes False. Where it is
-    false the Triton binder is left without the argument and the launch raises
-    TypeError, so the vLLM reference cannot run at all; the FlagOS CI image does
-    that on H800. Default it to False without touching the kernel code; a stack
-    that does pass ``launch_pdl=True`` still gets PDL. Same fix as
-    ``benchmark/test_fused_inv_rope_fp8_quant.py``'s MUSA baseline, and pytest
-    restores the original kernel afterwards, including on failure.
+    Two-dimensional shapes use topk=1, matching _input_fn.
     """
-    module = importlib.import_module(
-        "vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant"
+    return (shape[0], 1, shape[1]) if len(shape) == 2 else shape
+
+
+def _mthreads_shape_supported(shape):
+    """Return whether vLLM-MUSA musa_fast_moe_sum supports the shape."""
+    _, topk, hidden_size = _normalized_shape(shape)
+
+    # The native fast path is a statically-unrolled topk reduction and was
+    # validated on real MoE shapes (topk <= 16). Hidden rows use vectorized
+    # loads, so keep them aligned to 8 elements.
+    return topk <= 16 and hidden_size > 0 and hidden_size % 8 == 0
+
+
+def _iluvatar_shape_supported(shape):
+    """Return whether Iluvatar moe_output_reduce_sum supports the shape."""
+    _, topk, hidden_size = _normalized_shape(shape)
+
+    # The Iluvatar native kernel was validated on MoE shapes with topk <= 16
+    # and an even hidden size.
+    return topk <= 16 and hidden_size > 0 and hidden_size % 2 == 0
+
+
+def _ascend_shape_supported(shape):
+    """Return whether the Ascend MoeTokenUnpermute supports the shape."""
+    _, topk, _ = _normalized_shape(shape)
+
+    # torch_npu.npu_moe_token_unpermute rejects topK > 512.
+    return topk <= 512
+
+
+def _get_supported_dtypes():
+    """Return dtypes supported by both FlagGems and the selected baseline."""
+    if VENDOR == "iluvatar":
+        # Iluvatar moe_output_reduce_sum supports FP16/BF16 only.
+        return [
+            dtype
+            for dtype in consts.FLOAT_DTYPES
+            if dtype in (torch.float16, torch.bfloat16)
+        ]
+
+    # Ascend, Hygon, MThreads, NVIDIA and T-Head native kernels support the
+    # normal benchmark dtype set.
+    return consts.FLOAT_DTYPES
+
+
+# -----------------------------------------------------------------------------
+# Inputs
+# -----------------------------------------------------------------------------
+
+
+def _input_fn(shape, dtype, device):
+    shape = _normalized_shape(shape)
+    num_tokens, topk, hidden_size = shape
+    input_tensor = torch.randn(
+        num_tokens,
+        topk,
+        hidden_size,
+        dtype=dtype,
+        device=device,
+        requires_grad=False,
     )
-    kernel_name = "_fused_inv_rope_fp8_quant_per_head"
-    kernel = getattr(module, kernel_name, None)
-    if kernel is None:
-        return
-    params = inspect.signature(kernel.fn).parameters
-    pdl = params.get("launch_pdl")
-    if pdl is None or pdl.default is not inspect.Parameter.empty:
-        return
-    if (
-        next(reversed(params)) != "launch_pdl"
-        or pdl.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
-    ):
-        raise RuntimeError("unsupported vLLM launch_pdl signature")
 
-    fn = kernel.fn
-    adapted_fn = types.FunctionType(
-        fn.__code__, fn.__globals__, fn.__name__, (False,), fn.__closure__
+    output_tensor = torch.empty(
+        num_tokens,
+        hidden_size,
+        dtype=dtype,
+        device=device,
+        requires_grad=False,
     )
-    adapted_fn.__annotations__ = fn.__annotations__.copy()
-    adapted_fn.__module__ = fn.__module__
-    adapted_fn.__qualname__ = fn.__qualname__
-    adapted_kernel = triton.jit(
-        adapted_fn,
-        do_not_specialize=kernel.do_not_specialize,
-        do_not_specialize_on_alignment=kernel.do_not_specialize_on_alignment,
-        version=kernel.version,
-        debug=kernel.debug,
-        noinline=kernel.noinline,
-        launch_metadata=kernel.launch_metadata,
+    yield input_tensor, output_tensor
+
+
+# -----------------------------------------------------------------------------
+# Native argument caches
+# -----------------------------------------------------------------------------
+
+# Some native kernels need extra tensors (identity indices, ones/zeros) that
+# are not part of the benchmark input. Build them once per input buffer and
+# reuse them so their allocation does not land in the timed region.
+_AUX_CACHE = {}
+
+
+def _cache_key(input_tensor):
+    return (
+        input_tensor.data_ptr(),
+        tuple(input_tensor.shape),
+        input_tensor.dtype,
+        input_tensor.device,
     )
-    monkeypatch.setattr(module, kernel_name, adapted_kernel)
 
 
-@pytest.mark.dsv41_o_proj
-@pytest.mark.skipif(
-    not (HAS_VLLM and HOPPER),
-    reason="requires NVIDIA Hopper and vLLM with DeepGEMM support",
-)
-def test_perf_dsv41_o_proj_gems_vs_vllm(monkeypatch):
-    _default_vllm_launch_pdl(monkeypatch)
-    bench = Dsv41OProjBenchmark(
-        op_name="dsv41_o_proj",
-        torch_op=_vllm_wrapper,
-        dtypes=[torch.bfloat16],
+def _cached_aux(input_tensor, factory):
+    key = _cache_key(input_tensor)
+    aux = _AUX_CACHE.get(key)
+    if aux is None:
+        aux = factory()
+        _AUX_CACHE[key] = aux
+    return aux
+
+
+# -----------------------------------------------------------------------------
+# Baselines
+# -----------------------------------------------------------------------------
+
+
+def _vllm_native_op(input_tensor, output_tensor):
+    """vLLM native moe_sum baseline (NVIDIA and T-Head)."""
+    vendor_ops.moe_sum(input_tensor, output_tensor)
+
+
+def _hygon_native_op(input_tensor, output_tensor):
+    """Hygon lightop native moe_sum baseline.
+
+    With bias / expert_mask / num_local_tokens set to None and factor=1.0,
+    lightop reduces to out[t, h] = sum_k input[t, k, h].
+    """
+    hygon_op.moe_sum(
+        input=input_tensor,
+        output=output_tensor,
+        bias=None,
+        expert_mask=None,
+        num_local_tokens=None,
+        factor=1.0,
     )
-    bench.set_gems(_gems_wrapper)
-    bench.run()
 
 
-# ---------------------------------------------------------------------------
-# Hygon DCU
-# ---------------------------------------------------------------------------
-HYGON = flaggems_vllm.vendor_name == "hygon" and torch.cuda.is_available()
+def _ascend_native_op(input_tensor, output_tensor):
+    """Ascend MoeTokenUnpermute baseline used as a plain topk-sum.
 
+    torch_npu.npu_moe_token_unpermute allocates its own output, so the
+    pre-allocated output_tensor is intentionally unused.
+    """
+    del output_tensor
 
-class HygonDsv41OProjBenchmark(Dsv41OProjBenchmark):
-    """Same shapes and FP8 inputs as on Hopper; only the gems side runs here."""
+    num_tokens, topk, hidden_size = input_tensor.shape
 
-    def get_input_iter(self, cur_dtype):
-        del cur_dtype
-        device = flaggems_vllm.device
-        for t, g, h, r in self.shapes:
-            inputs = _make_inputs(t, g, h, r, device)
-            # Compile, and build the cached INT8 weight, outside the timed region.
-            _gems_wrapper(*inputs)
-            torch.cuda.synchronize()
-            yield inputs
+    def _make_args():
+        # Identity indices make the unpermute a no-op; unit probs turn the
+        # weighted reduction into the same plain topk-sum as FlagGems.
+        sorted_indices = torch.arange(
+            num_tokens * topk,
+            dtype=torch.int32,
+            device=input_tensor.device,
+        )
+        probs = torch.ones(
+            (num_tokens, topk),
+            dtype=input_tensor.dtype,
+            device=input_tensor.device,
+        )
+        return sorted_indices, probs
 
+    sorted_indices, probs = _cached_aux(input_tensor, _make_args)
 
-@pytest.mark.dsv41_o_proj
-@pytest.mark.skipif(not HYGON, reason="requires Hygon DCU")
-def test_perf_dsv41_o_proj_hygon():
-    bench = HygonDsv41OProjBenchmark(
-        op_name="dsv41_o_proj",
-        # No matching native implementation: --base-data supplies the baseline.
-        torch_op=None,
-        dtypes=[torch.bfloat16],
+    # Do not cache this view: it keeps the (potentially very large) input
+    # tensor alive for the lifetime of the process.
+    permuted = input_tensor.view(num_tokens * topk, hidden_size)
+
+    torch_npu.npu_moe_token_unpermute(
+        permuted,
+        sorted_indices,
+        probs=probs,
+        padded_mode=False,
+        restore_shape=None,
     )
-    bench.set_gems(_gems_wrapper)
+
+
+def _iluvatar_native_op(input_tensor, output_tensor):
+    """Iluvatar ixformer native moe_sum baseline.
+
+    Neutral parameters (unit weights, all-false mask, zero residual, scaling
+    1.0) make the native op compute the same plain topk-sum as FlagGems.
+    """
+    num_tokens, topk, hidden_size = input_tensor.shape
+
+    def _make_args():
+        router_weights = torch.ones(
+            (num_tokens, topk),
+            dtype=torch.float32,
+            device=input_tensor.device,
+        )
+        mask = torch.zeros(
+            num_tokens * topk,
+            dtype=torch.bool,
+            device=input_tensor.device,
+        )
+        residual = torch.zeros(
+            (num_tokens, hidden_size),
+            dtype=input_tensor.dtype,
+            device=input_tensor.device,
+        )
+        return router_weights, mask, residual
+
+    router_weights, mask, residual = _cached_aux(input_tensor, _make_args)
+
+    iluvatar_moe_reduce_sum(
+        input_tensor,
+        router_weights,
+        output_tensor,
+        mask,
+        residual,
+        1.0,
+    )
+
+
+def _mthreads_native_op(input_tensor, output_tensor):
+    """vLLM-MUSA native fast moe_sum baseline.
+
+    The MUSA fast-path guard and the lazy JIT build were already probed on
+    these buffers by MoeSumBenchmark.get_input_iter.
+    """
+    torch.ops.vllm.musa_fast_moe_sum(output_tensor, input_tensor)
+
+
+def _probe_musa_fast_path():
+    """One-shot runtime probe of vllm_musa's fast moe_sum path, per dtype.
+
+    Importing vllm_musa succeeds in builds where the JIT kernel cannot
+    actually be built (or where the guard rejects the dtype), and the guard
+    then returns False at call time instead of raising. Probe every dtype
+    the benchmark will run, once, on small real buffers; the caller decides
+    from the result whether a native baseline exists at all. Returns
+    {dtype: bool}; an empty dict when the library is missing.
+    """
+    results = {}
+    if maybe_fast_moe_sum is None:
+        return results
+    for dtype in _get_supported_dtypes():
+        try:
+            x = torch.randn(8, 6, 128, dtype=dtype, device=flaggems_vllm.device)
+            o = torch.empty(8, 128, dtype=dtype, device=flaggems_vllm.device)
+            results[dtype] = bool(maybe_fast_moe_sum(x, o))
+        except Exception:
+            results[dtype] = False
+    return results
+
+
+def _get_baseline_op():
+    """Select the baseline implementation for the current vendor.
+
+    Returns None when the vendor has no native op, when its library is not
+    installed in this environment, or (mthreads) when the importable fast
+    path rejects every dtype at runtime; the caller then runs latency-only
+    and can compare against --base-data instead.
+    """
+    global _BASELINE_PROBE_REJECTED, _MUSA_PROBE_RESULT
+
+    if VENDOR == "nvidia":
+        return _vllm_native_op if vendor_ops is not None else None
+
+    if VENDOR == "ascend":
+        return _ascend_native_op if torch_npu is not None else None
+
+    if VENDOR == "hygon":
+        return _hygon_native_op if hygon_op is not None else None
+
+    if VENDOR == "iluvatar":
+        return _iluvatar_native_op if iluvatar_moe_reduce_sum is not None else None
+
+    if VENDOR == "mthreads":
+        if maybe_fast_moe_sum is None:
+            return None
+        # Import success does not imply the JIT kernel is usable. Probe every
+        # dtype up front; if none pass, demote to the fallback route instead
+        # of silently skipping every shape in get_input_iter and reporting
+        # nothing. The per-shape probe in get_input_iter stays in place for
+        # the normal case where only some shapes are unsupported.
+        if _MUSA_PROBE_RESULT is None:
+            _MUSA_PROBE_RESULT = _probe_musa_fast_path()
+        if not any(_MUSA_PROBE_RESULT.values()):
+            _BASELINE_PROBE_REJECTED = True
+            return None
+        return _mthreads_native_op
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Benchmark
+# -----------------------------------------------------------------------------
+
+
+class MoeSumBenchmark(base.GenericBenchmarkExcluse1D):
+    """Benchmark FlagGems-vllm moe_sum against the vendor-native baseline.
+
+    Shapes are (num_tokens, topk, hidden_size) taken from mainstream MoE
+    models, with num_tokens in {512, 2048, 8192, 16384, 32768}.
+
+    NVIDIA:
+        vLLM native moe_sum
+
+    T-Head:
+        vLLM native moe_sum
+
+    Ascend:
+        torch_npu MoeTokenUnpermute (identity indices + unit probs)
+
+    Hygon:
+        lightop op.moe_sum
+
+    Iluvatar:
+        ixformer moe_output_reduce_sum (neutral extra parameters)
+
+    MThreads:
+        vLLM-MUSA musa_fast_moe_sum
+
+    Other vendors, or a listed vendor whose native library is not installed:
+        no native baseline: only FlagGems latency is measured, and when
+        --base-data is given the H800 latency scaled by _scaling_factors is
+        reported as the 'vs Base' comparison instead.
+    """
+
+    # Metrics measured by running torch_op. Without a vendor-native baseline
+    # they cannot be produced, so they are dropped instead of failing the run.
+    BASELINE_METRICS = ("latency_base", "speedup")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.torch_op is None:
+            self.metrics = [
+                metric for metric in self.metrics if metric not in self.BASELINE_METRICS
+            ]
+            self.to_bench_metrics = self.metrics
+
+    def set_shapes(self, shape_file_path=None):
+        # Fixed mainstream-model shape set; ignore the generic shape file.
+        _ = shape_file_path
+        self.shapes = MOE_SUM_SHAPES
+
+    def init_user_config(self):
+        """Apply restrictions imposed by the selected baseline."""
+        super().init_user_config()
+
+        if VENDOR == "ascend":
+            self.shapes = [
+                shape for shape in self.shapes if _ascend_shape_supported(shape)
+            ]
+
+        elif VENDOR == "mthreads":
+            self.shapes = [
+                shape for shape in self.shapes if _mthreads_shape_supported(shape)
+            ]
+
+        elif VENDOR == "iluvatar":
+            self.shapes = [
+                shape for shape in self.shapes if _iluvatar_shape_supported(shape)
+            ]
+
+    def get_input_iter(self, dtype):
+        # Also take the generic path when the MUSA library is missing, and
+        # when the runtime probe demoted the run to the latency-only fallback
+        # (self.torch_op is None): there is no native baseline to guard, so
+        # no shape may be skipped here.
+        if VENDOR != "mthreads" or maybe_fast_moe_sum is None or self.torch_op is None:
+            yield from super().get_input_iter(dtype)
+            return
+
+        # Probe the MUSA fast-path guard on the real buffers and skip shapes
+        # it rejects instead of failing the whole benchmark. The probe also
+        # warms up the JIT kernel, so the timed op can call the raw op.
+        yielded = False
+        for shape in self.shapes:
+            for args in self.input_fn(shape, dtype, self.device):
+                input_tensor, output_tensor = args
+                if not maybe_fast_moe_sum(input_tensor, output_tensor):
+                    continue
+
+                yielded = True
+                yield args
+
+        if not yielded:
+            warnings.warn(
+                f"moe_sum benchmark: musa fast path rejected every shape for "
+                f"dtype {dtype}; this dtype reports no results.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+
+# -----------------------------------------------------------------------------
+# Test
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.moe_sum
+def test_moe_sum():
+    baseline_op = _get_baseline_op()
+
+    if baseline_op is None:
+        # Second comparison mode: this vendor has no native moe_sum on the
+        # machine, either because the platform has no native op or because
+        # its library is not installed. FlagGems latency is still measured,
+        # and passing --base-data=<h800_baseline.json> additionally reports
+        # the H800 latency scaled by the bandwidth ratio as 'compared_speedup'.
+        if _BASELINE_PROBE_REJECTED:
+            reason = (
+                "vllm_musa fast moe_sum path is importable but rejected "
+                "every dtype at runtime (JIT build failure or guard "
+                f"rejection; probe={_MUSA_PROBE_RESULT})"
+            )
+        elif _BASELINE_IMPORT_ERROR is not None:
+            reason = (
+                f"native baseline library for vendor {VENDOR!r} is not "
+                f"installed ({_BASELINE_IMPORT_ERROR})"
+            )
+        else:
+            reason = f"vendor {VENDOR!r} has no native moe_sum baseline"
+        print(
+            f"[moe_sum] {reason}; measuring FlagGems latency only. Pass "
+            "--base-data to also report the scaled H800 comparison ('vs Base')."
+        )
+
+    elif VENDOR == "nvidia":
+        assert hasattr(
+            torch.ops._moe_C,
+            "moe_sum",
+        ), "vLLM native moe_sum is not available"
+
+    elif VENDOR == "ascend":
+        assert hasattr(
+            torch_npu,
+            "npu_moe_token_unpermute",
+        ), "torch_npu.npu_moe_token_unpermute is not available"
+
+    elif VENDOR == "hygon":
+        assert hasattr(
+            hygon_op,
+            "moe_sum",
+        ), "lightop op.moe_sum is not available"
+
+    elif VENDOR == "iluvatar":
+        assert callable(
+            iluvatar_moe_reduce_sum,
+        ), "Iluvatar moe_output_reduce_sum is not available"
+
+    elif VENDOR == "mthreads":
+        assert hasattr(
+            torch.ops.vllm,
+            "musa_fast_moe_sum",
+        ), "vLLM-MUSA musa_fast_moe_sum is not available"
+
+    bench = MoeSumBenchmark(
+        input_fn=_input_fn,
+        op_name="moe_sum",
+        # GenericBenchmark calls this field torch_op, but here it is always
+        # the vendor-native baseline; there is no PyTorch fallback.
+        torch_op=baseline_op,
+        # Top-level FlagGems API; vendors that register a specialized
+        # moe_sum backend are dispatched automatically.
+        gems_op=flaggems_vllm.moe_sum,
+        dtypes=_get_supported_dtypes(),
+    )
+
     bench.run()

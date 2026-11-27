@@ -41,6 +41,9 @@ import flaggems_vllm
 # actual culprit.
 # ---------------------------------------------------------------------------
 _DEVICE_CONTEXT_DEAD = False
+_DEFAULT_TORCH_DEVICE_FN = getattr(
+    getattr(flaggems_vllm, "runtime", None), "torch_device_fn", None
+)
 
 # On platforms without a native CUDA backend, torchada redirects
 # torch.cuda.* entry points (e.g. torch.cuda.synchronize) to the vendor
@@ -167,12 +170,12 @@ def pytest_configure(config):
 
     # Print info when first-parameter-only is enabled
     if FIRST_PARAMETER_ONLY:
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("FIRST-PARAMETER-ONLY MODE ENABLED")
         print(
             "   Each test function will run with only its first parameter combination"
         )
-        print(f"{'='*70}\n")
+        print(f"{'=' * 70}\n")
 
 
 def _probe_device_context() -> bool:
@@ -185,7 +188,12 @@ def _probe_device_context() -> bool:
     a bad state. It goes through ``torch_device_fn`` (the vendor's
     ``torch.cuda`` equivalent) so non-CUDA backends are probed the same way.
     """
-    torch_device_fn = flaggems_vllm.runtime.torch_device_fn
+    runtime_mod = getattr(flaggems_vllm, "runtime", None)
+    torch_device_fn = getattr(runtime_mod, "torch_device_fn", None)
+    if torch_device_fn is None:
+        torch_device_fn = _DEFAULT_TORCH_DEVICE_FN
+    if torch_device_fn is None:
+        return True
     try:
         if not torch_device_fn.is_available():
             return True
@@ -208,7 +216,12 @@ def pytest_runtest_setup(item):
         pytest.skip("device context poisoned by an earlier test failure")
 
 
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_teardown(item, nextitem):
+    # Run fixture teardowns (such as monkeypatch.undo()) before probing the
+    # device context, so tests that replace flaggems_vllm.runtime with a stub
+    # restore the real runtime module first.
+    yield
     global _DEVICE_CONTEXT_DEAD
     if not _DEVICE_CONTEXT_DEAD and not _probe_device_context():
         _DEVICE_CONTEXT_DEAD = True
@@ -384,13 +397,13 @@ def pytest_collection_modifyitems(session, config, items):
         original_count = len(items)
         items[:] = kept_items
 
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("FIRST-PARAMETER-ONLY MODE ENABLED (bfloat16 preferred)")
         print(f"   Original tests: {original_count}")
         print(f"   Running tests:  {len(kept_items)} (one per test function)")
         print(f"      bfloat16 preferred: {bfloat16_count}")
         print(f"      fallback (no bfloat16): {fallback_count}")
-        print(f"{'='*70}\n")
+        print(f"{'=' * 70}\n")
 
     if collect_marks_file:
         report = []

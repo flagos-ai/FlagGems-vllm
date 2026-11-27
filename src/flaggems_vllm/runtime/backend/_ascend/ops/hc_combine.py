@@ -26,6 +26,14 @@ _FIXED_CONFIG = (
     _CONFIGS[0] if len(_CONFIGS) == 1 and not _CONFIGS[0].kwargs["LOOP"] else None
 )
 _COMPILED_LAUNCH_HAS_CONSTEXPRS = major_version == 3 and 3 <= minor_version <= 6
+_FIXED_LAUNCH_OPTIONS = (
+    {}
+    if _FIXED_CONFIG is None
+    else {
+        "num_warps": _FIXED_CONFIG.num_warps,
+        "num_stages": _FIXED_CONFIG.num_stages,
+    }
+)
 
 
 @libentry()
@@ -47,6 +55,13 @@ def _hc_combine_runtime_shape(
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     block = tl.load(B + row * SB + d, d < D, other=0).to(tl.float32)
     _hc_combine_vectorized(R, I, O, block, row, d, D, SR, SI, HC, HAS_INJECTION)
+
+
+# LibEntry stores a kernel under its argument key plus the compile options of the
+# launch that built it, so a lookup that skips LibEntry has to append them too.
+_FIXED_LAUNCH_OPTIONS_KEY = _hc_combine_runtime_shape._launch_options_key(
+    _FIXED_LAUNCH_OPTIONS
+)
 
 
 def _launch_hc_combine(
@@ -73,18 +88,12 @@ def _launch_hc_combine(
             # and key, skipping its general argument binder on warm calls.
             device = runtime.torch_device_fn.current_device()
             entry = kernel.kernel_cache[device].get(
-                kernel.key(pointers, dimensions, constants)
+                kernel.key(pointers, dimensions, constants) + _FIXED_LAUNCH_OPTIONS_KEY
             )
             if entry is not None:
                 entry[0][grid](*pointers, *dimensions, *constants)
                 return
-        kernel[grid](
-            *pointers,
-            *dimensions,
-            *constants,
-            num_warps=_FIXED_CONFIG.num_warps,
-            num_stages=_FIXED_CONFIG.num_stages,
-        )
+        kernel[grid](*pointers, *dimensions, *constants, **_FIXED_LAUNCH_OPTIONS)
 
 
 def hc_combine(

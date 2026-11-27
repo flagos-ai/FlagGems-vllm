@@ -74,7 +74,8 @@ if FLANPU_CHUNK_KDA is not None:
     REF_SOURCES.append("flanpu")
 if VLLM_ASCEND_CHUNK_KDA is not None:
     REF_SOURCES.append("vllm_ascend")
-if VLLM_CHUNK_KDA is not None:
+if VLLM_CHUNK_KDA is not None and flaggems_vllm.vendor_name == "nvidia":
+    # The vLLM native kernel is only used as a reference on NVIDIA.
     REF_SOURCES.append("vllm")
 
 
@@ -287,7 +288,13 @@ def _vllm_chunk_kda_reference(
     ``A_log``/``dt_bias``/``lower_bound``, with beta pre-sigmoided and the q/k
     L2 norm done in-kernel.
     """
-    return VLLM_CHUNK_KDA(
+    if q.shape[2] != v.shape[2]:
+        raise pytest.skip("vLLM KDA does not support GQA (H != HV)")
+    # vLLM's native entry has no state_v_first switch and only accepts the
+    # [N, HV, V, K] (v-first) state layout; transpose around the call.
+    if initial_state is not None and not state_v_first:
+        initial_state = initial_state.transpose(-1, -2)
+    o, final_state = VLLM_CHUNK_KDA(
         q,
         k,
         v,
@@ -303,6 +310,9 @@ def _vllm_chunk_kda_reference(
         safe_gate=True,
         lower_bound=LOWER_BOUND,
     )
+    if final_state is not None and not state_v_first:
+        final_state = final_state.transpose(-1, -2)
+    return o, final_state
 
 
 def _vllm_ascend_chunk_kda_reference(

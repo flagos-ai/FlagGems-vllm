@@ -20,6 +20,14 @@ import flaggems_vllm
 from . import accuracy_utils as utils
 
 
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "enflame" and utils.TO_CPU,
+    reason=(
+        "enflame: --ref cpu reduces in fp64 while the GCU op reduces in fp32; "
+        "cross-order rounding noise (up to 1 fp16 ulp) makes it unreliable. "
+        "Use --ref gcu (bit-exact)."
+    ),
+)
 @pytest.mark.rwkv_mm_sparsity
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_rwkv_mmsparsity(dtype):

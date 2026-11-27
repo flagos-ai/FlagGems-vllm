@@ -62,11 +62,17 @@ class DeviceContextGuardTest(unittest.TestCase):
         exec(compile(module, str(source), "exec"), self.namespace)
         self.item = SimpleNamespace(nodeid="test_launch.py::test_async_launch")
 
+    def _finish_teardown(self):
+        hook = self.namespace["pytest_runtest_teardown"](self.item, None)
+        next(hook)
+        with self.assertRaises(StopIteration):
+            next(hook)
+
     def test_async_fault_fails_current_test_and_skips_later_tests(self):
         self.backend.synchronize.side_effect = RuntimeError("device context lost")
 
         with self.assertRaises(DeviceContextFailure):
-            self.namespace["pytest_runtest_teardown"](self.item, None)
+            self._finish_teardown()
 
         self.assertTrue(self.namespace["_DEVICE_CONTEXT_DEAD"])
         self.pytest.fail.assert_called_once_with(
@@ -74,11 +80,11 @@ class DeviceContextGuardTest(unittest.TestCase):
         )
         with self.assertRaises(unittest.SkipTest):
             self.namespace["pytest_runtest_setup"](self.item)
-        self.namespace["pytest_runtest_teardown"](self.item, None)
+        self._finish_teardown()
         self.backend.synchronize.assert_called_once_with()
 
     def test_healthy_context_keeps_scheduling_tests(self):
-        self.namespace["pytest_runtest_teardown"](self.item, None)
+        self._finish_teardown()
         self.namespace["pytest_runtest_setup"](self.item)
 
         self.assertFalse(self.namespace["_DEVICE_CONTEXT_DEAD"])
@@ -151,7 +157,7 @@ class DeviceContextGuardTest(unittest.TestCase):
     def test_unavailable_backend_does_not_require_synchronization(self):
         self.backend.is_available.return_value = False
 
-        self.namespace["pytest_runtest_teardown"](self.item, None)
+        self._finish_teardown()
         self.namespace["pytest_runtest_setup"](self.item)
 
         self.assertFalse(self.namespace["_DEVICE_CONTEXT_DEAD"])

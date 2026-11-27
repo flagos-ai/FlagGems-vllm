@@ -13,6 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 
+import flaggems_vllm  # noqa: E402
 from flaggems_vllm.ops.qwen4.hyperconnection import (  # noqa: E402
     qwen4_grouped_gemma_rmsnorm,
     qwen4_hc_gate_reduce,
@@ -35,6 +36,35 @@ from flaggems_vllm.ops.qwen4.qsa import (  # noqa: E402
 DEVICE = "cuda"
 HC = 4
 EPS = 1.0e-6
+
+# GCU (enflame): advanced indexing whose index tensors broadcast against each
+# other lowers to a topsaten "repeat" that aborts the whole process
+# (op_aten_repeat_base.h:386 -> TOPSATEN_STATUS_BAD_PARAM, gcu_utils.cpp:74;
+# P21 archive torch_gcu_aten_runtime_defects).  On that vendor the affected
+# lookups below are routed through flattened 1D advanced indexing instead --
+# numerically identical aten ops; other backends keep the original form.
+_P21_BROADCAST_INDEX = flaggems_vllm.vendor_name == "enflame"
+
+
+def _broadcast_lookup(table, row_idx, col_idx):
+    """table[row_idx, col_idx] with a P21-safe flattened fallback."""
+    if not _P21_BROADCAST_INDEX:
+        return table[row_idx, col_idx]
+    linear = row_idx * table.shape[1] + col_idx
+    return table.reshape(-1)[linear]
+
+
+def _paged_rows(cache, pages, offsets):
+    """cache[pages, offsets[None, :], 0] with a P21-safe flattened fallback."""
+    if not _P21_BROADCAST_INDEX:
+        return cache[pages, offsets[None, :], 0]
+    row = cache.shape[1] * cache.shape[2] * cache.shape[3]
+    column = cache.shape[2] * cache.shape[3]
+    head = pages * row + offsets[None, :] * column
+    linear = head[..., None] + torch.arange(
+        cache.shape[3], device=cache.device, dtype=head.dtype
+    )
+    return cache.reshape(-1)[linear]
 
 
 def _require_cuda() -> None:
@@ -129,7 +159,9 @@ def _qsa_mqa_reference(q, cache, table, token_to_req, positions, lengths, ratio)
     logical_page = col // cache.shape[1]
     offset = col % cache.shape[1]
     safe_logical = logical_page.clamp(0, table.shape[1] - 1)
-    physical = table[safe_req[:, None], safe_logical[None, :]].to(torch.int64)
+    physical = _broadcast_lookup(table, safe_req[:, None], safe_logical[None, :]).to(
+        torch.int64
+    )
     valid = (
         valid_req[:, None]
         & (col[None, :] < visible[:, None])
@@ -137,7 +169,7 @@ def _qsa_mqa_reference(q, cache, table, token_to_req, positions, lengths, ratio)
         & (physical < cache.shape[0])
     )
     safe_physical = physical.clamp(0, cache.shape[0] - 1)
-    keys = cache[safe_physical, offset[None, :], 0].float()
+    keys = _paged_rows(cache, safe_physical, offset).float()
     dots = torch.matmul(q.float(), keys.transpose(1, 2))
     logits = torch.relu(dots).sum(1) / math.sqrt(q.shape[-1])
     logits = logits.masked_fill(~valid, -float("inf"))

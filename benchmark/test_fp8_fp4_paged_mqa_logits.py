@@ -172,6 +172,16 @@ class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
             )
             num_sms = torch.cuda.get_device_properties(0).multi_processor_count
             schedule_meta = _vllm_get_metadata(context_lens, BLOCK_KV, num_sms)
+            # Vendor gate (enflame): the vLLM DeepGEMM reference on this stack
+            # is the FP8-only torch-native shim (deep_gemm/attention.py raises
+            # NotImplementedError for FP4 inputs), so FP4 shapes have no
+            # baseline leg there. Run them gems-only (the framework records
+            # latency_base/speedup as N/A) instead of failing the whole file;
+            # other vendors keep the full baseline comparison untouched.
+            if use_fp4 and base.vendor_name == "enflame":
+                self.torch_op = None
+            else:
+                self.torch_op = _baseline_fn
             yield (
                 q_packed,
                 q_scale,

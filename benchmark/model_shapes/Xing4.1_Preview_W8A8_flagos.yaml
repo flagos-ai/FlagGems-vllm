@@ -1,0 +1,337 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Xing4.1-Preview-RL-1114 (W8A8) 算子 Profiling — Benchmark Shapes
+#
+# 数据来源   : Xing4.1-Preview-RL-1114-W8A8.md（主）+ operator-profiling-xing41-w8a8-flagos.csv（补充）
+# 硬件       : 8×H100，TP8，统计 rank0
+# 运行时     : vLLM 0.24.0 + Xing4.1 W8A8（INT8 权重/激活），生产实例 nv-285b-prod
+# 服务配置   : TP=8  max-model-len=65536  max-num-seqs=128  index_topk=2048
+#
+# 采集方法
+#   Profiler   : vLLM --profiler-config（torch profiler, record_shapes=true），
+#                经 /start_profile /stop_profile 控制窗口
+#   Prefill    : 1 次 forward，输入 8201 tokens → 输出 8，并发 1（T=8192 取整）
+#   Decode     : 1024 个 decode step，输入 71 → 输出 1024，并发 1（T=1）
+#   kernel 累时: Prefill 488,849 µs；Decode 7,887,129 µs（7702 µs/step）
+#   占比口径   : 该阶段 rank0 全部前向 GPU kernel 累时；calls 为 Prefill 单次 forward
+#                / Decode 每 step 的调用次数（取自 md 表）
+#   注意       : profiler 开销约 12.5%，占比可信，绝对 µs 偏高
+#
+# 数据取舍
+#   * pct / calls 以 md 为准。md 未列出的算子（per_token_group_quant_fp8、
+#     moe_align_block_size_triton、cp_gather_indexer_k_quant_cache）取自 CSV，
+#     CSV 中 calls 为多 rank 累计，仅供相对参考。
+#   * CSV 的 shape_signature 经 kernel→aten 归因，很多行归因错位
+#     （如 fused_moe 行的 [29,4096] 实为 chunk 大小），因此 shape 以 md 为准，
+#     MoE 权重形状（w13 [256,512,4096] / w2 [256,4096,256]）取 CSV。
+#   * 标注 “推断” 的 shape 没有直接实测，由模型配置推得。
+#
+# 模型配置（推导 shape 用）
+#   hidden=4096；MoE 256 expert top-8，TP8 后每卡 intermediate=256（w13 的 N=512）
+#   MLA：每卡 16 head，kv_lora_rank=512，rope_dim=64；DSA index_topk=2048
+#   KV cache 686464 slot = 10726 block × block_size 64
+#
+# 与 flaggems_vllm 的匹配（conf/operators.yaml + benchmark/test_<op>.py）
+#   fused_moe_kernel                      → fused_experts_impl
+#   sm90 sparse_attn_fwd (FlashMLA)       → flash_mla_sparse_fwd / flash_mla_sparse_fwd_w8a8
+#   cutlass INT8 GEMM                     → cutlass_scaled_mm
+#   dynamic_scaled_int8_quant_kernel      → dynamic_scaled_int8_quant (scaled_int8_quant)
+#   grouped_topk_fused                    → grouped_topk
+#   RMSNorm (fused add)                   → fused_add_rms_norm
+#   concat_mla_q / concat_and_cache_mla   → 同名
+#   indexer_k_quant_and_cache             → 同名
+#   cp_gather_indexer_k_quant_cache       → 同名
+#   topKPerRowPrefill                     → top_k_per_row_prefill
+#   cooperative_topk_cs8                  → cooperative_topk
+#   act_and_mul (SiLU)                    → silu_and_mul
+#   moe_align_block_size_kernel           → moe_align_block_size_triton
+#   per_token_group_quant_8bit_kernel     → per_token_group_quant_fp8
+#
+# 未匹配（flaggems_vllm 暂无对应算子或无法单卡对比）
+#   nvjet / cublasLt splitK GEMM（cuBLAS）、NCCL / multimem / FlashInfer AllReduce
+#   （fused_allreduce_rms_norm 需多卡）、deep_gemm fp8_mqa_logits（DSA Indexer，
+#   Prefill 4.94% / Decode 2.18%）、_convert_req_index_to_global_index、
+#   FillFunctor、direct_copy、reduce_kernel
+#
+# 用法
+#   pytest -q benchmark/test_<op>.py --model-profile \
+#          benchmark/model_shapes/Xing4.1_Preview_W8A8_flagos.yaml --level core
+#   注：部分 benchmark 在代码内写死 shape（如 cutlass_scaled_mm、grouped_topk、
+#   moe_align_block_size_triton、fused_moe_int8），不读取本文件的 shapes，
+#   只用 profiling 块显示 'Time Share' 列。
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── FlashMLA DSA 稀疏注意力 ──────────────────────────────────────────────────
+# Prefill 最大热点。405 次 = 45 层×(1 主调用 grid=T + 8 空调用 grid=1) + 45 次 grid=9
+# 主调用 30.1%，空调用 4.4%（纯 launch 开销）
+flash_mla_sparse_fwd:
+  vllm_api: "_flashmla_C::sparse_prefill_fwd"
+  profiling:
+    prefill:
+      pct: 34.53
+      calls: 405
+    decode:
+      pct: 12.38
+      calls: 45
+  shapes:
+    # prefill  SQ=8192  HQ=64(语义未确认)  DQK=576  SKV=686464  HKV=1  TOPK=2048  DV=512
+    - [8192, 64, 576, 686464, 1, 2048, 512]
+    # decode   B=1；线上上下文 71~1095 token，有效索引数应 <= 1095（其余为 -1）
+    - [1, 64, 576, 686464, 1, 2048, 512]
+  shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
+
+# flash_mla_sparse_fwd_w8a8 仅支持 FP8（q_nope/KV 为 float8_e4m3fn，RoPE 为 bf16，
+# 需 Hopper + TLE），不支持 INT8，也不对应本模型 profile 中的 bf16 FlashMLA kernel。
+# 下方 profiling 块仅为 Time Share 展示用，勿与 bf16 的 flash_mla_sparse_fwd 做性能对比。
+flash_mla_sparse_fwd_w8a8:
+  vllm_api: "_flashmla_C::sparse_prefill_fwd"
+  profiling:
+    prefill:
+      pct: 34.53
+      calls: 405
+    decode:
+      pct: 12.38
+      calls: 45
+  shapes:
+    - [8192, 64, 576, 686464, 1, 2048, 512]
+    - [1, 64, 576, 686464, 1, 2048, 512]
+  shape_desc: "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
+
+# ── MoE 专家 GEMM（W8A8 INT8）────────────────────────────────────────────────
+# 42 层 MoE，256 expert top-8；Prefill 每专家平均 M≈9.1，访存受限
+fused_experts_impl:
+  vllm_api: "vllm.model_executor.layers.fused_moe.fused_moe.fused_experts_impl"
+  profiling:
+    prefill:
+      pct: 20.97
+      calls: 756
+    decode:
+      pct: 12.09
+      calls: 84
+  shapes:
+    # prefill  tokens=8192  E=256  hidden=4096  inter(per rank)=256  topk=8
+    - [8192, 256, 4096, 256, 8]
+    # decode   tokens=1
+    - [1, 256, 4096, 256, 8]
+  shape_desc: "num_tokens, num_experts, hidden_size, intermediate_size, topk"
+
+# ── INT8 GEMM（cutlass，MLA 投影 q_a/kv_a/q_b/kv_b）─────────────────────────
+# Prefill = 64×128×256(4.70%/270) + 64×64×256(2.32%/1800)
+# Decode  = 主支(18.11%/224.8) + 64×128×256(4.79%/45)
+cutlass_scaled_mm:
+  vllm_api: "_C::cutlass_scaled_mm"
+  profiling:
+    prefill:
+      pct: 7.02
+      calls: 2070
+    decode:
+      pct: 22.90
+      calls: 270
+  shapes:
+    # prefill  M=8192
+    - [8192, 2112, 4096]
+    - [8192, 3072, 1536]
+    - [8192, 8192, 1536]
+    # decode   M=1（推断）
+    - [1, 2112, 4096]
+    - [1, 3072, 1536]
+    - [1, 8192, 1536]
+  shape_desc: "M, N, K"
+
+# ── INT8 激活量化（token-wise dynamic）──────────────────────────────────────
+dynamic_scaled_int8_quant:
+  vllm_api: "_C::dynamic_scaled_int8_quant"
+  profiling:
+    prefill:
+      pct: 2.05
+      calls: 2430
+    decode:
+      pct: 5.83
+      calls: 270
+  shapes:
+    - [8192, 4096]
+    - [8192, 1536]
+    - [8192, 2048]
+    - [1, 4096]
+    - [1, 1536]
+    - [1, 2048]
+  shape_desc: "num_tokens, hidden_size"
+
+# ── MoE 路由 grouped_topk ───────────────────────────────────────────────────
+grouped_topk:
+  vllm_api: "_moe_C::grouped_topk"
+  profiling:
+    prefill:
+      pct: 0.59
+      calls: 378
+    decode:
+      pct: 2.02
+      calls: 42
+  shapes:
+    # FP32 scores [T,256] → top-8
+    - [8192, 256, 8]
+    - [1, 256, 8]
+  shape_desc: "num_tokens, num_experts, topk"
+
+# ── Fused add-RMSNorm ───────────────────────────────────────────────────────
+# md 中为两行（1.03%+0.97% / 0.95%+1.05%），此处按合计
+fused_add_rms_norm:
+  vllm_api: "_C::fused_add_rms_norm"
+  profiling:
+    prefill:
+      pct: 2.00
+      calls: 87
+    decode:
+      pct: 2.00
+      calls: 87
+  shapes:
+    - [8192, 4096]
+    - [1, 4096]
+  shape_desc: "num_tokens, hidden_size"
+
+# ── Concat MLA Q ────────────────────────────────────────────────────────────
+concat_mla_q:
+  vllm_api: "_C_cache_ops::concat_mla_q"
+  profiling:
+    prefill:
+      pct: 1.09
+      calls: 405
+    decode:
+      pct: 0.99
+      calls: 45
+  shapes:
+    - [8192, 16, 512, 64]
+    - [1, 16, 512, 64]
+  shape_desc: "tokens, heads, nope_width, rope_width"
+
+# ── Concat-and-cache MLA ────────────────────────────────────────────────────
+concat_and_cache_mla:
+  vllm_api: "_C_cache_ops::concat_and_cache_mla"
+  profiling:
+    prefill:
+      pct: 0.39
+      calls: 405
+    decode:
+      pct: 0.91
+      calls: 45
+  shapes:
+    - [512, 64, 8192, 64, 10726]
+    - [512, 64, 1, 64, 10726]
+  shape_desc: "kv_lora_rank, qk_rope_head_dim, num_tokens, block_size, num_blocks"
+
+# ── Indexer-K quant-and-cache（DSA indexer KV 写回）─────────────────────────
+indexer_k_quant_and_cache:
+  vllm_api: "_C_cache_ops::indexer_k_quant_and_cache"
+  profiling:
+    prefill:
+      pct: 0.0
+      calls: 0
+    decode:
+      pct: 1.07
+      calls: 45
+  shapes:
+    - [8192, 10726, 64, 128, 128]
+    - [1, 10726, 64, 128, 128]
+  shape_desc: "num_tokens, num_blocks, block_size, head_dim, quant_block_size"
+
+# ── CP-gather indexer-K quant-cache（数据来自 CSV）──────────────────────────
+cp_gather_indexer_k_quant_cache:
+  vllm_api: "_C_cache_ops::cp_gather_indexer_k_quant_cache"
+  profiling:
+    prefill:
+      pct: 0.05
+      calls: 1426
+    decode:
+      pct: 0.04
+      calls: 3555
+  shapes:
+    - [1, 8192, 64, 128, 128]
+  shape_desc: "batch_size, seq_len, block_size, head_dim, quant_block_size"
+
+# ── DSA top-k（prefill）────────────────────────────────────────────────────
+# topKPerRowPrefill：[T,511] logits → 2048 索引；md 建议与 cooperative_topk 融合
+top_k_per_row_prefill:
+  vllm_api: "_C::top_k_per_row_prefill"
+  profiling:
+    prefill:
+      pct: 2.48
+      calls: 90
+    decode:
+      pct: 0.0
+      calls: 0
+  shapes:
+    # num_rows=8192  vocab_size=8201  top_k=2048
+    - [8192, 8201, 2048, 8201, 1]
+  shape_desc: "num_rows, vocab_size, top_k, stride0, stride1"
+
+cooperative_topk:
+  vllm_api: "_C::cooperative_topk"
+  profiling:
+    prefill:
+      pct: 0.73
+      calls: 315
+    decode:
+      pct: 1.15
+      calls: 45
+  shapes:
+    # 推断：k=2048，width 取 prefill 序列长度与 max-model-len
+    - [1, 8201, 2048]
+    - [1, 65536, 2048]
+  shape_desc: "rows, width, k"
+
+# ── SiLU-and-mul（MoE 激活）─────────────────────────────────────────────────
+silu_and_mul:
+  vllm_api: "_C::silu_and_mul"
+  profiling:
+    prefill:
+      pct: 0.48
+      calls: 378
+    decode:
+      pct: 0.99
+      calls: 42
+  shapes:
+    - [8192, 4096]
+    - [1, 4096]
+  shape_desc: "num_tokens, intermediate_size"
+
+# ── MoE align block size（数据来自 CSV）─────────────────────────────────────
+moe_align_block_size_triton:
+  vllm_api: "_moe_C::moe_align_block_size"
+  profiling:
+    prefill:
+      pct: 0.18
+      calls: 616
+    decode:
+      pct: 0.16
+      calls: 1333
+  shapes:
+    - [256, 64, 8192, 8]
+    - [256, 16, 1, 8]
+  shape_desc: "num_experts, block_size, num_tokens, topk"
+
+# ── per-token group quant（数据来自 CSV；shape 取自 CSV 实测）──────────────
+per_token_group_quant_fp8:
+  vllm_api: "_C::per_token_group_fp8_quant"
+  profiling:
+    prefill:
+      pct: 1.05
+      calls: 924
+    decode:
+      pct: 1.21
+      calls: 56053
+  shapes:
+    - [11264, 128, 128]
+  shape_desc: "num_tokens, d, group_size"

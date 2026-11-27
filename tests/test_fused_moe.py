@@ -5,6 +5,8 @@ import importlib
 import pytest
 import torch
 
+import flaggems_vllm
+
 moe = importlib.import_module("flaggems_vllm.ops.fused_moe")
 pytestmark = [
     pytest.mark.fused_moe,
@@ -174,7 +176,10 @@ def test_quant_is_independent_of_flaggems_registration():
     meant a full, partial, or absent FlagGems registration each produced
     different results.  Nothing here may depend on that registration.
     """
-    import flag_gems
+    try:
+        import flag_gems
+    except ImportError:
+        flag_gems = None
 
     # 52 and the half-way values below are the cases that used to diverge
     # between the FlagGems and plain-Torch division paths.
@@ -189,6 +194,16 @@ def test_quant_is_independent_of_flaggems_registration():
         dtype=torch.bfloat16,
     )
     baseline = moe._int8_quantize_per_token_triton(x)
+    if flag_gems is None:
+        # Main-repo flag_gems is not installed (e.g. the enflame GCU service
+        # container ships only flaggems_vllm), so there is no registration
+        # state to toggle.  Keep the runnable coverage on the values that
+        # used to diverge, then skip the registration-toggling arms.
+        rq, rs = literal_quant(x)
+        assert torch.equal(baseline[0], rq)
+        torch.testing.assert_close(baseline[1], rs, rtol=0, atol=0, equal_nan=True)
+        assert torch.isnan(baseline[1][2]).item()
+        pytest.skip("main-repo flag_gems is not installed")
     registrations = (
         ["abs", "amax", "clamp", "true_divide", "round"],  # full chain
         ["abs"],  # partial: used to be rejected outright
@@ -284,9 +299,16 @@ def test_quant_offsets_promote_past_int32():
         pytest.skip(f"needs ~{needed >> 30} GiB free, has {free >> 30} GiB")
     base = torch.zeros(stride * (rows - 1) + k, device="cuda", dtype=torch.bfloat16)
     view = base.as_strided((rows, k), (stride, 1))
-    view.copy_(torch.randn((rows, k), device="cuda", dtype=torch.bfloat16) * 8)
+    data = torch.randn((rows, k), device="cuda", dtype=torch.bfloat16) * 8
+    view.copy_(data)
     q, s = moe._int8_quantize_per_token_triton(view)
-    rq, rs = literal_quant(view)
+    if flaggems_vllm.vendor_name == "enflame":
+        # torch_gcu ATen strided elementwise aborts on row offsets >= 2**31
+        # elements; evaluate the reference on a CPU copy of the same data.
+        q, s = q.cpu(), s.cpu()
+        rq, rs = literal_quant(data.cpu())
+    else:
+        rq, rs = literal_quant(view)
     assert torch.equal(q, rq)
     torch.testing.assert_close(s, rs, rtol=0, atol=0)
 

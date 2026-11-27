@@ -161,10 +161,6 @@ def _ihc_post(x, residual, post):
     layout_tag = sum(
         (not t.is_contiguous()) << i for i, t in enumerate((x, residual, post))
     )
-    if runtime.device.vendor_name == "ascend":
-        # The kernel only sees the contiguous copies below. Reuse compilation
-        # and tuning across input layouts that produce the same kernel inputs.
-        layout_tag = 0
     x = x.contiguous()
     residual = residual.contiguous()
     post = post.contiguous()
@@ -189,6 +185,13 @@ def _ihc_post(x, residual, post):
         )
     # Keep the native FP32 multiply and addition separate, including rounding.
     with runtime.torch_device_fn.device(x.device):
+        if runtime.device.vendor_name == "ascend":
+            from flaggems_vllm.runtime.backend._ascend.ops.ihc_post import (
+                _launch_ihc_post,
+            )
+
+            _launch_ihc_post(x, residual, post, output)
+            return output
         if runtime.device.vendor_name in (
             "nvidia",
             "thead",

@@ -940,3 +940,13 @@ thead_attention_decode:
   - META: {}
     num_warps: 4
     num_stages: 2
+
+lora_shrink_gemv:
+  - META: {BLOCK_R: 1, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+
+lora_shrink_grouped:
+  - META: {BLOCK_M: 16, BLOCK_R: 32, BLOCK_K: 256}
+    num_warps: 4
+    num_stages: 1
