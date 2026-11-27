@@ -1853,6 +1853,19 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: moe_align_block_size_ep
+  description: Aligns local MoE routes in place, filtering invalid global expert IDs
+    and optionally writing per-route scatter indices.
+  for:
+  - _moe_C.align_block_size
+  labels:
+  - fused
+  - Reduction
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.5'
 - id: moe_align_block_size_triton
   description: 'Aligns the token distribution across experts to be compatible with
     block size
