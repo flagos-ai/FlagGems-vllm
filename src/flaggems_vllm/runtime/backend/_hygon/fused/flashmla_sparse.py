@@ -122,6 +122,10 @@ _MIN_SPLIT_BLOCKS = 4
 # the 128 work items splitting is still worth 1.13-1.59x, at 96 and 120 it
 # already costs 10-21%.
 _MIN_SPLIT_GAIN = 2
+# Same idea for the short rows, where splitting also has to give up the peeled
+# single-block body: there the turnover is an eighth of the target rather than
+# half of it. See _plan.
+_SHORT_SPLIT_GAIN = 16
 
 
 @triton.jit
@@ -461,6 +465,131 @@ def _cu_count(device_index: int) -> int:
     return torch_device_fn.get_device_properties(device_index).multi_processor_count
 
 
+# Compiled launchers and their argument templates, keyed the same way `_plan`
+# is. `LibEntry` re-derives a cache key from all 34 kernel parameters on every
+# call - specializing each tensor argument individually, which walks the
+# storage of every pointer operand - and that costs ~58us of host time against
+# a ~7us launch. The device work on the short rows is well under that, so the
+# Python entry overhead is the whole latency there: 72.2us of host time per
+# call becomes 17.5us, which is also where the vendor's own entry sits.
+#
+# A captured template is the launcher's own argument tuple. Only the operand
+# slots and the stream are rewritten on replay; everything else (grid, kernel
+# handle, metadata, hooks, strides, extents) is fixed for a given key, which is
+# why the key has to name every one of them.
+_LAUNCH_CACHE = {}
+
+# Argument layout of the generated C entry point, which `HIPLauncher.__call__`
+# only prefixes two fixed values onto:
+#
+#   launch(coop, gridX, gridY, gridZ, stream, function, profile_scratch,
+#          packed_metadata, launch_metadata, enter_hook, exit_hook, *kernel_args)
+#
+# so kernel argument i sits at _ARG0 + i and the stream at _STREAM_SLOT.
+_STREAM_SLOT = 4
+_ARG0 = 11
+
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+# Triton specializes every pointer argument on 16-byte alignment, and this
+# backend additionally on whether the storage fits the 32-bit addressing that
+# buffer ops use (`HIPBackend.get_tensor_specialization`). Both are properties
+# of the tensor rather than of its shape - a view into a larger cache has the
+# same shape and a different specialization - so a captured launcher is only
+# valid for operands that agree on them, and they have to be part of the key.
+# The outputs are allocated here and always agree; only the caller's do not.
+_PTR_RANGE_MAX = 2**31 - 1
+
+
+def _spec_bits(tensors):
+    bits = 0
+    for t in tensors:
+        bits <<= 2
+        if t is not None:
+            if t.data_ptr() % 16:
+                bits |= 1
+            if t.untyped_storage().size() > _PTR_RANGE_MAX:
+                bits |= 2
+    return bits
+
+
+# Partial-accumulator scratch for the split path. It never escapes the op, so it
+# is kept across calls: the two torch.empty calls cost ~5us of host time against
+# a ~7us kernel launch, and on the rows this path serves the host is most of the
+# latency. One base buffer per (device, stream) grows to the largest shape seen
+# and the per-shape views are cached, so a steady-state call is a dict lookup.
+# Keying on the stream keeps concurrent callers from sharing an accumulator;
+# within one stream the launches are ordered, so reuse is safe.
+_WORKSPACE = {}
+
+
+def _split_workspace(device, stream, rows, dv):
+    state = _WORKSPACE.get((device, stream))
+    if state is None:
+        state = _WORKSPACE[(device, stream)] = [None, None, {}]
+    else:
+        pair = state[2].get(rows)
+        if pair is not None:
+            return pair
+    views = state[2]
+    if state[0] is None or state[0].numel() < rows * dv:
+        state[0] = torch.empty(rows * dv, device=device, dtype=torch.float32)
+        views.clear()
+    if state[1] is None or state[1].numel() < rows * 2:
+        state[1] = torch.empty(rows * 2, device=device, dtype=torch.float32)
+        views.clear()
+    pair = (
+        torch.as_strided(state[0], (rows, dv), (dv, 1)),
+        torch.as_strided(state[1], (rows, 2), (2, 1)),
+    )
+    views[rows] = pair
+    return pair
+
+
+def _capture_launch(run_through_entry, n_operands):
+    """Run one ordinary launch, returning (C entry, argument template) for it.
+
+    The `n_operands` leading kernel arguments are the ones a replay rewrites,
+    so they are cleared out of the template: a template that kept them would
+    pin the first call's tensors, and a captured KV cache is never freed.
+
+    Returns None when the launch cannot be replayed - a non-HCU build, a
+    kernel that wants per-launch profile scratch, or anything that did not
+    resolve to exactly one launcher call.
+    """
+    try:
+        from triton.backends.hcu.driver import HIPLauncher
+    except ImportError:  # not an HCU build, keep the portable path
+        run_through_entry()
+        return None
+
+    captured = []
+    original = HIPLauncher.__call__
+
+    def spy(self, *call_args):
+        captured.append((self, call_args))
+        return original(self, *call_args)
+
+    HIPLauncher.__call__ = spy
+    try:
+        run_through_entry()
+    finally:
+        HIPLauncher.__call__ = original
+
+    if len(captured) != 1:
+        return None
+    launcher, call_args = captured[0]
+    if launcher.profile_scratch_size > 0:
+        return None  # the scratch allocation needs the Python wrapper
+    template = [launcher.launch_cooperative_grid]
+    template += call_args[:5]  # grid x3, stream, function
+    template.append(None)  # profile scratch
+    template += call_args[5:]  # metadata, hooks, kernel arguments
+    for slot in range(_ARG0, _ARG0 + n_operands):
+        template[slot] = None
+    return launcher.launch, template
+
+
 @functools.lru_cache(maxsize=None)
 def _plan(
     sq: int, hq: int, topk: int, dqk: int, n_cu: int
@@ -469,14 +598,26 @@ def _plan(
 
     TOPK is only split when BH-head items cannot fill the CUs, which is the
     regime the latency is dominated by idle CUs rather than by the gather.
-    Splitting costs a second kernel launch (~80us of host time on this stack),
-    so it has to buy back more than a couple of key blocks of device time.
+    Splitting costs a second kernel launch, which the replayed launcher brings
+    down to ~7us of host time, so it has to buy back about that much of device
+    time.
     """
-    block_k = BLOCK_K_SINGLE if topk <= BLOCK_K_SINGLE else BLOCK_K_BY_DQK[dqk]
-    nblk = max(1, triton.cdiv(topk, block_k))
     items = sq * (hq // BLOCK_H)
     target = _CTAS_PER_CU * n_cu
-    if items * _MIN_SPLIT_GAIN > target or nblk < _MIN_SPLIT_BLOCKS:
+    saturated = items * _MIN_SPLIT_GAIN > target
+    # The wide block that lets a short TOPK be peeled is straight-line code that
+    # does not spill, and that is worth more per unit of work than the CUs it
+    # leaves idle - until there are almost no work items at all. Measured on
+    # TOPK=128 against the vendor, trading the peeled block for a narrow one
+    # split four ways: 0.83x -> 0.98x at 4 items and 0.83x -> 0.88x at 8, then
+    # 0.83x -> 0.78x at 12 and 0.82x -> 0.54x at 32. Only the first eighth of
+    # the occupancy target is desperate enough.
+    if topk <= BLOCK_K_SINGLE and items * _SHORT_SPLIT_GAIN > target:
+        block_k = BLOCK_K_SINGLE
+    else:
+        block_k = BLOCK_K_BY_DQK[dqk]
+    nblk = max(1, triton.cdiv(topk, block_k))
+    if saturated or nblk < _MIN_SPLIT_BLOCKS:
         # The narrow value block only pays off where the loop runs once and the
         # CUs are saturated, which is what makes occupancy the binding
         # constraint; see BLOCK_D_SINGLE.
@@ -535,19 +676,51 @@ def flash_mla_sparse_fwd(
     device_index = q.device.index
     if device_index is None:
         device_index = torch_device_fn.current_device()
+    stream = _raw_stream(device_index) if _raw_stream is not None else None
     block_k, block_d, nsplit, chunk = _plan(SQ, HQ, TOPK, DQK, _cu_count(device_index))
     if nsplit > 1:
-        o_part = torch.empty(
-            (SQ * nsplit * HQ, DV), device=q.device, dtype=torch.float32
-        )
-        ml_part = torch.empty(
-            (SQ * nsplit * HQ, 2), device=q.device, dtype=torch.float32
-        )
+        if stream is None:  # cannot tell callers apart, do not share scratch
+            o_part = torch.empty(
+                (SQ * nsplit * HQ, DV), device=q.device, dtype=torch.float32
+            )
+            ml_part = torch.empty(
+                (SQ * nsplit * HQ, 2), device=q.device, dtype=torch.float32
+            )
+        else:
+            o_part, ml_part = _split_workspace(q.device, stream, SQ * nsplit * HQ, DV)
     else:
         o_part = ml_part = output  # unused
 
-    with torch_device_fn.device(q.device):
-        _FWD_KERNEL[(SQ * nsplit * (HQ // BLOCK_H),)](
+    # Everything the template holds fixed has to be part of the key: the plan,
+    # the shapes it was specialized against, the two optional operands that
+    # select a kernel variant, and the per-tensor specialization bits.
+    key = (
+        SQ,
+        HQ,
+        TOPK,
+        DQK,
+        SKV,
+        nsplit,
+        chunk,
+        block_k,
+        block_d,
+        attn_sink is not None,
+        topk_length is not None,
+        _spec_bits((q, kv, indices, attn_sink, topk_length)),
+    )
+    entry = _LAUNCH_CACHE.get(key) if _raw_stream is not None else False
+
+    if entry is None or entry is False:
+        # Only the cold and portable paths need the strides; a replay keeps them.
+        q_s0, q_s1, _ = q.stride()
+        kv_s0 = kv.stride(0)
+        idx_s0 = indices.stride(0)
+        out_s0, out_s1, _ = output.stride()
+        ml_s0 = max_logits.stride(0)
+        lse_s0 = lse.stride(0)
+
+    def _fwd_args():
+        return (
             q,
             kv,
             indices,
@@ -559,18 +732,23 @@ def flash_mla_sparse_fwd(
             lse,
             o_part,
             ml_part,
-            q.stride(0),
-            q.stride(1),
-            kv.stride(0),
-            indices.stride(0),
-            output.stride(0),
-            output.stride(1),
-            max_logits.stride(0),
-            lse.stride(0),
+            q_s0,
+            q_s1,
+            kv_s0,
+            idx_s0,
+            out_s0,
+            out_s1,
+            ml_s0,
+            lse_s0,
             SKV,
             TOPK,
             nsplit,
             chunk,
+        )
+
+    def _fwd_launch():
+        return _FWD_KERNEL[(SQ * nsplit * (HQ // BLOCK_H),)](
+            *_fwd_args(),
             HQ=HQ,
             DQK=DQK,
             HAVE_ATTN_SINK=attn_sink is not None,
@@ -606,24 +784,79 @@ def flash_mla_sparse_fwd(
             ),
             **_backend_launch_options(DQK, nsplit > 1, chunk == 1),
         )
-        if nsplit > 1:
-            _hcu_sparse_mla_combine_kernel[(SQ * HQ // 8,)](
-                o_part,
-                ml_part,
-                attn_sink,
-                output,
-                max_logits,
-                lse,
-                output.stride(0),
-                output.stride(1),
-                max_logits.stride(0),
-                lse.stride(0),
-                HQ=HQ,
-                DV=DV,
-                NSPLIT=nsplit,
-                HAVE_ATTN_SINK=attn_sink is not None,
-                BHC=8,
-                num_warps=4,
-                num_stages=1,
-            )
+
+    def _combine_launch():
+        return _hcu_sparse_mla_combine_kernel[(SQ * HQ // 8,)](
+            o_part,
+            ml_part,
+            attn_sink,
+            output,
+            max_logits,
+            lse,
+            out_s0,
+            out_s1,
+            ml_s0,
+            lse_s0,
+            HQ=HQ,
+            DV=DV,
+            NSPLIT=nsplit,
+            HAVE_ATTN_SINK=attn_sink is not None,
+            BHC=8,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    if entry is None:
+        with torch_device_fn.device(q.device):
+            fwd = _capture_launch(_fwd_launch, 11)
+            cmb = _capture_launch(_combine_launch, 6) if nsplit > 1 else None
+        # Either capture coming back empty means the launch is not replayable;
+        # remember that so the portable path is taken without retrying.
+        _LAUNCH_CACHE[key] = (
+            (fwd[0], fwd[1], cmb) if fwd is not None and (nsplit == 1 or cmb) else False
+        )
+        return output, max_logits, lse
+
+    if entry is False:  # portable path
+        with torch_device_fn.device(q.device):
+            _fwd_launch()
+            if nsplit > 1:
+                _combine_launch()
+        return output, max_logits, lse
+
+    fwd_launch, fwd_template, cmb_entry = entry
+    if torch_device_fn.current_device() != device_index:
+        torch_device_fn.set_device(device_index)
+
+    args = fwd_template[:]
+    args[_STREAM_SLOT] = stream
+    args[_ARG0 : _ARG0 + 11] = (
+        q,
+        kv,
+        indices,
+        attn_sink,
+        topk_length,
+        sm_scale * LOG2E,
+        output,
+        max_logits,
+        lse,
+        o_part,
+        ml_part,
+    )
+    fwd_launch(*args)
+
+    if cmb_entry is not None:
+        cmb_launch, cmb_template = cmb_entry
+        args = cmb_template[:]
+        args[_STREAM_SLOT] = stream
+        args[_ARG0 : _ARG0 + 6] = (
+            o_part,
+            ml_part,
+            attn_sink,
+            output,
+            max_logits,
+            lse,
+        )
+        cmb_launch(*args)
+
     return output, max_logits, lse
