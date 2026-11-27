@@ -144,6 +144,7 @@ from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
 from flaggems_vllm.ops.input_batch import get_num_sampled_and_rejected
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
+from flaggems_vllm.ops.insert_context_kv import insert_context_kv
 from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.logprob import compute_topk_scores
 from flaggems_vllm.ops.lora_expand import lora_expand
@@ -429,6 +430,7 @@ __all__ = [
     "ihc_pre",
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
+    "insert_context_kv",
     "instance_norm",
     "invoke_fused_moe_triton_kernel",
     "kpool_compress_and_write_cache",
