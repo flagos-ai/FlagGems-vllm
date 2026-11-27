@@ -1454,6 +1454,17 @@ ops:
     - Sampling
   stages:
     - alpha: '5.4'
+- id: hc_collapse
+  description: BF16 HC streams reduced with FP32 pre-mix weights; Ascend tensor-view implementation.
+  for:
+  - hc_collapse_triton
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: hc_combine
   description: Pure hyperconnection combine with optional FP32 sigmoid injection gating.
   for:

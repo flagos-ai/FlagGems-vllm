@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # isort: off
+from flaggems_vllm.ops.hc_collapse import hc_collapse
 from flaggems_vllm.ops.batch_shard import gather_sampler_output
 from flaggems_vllm.ops.speculator import pad_trailing_draft_slots
 from flaggems_vllm.ops.act_quant import act_quant_triton
@@ -390,6 +391,7 @@ __all__ = [
     "grouped_topk",
     "gumbel_sample",
     "hadamard128",
+    "hc_collapse",
     "hc_combine",
     "hc_down_silu",
     "hc_head_fused_kernel",
