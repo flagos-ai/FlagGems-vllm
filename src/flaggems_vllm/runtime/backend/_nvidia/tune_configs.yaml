@@ -1820,6 +1820,11 @@ lora_expand_grouped:
     num_warps: 4
     num_stages: 1
 
+fused_kimi_k3_mla_decode_q_concat_ds_mla_insert:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
 fused_kimi_k3_mla_kv_concat:
   - META: {BLOCK: 256, ROW_LAYOUT: false}
     num_warps: 4
