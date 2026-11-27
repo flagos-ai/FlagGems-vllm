@@ -16,6 +16,9 @@ from flaggems_vllm.runtime.backend._ascend.fused.attention import (
     flash_attn_varlen_func,
     flash_attn_varlen_func_w8a8,
 )
+from flaggems_vllm.runtime.backend._ascend.fused.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
+)
 from flaggems_vllm.runtime.backend._ascend.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
 )
@@ -24,6 +27,7 @@ from flaggems_vllm.runtime.backend._ascend.fused.moe_sum import moe_sum
 __all__ = [
     "flash_attn_varlen_func",
     "flash_attn_varlen_func_w8a8",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "moe_sum",
 ]
