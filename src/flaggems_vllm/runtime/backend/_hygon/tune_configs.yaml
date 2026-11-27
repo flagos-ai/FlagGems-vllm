@@ -174,35 +174,143 @@ bmm:
 # The host selects BM consistently for routing and GEMM; BM is an autotune key.
 hygon_marlin_gemm:
   - META:
-      BN: 32
-      BK: 32
-    num_warps: 4
-    num_stages: 1
-  - META:
-      BN: 64
-      BK: 32
-    num_warps: 4
-    num_stages: 1
-  - META:
       BN: 64
       BK: 64
+      DOT_LAYOUT: 1
     num_warps: 4
-    num_stages: 1
-  - META:
-      BN: 64
-      BK: 64
-    num_warps: 8
     num_stages: 1
   - META:
       BN: 128
       BK: 64
+      DOT_LAYOUT: 1
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 256
+      BK: 64
+      DOT_LAYOUT: 3
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 128
+      BK: 64
+      DOT_LAYOUT: 2
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BN: 64
+      BK: 64
+      DOT_LAYOUT: 3
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 128
+      BK: 64
+      DOT_LAYOUT: 3
     num_warps: 4
     num_stages: 1
   - META:
       BN: 64
       BK: 128
+      DOT_LAYOUT: 3
     num_warps: 4
     num_stages: 1
+  - META:
+      BN: 64
+      BK: 64
+      DOT_LAYOUT: 2
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 64
+      DOT_LAYOUT: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BN: 128
+      BK: 64
+      DOT_LAYOUT: 2
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 128
+      BK: 64
+      DOT_LAYOUT: 2
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BN: 128
+      BK: 32
+      DOT_LAYOUT: 2
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BN: 128
+      BK: 128
+      DOT_LAYOUT: 2
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BN: 32
+      BK: 128
+      DOT_LAYOUT: 1
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 32
+      BK: 32
+      DOT_LAYOUT: 0
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 32
+      DOT_LAYOUT: 0
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 64
+      DOT_LAYOUT: 0
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 64
+      DOT_LAYOUT: 0
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BN: 128
+      BK: 64
+      DOT_LAYOUT: 0
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 64
+      BK: 128
+      DOT_LAYOUT: 0
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BN: 128
+      BK: 64
+      DOT_LAYOUT: 0
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BN: 128
+      BK: 32
+      DOT_LAYOUT: 0
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BN: 64
+      BK: 64
+      DOT_LAYOUT: 0
+    num_warps: 4
+    num_stages: 2
 
 hygon_marlin_gemv:
   - META:

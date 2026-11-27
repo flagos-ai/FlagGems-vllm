@@ -1473,6 +1473,80 @@ def _minimal_args(device=flaggems_vllm.device, dtype=torch.bfloat16):
     return _make_inputs_w4a16_int4(M, E, K, N, topk, dtype, device)
 
 
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "hygon", reason="Hygon output alias checks"
+)
+@pytest.mark.parametrize(
+    "input_name",
+    [
+        "w1",
+        "w2",
+        "w1_scale",
+        "w2_scale",
+        "topk_weights",
+        "topk_ids",
+        "w1_strided",
+        "w2_strided",
+    ],
+)
+@pytest.mark.parametrize(
+    "placement", ["before", "after", "overlap_begin", "overlap_end"]
+)
+def test_fused_marlin_moe_hygon_output_overlap(input_name, placement):
+    hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _minimal_args()
+    kwargs = dict(
+        hidden_states=hs,
+        w1=w1,
+        w2=w2,
+        bias1=None,
+        bias2=None,
+        w1_scale=s1,
+        w2_scale=s2,
+        topk_weights=tw,
+        topk_ids=ti,
+        quant_type_id=QUANT_TYPE_UINT4B8,
+    )
+    strided = input_name.endswith("_strided")
+    name = input_name[:-8] if strided else input_name
+    original = kwargs[name]
+    strides = tuple(stride * (2 if strided else 1) for stride in original.stride())
+    span = (
+        1 + sum((size - 1) * stride for size, stride in zip(original.shape, strides))
+    ) * original.element_size()
+    output_bytes = hs.numel() * hs.element_size()
+    shared = torch.empty(
+        span + output_bytes + hs.element_size(), device=hs.device, dtype=torch.uint8
+    )
+    input_start = output_bytes if placement == "before" else 0
+    output_start = {
+        "before": 0,
+        "after": span + hs.element_size() - 1,
+        "overlap_begin": 0,
+        "overlap_end": span - hs.element_size(),
+    }[placement]
+    # Keep the output aligned when a uint8 weight view has an odd byte span.
+    output_start -= output_start % hs.element_size()
+    view = (
+        shared[input_start : input_start + span]
+        .view(original.dtype)
+        .as_strided(original.shape, strides)
+    )
+    view.copy_(original)
+    kwargs[name] = view
+    kwargs["output"] = (
+        shared[output_start : output_start + output_bytes].view(hs.dtype).view_as(hs)
+    )
+    if placement.startswith("overlap"):
+        with pytest.raises(ValueError, match="Output must not alias"):
+            flaggems_vllm.fused_marlin_moe(**kwargs)
+    else:
+        result = flaggems_vllm.fused_marlin_moe(**kwargs)
+        assert result is kwargs["output"]
+        reference = _reference_swiglu_moe(hs, ref1, ref2, tw, ti)
+        assert compute_max_diff(result.float(), reference.float()) < 0.04
+
+
 def test_rejects_unsupported_quant_type():
     hs, w1_q, w2_q, _, _, tw, ti, w1s, w2s = _minimal_args()
     with pytest.raises(NotImplementedError, match="quant_type_id"):
@@ -1816,16 +1890,37 @@ def test_fused_marlin_moe_w8a16_fp8_graph_scale_updates_ppu(
 
 
 @pytest.mark.fused_marlin_moe_w4a16
-@pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head MXFP4")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name not in ("thead", "hygon"),
+    reason="T-Head or Hygon W4A16 scale updates",
+)
+@pytest.mark.parametrize(
+    "precision",
+    [
+        "mxfp4",
+        pytest.param(
+            "int4",
+            marks=pytest.mark.skipif(
+                flaggems_vllm.vendor_name != "hygon", reason="Hygon INT4 scale updates"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("num_tokens", [1, 33])
 @pytest.mark.parametrize("updated_tensor", ["w1_scale", "w2_scale"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("capture", [False, True], ids=["inference", "graph"])
-def test_fused_marlin_moe_mxfp4_scale_updates_ppu(
-    num_tokens, updated_tensor, dtype, capture
+def test_fused_marlin_moe_w4a16_scale_updates(
+    precision, num_tokens, updated_tensor, dtype, capture
 ):
+    if precision == "mxfp4":
+        make_inputs = _make_inputs_w4a16_mxfp4
+        quant_type, group_size = QUANT_TYPE_FP4_E2M1, MXFP4_GROUP_SIZE
+    else:
+        make_inputs = _make_inputs_w4a16_int4
+        quant_type, group_size = QUANT_TYPE_UINT4B8, GROUP_SIZE
     with torch.inference_mode(not capture):
-        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_w4a16_mxfp4(
+        hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = make_inputs(
             num_tokens, 4, 128, 256, 2, dtype, flaggems_vllm.device
         )
         kwargs = dict(
@@ -1838,29 +1933,31 @@ def test_fused_marlin_moe_mxfp4_scale_updates_ppu(
             w2_scale=s2,
             topk_weights=tw,
             topk_ids=ti,
-            quant_type_id=QUANT_TYPE_FP4_E2M1,
-            group_size=MXFP4_GROUP_SIZE,
+            quant_type_id=quant_type,
+            group_size=group_size,
         )
         scale = kwargs[updated_tensor]
-        flaggems_vllm.fused_marlin_moe(**kwargs)
         if capture:
-            backend = importlib.import_module(
-                "flaggems_vllm.runtime.backend._thead.fused.fused_marlin_moe"
-            )
-            version = scale._version
-            cached = backend._SCALE_CACHE.get(scale)
-            assert cached is not None and cached[0] == version
-            torch.cuda.synchronize()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            # Warm the same stream so a stream-keyed cache can be hit in capture.
+            with torch.cuda.stream(stream):
+                flaggems_vllm.fused_marlin_moe(**kwargs)
+            stream.synchronize()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, stream=stream):
                 actual = flaggems_vllm.fused_marlin_moe(**kwargs)
-        scale.view(torch.uint8).add_(1)
+        else:
+            flaggems_vllm.fused_marlin_moe(**kwargs)
+        if precision == "mxfp4":
+            scale.view(torch.uint8).add_(1)
+        else:
+            scale.mul_(2)
         if updated_tensor == "w1_scale":
             ref1 = ref1 * 2
         else:
             ref2 = ref2 * 2
         if capture:
-            assert scale._version > version
             graph.replay()
         else:
             actual = flaggems_vllm.fused_marlin_moe(**kwargs)
@@ -1893,7 +1990,8 @@ def test_fused_marlin_moe_mxfp4_alignment_ppu(hidden_size, intermediate_size):
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+    flaggems_vllm.vendor_name not in ("thead", "hygon"),
+    reason="T-Head or Hygon E4M3 byte decoding",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 33])
@@ -1923,12 +2021,14 @@ def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens, num_expe
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+    flaggems_vllm.vendor_name not in ("thead", "hygon"),
+    reason="T-Head or Hygon E4M3 byte decoding",
 )
 @pytest.mark.parametrize("num_tokens,num_experts", [(1, 2), (33, 2), (1, 16), (4, 16)])
-@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "special", ["weight_nan", "scale_inf", "scale_nan", "scale_large"]
+    "special",
+    ["weight_nan", "scale_inf", "scale_nan", "scale_nan_payload", "scale_large"],
 )
 def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
     num_tokens, num_experts, scale_dtype, special
@@ -1943,11 +2043,18 @@ def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
     s1 = s1.to(scale_dtype)
     if special == "weight_nan":
         w1.view(torch.uint8)[0, 0, 0] = 127
+    elif special == "scale_nan_payload":
+        if scale_dtype == torch.float32:
+            s1.view(torch.int32).fill_(0x7FFFFFFF)
+        else:
+            s1.view(torch.int16).fill_(0x7FFF)
     else:
         s1.fill_(
-            {"scale_inf": float("inf"), "scale_nan": float("nan"), "scale_large": 1e20}[
-                special
-            ]
+            {
+                "scale_inf": float("inf"),
+                "scale_nan": float("nan"),
+                "scale_large": min(1e20, torch.finfo(scale_dtype).max),
+            }[special]
         )
     w1_ref = (w1.float() * s1.expand(w1.shape)).to(hs.dtype)
     w2_ref = (w2.float() * s2.expand(w2.shape)).to(hs.dtype)
@@ -2020,6 +2127,14 @@ _W4A16_CASES += _cases(
         reason="T-Head grouped/reduce-direct coverage",
     ),
     id_prefix="ppu-",
+)
+_W4A16_CASES += _cases(
+    "mxfp4",
+    [(1, 4, 96, 160, 2), (33, 4, 96, 160, 2)],
+    marks=pytest.mark.skipif(
+        flaggems_vllm.vendor_name != "hygon", reason="Hygon MXFP4 group-32 tails"
+    ),
+    id_prefix="hygon-tail-",
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
