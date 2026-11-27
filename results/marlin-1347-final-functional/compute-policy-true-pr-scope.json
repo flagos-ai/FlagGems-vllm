@@ -1,0 +1,312 @@
+{
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "head": "c237ed4689172a0e8a421a04c588a129447851c6",
+  "changed_python_files": [
+    "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+    "benchmark/test_fused_marlin_moe_w8a16_int8.py",
+    "src/flaggems_vllm/ops/fused_marlin_moe.py",
+    "tests/test_fused_marlin_moe.py"
+  ],
+  "scan_mode": "original checker, explicit actual changed Python files, no warn-only or allowlist changes",
+  "snapshots": {
+    "head": {
+      "commit": "c237ed4689172a0e8a421a04c588a129447851c6",
+      "archive": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\marlin-g5-testfix-v2-package\\source-marlin.tar",
+      "archive_sha256": "7fbc90049d04c79734955ff7db2eac9d65cfce78a0fa5036abfd883df3925ae9",
+      "command": [
+        "python",
+        "tools/ci_checks/check_no_torch_fallback.py",
+        "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
+        "src/flaggems_vllm/ops/fused_marlin_moe.py",
+        "tests/test_fused_marlin_moe.py"
+      ],
+      "cwd": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\G0-marlin-c237-base122\\head",
+      "exit_code": 0,
+      "stdout": "checked 1 files, 0 violation(s)\n",
+      "stderr": "",
+      "source_binding": {
+        "benchmark/test_fused_marlin_moe_w8a16_fp8.py": {
+          "sha256": "01b8427aee2b654c911a27a8b91e07fa1053deda1975e60a827a2925f958a983",
+          "git_blob": "78bd4d694524ee7324b1915814eacf203e204f76",
+          "raw_git_exact": true
+        },
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py": {
+          "sha256": "c65ba0b30ee2e916084f799e5dc782f5c3ebb64f9ebb65f38cef9f3848cfa37b",
+          "git_blob": "9505377f50b7e26333fc1b5a1fa80cda2215c42d",
+          "raw_git_exact": true
+        },
+        "src/flaggems_vllm/ops/fused_marlin_moe.py": {
+          "sha256": "5e0af468904be2907d325aa1172ceb54545377bf18363cfe083a074bb32ecebd",
+          "git_blob": "16ddd941b57b1c25c4144747603d09897eec7e8b",
+          "raw_git_exact": true
+        },
+        "tests/test_fused_marlin_moe.py": {
+          "sha256": "8441a4fbc5b1eef748f4d37a2f2e6978be8ca5a8eb4c72ade311d4d63f988d68",
+          "git_blob": "b6532232c466806656b7727aac3fbd3df2a6b258",
+          "raw_git_exact": true
+        },
+        "tools/ci_checks/check_no_torch_fallback.py": {
+          "sha256": "f775ef84b363a9041df23066eb7754f71ba778db58154252f97cdec447ce5500",
+          "git_blob": "55284e1f4de20feac2594bd74b855511cf2a5811",
+          "raw_git_exact": true
+        }
+      }
+    },
+    "base": {
+      "commit": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+      "archive": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\marlin-main-control-package\\source-main.tar",
+      "archive_sha256": "e1148460cfe2fe8cbdde09880dbf8bbaec41408b5f3e19aabfe88c37231e32b9",
+      "command": [
+        "python",
+        "tools/ci_checks/check_no_torch_fallback.py",
+        "benchmark/test_fused_marlin_moe_w8a16_fp8.py",
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py",
+        "src/flaggems_vllm/ops/fused_marlin_moe.py",
+        "tests/test_fused_marlin_moe.py"
+      ],
+      "cwd": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\G0-marlin-c237-base122\\base",
+      "exit_code": 1,
+      "stdout": "src\\flaggems_vllm\\ops\\fused_marlin_moe.py:431: forbidden torch compute call torch.exp2()\nsrc\\flaggems_vllm\\ops\\fused_marlin_moe.py:456: forbidden torch compute call torch.exp2()\nsrc\\flaggems_vllm\\ops\\fused_marlin_moe.py:364: forbidden torch compute call torch.stack()\nchecked 1 files, 3 violation(s)\n",
+      "stderr": "",
+      "source_binding": {
+        "benchmark/test_fused_marlin_moe_w8a16_fp8.py": {
+          "sha256": "cf895120815e924aa81276a49a5bfe9d2d0b0c34745fa0cd525724c9ec0799b9",
+          "git_blob": "edb18af941e6f2aee23b7caccaffc951683aebd1",
+          "raw_git_exact": true
+        },
+        "benchmark/test_fused_marlin_moe_w8a16_int8.py": {
+          "sha256": "483bd917bf00da856f8bf24cb582b462f02c5e959886756b57f518e33c77f2ec",
+          "git_blob": "e794f4a2731aaeb47375ae1293dc0e7c2055395b",
+          "raw_git_exact": true
+        },
+        "src/flaggems_vllm/ops/fused_marlin_moe.py": {
+          "sha256": "b0552d2465f9061e3f587ac2ce9b377e7973e03ceb890870746c6fb9f6422f05",
+          "git_blob": "255eb79e5eb46932a8dbbcddda9d911d5405d825",
+          "raw_git_exact": true
+        },
+        "tests/test_fused_marlin_moe.py": {
+          "sha256": "03f072365e63e7ec922c8b56824cfa23b606627ca84b315a070c42244b53b653",
+          "git_blob": "6fa3b27152ad82edf996d1fd3bf1f99224509b74",
+          "raw_git_exact": true
+        },
+        "tools/ci_checks/check_no_torch_fallback.py": {
+          "sha256": "f775ef84b363a9041df23066eb7754f71ba778db58154252f97cdec447ce5500",
+          "git_blob": "55284e1f4de20feac2594bd74b855511cf2a5811",
+          "raw_git_exact": true
+        }
+      }
+    }
+  },
+  "call_paths": {
+    "base": [
+      {
+        "line": 364,
+        "caller": "_pack_w_interleave",
+        "call": "torch.stack"
+      },
+      {
+        "line": 381,
+        "caller": "_cached_pack_w",
+        "call": "_pack_w_interleave"
+      },
+      {
+        "line": 388,
+        "caller": "_cached_pack_w",
+        "call": "_pack_w_interleave"
+      },
+      {
+        "line": 417,
+        "caller": "w4a16_int4_pack",
+        "call": "_cached_pack_w"
+      },
+      {
+        "line": 418,
+        "caller": "w4a16_int4_pack",
+        "call": "_cached_pack_w"
+      },
+      {
+        "line": 431,
+        "caller": "_pack_scale_e8m0",
+        "call": "torch.exp2"
+      },
+      {
+        "line": 437,
+        "caller": "_cached_pack_scale_e8m0",
+        "call": "_pack_scale_e8m0"
+      },
+      {
+        "line": 440,
+        "caller": "_cached_pack_scale_e8m0",
+        "call": "_pack_scale_e8m0"
+      },
+      {
+        "line": 456,
+        "caller": "_pack_scale_e8m0_fold",
+        "call": "torch.exp2"
+      },
+      {
+        "line": 487,
+        "caller": "_cached_pack_scale_e8m0_fold",
+        "call": "_pack_scale_e8m0_fold"
+      },
+      {
+        "line": 490,
+        "caller": "_cached_pack_scale_e8m0_fold",
+        "call": "_pack_scale_e8m0_fold"
+      },
+      {
+        "line": 508,
+        "caller": "w4a16_mxfp4_pack",
+        "call": "_cached_pack_w"
+      },
+      {
+        "line": 509,
+        "caller": "w4a16_mxfp4_pack",
+        "call": "_cached_pack_w"
+      },
+      {
+        "line": 510,
+        "caller": "w4a16_mxfp4_pack",
+        "call": "scale_pack"
+      },
+      {
+        "line": 511,
+        "caller": "w4a16_mxfp4_pack",
+        "call": "scale_pack"
+      },
+      {
+        "line": 1402,
+        "caller": "fused_marlin_moe_w4a16_int4",
+        "call": "w4a16_int4_pack"
+      },
+      {
+        "line": 2078,
+        "caller": "fused_marlin_moe_w4a16_mxfp4",
+        "call": "w4a16_mxfp4_pack"
+      },
+      {
+        "line": 4380,
+        "caller": "fused_marlin_moe",
+        "call": "fused_marlin_moe_w4a16_int4"
+      },
+      {
+        "line": 4416,
+        "caller": "fused_marlin_moe",
+        "call": "fused_marlin_moe_w4a16_mxfp4"
+      }
+    ],
+    "head": [
+      {
+        "line": 395,
+        "caller": "_pack_w_interleave",
+        "call": "_pack_w_interleave_kernel[triton.cdiv(out.numel(), 256),]"
+      },
+      {
+        "line": 408,
+        "caller": "_cached_pack_w",
+        "call": "_pack_w_interleave"
+      },
+      {
+        "line": 415,
+        "caller": "_cached_pack_w",
+        "call": "_pack_w_interleave"
+      },
+      {
+        "line": 444,
+        "caller": "w4a16_int4_pack",
+        "call": "_cached_pack_w"
+      },
+      {
+        "line": 445,
+        "caller": "w4a16_int4_pack",
+        "call": "_cached_pack_w"
+      },
+      {
+        "line": 516,
+        "caller": "_pack_scale_e8m0_impl",
+        "call": "_pack_scale_e8m0_kernel[triton.cdiv(out.numel(), 256),]"
+      },
+      {
+        "line": 533,
+        "caller": "_pack_scale_e8m0",
+        "call": "_pack_scale_e8m0_impl"
+      },
+      {
+        "line": 538,
+        "caller": "_cached_pack_scale_e8m0",
+        "call": "_pack_scale_e8m0"
+      },
+      {
+        "line": 541,
+        "caller": "_cached_pack_scale_e8m0",
+        "call": "_pack_scale_e8m0"
+      },
+      {
+        "line": 550,
+        "caller": "_pack_scale_e8m0_fold",
+        "call": "_pack_scale_e8m0_impl"
+      },
+      {
+        "line": 578,
+        "caller": "_cached_pack_scale_e8m0_fold",
+        "call": "_pack_scale_e8m0_fold"
+      },
+      {
+        "line": 581,
+        "caller": "_cached_pack_scale_e8m0_fold",
+        "call": "_pack_scale_e8m0_fold"
+      },
+      {
+        "line": 599,
+        "caller": "w4a16_mxfp4_pack",
+        "call": "_cached_pack_w"
+      },
+      {
+        "line": 600,
+        "caller": "w4a16_mxfp4_pack",
+        "call": "_cached_pack_w"
+      },
+      {
+        "line": 601,
+        "caller": "w4a16_mxfp4_pack",
+        "call": "scale_pack"
+      },
+      {
+        "line": 602,
+        "caller": "w4a16_mxfp4_pack",
+        "call": "scale_pack"
+      },
+      {
+        "line": 1493,
+        "caller": "fused_marlin_moe_w4a16_int4",
+        "call": "w4a16_int4_pack"
+      },
+      {
+        "line": 2169,
+        "caller": "fused_marlin_moe_w4a16_mxfp4",
+        "call": "w4a16_mxfp4_pack"
+      },
+      {
+        "line": 4472,
+        "caller": "fused_marlin_moe",
+        "call": "fused_marlin_moe_w4a16_int4"
+      },
+      {
+        "line": 4508,
+        "caller": "fused_marlin_moe",
+        "call": "fused_marlin_moe_w4a16_mxfp4"
+      }
+    ]
+  },
+  "interpretation": {
+    "head_G0": "PASS original checker actual changed files:1 productionfile0 violations exit0",
+    "base_G0": "3 true existing production compute calls; not test-only references",
+    "same_checker_blob": true,
+    "same_operator_blob": false,
+    "PR_replacement": "_pack_w_interleave -> _pack_w_interleave_kernel; _pack_scale_e8m0/_pack_scale_e8m0_fold -> _pack_scale_e8m0_impl/_pack_scale_e8m0_kernel",
+    "no_production_policy_or_allowlist_change": true,
+    "GPU_operations": false,
+    "overall_readiness": "Marlin remains blocked by 5/14 G6 performance cases"
+  }
+}
