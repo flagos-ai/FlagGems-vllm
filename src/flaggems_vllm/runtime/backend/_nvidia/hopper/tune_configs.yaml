@@ -13,6 +13,85 @@
 # limitations under the License.
 
 
+# Wide pipelined reader tiles produced incorrect FP32 projections on H20.
+# Keep the same tiles with one stage, and retain the valid small-M pipelines.
+mhc_pre_packed_reader:
+  - META:
+      BLOCK_M: 32
+      BLOCK_K: 32
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 32
+      BLOCK_K: 32
+    num_warps: 4
+    num_stages: 3
+  - META:
+      BLOCK_M: 64
+      BLOCK_K: 32
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_M: 64
+      BLOCK_K: 32
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_M: 64
+      BLOCK_K: 64
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_M: 64
+      BLOCK_K: 64
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_M: 128
+      BLOCK_K: 32
+    num_warps: 4
+    num_stages: 1
+  - META:
+      BLOCK_M: 128
+      BLOCK_K: 64
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_M: 128
+      BLOCK_K: 128
+    num_warps: 8
+    num_stages: 1
+  - META:
+      BLOCK_M: 32
+      BLOCK_K: 64
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 32
+      BLOCK_K: 64
+    num_warps: 8
+    num_stages: 3
+  - META:
+      BLOCK_M: 32
+      BLOCK_K: 128
+    num_warps: 8
+    num_stages: 2
+  - META:
+      BLOCK_M: 16
+      BLOCK_K: 64
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 16
+      BLOCK_K: 128
+    num_warps: 4
+    num_stages: 2
+  - META:
+      BLOCK_M: 16
+      BLOCK_K: 128
+    num_warps: 8
+    num_stages: 3
+
 flash_attn_varlen_fa3_direct:
   - gen: true
     param_map: &direct_param_map

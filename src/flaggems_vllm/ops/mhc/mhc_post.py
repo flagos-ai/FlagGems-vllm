@@ -395,7 +395,12 @@ def mhc_post(
         if _has_aabs:
             _autotuning.adjust_block_size = False
         try:
-            from triton._flagtree_backend import FLAGTREE_BACKEND
+            try:
+                from triton._flagtree_backend import FLAGTREE_BACKEND
+            except ModuleNotFoundError as exc:
+                if exc.name != "triton._flagtree_backend":
+                    raise
+                FLAGTREE_BACKEND = None
 
             if FLAGTREE_BACKEND == "ppu":
                 # PPU: same ABI, vendor-shaped launch (one CTA per token).
