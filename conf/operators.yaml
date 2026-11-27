@@ -950,6 +950,22 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2
+  description: 'fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert adapted
+
+    for vllm 0.32.0
+
+    '
+  for:
+  - torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.3'
 - id: fused_experts_impl
   description: An implementation of fused MoE.
   for:

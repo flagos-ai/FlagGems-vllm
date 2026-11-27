@@ -20,6 +20,7 @@ from flaggems_vllm.runtime.backend._hygon.fused.fused_deepseek_v4_qnorm_rope_kv_
 )
 from flaggems_vllm.runtime.backend._hygon.fused.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2,
 )
 from flaggems_vllm.runtime.backend._hygon.fused.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
@@ -39,6 +40,7 @@ __all__ = [
     "flash_attn_varlen_func_w8a8_int8",
     "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2",
     "fused_inv_rope_fp8_quant",
     "fused_marlin_moe",
     "moe_sum",

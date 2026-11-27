@@ -107,6 +107,7 @@ from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_inser
 )
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2,
 )
 from flaggems_vllm.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from flaggems_vllm.ops.fused_indexer_k_norm import fused_indexer_k_norm
@@ -360,6 +361,7 @@ __all__ = [
     "fused_allreduce_rms_norm",
     "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_v2",
     "fused_experts_impl",
     "fused_indexer_k_norm",
     "fused_indexer_q_rope_quant",
