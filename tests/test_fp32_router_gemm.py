@@ -54,3 +54,29 @@ def test_fp32_router_graph():
         flaggems_vllm.fp32_router_gemm(x.repeat(9, 1), w)
     with pytest.raises(NotImplementedError):
         flaggems_vllm.fp32_router_gemm(x, w.bfloat16())
+
+
+@pytest.mark.parametrize("m", [0, 1, 32, 33, 64, 8192])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fp32_router_512_experts(m, dtype):
+    torch.manual_seed(329)
+    x = torch.randn((3072, m), device="cuda", dtype=dtype).T
+    w = (torch.randn((3072, 512), device="cuda") * 0.01).T
+
+    def reference():
+        return (x.double() @ w.double().T).float()
+
+    actual = flaggems_vllm.fp32_router_gemm(x, w)
+    torch.testing.assert_close(actual, reference(), rtol=2e-5, atol=8e-6)
+    if m != 64:
+        return
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = flaggems_vllm.fp32_router_gemm(x, w)
+    for sign in (-1, 1, -1):
+        x.neg_()
+        w.add_(sign * 0.001)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(out, reference(), rtol=2e-5, atol=8e-6)
