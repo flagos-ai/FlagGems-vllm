@@ -232,6 +232,9 @@ from flaggems_vllm.ops.silu_and_mul_with_clamp import (
 )
 from flaggems_vllm.ops.skip_layernorm import skip_layer_norm
 from flaggems_vllm.ops.sparse_attention import sparse_attn_triton
+from flaggems_vllm.ops.split_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
+    split_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
+)
 from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
     stage_deepseek_v4_mega_moe_inputs,
 )
@@ -486,6 +489,7 @@ __all__ = [
     "silu_and_mul_with_clamp_out",
     "skip_layer_norm",
     "sparse_attn_triton",
+    "split_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "stage_deepseek_v4_mega_moe_inputs",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",

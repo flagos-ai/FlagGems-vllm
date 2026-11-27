@@ -2037,3 +2037,25 @@ flash_mla_sparse_fwd:
   - META: {BK: 64, BH: 64}
     num_warps: 8
     num_stages: 4
+
+split_kv_compress_norm_rope_insert_sparse_attn_cutedsl:
+  - META: {BLOCK_D: 8}
+    num_warps: 2
+    num_stages: 1
+  - META: {BLOCK_D: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 64}
+    num_warps: 8
+    num_stages: 1
+
+split_kv_compress_norm_rope_insert_sparse_attn_cutedsl_store:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1

@@ -2396,6 +2396,19 @@ ops:
   stages:
   - beta: '5.0'
   - stable: '5.3'
+- id: split_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  description: Compress 128 paged DeepSeek-V4 state rows into the caller's FP32
+    workspace, apply weighted RMSNorm and RoPE, and write packed or full KV cache.
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl.split_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: stage_deepseek_v4_mega_moe_inputs
   description: 'Stages DeepSeekV4 Mega-MoE inputs by quantizing hidden states to FP8
 
