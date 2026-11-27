@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 import pytest
 import torch
 
 import flaggems_vllm
 from tests.test_flash_mla_sparse_fwd_w8a8 import (
-    HAS_FP8_MLA,
+    HAS_SPARSE_W8A8,
+    SPARSE_INT8_OP,
     assert_sparse_fixture_close,
+    assert_sparse_int8_close,
+    dequantize_sparse_int8_fixture,
     flashmla_reference,
     make_sparse_inputs,
-    quantize_sparse_fp8_fixture,
+    quantize_sparse_fixture,
 )
 
 from . import base
@@ -37,7 +42,15 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
             flashmla_reference().flash_mla_sparse_fwd,
             [torch.bfloat16],
         )
-        self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
+        if SPARSE_INT8_OP is not None:
+            self.is_int8 = True
+            # The native comparison includes BF16 input rounding.
+            self.assert_output = partial(assert_sparse_int8_close, lse_atol=2e-3)
+            self.set_gems(SPARSE_INT8_OP)
+        else:
+            self.is_int8 = False
+            self.assert_output = assert_sparse_fixture_close
+            self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
 
     def get_input_iter(self, dtype):
         for shape in self.shapes:
@@ -47,12 +60,20 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
                     "optionally followed by sink,topk_length,seed"
                 )
             inputs = make_sparse_inputs(shape, dtype=dtype)
-            packed = quantize_sparse_fp8_fixture(*inputs)
-            reference, _, reference_lse = self.torch_op(*inputs)
+            packed = quantize_sparse_fixture(*inputs, int8=self.is_int8)
+            if self.is_int8:
+                q, kv, indices, *options = dequantize_sparse_int8_fixture(
+                    packed, inputs[1].shape[0], dtype
+                )
+                # Validate on a separate clone because native flash_mla_sparse_fwd
+                # can sort indices in-place on Hygon.
+                validation_inputs = (q, kv, indices.clone(), *options)
+                inputs = (q, kv, indices.clone(), *options)
+            else:
+                validation_inputs = inputs
+            reference, _, reference_lse = self.torch_op(*validation_inputs)
             output, lse = self.gems_op(*packed)
-            assert_sparse_fixture_close(
-                output[:, 0], lse[:, :, 0], reference, reference_lse
-            )
+            self.assert_output(output[:, 0], lse[:, :, 0], reference, reference_lse)
             yield inputs, packed, shape
 
     def unpack_to_args_kwargs(self, input_tuple):
@@ -68,6 +89,6 @@ class FlashmlaSparseBenchmark(ParallelBenchmarkMixin, base.Benchmark):
 
 
 @pytest.mark.flash_mla_sparse_fwd_w8a8
-@pytest.mark.skipif(not HAS_FP8_MLA, reason="FP8 MLA requires NVIDIA Hopper and TLE")
+@pytest.mark.skipif(not HAS_SPARSE_W8A8, reason="Sparse W8A8 MLA is not registered")
 def test_flash_mla_sparse_fwd_w8a8():
     FlashmlaSparseBenchmark().run()

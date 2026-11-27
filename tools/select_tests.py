@@ -237,6 +237,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_metax/ops/w8a8_block_int8_bmm.py": [
         "tests/test_int8_einsum.py",
     ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/flash_mla_sparse_fwd_w8a8_int8.py": [
+        "tests/test_flash_mla_sparse_fwd_w8a8.py",
+    ],
     "src/flaggems_vllm/runtime/backend/_hygon/fused/attention.py": [
         "tests/test_flash_attn_varlen_func_w8a8_int8.py",
     ],
@@ -411,6 +414,9 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     "src/flaggems_vllm/ops/attention.py": [
         "benchmark/test_flash_attn_varlen_func.py",
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",
+    ],
+    "src/flaggems_vllm/runtime/backend/_hygon/ops/flash_mla_sparse_fwd_w8a8_int8.py": [
+        "benchmark/test_flash_mla_sparse_fwd_w8a8.py",
     ],
     "src/flaggems_vllm/runtime/backend/_hygon/fused/attention.py": [
         "benchmark/test_flash_attn_varlen_func_w8a8_int8.py",

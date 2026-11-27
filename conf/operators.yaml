@@ -805,10 +805,11 @@ ops:
   stages:
   - alpha: '5.3'
 - id: flash_mla_sparse_fwd_w8a8
-  description: Sparse MLA decoding with per-token FP8 NoPE and BF16 RoPE query and
-    shared key/value.
+  description: Sparse MLA decoding with per-token FP8 or INT8 NoPE, unquantized
+    RoPE, and a shared key/value cache.
   for:
   - flash_mla_sparse_fwd_w8a8
+  - flash_mla_sparse_fwd_w8a8_int8
   labels:
   - fused
   - Attention
