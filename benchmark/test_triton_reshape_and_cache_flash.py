@@ -38,7 +38,11 @@ def _positive_finite(value):
 
 def _chip_key(name):
     name = str(name or "").strip().lower()
-    return name[7:] if name.startswith("nvidia ") else name
+    if name.startswith("nvidia "):
+        name = name[7:]
+    # Separator-insensitive: the spec spells SKUs like "MTT-S5000" while the
+    # device reports "MTT S5000"; keep this in step with consts._chip_matches.
+    return "".join(ch for ch in name if ch.isalnum())
 
 
 class CacheFlashBenchmark(base.Benchmark):

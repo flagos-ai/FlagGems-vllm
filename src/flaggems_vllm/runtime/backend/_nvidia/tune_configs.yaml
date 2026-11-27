@@ -733,6 +733,36 @@ compute_global_topk_indices_and_lens:
     num_warps: 8
     num_stages: 3
 
+fused_moe_lora_gemv:
+  - META: {BLOCK_K: 64, BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_K: 128, BLOCK_N: 128}
+    num_warps: 4
+    num_stages: 1
+
+fused_moe_lora_grouped:
+  - META: {BLOCK_K: 32, BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_K: 64, BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_K: 64, BLOCK_N: 128}
+    num_warps: 4
+    num_stages: 3
+  - META: {BLOCK_K: 128, BLOCK_N: 128}
+    num_warps: 4
+    num_stages: 3
+
+fused_moe_lora_project:
+  - META: {BLOCK_K: 32, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_K: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 2
+
 fused_marlin_moe_w4a16_int4:
   - META: {BLOCK_SIZE_N: 64, GROUP_SIZE_M: 4}
     num_warps: 4
@@ -1502,6 +1532,23 @@ rejection_sample:
     num_warps: 8
     num_stages: 2
 
+triton_reshape_and_cache_flash_per_token_head_quant:
+  - META: {INDEPENDENT_TILES: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {INDEPENDENT_TILES: false}
+    num_warps: 1
+    num_stages: 1
+  - META: {INDEPENDENT_TILES: false}
+    num_warps: 8
+    num_stages: 1
+  - META: {INDEPENDENT_TILES: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {INDEPENDENT_TILES: true}
+    num_warps: 1
+    num_stages: 1
+
 flash_mla_fp8_copy_table:
   - META: {BLOCK: 128}
     num_warps: 4
@@ -1754,6 +1801,21 @@ logprob_fill_ids:
   - META: {}
     num_warps: 8
     num_stages: 3
+
+lora_expand_gemv:
+  - META: {BLOCK_M: 1, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+
+lora_expand_wide_gemv:
+  - META: {BLOCK_M: 1, BLOCK_N: 128}
+    num_warps: 4
+    num_stages: 1
+
+lora_expand_grouped:
+  - META: {BLOCK_M: 32, BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 1
 
 fused_kimi_k3_mla_kv_concat:
   - META: {BLOCK: 256, ROW_LAYOUT: false}
@@ -2028,3 +2090,8 @@ flash_mla_sparse_fwd:
   - META: {BK: 64, BH: 64}
     num_warps: 8
     num_stages: 4
+
+fused_kimi_k3_mla_decode_q_concat_kv_cache_insert:
+  - META: {}
+    num_warps: 4
+    num_stages: 1

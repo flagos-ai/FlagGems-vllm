@@ -12,6 +12,7 @@ import torch
 
 from benchmark.test_batch_shard import (
     KERNEL_NAMES,
+    REFERENCE_KERNELS,
     check_case,
     make_case,
     run_candidate,
@@ -28,6 +29,15 @@ pytestmark = [
         reason=f"requires an available {DEVICE} accelerator",
     ),
 ]
+
+
+def _check_reference(case):
+    if REFERENCE_KERNELS:
+        # A fresh output buffer also detects an incomplete reference write.
+        for output in case.outputs:
+            output.fill_(-123)
+        run_reference(case)
+        check_case(case)
 
 
 @pytest.mark.gather_sampler_output
@@ -48,10 +58,9 @@ pytestmark = [
 )
 def test_pack_unpack(name, n, k, c, scenario):
     case = make_case(name, n, k, c, scenario)
-    run_reference(case)
-    check_case(case)
     run_candidate(case)
     check_case(case)
+    _check_reference(case)
     run_candidate(case)
     check_case(case)
 
@@ -79,10 +88,9 @@ def test_integer_and_float_types(name, id_dtype, index_dtype, dtype):
         id_dtype=id_dtype,
         index_dtype=index_dtype,
     )
-    run_reference(case)
-    check_case(case)
     run_candidate(case)
     check_case(case)
+    _check_reference(case)
 
 
 @pytest.mark.parametrize("name", KERNEL_NAMES[:2])
@@ -115,10 +123,9 @@ def test_all_tuning_tiles(name):
 @pytest.mark.parametrize("name", [KERNEL_NAMES[0], KERNEL_NAMES[2]])
 def test_zero_source_columns(name):
     case = make_case(name, 9, 3, 7, source_cols=0)
-    run_reference(case)
-    check_case(case)
     run_candidate(case)
     check_case(case)
+    _check_reference(case)
 
 
 def test_logprob_special_values():
@@ -129,13 +136,13 @@ def test_logprob_special_values():
     case.args[6].copy_(values[None, :])
     # The second output is a guarded, contiguous float32 row.
     case.expected[1][:6] = values.cpu()
-    run_reference(case)
-    check_case(case)
     run_candidate(case)
     check_case(case)
     assert torch.equal(
         torch.signbit(case.outputs[1][3:5]), torch.tensor([False, True], device=DEVICE)
     )
+
+    _check_reference(case)
 
 
 @dataclass
@@ -153,25 +160,40 @@ class SamplerOutput:
 @pytest.mark.parametrize("name", KERNEL_NAMES)
 def test_large_integers_and_repeated_sources(name):
     case = make_case(name, 5, 3, 6, id_dtype=torch.int64, index_dtype=torch.int64)
+    large = 2**40 + 19
+    rows = case.n * case.k
+    # Update the CPU oracle together with each input mutation.
     if name == KERNEL_NAMES[0]:
         for index in (2, 4, 5, 6):
-            case.args[index].fill_(2**40 + 19)
+            case.args[index].fill_(large)
+        width = case.k + 3
+        expected = case.expected[0][: case.n * width].view(case.n, width)
+        expected[:, : case.k + 2] = large
+        expected[:, case.k + 2] = case.k * large
     elif name == KERNEL_NAMES[1]:
-        case.args[0].fill_(2**40 + 19)
+        case.args[0].fill_(large)
         case.args[2].fill_(0)
+        case.expected[0][:rows] = large
+        metadata = torch.tensor(large, dtype=torch.int64).to(torch.int32).item()
+        for expected in case.expected[1:]:
+            expected[: case.n] = metadata
     elif name == KERNEL_NAMES[2]:
         case.args[4].fill_(-(2**40) - 17)
-        case.args[8].fill_(2**40 + 19)
+        case.args[8].fill_(large)
+        expected = case.expected[0][: rows * (case.c + 1)].view(rows, case.c + 1)
+        expected[:, : case.c] = -(2**40) - 17
+        expected[:, case.c] = large
     else:
-        case.args[0].fill_(2**40 + 19)
+        case.args[0].fill_(large)
         case.args[4].fill_(0)
-    run_reference(case)
-    expected = [value.clone() for value in case.outputs]
-    for value in case.outputs:
-        value.fill_(-123)
+        case.expected[0][: rows * case.c] = large
+        case.expected[1][: rows * case.c] = (
+            case.args[2][: case.k].cpu().repeat(case.n, 1).reshape(-1)
+        )
+        case.expected[2][:rows] = large
     run_candidate(case)
-    for actual, ref in zip(case.outputs, expected):
-        torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+    check_case(case)
+    _check_reference(case)
 
 
 @pytest.mark.parametrize(

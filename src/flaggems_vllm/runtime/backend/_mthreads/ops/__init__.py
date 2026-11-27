@@ -18,6 +18,9 @@ from flaggems_vllm.runtime.backend._mthreads.ops.compress_norm_mrope import (
 from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
     cooperative_topk,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.deep_gemm_fp8_o_proj import (
+    deep_gemm_fp8_o_proj,
+)
 from flaggems_vllm.runtime.backend._mthreads.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
@@ -49,6 +52,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.hc_combine import hc_combine
 from flaggems_vllm.runtime.backend._mthreads.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.logprob import compute_topk_scores
 from flaggems_vllm.runtime.backend._mthreads.ops.mhc_pre_broadcast import (
     mhc_pre_broadcast,
 )
@@ -77,7 +81,9 @@ from flaggems_vllm.runtime.backend._mthreads.ops.watermark import (
 
 __all__ = [
     "chunk_gated_delta_rule_w8a16_fp8",
+    "compute_topk_scores",
     "cooperative_topk",
+    "deep_gemm_fp8_o_proj",
     "dequantize_and_gather_k_cache",
     "draft_watermarking_mask",
     "flash_attn_varlen_func_w8a8_fp8",

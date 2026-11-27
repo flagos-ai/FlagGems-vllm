@@ -71,7 +71,6 @@ class KdaConvScatterBenchmark(base.Benchmark):
 def _torch_scatter(cstate, flat, staged):
     """The full replaced sentinel chain (not a bare index_copy_): arange +
     masked_fill + where/zeros_like/sum row-0 guard + index_copy_."""
-    out = cstate.clone()
     valid = flat != -1
     safe = flat.masked_fill(~valid, 0).to(torch.long)
     mask_shape = (valid.numel(),) + (1,) * (staged.ndim - 1)
@@ -79,16 +78,15 @@ def _torch_scatter(cstate, flat, staged):
     uz = torch.where(valid_zero.view(mask_shape), staged, torch.zeros_like(staged)).sum(
         dim=0
     )
-    ez = torch.where(valid_zero.any(), uz, out[0])
+    ez = torch.where(valid_zero.any(), uz, cstate[0])
     restore = torch.where(valid.view(mask_shape), staged, ez.unsqueeze(0))
-    out.index_copy_(0, safe, restore)
-    return out
+    cstate.index_copy_(0, safe, restore)
+    return cstate
 
 
 def _gems_scatter(cstate, flat, staged):
-    out = cstate.clone()
-    flaggems_vllm.scatter_conv_state(out, flat, staged)
-    return out
+    flaggems_vllm.scatter_conv_state(cstate, flat, staged)
+    return cstate
 
 
 @pytest.mark.scatter_conv_state

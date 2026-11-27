@@ -29,6 +29,14 @@ __all__ = [
     "w8a8_block_matmul",
 ]
 
+# The compiled launcher uses the Triton 3.6 calling convention.
+if triton.__version__.startswith("3.6."):
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert import (  # noqa: E501
+        fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
+    )
+
+    __all__.append(fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert.__name__)
+
 if _triton_version_utils.has_triton_tle(3, 6, 0):
     from flaggems_vllm.runtime.backend._nvidia.hopper.ops.megamoe import (  # noqa: F401
         megamoe_fp8,
