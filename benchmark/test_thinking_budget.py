@@ -13,20 +13,16 @@ import statistics
 import pytest
 import torch
 
+from benchmark import base, consts
+from benchmark.conftest import Config
+from flaggems_vllm import apply_thinking_budget, runtime
+
 try:
     from vllm.v1.worker.gpu.sample.thinking_budget import (
         apply_thinking_budget as vllm_reference,
     )
-except ImportError as exc:
-    raise ImportError(
-        "Failed to import apply_thinking_budget from vLLM. "
-        "Check that the installed vLLM version provides this API "
-        "and its dependencies are installed correctly."
-    ) from exc
-
-from benchmark import base, consts
-from benchmark.conftest import Config
-from flaggems_vllm import apply_thinking_budget, runtime
+except ImportError:
+    vllm_reference = None
 
 pytestmark = [
     pytest.mark.apply_thinking_budget,
@@ -57,7 +53,9 @@ class ThinkingBudgetBenchmark(base.Benchmark):
     WARMUP_STEPS = 10
     ITERATIONS = 100
 
-    def __init__(self):
+    def __init__(self, vllm_reference):
+        if vllm_reference is None:
+            self.DEFAULT_METRICS = ["latency"]
         super().__init__(
             op_name="apply_thinking_budget",
             torch_op=vllm_reference,
@@ -118,7 +116,8 @@ class ThinkingBudgetBenchmark(base.Benchmark):
                 torch.tensor([91], dtype=torch.int32, device=self.device),
             )
             if not mode.startswith("cold-"):
-                vllm_reference(*args)
+                initializer = self.torch_op or self.gems_op
+                initializer(*args)
             self._original = [args[index].clone() for index in (0, 5, 8, 9, 10)]
             yield args
 
@@ -172,5 +171,5 @@ class ThinkingBudgetBenchmark(base.Benchmark):
             return statistics.median(samples)
 
 
-def test_thinking_budget_perf():
-    ThinkingBudgetBenchmark().run()
+def test_thinking_budget():
+    ThinkingBudgetBenchmark(vllm_reference).run()
