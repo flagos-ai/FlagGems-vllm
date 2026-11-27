@@ -2097,6 +2097,24 @@ ops:
   - Attention
   stages:
   - beta: '5.3'
+- id: qsa_select_paged_decode
+  description: 'QSA (Qwen4Exp / Qwen3.8-Flash-Next sparse attention) indexer decode-step
+
+    block selection: scores the visible compressed blocks of each request''s paged
+
+    key cache with sum_h relu(K . q) and writes the top-k block indices.
+
+    '
+  for:
+  - vllm.models.qwen4_exp.nvidia.ops.qsa_indexer.qsa_select_paged_decode
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: qsa_sparse_paged_attention
   description: 'Computes sparse grouped-query attention over paged BF16 or FP8 KV
     caches
