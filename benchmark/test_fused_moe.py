@@ -14,9 +14,8 @@
 
 """Benchmark FlagGems fused_experts_impl against each platform MoE baseline.
 
-Production entries are used where they are wired up. NVIDIA currently uses the
-functional vLLM fused_experts_impl as its reference until the production modular
-baseline is agreed with the platform partner.
+Production entries are used on every vendor. NVIDIA uses the same FusedMoE
+execution path as the other platforms instead of the functional reference.
 """
 
 import gc
@@ -33,15 +32,6 @@ import flaggems_vllm
 from . import base
 
 VENDOR = flaggems_vllm.vendor_name
-
-# Vendors whose benchmark baseline is the functional vLLM fused_experts_impl.
-# MetaX is not listed here: its production entry is selected below.
-VLLM_FUNCTIONAL_VENDORS = {"nvidia"}
-
-if VENDOR in VLLM_FUNCTIONAL_VENDORS:
-    from vllm.model_executor.layers.fused_moe.fused_moe import (
-        fused_experts_impl as vllm_fused_experts_impl,
-    )
 
 # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
 _SHAPES = [
@@ -108,17 +98,6 @@ def _input_fn(shape, dtype, device):
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
     yield hidden_states, w1, w2, topk_weights, topk_ids
-
-
-def _vllm_functional_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
-    return vllm_fused_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        activation="silu",
-    )
 
 
 # Production baseline used by this benchmark and by the accuracy tests.
@@ -240,6 +219,62 @@ def _build_metax_layer(num_experts, hidden_size, intermediate_size, topk, dtype)
     finally:
         torch.set_default_device(previous)
     _CACHE.update(layer=runner, experts=runner.routed_experts, ctx=ctx)
+
+
+def nvidia_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Run vLLM's production NVIDIA unquantized MoE method.
+
+    Keep ``moe_backend`` at its default ``auto`` value so the production
+    oracle, not the benchmark, selects the backend.
+    """
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+
+    torch.set_default_device(hidden_states.device)
+    _, hidden_size = hidden_states.shape
+    num_experts = w1.shape[0]
+    intermediate_size = w2.shape[2]
+    topk = topk_ids.shape[1]
+
+    key = (
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        hidden_states.dtype,
+        w1.data_ptr(),
+        w2.data_ptr(),
+    )
+    if key != _CACHE.get("nvidia_key"):
+        _CACHE["layer"] = None
+        torch.cuda.empty_cache()
+        _build_layer(
+            num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
+        )
+        _CACHE["nvidia_key"] = key
+        experts = _CACHE["experts"]
+        with set_current_vllm_config(_CACHE["ctx"]):
+            experts.w13_weight.data.copy_(w1)
+            experts.w2_weight.data.copy_(w2)
+            experts.quant_method.process_weights_after_loading(experts)
+
+    experts = _CACHE["experts"]
+    ctx = _CACHE["ctx"]
+    qm = experts.quant_method
+    params = inspect.signature(qm.apply).parameters
+    kwargs = {
+        "layer": experts,
+        "x": hidden_states,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+    }
+    if "shared_experts" in params:
+        kwargs["shared_experts"] = None
+    if "shared_experts_input" in params:
+        kwargs["shared_experts_input"] = None
+
+    with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
+        return qm.apply(**kwargs)
 
 
 def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
@@ -590,6 +625,7 @@ PRODUCTION_MOE_VENDORS = {
     "metax": metax_fused_moe_op,
     "mthreads": mthreads_fused_moe_op,
     "hygon": hygon_fused_moe_op,
+    "nvidia": nvidia_fused_moe_op,
 }
 
 
@@ -600,14 +636,12 @@ def production_moe_op(vendor_name):
     return PRODUCTION_MOE_VENDORS.get(vendor_name)
 
 
-_PRODUCTION_BASELINE_VENDORS = {"thead", "metax", "mthreads", "hygon"}
+_PRODUCTION_BASELINE_VENDORS = {"thead", "metax", "mthreads", "hygon", "nvidia"}
 
 
 def _get_baseline_op():
     if VENDOR in _PRODUCTION_BASELINE_VENDORS:
         return production_moe_op(VENDOR)
-    if VENDOR in VLLM_FUNCTIONAL_VENDORS:
-        return _vllm_functional_fused_moe_op
     return None
 
 
