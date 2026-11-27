@@ -156,6 +156,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
 )
 from flaggems_vllm.runtime.backend._ascend.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.watermark import draft_watermarking_mask
 
 __all__ = [
     "add_rms_norm",
@@ -173,6 +174,7 @@ __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "deep_gemm_fp8_o_proj",
     "dequantize_and_gather_k_cache",
+    "draft_watermarking_mask",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
