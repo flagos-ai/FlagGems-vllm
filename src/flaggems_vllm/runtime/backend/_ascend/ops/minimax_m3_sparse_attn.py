@@ -148,6 +148,9 @@ def separate_kv_attention(
         for t in (q, k, v, out)
     ):
         raise ValueError("Expected inference-only BF16 data on the query device")
+    # Unit-stride D128 vectors fit 64 tokens per tile in the Ascend UB.
+    # Masked dimensions and strided vectors need more temporary storage.
+    tile = 64 if dim == 128 and all(t.stride(-1) == 1 for t in (q, k, v, out)) else 16
     if rows and heads:
         with torch.npu.device(q.device):
             _sparse_gqa[(rows, heads)](
@@ -179,5 +182,6 @@ def separate_kv_attention(
                 limit,
                 scale,
                 decode,
-                16,
+                tile,
+                multibuffer=False,
             )

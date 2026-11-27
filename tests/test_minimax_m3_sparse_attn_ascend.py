@@ -15,12 +15,12 @@ import flaggems_vllm
         pytest.param(True, marks=pytest.mark.minimax_m3_sparse_attn_decode),
     ],
 )
-@pytest.mark.parametrize("groups", [1, 4])
-def test_selected_pages(decode, groups):
+@pytest.mark.parametrize("groups,dim,stride", [(1, 128, 1), (4, 128, 1), (4, 96, 2)])
+def test_selected_pages(decode, groups, dim, stride):
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("Requires an Ascend NPU")
     generator = torch.Generator().manual_seed(291)
-    kv_heads, dim = 2, 128
+    kv_heads = 2
     lengths = [1, 1] if decode else [3, 2]
     seq = [131, 7]
     prefix = [130, 6] if decode else [126, 2]
@@ -58,9 +58,14 @@ def test_selected_pages(decode, groups):
                     scores = kv[:, 0] @ q[row, head].double()
                     expected[row, head] = (scores * scale).softmax(0) @ kv[:, 1]
     device_cache = cache.to("npu")
-    out = torch.full_like(q, float("nan"), device="npu")
+    storage = torch.full(
+        (*q.shape[:2], dim * stride), float("nan"), dtype=q.dtype, device="npu"
+    )
+    out = storage[..., ::stride]
+    device_q = torch.empty_like(storage)[..., ::stride]
+    device_q.copy_(q)
     args = (
-        q.to("npu"),
+        device_q,
         (device_cache[:, 0], device_cache[:, 1]),
         selected.to("npu"),
         torch.tensor(table, dtype=torch.int32, device="npu"),
@@ -82,6 +87,8 @@ def test_selected_pages(decode, groups):
             out,
         )
     assert result is None
+    if stride > 1:
+        assert storage[..., 1::stride].isnan().all().item()
     torch.testing.assert_close(out.cpu(), expected, atol=0.01, rtol=0.02)
 
 
@@ -127,6 +134,11 @@ def test_replay_reads_live_metadata(decode):
     out.fill_(float("nan"))
     graph.replay()
     torch.testing.assert_close(out.cpu(), torch.full_like(out.cpu(), 3))
+    idx.fill_(-1)
+    out.fill_(float("nan"))
+    graph.replay()
+    assert torch.count_nonzero(out.cpu()).item() == 0
+    idx.zero_()
     seq.zero_()
     out.fill_(float("nan"))
     graph.replay()
