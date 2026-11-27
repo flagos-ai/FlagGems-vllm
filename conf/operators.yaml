@@ -1383,6 +1383,17 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: gems_rms_forward
+  description: FlagGems-compatible inference RMSNorm with optional in-place residual addition.
+  for:
+  - vllm.model_executor.layers.layernorm.RMSNorm
+  labels:
+  - vLLM
+  - Normalization
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: get_num_sampled_and_rejected
   description: Update sampled and rejected token counts per request.
   for:
