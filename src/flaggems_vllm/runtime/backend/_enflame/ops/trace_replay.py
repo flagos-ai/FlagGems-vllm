@@ -29,7 +29,7 @@ def _trace_replay_kernel(
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx, mask=active, other=-1)
     valid = active & (req_state_idx >= 0)
     # Enflame: select instead of arith.maxsi, which GCU300 cannot legalize once
-    # the value is used as an address; see the module docstring for equivalence.
+    # the value is used as an address.
     safe_req_idx = tl.where(valid, req_state_idx, 0)
 
     trace_len = tl.load(trace_len_ptr + safe_req_idx, mask=valid, other=0)
