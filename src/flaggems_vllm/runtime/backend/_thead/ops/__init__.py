@@ -25,6 +25,9 @@ from flaggems_vllm.runtime.backend._thead.ops.deepseek_v4_attention_fused_q_kv_r
 from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache import (
     flash_mla_with_kvcache,
 )
+from flaggems_vllm.runtime.backend._thead.ops.flash_mla_with_kvcache_w8a8 import (
+    flash_mla_with_kvcache_w8a8,
+)
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -65,6 +68,7 @@ __all__ = [
     "cooperative_topk",
     "deep_gemm_fp8_o_proj",
     "flash_mla_with_kvcache",
+    "flash_mla_with_kvcache_w8a8",
     "fused_experts_impl",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
