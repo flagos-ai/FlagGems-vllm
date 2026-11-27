@@ -214,6 +214,9 @@ from flaggems_vllm.ops.reshape_and_cache_flash_strided import (
 from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
+from flaggems_vllm.ops.triton_reshape_and_cache_flash_per_token_head_quant import (
+    triton_reshape_and_cache_flash_per_token_head_quant,
+)
 from flaggems_vllm.ops.rotary_embedding import apply_rotary_pos_emb
 from flaggems_vllm.ops.router_gemm import router_gemm
 from flaggems_vllm.ops.rwkv_ka_fusion import rwkv_ka_fusion
@@ -495,6 +498,7 @@ __all__ = [
     "triton_ihc_post",
     "triton_ihc_pre",
     "triton_reshape_and_cache_flash",
+    "triton_reshape_and_cache_flash_per_token_head_quant",
     "triton_scaled_mm",
     "triton_unified_attention",
     "unpack_seq_triton",

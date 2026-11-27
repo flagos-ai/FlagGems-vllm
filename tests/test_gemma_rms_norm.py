@@ -39,10 +39,17 @@ def _vllm_gemma_rms_norm(x, w, eps):
     """Reference using vllm.model_executor.layers.layernorm.GemmaRMSNorm."""
     # vLLM's CustomOp must be instantiated inside a vLLM config context;
     # newer vLLM raises "Current vLLM config is not set" otherwise.
-    from vllm.config import VllmConfig, set_current_vllm_config
+    # CustomOp dispatch only reads .compilation_config, and constructing a
+    # full VllmConfig() lazily imports vllm.v1.executor -> ... -> xgrammar,
+    # which breaks on environments with a mismatched tvm-ffi/xgrammar pair,
+    # so use a minimal stand-in carrying only a CompilationConfig.
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationConfig, set_current_vllm_config
 
     N = x.shape[-1]
-    with set_current_vllm_config(VllmConfig()):
+    minimal_config = SimpleNamespace(compilation_config=CompilationConfig())
+    with set_current_vllm_config(minimal_config):
         norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
     norm.weight = torch.nn.Parameter(w.float())
     norm = norm.to(x.device)

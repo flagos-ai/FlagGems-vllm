@@ -1121,6 +1121,7 @@ ops:
   description: |
     Fuse MQA query RoPE and FP8 packing with indexer query RoPE,
     UE8M0 quantization, and index-weight scaling. Includes H20 scheduling.
+    Includes an Ascend specialization for the full BF16 workload, validated on 910B4-1.
   for:
     - vllm.models.deepseek_v32.common.kernels.fused_q
   labels:
@@ -2423,6 +2424,33 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '5.0'
+- id: swiglu_group_quant
+  description: 'SwiGLU fused with block-wise FP8 quantization for Ascend 950DT
+
+    (A5 / arch35). The implementation lives under
+
+    `runtime/backend/_ascend/a5/ops/` and targets the CANN
+
+    `aclnnSwigluGroupQuant` interface: BF16/FP16 input, E4M3/E5M2 output,
+
+    optional per-token FP32 weight, clamp and group_index, and MX E8M0 scales
+
+    or block FP32 scales. Quant modes 0 and 1 are supported; HiFloat8 modes
+
+    2 and 3 are not available through Triton and raise an explicit error.
+
+    '
+  for:
+  - swiglu_group_quant
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  - MoE
+  kind:
+  - Quantization
+  stages:
+  - beta: '0.3'
 - id: top_k_per_row_decode
   description: 'Triton top-K per row for DeepSeek V4 decode-phase token selection.
 
@@ -2571,6 +2599,18 @@ ops:
   - Attention
   stages:
   - alpha: '0.1'
+- id: triton_reshape_and_cache_flash_per_token_head_quant
+  description: Quantize paged K and V per token and KV head, updating separate
+    data and FP32 scale caches in place.
+  for:
+  - triton_reshape_and_cache_flash_per_token_head_quant
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
 - id: unpack_seq_triton
   description: Unpack a packed sequence tensor back to its original variable-length
     form.

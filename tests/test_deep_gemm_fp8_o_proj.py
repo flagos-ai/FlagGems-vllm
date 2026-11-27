@@ -57,14 +57,21 @@ def is_ascend_vendor():
     return flaggems_vllm.vendor_name == "ascend"
 
 
+def is_mthreads_vendor():
+    """MThreads S5000 has native FP8 tensor cores and its own o_proj kernel."""
+    return flaggems_vllm.vendor_name == "mthreads"
+
+
 def _device_available():
     if is_ascend_vendor():
         return torch.npu.is_available()
+    if is_mthreads_vendor():
+        return torch.musa.is_available()
     return torch.cuda.is_available()
 
 
 def is_supported_backend():
-    if is_int8_transport_vendor() or is_ascend_vendor():
+    if is_int8_transport_vendor() or is_ascend_vendor() or is_mthreads_vendor():
         return _device_available()
     return is_hopper_available()
 
@@ -92,14 +99,18 @@ pytestmark = [
         not CUDA_AVAILABLE,
         reason=(
             "requires NVIDIA Hopper or a non-FP8-einsum vendor "
-            "(MetaX/Hygon/PPU/Ascend)"
+            "(MetaX/Hygon/PPU/Ascend) or MThreads"
         ),
     ),
 ]
 
 # The INT8 transport adds at most half an INT8 step on top of the FP8 grid
 # (~1.2% peak-relative measured); Hopper stays on exact FP8.
-COMPOSED_ATOL = 0.02 if (is_int8_transport_vendor() or is_ascend_vendor()) else 0.01
+COMPOSED_ATOL = (
+    0.02
+    if (is_int8_transport_vendor() or is_ascend_vendor() or is_mthreads_vendor())
+    else 0.01
+)
 
 
 class _QuantizedActivation:
