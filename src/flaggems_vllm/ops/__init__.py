@@ -31,6 +31,9 @@ from flaggems_vllm.ops.cast_sigmoid import cast_sigmoid
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
+from flaggems_vllm.ops.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert import (
+    fused_kimi_k3_mla_decode_q_concat_kv_cache_insert,
+)
 from flaggems_vllm.ops.fused_kimi_k3_mla_kv_concat import fused_kimi_k3_mla_kv_concat
 from flaggems_vllm.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
@@ -102,6 +105,9 @@ from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     configure_fused_matmul_reduce_scatter,
     fused_matmul_reduce_scatter,
 )
+from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
 )
@@ -122,6 +128,7 @@ from flaggems_vllm.ops.fused_moe import (
     invoke_fused_moe_triton_kernel,
     outplace_fused_experts,
 )
+from flaggems_vllm.ops.fused_moe_lora import fused_moe_lora
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
 from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
@@ -130,6 +137,7 @@ from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.logprob import compute_topk_scores
+from flaggems_vllm.ops.lora_expand import lora_expand
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
@@ -364,6 +372,7 @@ __all__ = [
     "fp8_fp4_paged_mqa_logits_graph",
     "fused_add_rms_norm",
     "fused_allreduce_rms_norm",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
@@ -371,10 +380,12 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
+    "fused_kimi_k3_mla_decode_q_concat_kv_cache_insert",
     "fused_kimi_k3_mla_kv_concat",
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
+    "fused_moe_lora",
     "fused_q",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
@@ -410,6 +421,7 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "lora_expand",
     "mamba_mixer",
     "marlin_gemm",
     "matmul_persistent",

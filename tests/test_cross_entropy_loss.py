@@ -56,6 +56,13 @@ def test_cross_entropy_loss_indices(
     target = torch.randint(0, up_limit, target_shape, device=flaggems_vllm.device)
     ref_inp = utils.to_reference(inp, True)
     ref_target = utils.to_reference(target)
+    # torch_gcu (P21): aten cross_entropy with an int64 class-index target plus
+    # weight/label_smoothing routes through topsatenMaskedSelect, which aborts
+    # with TOPSATEN_STATUS_NOT_SUPPORT on Long inputs. int32 class targets are
+    # semantically identical in aten on every backend, so only the enflame
+    # reference leg is narrowed; the op under test keeps its int64 target.
+    if flaggems_vllm.vendor_name == "enflame" and ref_target.dtype == torch.int64:
+        ref_target = ref_target.to(torch.int32)
 
     if weight:
         wgt = torch.randn(shape[dim], dtype=dtype, device=flaggems_vllm.device)
