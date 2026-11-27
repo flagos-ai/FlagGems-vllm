@@ -165,11 +165,35 @@ def _fused_minimax_m3_op(
     kv_cache_dtype: str,
 ) -> None:
     """Same mutation/gather contract as vLLM's MiniMax M3 fused wrapper."""
-    if qkv.device.type != "cuda" or qkv.dtype != torch.bfloat16:
-        raise NotImplementedError("M3 cache writer requires CUDA BF16 QKV")
+    ascend = qkv.device.type == "npu"
+    if ascend and (
+        num_index_heads
+        or kv_cache_dtype not in ("auto", "bfloat16")
+        or any(
+            arg is not None
+            for arg in (
+                index_q_norm_weight,
+                index_k_norm_weight,
+                slot_mapping,
+                index_slot_mapping,
+                kv_cache,
+                index_cache,
+                index_q_out,
+            )
+        )
+    ):
+        raise NotImplementedError("Ascend supports main BF16 Q/K preprocessing only")
+    if qkv.device.type not in ("cuda", "npu") or qkv.dtype != torch.bfloat16:
+        raise NotImplementedError("M3 preprocessing requires CUDA or Ascend BF16 QKV")
     assert num_heads > 0 and num_kv_heads > 0 and num_index_heads >= 0
     assert eps >= 0
-    assert qkv.is_contiguous()
+    if ascend:
+        if qkv.ndim != 2 or qkv.stride(1) != 1 or qkv.stride(0) < qkv.shape[1]:
+            raise ValueError(
+                "Expected disjoint packed QKV rows with unit feature stride"
+            )
+    else:
+        assert qkv.is_contiguous()
     assert positions.dtype == torch.int64 and positions.device == qkv.device
     assert positions.is_contiguous()
     assert positions.numel() >= qkv.shape[0]
@@ -242,6 +266,24 @@ def _fused_minimax_m3_op(
     if qkv.shape[0] == 0:
         return
     with torch_device_fn.device(qkv.device):
+        if ascend:
+            from flaggems_vllm.runtime.backend._ascend.ops.minimax_m3_qknorm_rope import (
+                main_qk_norm_rope,
+            )
+
+            main_qk_norm_rope(
+                qkv,
+                q_norm_weight,
+                k_norm_weight,
+                cos_sin_cache,
+                positions,
+                num_heads,
+                num_kv_heads,
+                rotary_dim,
+                eps,
+                q_out,
+            )
+            return
         _fused_minimax_m3_kernel[(qkv.shape[0], packed_heads)](
             qkv,
             q_norm_weight,

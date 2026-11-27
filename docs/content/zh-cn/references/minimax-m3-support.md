@@ -13,7 +13,7 @@ weight: 15
 |---|---|
 | `fp32_router_gemm` | BF16/FP32 `[M,6144]`, FP32 `[128,6144]`, M<=32；原生 FP32 logits，固定 FMA/约简逻辑，禁用 TF32/原子操作，2D strides，支持空批次。拒绝不支持的维度。 |
 | `topk_sigmoid` | FP16/BF16/FP32 连续 `[M,E]`, E<=256, K<=min(32,E)；可选 FP32 修正偏置仅影响选择不影响输出概率；稳定的 tie 打平规则，精确源行 ID，可选重归一化与 NaN 填充，支持就地修改调用方缓冲区。 |
-| `fused_minimax_m3_qknorm_rope_kv_insert` | 连续 BF16 打包 QKV, D128, Gemma RMSNorm, NeoX rotary 前缀 8/16/32/64/128，可选 Q/index-Q gather，strided NHD/HND 分页主缓存，BF16 index 缓存，BF16 或单位比例 E4M3 主缓存。负 slot 自动跳过写入。调用方需提供有效位置、缓存边界和互不重复的非负目标位置。 |
+| `fused_minimax_m3_qknorm_rope_kv_insert` | CUDA：连续 BF16 打包 QKV, D128, Gemma RMSNorm, NeoX rotary 前缀 8/16/32/64/128，可选 Q/index-Q gather，strided NHD/HND 分页主缓存，BF16 index 缓存，BF16 或单位比例 E4M3 主缓存。负 slot 自动跳过写入。调用方需提供有效位置、缓存边界和互不重复的非负目标位置。 Ascend 支持 BF16 主 Q/K 预处理，head dim 为 128，旋转宽度同上。传入特征维步长为 1 的主 QKV 列和有效位置。K 原地更新，Q 可原地更新或写入连续 BF16 `q_out`。V 和行尾 index 列保持原值。 |
 | `vit_flash_attn_wrapper` / `vision_flash_attn_varlen` | 非因果 FP16/BF16 D64/80 注意力；3D packed 或 4D batch 输入，Triton 步长打包/均匀累计长度，有限缩放（含 0 与负数），设备序列边界保持重放输入。复用现有变长注意力内核。 |
 | OAI MoE | 显式 `swigluoai_uninterleave` 配合有限 alpha/beta/clamp 参数，透传至所有专家包装器；保留原有激活函数命名。 |
 | 动态 INT8 融合 | BF16/FP16 2D 行至 K8192；可选 OAI+quant2 保留取整激活工作区。纯 Torch 与完整 FlagGems 量化注册保留各自算术；混合注册保留原有未融合路径。 |
