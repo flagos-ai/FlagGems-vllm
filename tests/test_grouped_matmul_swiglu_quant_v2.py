@@ -18,9 +18,8 @@ Compares the Triton kernel and the vendor operator against a pure-torch
 fp32 reference implementation.
 
 Usage:
-  ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src python \\
-      src/flaggems_vllm/runtime/backend/_ascend/a5/tests/test_grouped_matmul_swiglu_quant_v2_ref.py
-  ... --shape qwen
+  ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src pytest -q \\
+      tests/test_grouped_matmul_swiglu_quant_v2.py
 """
 
 import os
@@ -29,12 +28,12 @@ import os
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
 
-import argparse
-
+import pytest
 import torch
-import torch_npu  # noqa: F401
 
-from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_swiglu_quant_v2 import (
+torch_npu = pytest.importorskip("torch_npu")
+
+from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_swiglu_quant_v2 import (  # noqa: E402
     E4M3_EMAX,
     MX_BLOCK,
     grouped_matmul_swiglu_quant_v2,
@@ -198,15 +197,10 @@ def compare(tag, y, ys, ry, rys, valid, nh):
     return nbad == 0 and sbad == 0
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--shape", default="glm_w8", choices=sorted(SHAPES))
-    ap.add_argument(
-        "--scale-alg", type=int, default=0, help="0=OCP (vendor default), 1=cuBLAS"
-    )
-    args = ap.parse_args()
-
-    cfg = SHAPES[args.shape]
+@pytest.mark.parametrize("shape", ["glm_w8", "qwen"])
+@pytest.mark.parametrize("scale_alg", [0, 1])
+def test_grouped_matmul_swiglu_quant_v2(shape, scale_alg, capsys):
+    cfg = SHAPES[shape]
     M, K, N, E = cfg["M"], cfg["K"], cfg["N"], cfg["E"]
     NH = N // 2
     print(f"== {cfg['name']}: x[{M},{K}] w[{E},{K},{N}] -> y[{M},{NH}] ==")
@@ -218,10 +212,10 @@ def main():
     )
 
     ty, tys = grouped_matmul_swiglu_quant_v2(
-        x, w, sb, sa, gl, group_list_type=0, scale_alg=args.scale_alg
+        x, w, sb, sa, gl, group_list_type=0, scale_alg=scale_alg
     )
     ry, rys, rvalid = grouped_matmul_swiglu_quant_v2_ref(
-        x, w, sb, sa, gl, group_list_type=0, scale_alg=args.scale_alg
+        x, w, sb, sa, gl, group_list_type=0, scale_alg=scale_alg
     )
     n = min(valid, rvalid)
     ok = compare("triton vs torch", ty, tys, ry, rys, n, NH)
@@ -230,8 +224,4 @@ def main():
     ok &= compare("vendor vs torch", vy, vys, ry, rys, n, NH)
     ok &= compare("triton vs vendor", ty, tys, vy, vys, valid, NH)
 
-    print("\nPASS" if ok else "\nFAIL")
-
-
-if __name__ == "__main__":
-    main()
+    assert ok, capsys.readouterr().out
