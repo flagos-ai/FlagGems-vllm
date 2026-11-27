@@ -7,6 +7,7 @@ FP16 weight decoding uses native INT8 conversion and FP16 multiplication.
 GEMM accumulation and router-weighted reduction use FP32.
 """
 
+import ctypes
 import inspect
 import os
 import weakref
@@ -93,6 +94,32 @@ def use_expert_panel(bits, dtype, k, n, bm, r, e, cores) -> bool:
             )
         )
     )
+
+
+@lru_cache(maxsize=32)
+def weight_cache_offset(device_index: int) -> int:
+    """Return the device's non-allocating GM alias for streaming packed weights."""
+    if not torch.npu.get_device_name(device_index).startswith("Ascend910B"):
+        return 0
+    try:
+        query = ctypes.CDLL("libruntime.so").rtGetL2CacheOffset
+    except (OSError, AttributeError):
+        return 0
+    query.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_int
+    offset = ctypes.c_uint64()
+    # CANN maps the user-visible index to the driver device internally.
+    with torch.npu.device(device_index):
+        status = query(device_index, ctypes.byref(offset))
+    return offset.value if status == 0 else 0
+
+
+@triton.jit
+def streaming_weight_pointer(Q, OFFSET: tl.constexpr):
+    # The alias reads the same packed bytes without displacing the decoded tiles in L2.
+    if OFFSET:
+        return (Q.to(tl.uint64) + OFFSET).to(Q.dtype)
+    return Q
 
 
 @triton.jit
@@ -1297,6 +1324,7 @@ def gemm_kernel(
     TAIL_TILES: tl.constexpr = False,
     Routes=None,
     TopK: tl.constexpr = 1,
+    WEIGHT_OFFSET: tl.constexpr = 0,
 ):
     with tle.scope(core_mode="cube"):
         if TAIL_TILES:
@@ -1366,6 +1394,7 @@ def gemm_kernel(
                 Offsets=Offsets,
             )
     with tle.scope(core_mode="vector"):
+        Q = streaming_weight_pointer(Q, WEIGHT_OFFSET)
         if TAIL_TILES:
             dequantize_adaptive_weights(
                 Q,
@@ -1455,6 +1484,7 @@ def expert_panel_kernel(
     GateCache=None,
     PANEL_ROWS: tl.constexpr = 0,
     PANEL_STRIDE: tl.constexpr = 0,
+    WEIGHT_OFFSET: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     COLS: tl.constexpr = N // BN
@@ -1793,6 +1823,7 @@ def expert_panel_kernel(
                     sync_ring_set("cube", "vector", 3)
                     cube_iteration += 1
     with tle.scope(core_mode="vector"):
+        Q = streaming_weight_pointer(Q, WEIGHT_OFFSET)
         sub = tle.dsa.ascend.sub_vec_id()
         VBN: tl.constexpr = BN // 2
         ns = tl.arange(0, triton.next_power_of_2(VBN))
@@ -1924,7 +1955,17 @@ def expert_panel_kernel(
 
 
 @triton.jit
-def decode_expert_matrix(Q, S, B, Counts, expert, K: tl.constexpr, N: tl.constexpr):
+def decode_expert_matrix(
+    Q,
+    S,
+    B,
+    Counts,
+    expert,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    WEIGHT_OFFSET: tl.constexpr = 0,
+):
+    Q = streaming_weight_pointer(Q, WEIGHT_OFFSET)
     if tl.load(Counts + expert) > 0:
         index = tl.arange(0, 128)
         for job in range(tl.program_id(0), (K // 128) * (N // 128), tl.num_programs(0)):
@@ -2017,6 +2058,15 @@ def grouped_quantized_gemm(
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
         "num_aicore"
     ]
+    # Each group128 weight tile is read once per projected row block.
+    weight_offset = (
+        weight_cache_offset(a.device.index)
+        if bits == 8
+        and a.dtype == torch.float16
+        and k % 1024 == 0
+        and s.stride(1) % 1024 == 0
+        else 0
+    )
     if expert_panel:
         if fuse_swiglu:
             n *= 2
@@ -2044,7 +2094,16 @@ def grouped_quantized_gemm(
             matrix = torch.empty((k, n), device=a.device, dtype=a.dtype)
             for expert in range(w.shape[0]):
                 decode_expert_matrix[(2 * cores,)](
-                    w, s, matrix, counts, expert, k, n, num_warps=1, multibuffer=False
+                    w,
+                    s,
+                    matrix,
+                    counts,
+                    expert,
+                    k,
+                    n,
+                    num_warps=1,
+                    multibuffer=False,
+                    WEIGHT_OFFSET=weight_offset,
                 )
                 project_expert_matrix[(cores,)](
                     a,
@@ -2102,6 +2161,7 @@ def grouped_quantized_gemm(
                 GateCache=gate_cache,
                 PANEL_ROWS=144 if wide_input else 0,
                 PANEL_STRIDE=out.stride(0),
+                WEIGHT_OFFSET=weight_offset,
                 disable_auto_inject_block_sync=True,
                 num_warps=1,
                 enable_fp_fusion=False,
@@ -2155,6 +2215,7 @@ def grouped_quantized_gemm(
         tail_tiles,
         routes,
         topk,
+        WEIGHT_OFFSET=weight_offset,
         disable_auto_inject_block_sync=True,
         num_warps=1,
         enable_fp_fusion=False,
@@ -2475,6 +2536,7 @@ def small_route_interval_kernel(
     M: tl.constexpr,
     T: tl.constexpr,
     GRID: tl.constexpr,
+    WEIGHT_OFFSET: tl.constexpr = 0,
 ):
     routes: tl.constexpr = M * T
     with tle.scope(core_mode="cube"):
@@ -2488,6 +2550,8 @@ def small_route_interval_kernel(
         )
         tle.dsa.ascend.sync_block_all("all", 10)
     with tle.scope(core_mode="vector"):
+        Q1 = streaming_weight_pointer(Q1, WEIGHT_OFFSET)
+        Q2 = streaming_weight_pointer(Q2, WEIGHT_OFFSET)
         vector_id = 2 * tl.program_id(0) + tle.dsa.ascend.sub_vec_id()
         project_route_intervals(
             X, Q1, S1, IDs, Work, GateUp, K, 2 * N, routes, T, GRID, True
@@ -2590,6 +2654,7 @@ def small_route_moe(x, w1, w2, s1, s2, p, ids, out, bits):
             m,
             t,
             g,
+            WEIGHT_OFFSET=weight_cache_offset(x.device.index),
             disable_auto_inject_block_sync=True,
             num_warps=1,
             enable_fp_fusion=False,

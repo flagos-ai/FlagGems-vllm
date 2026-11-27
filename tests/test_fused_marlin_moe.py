@@ -1708,6 +1708,26 @@ def test_fused_marlin_moe_w8a16_projection_cancellation(tokens, n):
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend FP16 streaming weight reads"
+)
+@pytest.mark.parametrize("tokens", [1, 33])
+def test_fused_marlin_moe_w8a16_streaming_weight_updates(tokens):
+    hs, w1, w2, ref1, ref2, probs, ids, s1, s2 = _make_inputs_w8a16_int8(
+        tokens, 4, 1024, 1024, 2, torch.float16, flaggems_vllm.device
+    )
+    args = hs, w1, w2, None, None, s1, s2, probs, ids, QUANT_TYPE_UINT8B128
+    flaggems_vllm.fused_marlin_moe(*args)
+    # An in-place update must be visible through the read alias after repacking.
+    w2[..., 512:].fill_(128)
+    ref2[..., 512:].zero_()
+    actual = flaggems_vllm.fused_marlin_moe(*args)
+    expected = _reference_w8a16_grouped(hs, ref1, ref2, probs, ids)
+    error = compute_max_diff(actual.float(), expected)
+    gems_assert_close(error, torch.zeros_like(error), torch.float32, atol=0.04)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
     flaggems_vllm.vendor_name != "ascend", reason="Ascend rectangular expert panels"
 )
 def test_fused_marlin_moe_w8a16_rectangular_panels():
