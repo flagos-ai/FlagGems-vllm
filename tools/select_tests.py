@@ -89,6 +89,9 @@ FULL_BENCHMARK_TRIGGER_FILES = {
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_mla_sparse_fwd_w8a8.cu": [
+        "tests/test_flash_mla_sparse_fwd_w8a8.py",
+    ],
     "conftest.py": ["tests/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "tests/test_fused_matmul_reduce_scatter.py"
@@ -298,6 +301,9 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    "src/flaggems_vllm/runtime/backend/_metax/ops/flash_mla_sparse_fwd_w8a8.cu": [
+        "benchmark/test_flash_mla_sparse_fwd_w8a8.py",
+    ],
     "conftest.py": ["benchmark/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "benchmark/test_fused_matmul_reduce_scatter.py"
