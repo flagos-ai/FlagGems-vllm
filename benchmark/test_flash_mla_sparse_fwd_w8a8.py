@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import csv
 from functools import partial
 from pathlib import Path
 
@@ -31,8 +30,7 @@ from tests.test_flash_mla_sparse_fwd_w8a8 import (
     quantize_sparse_int8,
 )
 
-from . import base, consts
-from .conftest import Config
+from . import base
 from .test_blas_perf_parallel import ParallelBenchmarkMixin
 
 
@@ -85,18 +83,26 @@ class PPUSparseBenchmark(FlashmlaSparseBenchmark):
         self.set_gems(flaggems_vllm.flash_mla_sparse_fwd_w8a8)
 
     def set_shapes(self, shape_file_path=None):
-        if Path(shape_file_path).resolve() != Path(self.DEFAULT_SHAPE_FILES).resolve():
+        default_path = Path(self.DEFAULT_SHAPE_FILES).resolve()
+        if (
+            shape_file_path is not None
+            and Path(shape_file_path).resolve() != default_path
+        ):
             return super().set_shapes(shape_file_path)
-        # FlagGems-vllm #997, head 20ee2cbb, performance tables (including diagnostics).
-        path = Path(__file__).with_name("model_shapes") / "ppu_sparse_mla_997.csv"
-        with path.open() as f:
-            rows = list(csv.DictReader(f))
-        if Config.bench_level != consts.BenchLevel.COMPREHENSIVE or Config.query:
-            traces = [row for row in rows if row["group"] != "diagnostic"]
-            rows = sorted(traces, key=lambda row: int(row["count"]), reverse=True)[:10]
-        fields = ("sq", "hq", "d", "skv", "hkv", "topk", "dv")
+        # Top 10 by call count from the DeepSeek-V4-Flash and GLM-5.2 traces in #997.
         self.shape_desc = "SQ, HQ, DQK, SKV, HKV, TOPK, DV"
-        self.shapes = [tuple(int(row[field]) for field in fields) for row in rows]
+        self.shapes = [
+            (16, 64, 512, 1114624, 1, 640, 512),
+            (16, 64, 512, 98816, 1, 8320, 512),
+            (64, 64, 576, 361344, 1, 2048, 512),
+            (449, 64, 576, 361344, 1, 2048, 512),
+            (4112, 64, 512, 1114624, 1, 640, 512),
+            (4112, 64, 512, 98816, 1, 8320, 512),
+            (4, 64, 512, 1114624, 1, 640, 512),
+            (4, 64, 512, 98816, 1, 8320, 512),
+            (193, 64, 576, 361344, 1, 2048, 512),
+            (512, 64, 576, 361344, 1, 2048, 512),
+        ]
 
     def get_input_iter(self, dtype):
         from flash_mla import (
