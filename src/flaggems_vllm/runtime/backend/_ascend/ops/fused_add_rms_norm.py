@@ -23,9 +23,19 @@ from flaggems_vllm.ops.fused_add_rms_norm import (
     fused_add_rms_norm as generic_fused_add_rms_norm,
 )
 from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime.backend._ascend.tensorview import (
+    HAS_TENSORVIEW,
+    MIN_TILE_ROWS,
+    tensorview_call,
+    tile_rows_for_ub,
+)
 from flaggems_vllm.utils import libentry
 
 logger = logging.getLogger(__name__)
+
+if HAS_TENSORVIEW:
+    import triton.experimental.tle as tle_exp
+    from triton.experimental.tle import tile_load, tile_store
 
 
 # =============================================================================
@@ -954,6 +964,105 @@ def fused_add_rms_norm_wide_kernel(
 
 
 # =============================================================================
+# TensorView multi-row path (opt-in for narrow, contiguous rows only)
+# =============================================================================
+
+_TV_BLOCK_M = 32
+
+if HAS_TENSORVIEW:
+
+    @triton.jit(do_not_specialize=["eps"])
+    def _fused_add_rms_norm_tv_kernel(
+        x,
+        residual,
+        weight,
+        rows,
+        eps,
+        WIDTH: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        tile = tl.program_id(0)
+        x_view = tle_exp.make_partition_view(
+            x, shape=[rows, WIDTH], strides=[WIDTH, 1], tile=[BLOCK_M, WIDTH]
+        )
+        r_view = tle_exp.make_partition_view(
+            residual, shape=[rows, WIDTH], strides=[WIDTH, 1], tile=[BLOCK_M, WIDTH]
+        )
+        w_view = tle_exp.make_partition_view(
+            weight, shape=[WIDTH], strides=[1], tile=[WIDTH]
+        )
+        x_tile = tile_load(
+            x_view, index=(tile, 0), dst_space=tle_exp.language.dsa.ascend.UB
+        ).to(tl.float32)
+        r_tile = tile_load(
+            r_view, index=(tile, 0), dst_space=tle_exp.language.dsa.ascend.UB
+        ).to(tl.float32)
+        scale = tile_load(
+            w_view, index=(0,), dst_space=tle_exp.language.dsa.ascend.UB
+        ).to(tl.float32)
+        # The existing Ascend kernels round the addition to the input dtype
+        # before computing the variance and normalization.
+        summed = (x_tile + r_tile).to(residual.dtype.element_ty)
+        summed_f32 = summed.to(tl.float32)
+        rrms = tl.rsqrt(tl.sum(summed_f32 * summed_f32, axis=1) / WIDTH + eps)
+        output = summed_f32 * rrms[:, None] * scale[None, :]
+        tile_store(
+            r_view,
+            value=summed,
+            index=(tile, 0),
+            src_space=tle_exp.language.dsa.ascend.UB,
+        )
+        tile_store(
+            x_view,
+            value=output.to(x.dtype.element_ty),
+            index=(tile, 0),
+            src_space=tle_exp.language.dsa.ascend.UB,
+        )
+
+    def _fused_add_rms_norm_tensorview(x, residual, normalized_shape, weight, eps):
+        width = normalized_shape[0]
+        rows = x.numel() // width
+        block_m = tile_rows_for_ub(width * 4, 4, _TV_BLOCK_M)
+        with torch_device_fn.device(x.device):
+            _fused_add_rms_norm_tv_kernel[(triton.cdiv(rows, block_m),)](
+                x,
+                residual,
+                weight,
+                rows,
+                eps,
+                WIDTH=width,
+                BLOCK_M=block_m,
+            )
+        return x, residual
+
+
+def _tv_eligible(x, residual, normalized_shape, weight, M, N):
+    if not HAS_TENSORVIEW or len(normalized_shape) != 1:
+        return False
+    if (
+        N <= 1
+        or M < 2
+        or x.numel() == 0
+        or x.shape[-1] != N
+        or x.shape != residual.shape
+        or weight.numel() != N
+        or x.dtype != residual.dtype
+        or not x.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+        or triton.next_power_of_2(N) != N
+    ):
+        return False
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    # Keep established shape-specialized kernels until end-to-end measurements
+    # demonstrate an advantage for TensorView on those shapes.
+    if N in (_N100, _N256, _N1024, _N4096):
+        return False
+    return tile_rows_for_ub(N * 4, 4, _TV_BLOCK_M) >= MIN_TILE_ROWS
+
+
+# =============================================================================
 # Python entry
 # =============================================================================
 
@@ -983,6 +1092,25 @@ def fused_add_rms_norm(
 
     if M == 0 or N == 0:
         return x, residual
+
+    if _tv_eligible(x, residual, normalized_shape, weight, M, N):
+        return tensorview_call(
+            "FUSED_ADD_RMS_NORM",
+            _fused_add_rms_norm_tensorview,
+            _fused_add_rms_norm_tuned,
+            x,
+            residual,
+            normalized_shape,
+            weight,
+            eps,
+        )
+    return _fused_add_rms_norm_tuned(x, residual, normalized_shape, weight, eps)
+
+
+def _fused_add_rms_norm_tuned(x, residual, normalized_shape, weight, eps):
+    dim = x.ndim - len(normalized_shape)
+    M = math.prod(x.shape[:dim])
+    N = math.prod(normalized_shape)
 
     # -------------------------------------------------------------------------
     # N == 1

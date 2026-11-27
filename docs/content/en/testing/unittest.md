@@ -7,6 +7,31 @@ weight: 10
 
 FlagGems-vllm functional tests validate operator correctness against reference implementations.
 
+## Reproducible collection and Ascend dispatch checks
+
+Use the helper to validate test collection and save the complete node ID list
+before running anything:
+
+```shell
+python tools/repro_ascend_dispatch.py tests/test_unpack_seq.py \
+    --output-dir /tmp/flag-gems-vllm-unpack
+```
+
+Collection is hardware-independent and fails if pytest errors or discovers zero
+nodes. `collection.log` stores the pytest status and count; `nodeids.txt`
+contains every discovered node. On an Ascend-enabled host, add `--execute
+--quick` to run the same node IDs once through normal eligibility/dispatch and
+once with TensorView dispatch sites forced to the generic implementation, in
+the same Python process. `results.json` stores per-node pass/fail/skip outcomes
+and route events, including fast-path success, generic fallback, and fast-path
+compile errors. No NPU execution is needed for collection-only mode.
+
+```shell
+FLAGGEMS_VENDOR=ascend python tools/repro_ascend_dispatch.py \
+    tests/test_unpack_seq.py --execute --quick \
+    --output-dir /tmp/flag-gems-vllm-unpack
+```
+
 ## Running Tests
 
 ### Collect Tests

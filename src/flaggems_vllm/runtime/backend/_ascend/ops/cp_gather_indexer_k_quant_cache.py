@@ -18,7 +18,17 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.runtime import torch_device_fn
+from flaggems_vllm.runtime.backend._ascend.tensorview import (
+    HAS_TENSORVIEW,
+    tensorview_call,
+)
+
 logger = logging.getLogger(__name__)
+
+if HAS_TENSORVIEW:
+    import triton.experimental.tle as tle_exp
+    from triton.experimental.tle import tile_load, tile_store
 
 
 @triton.jit
@@ -283,6 +293,24 @@ def cp_gather_indexer_k_quant_cache(
     block_table: torch.Tensor,
     cu_seqlen: torch.Tensor,
 ):
+    args = (k_cache, k_fp8, k_fp8_scale, block_table, cu_seqlen)
+    if HAS_TENSORVIEW and _cp_tv_eligible(*args):
+        return tensorview_call(
+            "CP_GATHER_INDEXER_K_QUANT_CACHE",
+            _cp_gather_tensorview,
+            _cp_gather_generic,
+            *args,
+        )
+    return _cp_gather_generic(*args)
+
+
+def _cp_gather_generic(
+    k_cache: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_fp8_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+):
     logger.debug("GEMS_ASCEND CP_GATHER_INDEXER_K_QUANT_CACHE")
     num_tokens = k_fp8.size(0)
     head_dim = k_fp8.size(-1)
@@ -351,3 +379,198 @@ def cp_gather_indexer_k_quant_cache(
         SCALE_TILE=scale_tile,
         num_warps=8,
     )
+
+
+if HAS_TENSORVIEW:
+
+    @triton.jit
+    def _cp_gather_tv_kernel(
+        kv_cache,
+        kv_cache_scale,
+        k_fp8,
+        k_scale,
+        block_table,
+        cu_seqlen,
+        num_tokens,
+        cache_tiles,
+        block_size,
+        block_table_stride,
+        kv_cache_scale_stride,
+        num_quant_blocks,
+        batch_size,
+        HEAD_DIM: tl.constexpr,
+        ROW_TILES: tl.constexpr,
+        QUANT_SLOTS: tl.constexpr,
+        BATCH_SCAN_SIZE: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr,
+        SMALL_BATCH: tl.constexpr,
+        TOKEN_BLOCK: tl.constexpr,
+    ):
+        token_block = tl.program_id(0)
+        tid = token_block * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)
+        in_range = tid < num_tokens
+        if SMALL_BATCH:
+            batch_offsets = tl.arange(0, BATCH_SCAN_SIZE)
+            batch_mask = batch_offsets < batch_size
+            seq_starts = tl.load(cu_seqlen + batch_offsets, mask=batch_mask, other=0)
+            seq_ends = tl.load(cu_seqlen + batch_offsets + 1, mask=batch_mask, other=0)
+            in_batch = (
+                (tid[:, None] >= seq_starts[None, :])
+                & (tid[:, None] < seq_ends[None, :])
+                & batch_mask[None, :]
+            )
+            batch_id = tl.max(tl.where(in_batch, batch_offsets[None, :], -1), axis=1)
+        else:
+            left = tl.zeros((TOKEN_BLOCK,), dtype=tl.int32)
+            right = tl.full((TOKEN_BLOCK,), batch_size + 1, dtype=tl.int32)
+            for _ in tl.static_range(0, SEARCH_STEPS):
+                mid = (left + right) // 2
+                seq_start = tl.load(
+                    cu_seqlen + mid, mask=mid <= batch_size, other=2147483647
+                )
+                before = seq_start <= tid
+                left = tl.where(before, mid + 1, left)
+                right = tl.where(before, right, mid)
+            batch_id = left - 1
+
+        valid_batch = (batch_id >= 0) & (batch_id < batch_size)
+        safe_batch_id = tl.minimum(tl.maximum(batch_id, 0), batch_size - 1)
+        batch_start = tl.load(cu_seqlen + safe_batch_id, mask=valid_batch, other=0)
+        batch_end = tl.load(cu_seqlen + safe_batch_id + 1, mask=valid_batch, other=0)
+        valid = in_range & valid_batch & (tid >= batch_start) & (tid < batch_end)
+        batch_offset = tid - batch_start
+        block_id = tl.load(
+            block_table
+            + safe_batch_id * block_table_stride
+            + batch_offset // block_size,
+            mask=valid,
+            other=0,
+        )
+        block_offset = batch_offset % block_size
+        # The full cache allocation includes inline scales; tile row indices
+        # must step over the scale bytes between adjacent physical blocks.
+        rows = tl.where(valid, block_id * ROW_TILES + block_offset, -1).to(tl.int32)
+        cache_view = tle_exp.make_gather_scatter_view(
+            kv_cache,
+            shape=[cache_tiles, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            tile=[TOKEN_BLOCK, HEAD_DIM],
+            sparse_dim=[0],
+            bounds_check=True,
+        )
+        gathered = tile_load(
+            cache_view, index=(rows, 0), dst_space=tle_exp.language.dsa.ascend.UB
+        )
+        out_view = tle_exp.make_partition_view(
+            k_fp8,
+            shape=[tl.minimum(tl.load(cu_seqlen + batch_size), num_tokens), HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            tile=[TOKEN_BLOCK, HEAD_DIM],
+        )
+        tile_store(
+            out_view,
+            value=gathered,
+            index=(token_block, 0),
+            src_space=tle_exp.language.dsa.ascend.UB,
+        )
+
+        quant = tl.arange(0, QUANT_SLOTS)
+        scale_mask = valid[:, None] & (quant < num_quant_blocks)[None, :]
+        scale_val = tl.load(
+            kv_cache_scale
+            + block_id[:, None] * kv_cache_scale_stride
+            + block_offset[:, None] * num_quant_blocks
+            + quant[None, :],
+            mask=scale_mask,
+            other=0.0,
+        )
+        tl.store(
+            k_scale + tid[:, None] * num_quant_blocks + quant[None, :],
+            scale_val,
+            mask=scale_mask,
+        )
+
+    def _cp_tv_eligible(k_cache, k_fp8, k_fp8_scale, block_table, cu_seqlen):
+        if k_cache.ndim < 2 or k_fp8.ndim != 2 or k_fp8_scale.ndim != 2:
+            return False
+        if block_table.ndim != 2 or cu_seqlen.ndim != 1:
+            return False
+        if k_cache.numel() == 0 or k_fp8.numel() == 0 or block_table.numel() == 0:
+            return False
+        if not (
+            k_cache.is_contiguous()
+            and k_fp8.is_contiguous()
+            and k_fp8_scale.is_contiguous()
+        ):
+            return False
+        if any(
+            t.device != k_cache.device
+            for t in (k_fp8, k_fp8_scale, block_table, cu_seqlen)
+        ):
+            return False
+        if k_cache.dtype != torch.uint8 or k_fp8.element_size() != 1:
+            return False
+        if k_fp8_scale.dtype != torch.float32:
+            return False
+        head_dim = k_fp8.shape[-1]
+        scale_bytes = k_fp8_scale.shape[1]
+        if head_dim == 0 or head_dim != triton.next_power_of_2(head_dim):
+            return False
+        if scale_bytes == 0 or scale_bytes % 4 != 0:
+            return False
+        if k_fp8.stride(0) != head_dim or k_fp8.stride(1) != 1:
+            return False
+        quant_block_size = head_dim * 4 // scale_bytes
+        if quant_block_size == 0 or head_dim % quant_block_size != 0:
+            return False
+        row_stride = k_cache.shape[1] * (head_dim + scale_bytes)
+        if k_cache.stride(0) != row_stride or row_stride % head_dim != 0:
+            return False
+        if k_cache.numel() % row_stride != 0 or block_table.stride(1) != 1:
+            return False
+        if triton.next_power_of_2(scale_bytes // 4) * 4 > 8192:
+            return False
+        return block_table.dtype in (torch.int32, torch.int64) and cu_seqlen.dtype in (
+            torch.int32,
+            torch.int64,
+        )
+
+    def _cp_gather_tensorview(k_cache, k_fp8, k_fp8_scale, block_table, cu_seqlen):
+        num_tokens = k_fp8.shape[0]
+        block_size = k_cache.shape[1]
+        head_dim = k_fp8.shape[-1]
+        num_blocks = k_cache.shape[0]
+        num_quant_blocks = k_fp8_scale.shape[1] // 4
+        k_cache_flat = k_cache.view(num_blocks, -1)
+        k_cache_scale = k_cache_flat[:, block_size * head_dim :].view(torch.float32)
+        k_fp8_u8 = k_fp8.view(torch.uint8)
+        k_fp8_scale_f32 = k_fp8_scale.view(torch.float32)
+        batch_size = block_table.shape[0]
+        small_batch = batch_size <= 16
+        token_block = 32
+        with torch_device_fn.device(k_cache.device):
+            _cp_gather_tv_kernel[(triton.cdiv(num_tokens, token_block),)](
+                k_cache_flat,
+                k_cache_scale,
+                k_fp8_u8,
+                k_fp8_scale_f32,
+                block_table,
+                cu_seqlen,
+                num_tokens,
+                num_blocks * (k_cache_flat.stride(0) // head_dim),
+                block_size,
+                block_table.stride(0),
+                k_cache_scale.stride(0),
+                num_quant_blocks,
+                batch_size,
+                HEAD_DIM=head_dim,
+                ROW_TILES=k_cache_flat.stride(0) // head_dim,
+                QUANT_SLOTS=triton.next_power_of_2(num_quant_blocks),
+                BATCH_SCAN_SIZE=(
+                    triton.next_power_of_2(batch_size) if small_batch else 1
+                ),
+                SEARCH_STEPS=(batch_size + 1).bit_length(),
+                SMALL_BATCH=small_batch,
+                TOKEN_BLOCK=token_block,
+            )
+        return None
