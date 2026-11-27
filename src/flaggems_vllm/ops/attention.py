@@ -14,7 +14,7 @@
 
 import logging
 import math
-from functools import partial
+from functools import lru_cache, partial
 from numbers import Integral
 
 import flag_gems
@@ -31,6 +31,61 @@ from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.shape_utils import broadcasted_stride
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _ascend_varlen_missing_tle():
+    """Check the compiler before importing any Ascend varlen kernel."""
+    try:
+        import triton.experimental.tle as tle_api
+        from triton._C.libtriton import tle as tle_ir
+        from triton._flagtree_backend import FLAGTREE_BACKEND
+        from triton.experimental.tle.language import dsa
+        from triton.experimental.tle.language.dsa import ascend
+    except (ImportError, RuntimeError) as exc:
+        return (str(exc),)
+
+    if FLAGTREE_BACKEND != "ascend":
+        return ("Ascend FlagTree backend",)
+
+    dsa_ops = (
+        "alloc",
+        "copy",
+        "extract_slice",
+        "insert_slice",
+        "subview",
+        "to_buffer",
+        "to_tensor",
+    )
+    sync_ops = ("sub_vec_id", "sync_block_all", "sync_block_set", "sync_block_wait")
+    missing = [f"dsa.{op}" for op in dsa_ops if not callable(getattr(dsa, op, None))]
+    missing += [
+        f"dsa.ascend.{op}" for op in sync_ops if not callable(getattr(ascend, op, None))
+    ]
+    missing += [
+        f"dsa.ascend.{name}"
+        for name in ("L1", "UB", "PIPE")
+        if not hasattr(ascend, name)
+    ]
+    if not callable(getattr(tle_api, "scope", None)):
+        missing.append('tle.scope(core_mode="cube"/"vector")')
+
+    # The registry lists the DSA operations; legacy core scopes and Ascend
+    # synchronization intrinsics are not registry entries.
+    features = tuple(f"dsa.{op}" for op in dsa_ops)
+    is_tle_supported = getattr(tle_api, "is_tle_supported", None)
+    if callable(is_tle_supported):
+        if not is_tle_supported(features):
+            missing += [name for name in features if not is_tle_supported((name,))]
+            if not missing:
+                missing.append("combined DSA operations")
+    # Older Ascend FlagTree builds have no registry API. Require the actual
+    # CommonIR DSA bindings in addition to the Python surface on those builds.
+    elif not callable(
+        getattr(getattr(tle_ir, "dsa_ir", None), "load_tile_dialects", None)
+    ):
+        missing.append("CommonIR DSA compiler bindings")
+    return tuple(dict.fromkeys(missing))
 
 
 # Modified from Triton tutorial: https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html
@@ -1519,6 +1574,7 @@ def flash_attn_varlen_func(
         )
 
     is_metax = runtime.device.vendor_name == "metax"
+    is_ascend = runtime.device.vendor_name == "ascend"
     if is_metax:
         if fa_version != 2:
             raise NotImplementedError("MetaX varlen attention supports fa_version=2")
@@ -1571,12 +1627,158 @@ def flash_attn_varlen_func(
             assert block_table.stride(-1) == 1
         if out is not None:
             assert out.device == q.device
+    elif is_ascend:
+        missing_tle = _ascend_varlen_missing_tle()
+        if missing_tle:
+            raise NotImplementedError(
+                "Ascend varlen FlashAttention requires FlagTree TLE support; "
+                f"missing: {', '.join(missing_tle)}"
+            )
+        if fa_version != 2:
+            raise NotImplementedError("Ascend varlen attention supports fa_version=2")
+        if dropout_p != 0:
+            raise NotImplementedError("Ascend varlen attention supports dropout_p=0")
+        if return_attn_probs:
+            raise NotImplementedError(
+                "Ascend varlen attention does not return attention probabilities"
+            )
+        if (
+            q_v is not None
+            or scheduler_metadata is not None
+            or q_descale is not None
+            or k_descale is not None
+            or v_descale is not None
+            or s_aux is not None
+            or cp_tot_seqused_k is not None
+            or cp_world_size != 1
+            or cp_rank != 0
+        ):
+            raise NotImplementedError(
+                "Ascend varlen attention does not support FA3 or context-parallel extensions"
+            )
+        if type(num_splits) is not int and (
+            isinstance(num_splits, bool) or not isinstance(num_splits, int)
+        ):
+            raise TypeError(
+                f"num_splits must be an integer in [0, 1], got {num_splits!r}"
+            )
+        if not 0 <= num_splits <= 1:
+            raise ValueError(f"num_splits must be in [0, 1], got {num_splits}")
+        if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
+            if not isinstance(max_seqlen_q, Integral) or not isinstance(
+                max_seqlen_k, Integral
+            ):
+                raise TypeError("max_seqlen_q and max_seqlen_k must be host integers")
+            max_seqlen_q, max_seqlen_k = int(max_seqlen_q), int(max_seqlen_k)
+        if max_seqlen_q < 0 or max_seqlen_k < 0:
+            raise ValueError("maximum sequence lengths must be nonnegative")
+        device = q.device
+        assert device == k.device == v.device
+        assert cu_seqlens_q.device == device
+        if cu_seqlens_k is not None:
+            assert cu_seqlens_k.device == device
+        if seqused_k is not None:
+            assert seqused_k.device == device and seqused_k.dtype == torch.int32
+        if block_table is not None:
+            assert block_table.device == device and block_table.dtype == torch.int32
+            assert block_table.stride(-1) == 1
+        if out is not None:
+            assert out.device == device
+        elif (
+            not return_softmax_lse
+            and max_seqlen_q == max_seqlen_k == 1
+            and block_table is not None
+            and seqused_k is not None
+            and cu_seqlens_k is None
+            and alibi_slopes is None
+            and softcap <= 0
+            and (
+                window_size is None
+                or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
+            )
+        ):
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
+                singleton_paged_output,
+            )
+
+            singleton_out = singleton_paged_output(
+                q, k, v, cu_seqlens_q, seqused_k, block_table, device
+            )
+            if singleton_out is not None:
+                return singleton_out
+        elif (
+            not return_softmax_lse
+            and num_splits == 0
+            and max_seqlen_q == 1
+            and max_seqlen_k >= 32768
+            and block_table is not None
+            and seqused_k is not None
+            and cu_seqlens_k is None
+            and alibi_slopes is None
+            and softcap <= 0
+            and (
+                window_size is None
+                or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
+            )
+        ):
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.decode import (
+                raw_q1_output,
+            )
+
+            q1_out = raw_q1_output(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_k,
+                softmax_scale,
+                device,
+            )
+            if q1_out is not None:
+                return q1_out
+        elif (
+            not return_softmax_lse
+            and max_seqlen_q <= max_seqlen_k <= 1152
+            and max_seqlen_q >= 512
+            and causal
+            and cu_seqlens_q.shape == (2,)
+            and cu_seqlens_q.dtype == torch.int32
+            and cu_seqlens_q.is_contiguous()
+            and block_table is not None
+            and seqused_k is not None
+            and cu_seqlens_k is None
+            and alibi_slopes is None
+            and softcap <= 0
+            and (
+                window_size is None
+                or (len(window_size) == 2 and window_size[0] < 0 and window_size[1] < 0)
+            )
+        ):
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.prefill import (
+                short_prefill_output,
+            )
+
+            prefill_out = short_prefill_output(
+                q,
+                k,
+                v,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                device,
+            )
+            if prefill_out is not None:
+                return prefill_out
     else:
         if fa_version != 2:
             raise RuntimeError("Only FA2 is implemented.")
         if num_splits > 0:
             raise RuntimeError("num_splits > 0 is not implemented in GEMS.")
-    if use_c_extension and not is_metax:
+    if use_c_extension and not is_metax and not is_ascend:
         logger.debug("GEMS FLASH_ATTN_VARLEN_FUNC(C EXTENSION)")
         with torch_device_fn.device(q.device):
             out_cpp, softmax_lse = torch.ops.flaggems_vllm.flash_attn_varlen_func(
@@ -1637,9 +1839,17 @@ def flash_attn_varlen_func(
             )
 
             q, k, v = [ensure_last_dim_contiguous(x) for x in (q, k, v)]
+        elif is_ascend:
+            from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
+                ensure_last_dim_contiguous,
+            )
+
+            q, k, v = [ensure_last_dim_contiguous(x) for x in (q, k, v)]
         else:
             q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-        dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
+        if cu_seqlens_k is None and not is_ascend:
+            # The common CUDA API expects a tensor even when using seqused_k.
+            cu_seqlens_k = torch.empty_like(cu_seqlens_q)
         max_seqlen_q = (
             max_seqlen_q.item() if hasattr(max_seqlen_q, "item") else max_seqlen_q
         )
@@ -1652,9 +1862,7 @@ def flash_attn_varlen_func(
             v,
             out,
             cu_seqlens_q,
-            # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp
-            # still wants it so we pass all zeros
-            dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
+            cu_seqlens_k,
             seqused_k,
             None,
             block_table,

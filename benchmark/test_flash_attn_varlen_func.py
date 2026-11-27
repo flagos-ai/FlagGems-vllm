@@ -13,15 +13,17 @@
 # limitations under the License.
 
 import inspect
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import Any, List, Optional
 
 import pytest
 import torch
+import triton
 
 import flaggems_vllm
 
-from . import base, utils
+from . import base, consts, utils
+from .conftest import Config
 
 vendor_name = flaggems_vllm.vendor_name
 IS_HOPPER = (
@@ -73,6 +75,26 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
     """
     benchmark for flash_attn_varlen_func
     """
+
+    def get_latency(self, op, *args, **kwargs):
+        if vendor_name == "ascend":
+            if op is flash_attn_varlen_ascend:
+                # FIA takes host lengths. Prepare them once per case before timing;
+                # FlagGems still gets the original device tensors.
+                fia_args = list(args)
+                fia_args[4] = fia_args[4].cpu().tolist()[1:]
+                fia_args[7] = fia_args[7].cpu().tolist()
+                args = tuple(fia_args)
+            if Config.mode == consts.BenchMode.KERNEL:
+                # Time one whole call between device events, including any packing
+                # and merge kernels. Host metadata preparation is outside the events.
+                return triton.testing.do_bench(
+                    lambda: op(*args, **kwargs),
+                    warmup=Config.warm_up,
+                    rep=Config.repetition,
+                    return_mode="median",
+                )
+        return super().get_latency(op, *args, **kwargs)
 
     def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
         # Collected from Qwen3.6-35B-A3B: six TP1 cases followed by six TP4 cases.
@@ -245,7 +267,8 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
                 dtype=dtype,
                 device=device,
             )
-            out = torch.empty_like(query)
+            # FIA allocates its output, so let both Ascend paths allocate it.
+            out = None if vendor_name == "ascend" else torch.empty_like(query)
             key_cache = torch.randn(
                 num_blocks,
                 block_size,
@@ -445,6 +468,61 @@ def flash_attn_varlen_metax(*args, **kwargs):
     )
 
 
+@lru_cache(maxsize=None)
+def _ascend_fia_causal_mask(device):
+    return torch.triu(
+        torch.ones((2048, 2048), dtype=torch.int8, device=device), diagonal=1
+    )
+
+
+def flash_attn_varlen_ascend(*args, **kwargs):
+    """Call paged CANN FIA with sequence lengths prepared on the host."""
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        actual_seq_lengths,
+        _,
+        _,
+        actual_seq_lengths_kv,
+        _,
+        _,
+        scale,
+        causal,
+        window_size,
+        _,
+        _,
+        _,
+        _,
+        block_tables,
+        _,
+        _,
+        *_,
+    ) = args
+
+    import torch_npu
+
+    if tuple(window_size) != (-1, -1):
+        raise NotImplementedError("The FIA benchmark adapter requires full attention")
+
+    return torch_npu.npu_fused_infer_attention_score(
+        query,
+        key_cache.view(*key_cache.shape[:2], -1),
+        value_cache.view(*value_cache.shape[:2], -1),
+        atten_mask=_ascend_fia_causal_mask(query.device) if causal else None,
+        actual_seq_lengths=actual_seq_lengths,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        num_heads=query.shape[1],
+        num_key_value_heads=key_cache.shape[2],
+        input_layout="TND",
+        block_table=block_tables,
+        block_size=key_cache.shape[1],
+        scale=scale,
+        sparse_mode=3 if causal else 0,
+    )[0]
+
+
 @pytest.mark.skipif(
     utils.SkipVersion("vllm", "<0.9"),
     reason="vLLM version prior to 0.9 does not include the flash_attn_varlen_func API.",
@@ -464,6 +542,8 @@ def test_flash_attn_varlen_func(monkeypatch):
     elif vendor_name == "iluvatar":
         # iluvatar does not have updated vllm_flash_attn, use conversion wrapper
         flash_attn_varlen_func = flash_attn_varlen_legacy
+    elif vendor_name == "ascend":
+        flash_attn_varlen_func = flash_attn_varlen_ascend
     elif vendor_name == "enflame":
         # vLLM 0.20.0's flash-attn extensions are CUDA-only and cannot be
         # imported on GCU. No independent native reference exists on this

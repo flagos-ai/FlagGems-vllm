@@ -103,7 +103,7 @@ def do_bench_cudagraph(
     warmup_replay_count=0,
     rank_barrier=None,
 ):
-    """Run the repository's common CUDA Graph benchmark path.
+    """Time CUDA Graphs, or ACL Graphs on Ascend with a fixed replay count.
 
     ``replay_count`` gives distributed collectives an identical replay count
     on every rank. The default keeps Triton's duration-based behavior.
@@ -120,17 +120,22 @@ def do_bench_cudagraph(
             "replay_count must be positive and warmup_replay_count nonnegative"
         )
     if grad_to_none is not None:
-        raise ValueError("fixed CUDA Graph replay does not support gradients")
+        raise ValueError("fixed Graph replay does not support gradients")
     if return_mode != "mean":
-        raise ValueError("fixed CUDA Graph replay reports mean latency")
+        raise ValueError("fixed Graph replay reports mean latency")
 
     fn()
     torch_device_fn.synchronize()
     if rank_barrier is not None:
         rank_barrier()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        fn()
+    backend = torch.npu if device == "npu" else torch.cuda
+    graph = backend.NPUGraph() if device == "npu" else backend.CUDAGraph()
+    stream = None
+    if device == "npu" and backend.current_stream() != backend.default_stream():
+        # Prepared NPU operators must capture on the stream that owns their workspace.
+        stream = backend.current_stream()
+    with backend.graph(graph, stream=stream):
+        outputs = fn()  # Keep captured outputs alive through replay.
     torch_device_fn.synchronize()
     if rank_barrier is not None:
         rank_barrier()
@@ -141,8 +146,8 @@ def do_bench_cudagraph(
     if rank_barrier is not None:
         rank_barrier()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = backend.Event(enable_timing=True)
+    end = backend.Event(enable_timing=True)
     start.record()
     for _ in range(replay_count):
         graph.replay()
@@ -152,6 +157,7 @@ def do_bench_cudagraph(
     if rank_barrier is not None:
         rank_barrier()
     graph.reset()
+    del outputs
     return latency
 
 
@@ -418,10 +424,13 @@ class Benchmark:
             end = time.time()
             latency = (end - start) / n_rep * 1000
         elif Config.mode == consts.BenchMode.CUDAGRAPH:
+            acl_graph = device == "npu"
             latency = do_bench_cudagraph(
                 fn,
                 rep=Config.repetition,
-                return_mode="median",
+                replay_count=Config.repetition if acl_graph else None,
+                warmup_replay_count=Config.warm_up if acl_graph else 0,
+                return_mode="mean" if acl_graph else "median",
                 grad_to_none=xs if self.is_backward else None,
             )
         else:

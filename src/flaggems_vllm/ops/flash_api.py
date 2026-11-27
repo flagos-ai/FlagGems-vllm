@@ -316,6 +316,7 @@ def mha_varlan_fwd(
     num_splits=0,
 ):
     is_metax = runtime.device.vendor_name == "metax"
+    is_ascend = runtime.device.vendor_name == "ascend"
     if is_metax:
         if p_dropout != 0 or return_softmax:
             raise NotImplementedError(
@@ -329,6 +330,17 @@ def mha_varlan_fwd(
             fill_tensor,
             reshape_view_or_copy,
             view_tensor,
+        )
+    elif is_ascend:
+        if p_dropout != 0 or return_softmax:
+            raise NotImplementedError(
+                "Ascend varlen attention supports inference without dropout"
+            )
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention import (
+            launch_attention as launch_ascend_attention,
+        )
+        from flaggems_vllm.runtime.backend._ascend.ops.flash_attention.common import (
+            fill_tensor,
         )
     elif num_splits > 0:
         raise RuntimeError("num_splits > 0 is not implemented in GEMS.")
@@ -348,8 +360,11 @@ def mha_varlan_fwd(
     assert cu_seqlens_q.dtype == torch.int32
     assert cu_seqlens_q.is_contiguous()
 
-    assert cu_seqlens_k.dtype == torch.int32
-    assert cu_seqlens_k.is_contiguous()
+    if not is_ascend or cu_seqlens_k is not None:
+        assert cu_seqlens_k.dtype == torch.int32
+        assert cu_seqlens_k.is_contiguous()
+    else:
+        assert seqused_k is not None
 
     is_paged = page_table is not None
     if not is_paged:
@@ -372,7 +387,8 @@ def mha_varlan_fwd(
 
     assert k.size() == v.size()
     assert cu_seqlens_q.size() == (batch_size + 1,)
-    assert cu_seqlens_k.size() == (batch_size + 1,)
+    if cu_seqlens_k is not None:
+        assert cu_seqlens_k.size() == (batch_size + 1,)
 
     # Check output shape
     if out is not None:
@@ -393,11 +409,22 @@ def mha_varlan_fwd(
     # check disable swa
     if window_size_left >= max_seqlen_k:
         window_size_left = -1
-    if window_size_right >= (max_seqlen_q if is_metax else max_seqlen_k):
-        window_size_right = -1
+    if is_ascend:
+        if window_size_right >= max_seqlen_q:
+            window_size_right = -1
+    else:
+        if window_size_right >= (max_seqlen_q if is_metax else max_seqlen_k):
+            window_size_right = -1
 
     is_local = window_size_left >= 0
     if is_metax:
+        is_local = is_local or (window_size_right >= 0 and not is_causal)
+        if is_local:
+            if window_size_left < 0:
+                window_size_left = max_seqlen_k
+            if window_size_right < 0:
+                window_size_right = max_seqlen_q
+    elif is_ascend:
         is_local = is_local or (window_size_right >= 0 and not is_causal)
         if is_local:
             if window_size_left < 0:
@@ -415,6 +442,8 @@ def mha_varlan_fwd(
         and window_size_right < 0
         and p_dropout == 0
     )
+    if is_ascend:
+        seqlenq_ngroups_swapped = False
     q_groups = num_heads // num_heads_k
     if seqlenq_ngroups_swapped:
         logger.debug("Swapping query groups and sequence dimensions")
@@ -524,7 +553,11 @@ def mha_varlan_fwd(
             )
         else:
             is_dropout = False
-            philox_args = torch.empty((2,), dtype=torch.int64, device=q_device)
+            philox_args = (
+                None
+                if is_ascend
+                else torch.empty((2,), dtype=torch.int64, device=q_device)
+            )
 
         p_dropout = 1 - p_dropout
         p_dropout_in_uint8_t = math.floor(p_dropout * 255.0)
@@ -537,10 +570,13 @@ def mha_varlan_fwd(
                 device=q_device,
             )
         else:
-            p = torch.empty((), device=q_device)
+            p = None if is_ascend else torch.empty((), device=q_device)
 
         if zero_tensors:
             if is_metax:
+                fill_tensor(out, 0.0)
+                fill_tensor(lse, float("-inf"))
+            elif is_ascend:
                 fill_tensor(out, 0.0)
                 fill_tensor(lse, float("-inf"))
             else:
@@ -617,6 +653,8 @@ def mha_varlan_fwd(
 
         if is_metax:
             launch_attention(params, num_splits=num_splits)
+        elif is_ascend:
+            launch_ascend_attention(params, num_splits=num_splits)
         else:
             if flaggems_vllm.vendor_name == "iluvatar":
                 params.k_ptr = k.view(k.shape[0], k.shape[1], -1)
@@ -710,7 +748,9 @@ def mha_varlan_fwd(
                     out = out.reshape(batch_size, num_heads_k * max_seqlen_q, head_size)
                 lse = lse.reshape(num_heads_k, batch_size, max_seqlen_q)
                 lse = lse.reshape(num_heads_k * max_seqlen_q, batch_size)
-        unused = torch.empty((), dtype=torch.int64, device=q_device)
+        unused = (
+            None if is_ascend else torch.empty((), dtype=torch.int64, device=q_device)
+        )
     return out, q, k, v, lse, philox_args, unused, p
 
 
