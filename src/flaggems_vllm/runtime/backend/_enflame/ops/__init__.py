@@ -268,6 +268,7 @@ from flaggems_vllm.runtime.backend._enflame.ops.topk_softmax import topk_softmax
 from flaggems_vllm.runtime.backend._enflame.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
+from flaggems_vllm.runtime.backend._enflame.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.runtime.backend._enflame.ops.triton_scaled_mm import triton_scaled_mm
 from flaggems_vllm.runtime.backend._enflame.ops.triton_unified_attention import (
     triton_unified_attention,
@@ -353,6 +354,7 @@ __all__ = [
     "add_rms_norm",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
+    "apply_trace_tokens",
     "attn_res",
     "beam_search_score",
     "beam_search_score_",
