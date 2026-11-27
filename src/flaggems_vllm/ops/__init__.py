@@ -32,8 +32,14 @@ from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.chunk_kda_fwd_h import chunk_kda_fwd_h
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
+from flaggems_vllm.ops.fused_kimi_k3_mla_decode_q_concat_ds_mla_insert import (
+    fused_kimi_k3_mla_decode_q_concat_ds_mla_insert,
+)
 from flaggems_vllm.ops.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert import (
     fused_kimi_k3_mla_decode_q_concat_kv_cache_insert,
+)
+from flaggems_vllm.ops.fused_kimi_k3_mla_key_concat_kv_cache_insert import (
+    fused_kimi_k3_mla_key_concat_kv_cache_insert,
 )
 from flaggems_vllm.ops.fused_kimi_k3_mla_kv_concat import fused_kimi_k3_mla_kv_concat
 from flaggems_vllm.ops.cooperative_topk import cooperative_topk
@@ -187,6 +193,7 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_store_qsa_rows,
     qsa_prepare,
 )
+from flaggems_vllm.ops.lora_shrink import lora_shrink
 from flaggems_vllm.ops.minimax_m3_sparse_attn import (
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
@@ -241,6 +248,9 @@ from flaggems_vllm.ops.silu_and_mul_with_clamp import (
 )
 from flaggems_vllm.ops.skip_layernorm import skip_layer_norm
 from flaggems_vllm.ops.sparse_attention import sparse_attn_triton
+from flaggems_vllm.ops.split_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
+    split_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
+)
 from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
     stage_deepseek_v4_mega_moe_inputs,
 )
@@ -379,7 +389,9 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
+    "fused_kimi_k3_mla_decode_q_concat_ds_mla_insert",
     "fused_kimi_k3_mla_decode_q_concat_kv_cache_insert",
+    "fused_kimi_k3_mla_key_concat_kv_cache_insert",
     "fused_kimi_k3_mla_kv_concat",
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
@@ -421,6 +433,7 @@ __all__ = [
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
     "lora_expand",
+    "lora_shrink",
     "mamba_mixer",
     "marlin_gemm",
     "matmul_persistent",
@@ -500,6 +513,7 @@ __all__ = [
     "silu_and_mul_with_clamp_out",
     "skip_layer_norm",
     "sparse_attn_triton",
+    "split_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "stage_deepseek_v4_mega_moe_inputs",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
