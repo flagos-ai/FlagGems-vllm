@@ -1573,6 +1573,33 @@ ops:
   stages:
   - beta: '5.2'
   - stable: '5.3'
+- id: hc_pre
+  description: 'HcPre, the mHC pre block, fused for Ascend 950DT (A5 / arch35).
+
+    Baseline is the vllm-ascend vendor custom op `npu_hc_pre_v2` (`csrc/moe/hc_pre`),
+    which is not a CANN builtin.
+
+    One call returns y, post and comb: the pre-gate weighted residual sum, the
+    post sigmoid gates and the Sinkhorn-normalised comb matrix, from a bf16 x
+    with fp32 fn/scale/base.
+
+    `hc_mult` is limited to 4, the same limit as the baseline (HC_PRE_HC_LIMIT);
+    other values raise.
+
+    Dispatch forks on the token count along two independent axes: a vector versus
+    a split-K cube mixes GEMM, and a fused versus a split comb/y epilogue.
+
+    '
+  for:
+  - npu_hc_pre_v2
+  labels:
+  - fused
+  - vLLM
+  - DSA
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: hc_split_sinkhorn
   description: 'Splits the mHC mix coefficients into the pre/post gates and the comb
     matrix, then runs the Sinkhorn normalisation on the comb matrix.
