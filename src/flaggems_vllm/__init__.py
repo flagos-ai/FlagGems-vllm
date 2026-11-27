@@ -22,6 +22,7 @@ from importlib.metadata import version as _metadata_version
 from flaggems_vllm import testing  # noqa: F401
 from flaggems_vllm import runtime
 from flaggems_vllm.ops import *  # noqa: F401,F403
+from flaggems_vllm.runtime import flagtune  # noqa: F401
 from flaggems_vllm.runtime.symm_mem import (
     disable_symm_mem,
     enable_symm_mem,
@@ -51,8 +52,11 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 __all__ = [
     "disable_symm_mem",
     "enable_symm_mem",
+    "fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "SUPPORTED_FP8_DTYPE",
     "gumbel_sample",
     "insert_context_kv",
+    "lora_expand",
+    "triton_reshape_and_cache_flash_per_token_head_quant",
     "use_symm_mem",
 ]

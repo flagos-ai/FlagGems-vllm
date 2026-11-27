@@ -23,9 +23,10 @@ import triton.language as tl
 import yaml
 
 from flaggems_vllm import runtime
+from flaggems_vllm.flagtune.inference.cost_model import tensor_dtypes
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
-from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle, pipeline_options
 
 logger = logging.getLogger(__name__)
 CACHE_USAGE_THRESHOLD = 0.8
@@ -535,6 +536,23 @@ def _get_swap_ab_placeholder_configs(pre_hook=None):
     ]
 
 
+@triton.jit
+def _zero_splitk_output_kernel(C, M, N, stride_cm, stride_cn, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    rows = offsets // N
+    cols = offsets % N
+    tl.store(C + rows * stride_cm + cols * stride_cn, 0.0, offsets < M * N)
+
+
+def _reset_splitk_output(nargs):
+    """Include initialization in every timed and cached atomic split-K launch."""
+    c = nargs["C"]
+    m, n = nargs["M"], nargs["N"]
+    _zero_splitk_output_kernel[(triton.cdiv(m * n, 1024),)](
+        c, m, n, c.stride(0), c.stride(1), BLOCK=1024
+    )
+
+
 def _get_swap_ab_splitk_placeholder_configs(pre_hook=None):
     return [
         triton.Config(
@@ -597,6 +615,11 @@ def _get_fixed_matmul_meta(M: int, N: int, K: int, block_n: int, block_k: int):
     strategy=["align32", "align32", "align32", "align32", "align32"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="hopper_general",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_general",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -714,6 +737,11 @@ def w8a8_block_fp8_matmul_kernel_general(
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="hopper_swap",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_swap_ab",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -861,15 +889,20 @@ def w8a8_block_fp8_matmul_kernel_swap_ab(
 
 @libentry()
 @libtuner(
-    configs=_get_swap_ab_splitk_placeholder_configs(pre_hook=None),
+    configs=_get_swap_ab_splitk_placeholder_configs(pre_hook=_reset_splitk_output),
     key=["M", "N", "K", "stride_am", "stride_bk"],
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="hopper_splitk_complete",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_swap_ab_splitk",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
-    flagtune_pre_hook=None,
+    flagtune_pre_hook=_reset_splitk_output,
 )
 @triton.jit
 def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
@@ -1002,6 +1035,123 @@ def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
         tl.atomic_add(c_ptrs, acc.to(tl.float32), mask=c_mask, sem="relaxed")
 
 
+def _swap_ab_stages(K, block_k):
+    return 4 if triton.cdiv(K, block_k) >= 32 else 3
+
+
+def _pipeline_choice_configs(stages):
+    """Prefetch candidates of the swap-AB kernels on FlagTree (empty on
+    backends without its pipeline options).
+
+    For each ``num_stages`` of the fixed rule: that depth with
+    ``pipeline_hoist_copy`` on and off, plus two stages with the hoist on.
+    Issuing the next block's prefetch before the WGMMA wait costs registers.
+    On H20 the hoist gains 3-30% on most shapes, but where the lower occupancy
+    needs one more wave of CTAs it loses 5-10% (M=400-448, N=512, K=7168), and
+    on some shapes with many CTAs per SM two stages with the hoist are 3-5%
+    ahead (N=8192), so the tuning library decides per shape. The block sizes
+    stay the fixed rule's: they are passed at the launch.
+    """
+    if not pipeline_options(pipeline_hoist_copy=False):
+        return []
+    candidates = [(s, hoist) for s in stages for hoist in (True, False)]
+    candidates.append((2, True))
+    return [
+        triton.Config({"pipeline_hoist_copy": hoist}, num_warps=4, num_stages=s)
+        for s, hoist in candidates
+    ]
+
+
+def _prune_swap_ab_pipeline_choice(configs, named_args, **kwargs):
+    """Drop the candidates of the rule's other depth."""
+    stages = _swap_ab_stages(named_args["K"], kwargs["BLOCK_K"])
+    return [config for config in configs if config.num_stages in (2, stages)]
+
+
+def _pipeline_choice_tuner(kernel, stages, key, **kwargs):
+    configs = _pipeline_choice_configs(stages)
+    if not configs:
+        return None
+    # timed in a CUDA graph: the candidates differ by a few percent of a launch
+    # that takes some 20 us, less than the launch overhead of a plain loop
+    return libtuner(configs=configs, key=key, use_cuda_graph=True, **kwargs)(kernel)
+
+
+_PIPELINE_CHOICE_KEY = [
+    "M",
+    "N",
+    "K",
+    "stride_am",
+    "stride_bk",
+    "GROUP_N",
+    "GROUP_K",
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_K",
+]
+
+_swap_ab_pipeline_choice = _pipeline_choice_tuner(
+    w8a8_block_fp8_matmul_kernel_swap_ab.fn.fn,
+    (3, 4),
+    _PIPELINE_CHOICE_KEY,
+    prune_configs_by={"early_config_prune": _prune_swap_ab_pipeline_choice},
+)
+
+_swap_ab_splitk_pipeline_choice = _pipeline_choice_tuner(
+    w8a8_block_fp8_matmul_kernel_swap_ab_splitk.fn.fn,
+    (3,),
+    _PIPELINE_CHOICE_KEY + ["SPLIT_K"],
+    reset_to_zero=["C"],
+)
+
+# launch (kernel, sizes and strides, block sizes) -> the candidate chosen for it
+_pipeline_choices = {}
+
+
+def _launch_pipeline_choice(kernel, tuner, grid, *args, **meta):
+    """Launch ``kernel`` with the prefetch candidate chosen for this shape.
+
+    The first launch of a shape goes through ``tuner``, which measures the
+    candidates once and keeps the choice in the tuning cache; later launches
+    go to the kernel directly, as the fixed configuration always did. Without
+    the FlagTree options (``tuner`` is None) nothing changes.
+    """
+    if tuner is None:
+        return kernel[grid](*args, **meta)
+    key = (
+        kernel,
+        tuple(arg for arg in args if isinstance(arg, int)),
+        tuple(sorted(meta.items())),
+    )
+    choice = _pipeline_choices.get(key)
+    if choice is None:
+        # the candidates carry num_warps and num_stages
+        launch = {
+            name: value
+            for name, value in meta.items()
+            if name not in ("num_warps", "num_stages")
+        }
+        # FlagTree's AABS (auto block-size adjustment) shrinks BLOCK_N to the
+        # token count when M < 16 and writes it into the candidate configs.
+        # The candidates would then be timed with a block size that later
+        # launches do not use, and the launch fails with a duplicate BLOCK_N.
+        # Turn it off for this call only; scope() restores the setting even if
+        # the launch raises. Reaching here means the FlagTree pipeline options
+        # exist, so the knob does too.
+        from triton import knobs
+
+        with knobs.autotuning.scope():
+            knobs.autotuning.adjust_block_size = False
+            tuner[grid](*args, **launch)
+        best = tuner.best_config
+        _pipeline_choices[key] = {
+            "num_stages": best.num_stages,
+            "pipeline_hoist_copy": best.kwargs["pipeline_hoist_copy"],
+        }
+        return None
+    return kernel[grid](*args, **{**meta, **choice})
+
+
 @libentry()
 @libtuner(
     configs=_get_short_k256_placeholder_configs(pre_hook=None),
@@ -1009,6 +1159,11 @@ def w8a8_block_fp8_matmul_kernel_swap_ab_splitk(
     strategy=["default", "default", "default", "default", "default"],
     warmup=5,
     rep=5,
+    use_cuda_graph=True,
+    policy="flagtune",
+    flagtune_op_id="flaggems_vllm/w8a8_block_matmul",
+    flagtune_variant="hopper_shortk",
+    flagtune_dtype_resolver=tensor_dtypes("A", "B", "As", "Bs", "C"),
     flagtune_op_name="w8a8_block_matmul",
     flagtune_expand_op_name="w8a8_block_fp8_short_k256",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -1234,7 +1389,7 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             _SWAP_BN = 16 if M <= 16 else 32
 
             _SWAP_BK = 128
-            _SWAP_STAGES = 4 if triton.cdiv(K, _SWAP_BK) >= 32 else 3
+            _SWAP_STAGES = _swap_ab_stages(K, _SWAP_BK)
 
             SWAP_META = {
                 "BLOCK_M": _SWAP_BM,
@@ -1251,7 +1406,10 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             )
 
             with torch_device_fn.device(a.device):
-                w8a8_block_fp8_matmul_kernel_swap_ab.fn.fn[swap_grid](
+                _launch_pipeline_choice(
+                    w8a8_block_fp8_matmul_kernel_swap_ab.fn.fn,
+                    _swap_ab_pipeline_choice,
+                    swap_grid,
                     a,
                     b,
                     c,
@@ -1284,7 +1442,6 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
                 META["SPLIT_K"],
             )
             with torch_device_fn.device(a.device):
-                c.zero_()
                 w8a8_block_fp8_matmul_kernel_swap_ab_splitk[swap_splitk_grid](
                     a,
                     b,
@@ -1334,11 +1491,14 @@ def general_w8a8_block_fp8_matmul(a, b, c, a_s, b_s, M, N, K, group_n, group_k):
             sm_count = torch.cuda.get_device_properties(dev_index).multi_processor_count
             split_k = min(total_k_iters, max(4, 2 * sm_count // max(grid_mn, 1)))
 
-            c.zero_()
             swap_splitk_grid = (grid_m, grid_n, split_k)
 
             with torch_device_fn.device(a.device):
-                w8a8_block_fp8_matmul_kernel_swap_ab_splitk.fn.fn[swap_splitk_grid](
+                _reset_splitk_output({"C": c, "M": M, "N": N})
+                _launch_pipeline_choice(
+                    w8a8_block_fp8_matmul_kernel_swap_ab_splitk.fn.fn,
+                    _swap_ab_splitk_pipeline_choice,
+                    swap_splitk_grid,
                     a,
                     b,
                     c,
