@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the shared fused_q workload on NVIDIA and Ascend."""
+"""Benchmark the shared fused_q workload on NVIDIA, Ascend and T-Head PPU."""
 
 import inspect
 import math
@@ -26,6 +26,11 @@ import flaggems_vllm as gems
 from baseline import fused_q as workload
 from tests.test_fused_q import assert_benchmark_case
 from tests.test_fused_q_ascend import assert_ascend_outputs, build_ascend_inputs
+from tests.test_fused_q_ppu import (
+    assert_ppu_outputs,
+    build_ppu_inputs,
+    require_ppu_operator,
+)
 
 from . import base, consts
 from .conftest import Config
@@ -194,8 +199,8 @@ class FusedQBenchmark(base.Benchmark):
             return None
 
 
-class AscendFusedQBenchmark(FusedQBenchmark):
-    """Benchmark the public Ascend entry using the shared CPU golden."""
+class CPUReferenceFusedQBenchmark(FusedQBenchmark):
+    """Benchmark a backend using the shared CPU golden before timing."""
 
     DEFAULT_METRICS = ["latency"]
 
@@ -206,7 +211,7 @@ class AscendFusedQBenchmark(FusedQBenchmark):
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             self.binding = workload.binding_from_shape(shape)
-            self._cpu_inputs, values = build_ascend_inputs(self.binding, dtype)
+            self._cpu_inputs, values = self.build_device_inputs(self.binding, dtype)
             yield (values,)
 
     def record_shapes(self, *args, **kwargs):
@@ -217,15 +222,34 @@ class AscendFusedQBenchmark(FusedQBenchmark):
         return detail
 
     def get_latency(self, op, *args, **kwargs):
-        assert_ascend_outputs(self._cpu_inputs, kwargs, op(*args, **kwargs))
+        self.assert_device_outputs(self._cpu_inputs, kwargs, op(*args, **kwargs))
         latency = base.Benchmark.get_latency(self, op, *args, **kwargs)
         if not math.isfinite(latency) or latency <= 0:
-            raise ValueError(f"Invalid Ascend latency: {latency!r}")
+            raise ValueError(f"Invalid {gems.vendor_name} latency: {latency!r}")
         return latency
+
+
+class AscendFusedQBenchmark(CPUReferenceFusedQBenchmark):
+    build_device_inputs = staticmethod(build_ascend_inputs)
+    assert_device_outputs = staticmethod(assert_ascend_outputs)
+
+
+class PPUFusedQBenchmark(CPUReferenceFusedQBenchmark):
+    build_device_inputs = staticmethod(build_ppu_inputs)
+    assert_device_outputs = staticmethod(assert_ppu_outputs)
 
 
 @pytest.mark.fused_q
 def test_fused_q_benchmark():
+    if gems.vendor_name == "thead":
+        PPUFusedQBenchmark(
+            op_name="fused_q",
+            torch_op=None,
+            gems_op=require_ppu_operator(),
+            dtypes=workload.DTYPES,
+            is_inplace=workload.IS_INPLACE,
+        ).run()
+        return
     if gems.vendor_name == "ascend":
         if not torch.npu.is_available():
             pytest.fail("Ascend backend selected, but no NPU is available")
@@ -238,7 +262,7 @@ def test_fused_q_benchmark():
         ).run()
         return
     if gems.vendor_name != "nvidia":
-        pytest.skip("requires NVIDIA or Ascend")
+        pytest.skip("requires NVIDIA, Ascend or T-Head PPU")
     assert torch.cuda.is_available(), "NVIDIA CUDA is unavailable"
     bench = FusedQBenchmark(
         op_name="fused_q",

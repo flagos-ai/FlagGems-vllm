@@ -30,6 +30,7 @@ from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
+from flaggems_vllm.runtime.backend._thead.ops.fused_q import fused_q
 from flaggems_vllm.runtime.backend._thead.ops.gdn_w8a16_int8 import (
     chunk_gated_delta_rule_w8a16_int8,
     gdn_w8a16_int8,
@@ -66,6 +67,7 @@ __all__ = [
     "deep_gemm_fp8_o_proj",
     "flash_mla_with_kvcache",
     "fused_experts_impl",
+    "fused_q",
     "fused_q_kv_rmsnorm",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
