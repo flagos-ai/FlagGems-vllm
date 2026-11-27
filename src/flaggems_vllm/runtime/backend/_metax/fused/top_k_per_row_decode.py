@@ -30,12 +30,12 @@ _generic = import_module("flaggems_vllm.ops.top_k_per_row_decode")
 
 # BEGIN TLE GATE: identical in top_k_per_row_decode.py and top_k_per_row_prefill.py
 # The TLE path keeps the histogram and counters in shared memory, where a
-# single-address atomic is ~17x cheaper than in global scratch on a C550. It is
-# taken whenever this Triton has TLE at all. What it needs beyond that is not
-# checked: a FlagTree built with mctle, with __MCTLE__ reaching TableGen -- or
-# the first kernel fails to compile -- and with metax's Alias.cpp aware of
-# mctle.local_pointers, or it compiles and returns wrong answers.
-# FLAGGEMS_METAX_TLE=0 forces the generic non-TLE path.
+# single-address atomic is ~17x cheaper than in global scratch on a C550. It
+# needs a FlagTree built with mctle, with __MCTLE__ reaching TableGen, and with
+# metax's Alias.cpp aware of mctle.local_pointers. Triton 3.6.0 on the validated
+# C550 stack rejects these shared-memory atomics in the MLIR verifier, so keep
+# TLE opt-in until the compiler capability is proven. FLAGGEMS_METAX_TLE=1 opts
+# in; 0 explicitly selects the default generic path.
 
 # Thread limit of the compiled merge kernel on a C550; torch reports more.
 _MAX_THREADS = 512
@@ -142,13 +142,14 @@ def ensure_tle():
         if _state["done"]:
             return _state["on"]
         env = os.environ.get("FLAGGEMS_METAX_TLE", "").strip().lower()
-        on, why = False, ""
+        on, why = False, "generic path (TLE requires explicit opt-in)"
         if env in ("0", "false", "off", "no"):
             why = "disabled by FLAGGEMS_METAX_TLE"
-        elif _SHIM is None:
-            why = "this Triton has no TLE"
-        else:
-            on, why = True, "TLE available"
+        elif env in ("1", "true", "on", "yes"):
+            if _SHIM is None:
+                why = "this Triton has no TLE"
+            else:
+                on, why = True, "TLE enabled by FLAGGEMS_METAX_TLE"
         if on:
             _install()
             logger.info("%s: MetaX TLE path enabled (%s)", _generic.__name__, why)
