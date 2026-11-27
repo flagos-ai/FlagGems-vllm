@@ -29,6 +29,9 @@ from flaggems_vllm.runtime.backend._hygon.ops.fused_add_rms_norm import (
 from flaggems_vllm.runtime.backend._hygon.ops.fused_indexer_weight_scale import (
     fused_indexer_weight_scale,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.fused_kimi_k3_mla_key_concat_ds_mla_insert import (
+    fused_kimi_k3_mla_key_concat_ds_mla_insert,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
     inplace_fused_experts,
@@ -88,6 +91,7 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
+    "fused_kimi_k3_mla_key_concat_ds_mla_insert",
     "fused_q_kv_rmsnorm",
     "gate_sigmoid_mul",
     "gdn_w8a16",

@@ -37,6 +37,9 @@ from flaggems_vllm.ops.fused_kimi_k3_mla_decode_q_concat_ds_mla_insert import (
 from flaggems_vllm.ops.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert import (
     fused_kimi_k3_mla_decode_q_concat_kv_cache_insert,
 )
+from flaggems_vllm.ops.fused_kimi_k3_mla_key_concat_ds_mla_insert import (
+    fused_kimi_k3_mla_key_concat_ds_mla_insert,
+)
 from flaggems_vllm.ops.fused_kimi_k3_mla_key_concat_kv_cache_insert import (
     fused_kimi_k3_mla_key_concat_kv_cache_insert,
 )
@@ -392,6 +395,7 @@ __all__ = [
     "fused_inv_rope_fp8_quant",
     "fused_kimi_k3_mla_decode_q_concat_ds_mla_insert",
     "fused_kimi_k3_mla_decode_q_concat_kv_cache_insert",
+    "fused_kimi_k3_mla_key_concat_ds_mla_insert",
     "fused_kimi_k3_mla_key_concat_kv_cache_insert",
     "fused_kimi_k3_mla_kv_concat",
     "fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
