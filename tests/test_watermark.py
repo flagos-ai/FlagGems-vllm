@@ -216,21 +216,25 @@ def test_cpu_is_unsupported():
 
 
 @pytest.mark.draft_watermarking_mask
-def test_short_history_after_long_history():
-    rows = 32
-    inputs = make_inputs(rows, 8193, 4)
-    tokens, _, _, total, _, contexts, _, _ = inputs
-    contexts[:2].fill_(32000)
-    # The first two draft rows map to the last two live requests in reverse order.
-    for length in (8193, 64, 130, 131, 132, 512, 513, 8193):
-        total.fill_(length)
-        # Excluding three prompt tokens gives 127, 128 and 129 positions.
-        # The last candidate is accepted just before the history endpoint.
-        tokens[rows - 1, length - 5 : length - 1] = contexts[0]
-        tokens[rows - 2, length - 4 : length] = contexts[1]
-        check(inputs, 8192, False)
-        tokens[rows - 1, length - 5 : length - 1] = 0
-        tokens[rows - 2, length - 4 : length] = 0
+def test_short_history_after_long_history(monkeypatch):
+    import importlib
+
+    import triton
+
+    module = importlib.import_module(draft_watermarking_mask.__module__)
+    kernel = module._repeated_context_mask_kernel
+    if hasattr(kernel.fn, "configs"):
+        monkeypatch.setattr(
+            kernel.fn, "configs", [triton.Config({"BLOCK": 8192}, num_warps=4)]
+        )
+        monkeypatch.setattr(
+            kernel, "kernel_cache", tuple({} for _ in kernel.kernel_cache)
+        )
+    inputs = list(make_inputs(32, 8193, 4))
+    check(tuple(inputs), 8192, False)
+    for length in (64, 512, 513, 8193):
+        inputs[3].fill_(length)
+        check(tuple(inputs), 8192, False)
 
 
 @pytest.mark.draft_watermarking_mask

@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-draft_watermarking_mask:
-  - META:
-      BLOCK: 512
-    num_warps: 4
-    num_stages: 1
-
 moe_sum_topk1:
   - META:
       BLOCK_SIZE: 1024

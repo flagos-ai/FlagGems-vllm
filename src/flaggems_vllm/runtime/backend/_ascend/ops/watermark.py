@@ -5,11 +5,11 @@
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm import runtime
-from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils import libentry
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def _update_prior_contexts_ascend(
 ):
     first_step = 0 if MAX_HISTORY == 0 else tl.maximum(0, step - MAX_HISTORY)
     repeated = tl.full((), False, tl.int1)
-    # Read each slot directly to avoid a masked strided transfer across steps.
+    # Masked strided loads across draft slots can trigger CANN 507035.
     for previous_step in range(first_step, step):
         previous_ptr = prior_row + previous_step * prior_step_stride
         matches = tl.full((), True, tl.int1)
@@ -85,13 +85,7 @@ def _update_prior_contexts_ascend(
     return repeated
 
 
-# Tuning rewrites only the current slot; reads are restricted to earlier steps.
 @libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("draft_watermarking_mask"),
-    key=["CONTEXT_WIDTH"],
-    use_cuda_graph=False,
-)
 @triton.jit
 def _repeated_context_mask_ascend_kernel(
     output_ptr,
@@ -147,20 +141,37 @@ def _repeated_context_mask_ascend_kernel(
     tl.store(output_ptr + row, enabled & ~repeated)
 
 
-def _launch_draft_watermarking_mask(
-    output,
-    all_token_ids,
-    req_indices,
-    prompt_lens,
-    total_lens,
-    prior_contexts,
-    contexts,
-    steps,
-    enabled,
-    max_history,
-    include_prompt,
-):
+def draft_watermarking_mask(
+    all_token_ids: torch.Tensor,
+    req_indices: torch.Tensor,
+    prompt_lens: torch.Tensor,
+    total_lens: torch.Tensor,
+    prior_contexts: torch.Tensor,
+    contexts: torch.Tensor,
+    steps: torch.Tensor,
+    enabled: torch.Tensor,
+    max_history: int | None,
+    include_prompt: bool,
+) -> torch.Tensor:
+    """Return active watermark rows and record each valid row's current context.
+
+    History tokens and request lengths are contiguous within rows. Context
+    buffers have unit column stride. Steps may be a stride-zero broadcast.
+    Each step is in ``[0, prior_contexts.shape[1])``.
+    """
     logger.debug("GEMS_ASCEND DRAFT_WATERMARKING_MASK")
+    if contexts.device.type == "cpu":
+        raise NotImplementedError("draft_watermarking_mask requires an accelerator")
+    if max_history is not None and max_history < 1:
+        raise ValueError("max_history must be positive or None")
+    if prior_contexts.stride(-1) != 1:
+        raise ValueError("prior_contexts must have unit column stride")
+    contexts = contexts.contiguous() if contexts.stride(-1) != 1 else contexts
+    req_indices = req_indices.contiguous()
+    enabled = enabled.contiguous()
+    output = torch.empty(contexts.shape[0], device=contexts.device, dtype=torch.bool)
+    if contexts.shape[0] == 0:
+        return output
     _repeated_context_mask_ascend_kernel[(contexts.shape[0],)](
         output,
         all_token_ids,
@@ -179,4 +190,8 @@ def _launch_draft_watermarking_mask(
         CONTEXT_WIDTH=contexts.shape[1],
         MAX_HISTORY=0 if max_history is None else max_history,
         INCLUDE_PROMPT=include_prompt,
+        BLOCK=512,
+        num_warps=4,
+        num_stages=1,
     )
+    return output
