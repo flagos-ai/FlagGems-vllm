@@ -2599,6 +2599,18 @@ ops:
   - Attention
   stages:
   - alpha: '0.1'
+- id: triton_reshape_and_cache_flash_per_token_head_quant
+  description: Quantize paged K and V per token and KV head, updating separate
+    data and FP32 scale caches in place.
+  for:
+  - triton_reshape_and_cache_flash_per_token_head_quant
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
 - id: unpack_seq_triton
   description: Unpack a packed sequence tensor back to its original variable-length
     form.

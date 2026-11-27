@@ -1494,6 +1494,23 @@ triton_reshape_and_cache_flash:
     num_warps: 8
     num_stages: 1
 
+triton_reshape_and_cache_flash_per_token_head_quant:
+  - META: {INDEPENDENT_TILES: false}
+    num_warps: 4
+    num_stages: 1
+  - META: {INDEPENDENT_TILES: false}
+    num_warps: 1
+    num_stages: 1
+  - META: {INDEPENDENT_TILES: false}
+    num_warps: 8
+    num_stages: 1
+  - META: {INDEPENDENT_TILES: true}
+    num_warps: 4
+    num_stages: 1
+  - META: {INDEPENDENT_TILES: true}
+    num_warps: 1
+    num_stages: 1
+
 flash_mla_fp8_copy_table:
   - META: {BLOCK: 128}
     num_warps: 4
