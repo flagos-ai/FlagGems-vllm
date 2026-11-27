@@ -51,6 +51,9 @@ from flaggems_vllm.ops.qwen4.qsa_sparse_paged_attention import (
     qsa_sparse_paged_attention,
 )
 
+
+from .ple_gate import ple_gate  # noqa: F401
+
 if _runtime.device.vendor_name == "thead":
     from flaggems_vllm.runtime.backend._thead.ops import grouped_gemma_rmsnorm
 else:
