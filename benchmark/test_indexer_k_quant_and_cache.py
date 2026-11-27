@@ -57,6 +57,10 @@ class IndexerKQuantAndCacheBenchmark(base.Benchmark):
             yield k, cache, slots, quant_block_size, {"scale_fmt": scale_fmt}
 
 
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "enflame",
+    reason="aten and cpu dosenot support",
+)
 @pytest.mark.indexer_k_quant_and_cache
 def test_indexer_k_quant_and_cache_benchmark():
     bench = IndexerKQuantAndCacheBenchmark(

@@ -69,6 +69,14 @@ try:
             gemma_rms_norm(out, x, w, eps)
             return out
 
+    elif vendor == "enflame":
+
+        def baseline_op(x, w, eps=1e-5):
+            x = x.to(dtype=torch.float32)
+            w = w.to(dtype=torch.float32)
+            rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
+            return (1 + w) * x * rrms
+
 except Exception as e:
     # Fall back to vllm.model_executor.layers.layernorm.GemmaRMSNorm when
     # the vendor-specific library (flashinfer, lightop, etc.) is absent.
@@ -78,8 +86,21 @@ except Exception as e:
         )
 
         def baseline_op(x, w, eps=1e-5):
+            # vLLM's CustomOp must be instantiated inside a vLLM config
+            # context; newer vLLM raises "Current vLLM config is not set"
+            # otherwise. CustomOp dispatch only reads .compilation_config,
+            # and constructing a full VllmConfig() lazily imports
+            # vllm.v1.executor -> ... -> xgrammar, which breaks on
+            # environments with a mismatched tvm-ffi/xgrammar pair, so use
+            # a minimal stand-in carrying only a CompilationConfig.
+            from types import SimpleNamespace
+
+            from vllm.config import CompilationConfig, set_current_vllm_config
+
             N = x.shape[-1]
-            norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
+            minimal_config = SimpleNamespace(compilation_config=CompilationConfig())
+            with set_current_vllm_config(minimal_config):
+                norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
             norm.weight = torch.nn.Parameter(w.float())
             norm = norm.to(x.device)
             with torch.inference_mode():

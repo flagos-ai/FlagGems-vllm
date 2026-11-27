@@ -106,6 +106,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.matmul_persistent import (
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre_clamp_sinkhorn
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.pad_indexer_heads import (
+    pad_indexer_heads,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -151,10 +154,12 @@ from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
 
 __all__ = [
     "add_rms_norm",
+    "apply_trace_tokens",
     "build_compressor_metadata",
     "causal_conv1d_fn",
     "causal_conv1d_update",
@@ -196,6 +201,7 @@ __all__ = [
     "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
     "pack_seq_triton",
+    "pad_indexer_heads",
     "paged_scatter_triton",
     "per_token_group_quant_fp8",
     "persistent_topk",
