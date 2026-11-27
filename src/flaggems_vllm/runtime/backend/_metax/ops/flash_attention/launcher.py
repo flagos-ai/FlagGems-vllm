@@ -258,6 +258,19 @@ def launch_attention(
     params, *, num_splits=0, _skip_single_prefill=False, _skip_selection_desc=None
 ):
     """Plan and launch C550 attention after common API input preparation."""
+    if params.q_ptr.dtype == torch.float32:
+        if params.total_q == 0:
+            return None
+        # The other families are tuned for low-precision/paged attention.
+        return launch_direct(
+            params,
+            max_seqlen_q=params.seqlen_q,
+            batch_size=params.b,
+            num_heads=params.h,
+            total_q=params.total_q,
+            head_size=params.d,
+            is_paged=False,
+        )
     from flaggems_vllm.runtime.backend._metax.ops.flash_attention.contiguous_splitkv import (
         can_use_contiguous_splitkv,
         launch_contiguous_splitkv,
