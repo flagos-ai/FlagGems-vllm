@@ -1117,6 +1117,21 @@ ops:
   - DataMovement
   stages:
   - beta: '5.4'
+- id: fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  description: |
+    Compress overlapping four-token groups in the DeepSeek V4 paged state cache,
+    apply weighted RMSNorm and interleaved RoPE, and write packed or full keys
+    to the destination cache.
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
 - id: fused_marlin_moe_w4a16
   description: 'Fused mixture-of-experts computation with 4-bit weights and 16-bit
 
@@ -2246,6 +2261,18 @@ ops:
   stages:
   - alpha: '4.2'
   - beta: '5.3'
+- id: rejection_sample
+  description: 'Ordinary chain speculative decoding rejection verification with residual and bonus sampling.'
+  for:
+  - vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils.rejection_sample
+  labels:
+  - fused
+  - vLLM
+  - speculative-decoding
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.5'
 - id: reshape_and_cache
   description: Store the key/value token states into the pre-allcated kv_cache buffers
     of paged attention.

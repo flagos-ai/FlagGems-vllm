@@ -58,6 +58,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import 
 from flaggems_vllm.runtime.backend._ascend.ops.fused_kimi_k3_mla_key_concat_ds_mla_insert import (
     fused_kimi_k3_mla_key_concat_ds_mla_insert,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -124,6 +127,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer import (
     quant_lightning_indexer,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.rejection_sampler import rejection_sample
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -183,6 +187,7 @@ __all__ = [
     "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
     "fused_kimi_k3_mla_key_concat_ds_mla_insert",
+    "fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "fused_q",
     "fused_q_kv_rmsnorm",
     "gather_conv_state",
@@ -219,6 +224,7 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
+    "rejection_sample",
     "scaled_int8_quant",
     "scatter_conv_state",
     "scatter_kda_state",
