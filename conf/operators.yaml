@@ -1665,6 +1665,17 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: l2norm_fwd
+  description: Normalize BF16 rows along the last dimension on Atlas A5.
+  for:
+  - l2norm_fwd
+  labels:
+  - non-aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: lightning_indexer
   description: 'TLE implementation of the Ascend paged-attention Lightning Indexer:
 
