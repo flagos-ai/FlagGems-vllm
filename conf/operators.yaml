@@ -715,6 +715,17 @@ ops:
   - Indexing
   stages:
   - beta: '0.3'
+- id: fla_causal_conv1d_fn
+  description: FLA token-major four-tap causal convolution with in-place state and a head-major result on Atlas A5.
+  for:
+  - fla_causal_conv1d_fn
+  labels:
+  - non-aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: flash_attention_forward
   description: Forward pass of FlashAttention computing scaled dot-product attention.
   for:
