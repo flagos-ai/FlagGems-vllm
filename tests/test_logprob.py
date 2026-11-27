@@ -457,6 +457,15 @@ def test_cu_num_logits_output_fields(candidate_logprob, device, cu_num_logits_ki
         "list": [1],
         "tensor": torch.tensor([1], device=device),
     }[cu_num_logits_kind]
+    has_tensor_metadata = (
+        "cu_num_generated_tokens_tensor" in candidate_logprob.LogprobsTensors._fields
+    )
+    if cu_num_logits_kind == "tensor" and not has_tensor_metadata:
+        with pytest.raises(NotImplementedError, match="cu_num_generated_tokens_tensor"):
+            candidate_logprob.compute_topk_scores(
+                logits, 0, sampled, cu_num_logits=cu_num_logits
+            )
+        return
     result = candidate_logprob.compute_topk_scores(
         logits, 0, sampled, cu_num_logits=cu_num_logits
     )
@@ -473,4 +482,5 @@ def test_cu_num_logits_output_fields(candidate_logprob, device, cu_num_logits_ki
         assert result.cu_num_generated_tokens_tensor is cu_num_logits
     else:
         assert result.cu_num_generated_tokens is cu_num_logits
-        assert result.cu_num_generated_tokens_tensor is None
+        if has_tensor_metadata:
+            assert result.cu_num_generated_tokens_tensor is None
