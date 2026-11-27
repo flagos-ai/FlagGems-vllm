@@ -1708,6 +1708,30 @@ def test_fused_marlin_moe_w8a16_projection_cancellation(tokens, n):
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend rectangular expert panels"
+)
+def test_fused_marlin_moe_w8a16_rectangular_panels():
+    hs, w1, w2, ref1, ref2, probs, ids, s1, s2 = _make_inputs_w8a16_int8(
+        256, 8, 3072, 1024, 4, torch.float16, flaggems_vllm.device
+    )
+    # Exercise short and multi-panel experts plus the final 32 columns of the
+    # 2048-column gate/up matrix. One expert has no routes.
+    ids = (
+        torch.arange(ids.numel(), device=ids.device, dtype=torch.int64).reshape_as(ids)
+        % 8
+    )
+    ids[ids == 7] = 0
+    ids[:160] = torch.where(ids[:160] == 1, 0, ids[:160])
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, probs, ids, QUANT_TYPE_UINT8B128
+    )
+    expected = _reference_w8a16_grouped(hs, ref1, ref2, probs, ids)
+    error = compute_max_diff(actual.float(), expected)
+    gems_assert_close(error, torch.zeros_like(error), torch.float32, atol=0.04)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
     flaggems_vllm.vendor_name != "ascend", reason="Ascend workspace bound"
 )
 @pytest.mark.parametrize(("hidden_size", "workspace_mib"), [(1024, 24), (2048, 40)])

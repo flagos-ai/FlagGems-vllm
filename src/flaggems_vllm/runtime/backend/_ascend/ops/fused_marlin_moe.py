@@ -145,7 +145,12 @@ def load_a_tile(
     RowEnd=None,
     USE_BLOCK_PTR: tl.constexpr = False,
 ):
-    if USE_BLOCK_PTR:
+    if USE_BLOCK_PTR and RowEnd is not None:
+        ptr = tl.make_block_ptr(
+            A + row * K, (RowEnd - row, K), (K, 1), (0, k_offset), (BM, 128), (1, 0)
+        )
+        a = tl.load(ptr, boundary_check=(0,), padding_option="zero")
+    elif USE_BLOCK_PTR:
         a = tl.load(
             tl.make_block_ptr(
                 A + row * K, (BM, K), (K, 1), (0, k_offset), (BM, 128), (1, 0)
@@ -172,12 +177,25 @@ def load_cube_weight_stage(
     STREAM_FIRST: tl.constexpr = False,
     STAGE_N: tl.constexpr = 0,
 ):
-    ni = tl.arange(0, BN)
+    ni = tl.arange(0, triton.next_power_of_2(BN))
     ki = tl.arange(0, 128)
     if PANEL_N:
         if STREAM_FIRST:
             sync_ring_wait("vector", "cube", 2)
-        b = tl.load(Work + iteration * PANEL_N * 128 + ni[None, :] * 128 + ki[:, None])
+        if BN & (BN - 1):
+            ptr = tl.make_block_ptr(
+                Work + iteration * PANEL_N * 128,
+                (BN, 128),
+                (128, 1),
+                (0, 0),
+                (BN, 128),
+                (1, 0),
+            )
+            b = tl.trans(tl.load(ptr))
+        else:
+            b = tl.load(
+                Work + iteration * PANEL_N * 128 + ni[None, :] * 128 + ki[:, None]
+            )
         if STREAM_FIRST:
             sync_ring_set("cube", "vector", 4)
     else:
@@ -280,8 +298,8 @@ def cube_tile_pair(
     STAGE_N: tl.constexpr = 0,
     USE_BLOCK_PTR: tl.constexpr = False,
 ):
-    mi = tl.arange(0, BM)
-    ni = tl.arange(0, BN)
+    mi = tl.arange(0, triton.next_power_of_2(BM))
+    ni = tl.arange(0, triton.next_power_of_2(BN))
     RESIDENT: tl.constexpr = (
         not USE_BLOCK_PTR
         and K == 4096
@@ -345,7 +363,12 @@ def cube_tile_pair(
             )
             acc = tl.dot(a0, b0, acc)
             iteration += 1
-    if USE_BLOCK_PTR:
+    if USE_BLOCK_PTR and RowEnd is not None:
+        cp = tl.make_block_ptr(
+            Output + row * N + col, (RowEnd - row, BN), (N, 1), (0, 0), (BM, BN), (1, 0)
+        )
+        tl.store(cp, acc.to(Output.dtype.element_ty), boundary_check=(0,))
+    elif USE_BLOCK_PTR:
         cp = tl.make_block_ptr(
             Output + row * N + col, (BM, BN), (N, 1), (0, 0), (BM, BN), (1, 0)
         )
@@ -874,6 +897,13 @@ def load_weight_tile(
     group_bytes: tl.constexpr = 128 // (8 // BITS)
     groups: tl.constexpr = K // 128
     base = (expert.to(tl.int64) * groups + kb) * N + col
+    if RB & (RB - 1):
+        tl.static_assert(BITS == 8)
+        p = tl.make_block_ptr(
+            Q + base * 128, (RB, 128), (128, 1), (0, 0), (RB, 128), (1, 0)
+        )
+        sp = tl.make_block_ptr(S + base, (RB, 1), (1, 1), (0, 0), (RB, 1), (1, 0))
+        return tl.load(p).to(tl.int8, bitcast=True).to(tl.float16) * tl.load(sp)
     q = tl.load(Q + base * group_bytes + tl.arange(0, RB * group_bytes))
     scales = tl.load(S + base + tl.arange(0, RB))
     if BITS == 4:
@@ -1383,9 +1413,24 @@ def compact_panel_tile(
     BM: tl.constexpr,
     BN: tl.constexpr,
     FIRST: tl.constexpr = False,
+    RowEnd=None,
 ):
     cube_tile_pair(
-        A, panel, output, row, col, pid, pid * 0, K, N, BM, BN, None, BN, FIRST
+        A,
+        panel,
+        output,
+        row,
+        col,
+        pid,
+        pid * 0,
+        K,
+        N,
+        BM,
+        BN,
+        RowEnd,
+        BN,
+        FIRST,
+        USE_BLOCK_PTR=RowEnd is not None,
     )
 
 
@@ -1408,6 +1453,8 @@ def expert_panel_kernel(
     STAGES: tl.constexpr = 1,
     EXPERT_OUTER: tl.constexpr = False,
     GateCache=None,
+    PANEL_ROWS: tl.constexpr = 0,
+    PANEL_STRIDE: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     COLS: tl.constexpr = N // BN
@@ -1487,6 +1534,44 @@ def expert_panel_kernel(
                     sender_pipe=al.PIPE.PIPE_MTE2,
                     receiver_pipe=al.PIPE.PIPE_FIX,
                 )
+        elif PANEL_ROWS:
+            for task in range(pid, E * COLS, GRID):
+                expert = task // COLS
+                count = tl.load(Counts + expert)
+                if count > 0:
+                    row = tl.load(Offsets + expert)
+                    col = task % COLS * BN
+                    panel = Work + pid * K * BN
+                    end = row + count
+                    compact_panel_tile(
+                        A,
+                        panel,
+                        Output,
+                        row,
+                        col,
+                        pid,
+                        K,
+                        PANEL_STRIDE,
+                        PANEL_ROWS,
+                        BN,
+                        True,
+                        RowEnd=end,
+                    )
+                    for start in range(PANEL_ROWS, count, 64):
+                        compact_panel_tile(
+                            A,
+                            panel,
+                            Output,
+                            row + start,
+                            col,
+                            pid,
+                            K,
+                            PANEL_STRIDE,
+                            64,
+                            BN,
+                            RowEnd=end,
+                        )
+                    sync_ring_set("cube", "vector", 3)
         elif BM == 32:
             # Consume only this expert's 32-row-aligned range.
             for task in range(pid, E * COLS, GRID):
@@ -1710,7 +1795,7 @@ def expert_panel_kernel(
     with tle.scope(core_mode="vector"):
         sub = tle.dsa.ascend.sub_vec_id()
         VBN: tl.constexpr = BN // 2
-        ns = tl.arange(0, VBN)
+        ns = tl.arange(0, triton.next_power_of_2(VBN))
         ks = tl.arange(0, 128)
         vector_iteration = 0
         if EXPERT_OUTER:
@@ -1777,14 +1862,25 @@ def expert_panel_kernel(
                         )
                         if kb >= 2:
                             sync_ring_wait("cube", "vector", 4)
-                        tl.store(
-                            Work
-                            + vector_stage
-                            + kb * BN * 128
-                            + (sub * VBN + ns[:, None]) * 128
-                            + ks[None, :],
-                            decoded,
-                        )
+                        if VBN & (VBN - 1):
+                            dst = tl.make_block_ptr(
+                                Work + vector_stage + (kb * BN + sub * VBN) * 128,
+                                (VBN, 128),
+                                (128, 1),
+                                (0, 0),
+                                (VBN, 128),
+                                (1, 0),
+                            )
+                            tl.store(dst, decoded)
+                        else:
+                            tl.store(
+                                Work
+                                + vector_stage
+                                + kb * BN * 128
+                                + (sub * VBN + ns[:, None]) * 128
+                                + ks[None, :],
+                                decoded,
+                            )
                         sync_ring_set("vector", "cube", 2)
                     for _ in range(tl.minimum(K // 128, 2)):
                         sync_ring_wait("cube", "vector", 4)
@@ -1915,6 +2011,7 @@ def grouped_quantized_gemm(
     routes=None,
     topk=1,
     fuse_swiglu=False,
+    wide_input=False,
 ):
     n, k = out.shape[1], a.shape[1]
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
@@ -1923,7 +2020,7 @@ def grouped_quantized_gemm(
     if expert_panel:
         if fuse_swiglu:
             n *= 2
-        panel_bn = 256
+        panel_bn = 224 if wide_input else 256
         expert_outer = k <= 512 and bm != 32
         panel_stages = 2 if expert_outer else 1
         panel_grid = min(
@@ -1972,29 +2069,44 @@ def grouped_quantized_gemm(
             if fuse_swiglu
             else None
         )
-        expert_panel_kernel[(panel_grid,)](
-            a,
-            w,
-            s,
-            counts,
-            offsets,
-            panel_work,
-            out,
-            k,
-            n,
-            s.stride(1),
-            w.shape[0],
-            bm,
-            panel_bn,
-            panel_grid,
-            panel_stages,
-            expert_outer,
-            GateCache=gate_cache,
-            disable_auto_inject_block_sync=True,
-            num_warps=1,
-            enable_fp_fusion=False,
-            multibuffer=False,
-        )
+        sections = ((0, n, panel_bn),)
+        if wide_input and n % panel_bn:
+            # The final narrower panel reads from the original pitched weight
+            # matrix and writes into the matching columns of the output.
+            tail = n % panel_bn
+            sections = ((0, n - tail, panel_bn), (n - tail, tail, tail))
+        for start, width, tile_n in sections:
+            if width == n:
+                weights, scales, destination = w, s, out
+            else:
+                weights = w.narrow(2, start, width)
+                scales = s.narrow(2, start, width)
+                destination = out.narrow(1, start, width)
+            expert_panel_kernel[(panel_grid,)](
+                a,
+                weights,
+                scales,
+                counts,
+                offsets,
+                panel_work,
+                destination,
+                k,
+                width,
+                s.stride(1),
+                w.shape[0],
+                bm,
+                tile_n,
+                panel_grid,
+                panel_stages,
+                expert_outer,
+                GateCache=gate_cache,
+                PANEL_ROWS=144 if wide_input else 0,
+                PANEL_STRIDE=out.stride(0),
+                disable_auto_inject_block_sync=True,
+                num_warps=1,
+                enable_fp_fusion=False,
+                multibuffer=False,
+            )
         return
     # Limit BN to fit two decoded BF16 weight tiles and both A tiles in L1.
     bn = min(n & -n, 512 if bits == 8 and bm <= 64 else 256, 32768 // bm)
@@ -3335,6 +3447,14 @@ def grouped_route_moe(
             True,
             panel,
             fuse_swiglu=fuse_up,
+            wide_input=(
+                panel
+                and not fuse_up
+                and k > 2 * n
+                and k % 1024 == 0
+                and n % 1024 == 0
+                and 96 * e <= m * t <= 144 * e
+            ),
         )
     else:
         grouped_quantized_gemm(packed_x, w1, s1, experts, h, bm, bits, offsets=offsets)
