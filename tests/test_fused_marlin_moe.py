@@ -1007,11 +1007,11 @@ def test_fused_marlin_moe_w8a16_target_device(monkeypatch):
         module, "_fused_marlin_moe_w8a16", lambda *a, **kw: kw["device_info"]
     )
     w = SimpleNamespace(ndim=3, dtype=torch.float8_e4m3fn, shape=(2, 256, 128))
-    hs = SimpleNamespace(device=torch.device("cuda:1"))
+    hs = SimpleNamespace(device=SimpleNamespace(type="cuda", index=1))
     assert fused_marlin_moe(
         hs, w, w, None, None, None, None, None, None, QUANT_TYPE_FP8_E4M3
     ).is_hopper
-    hs.device = torch.device("cuda:0")
+    hs.device = SimpleNamespace(type="cuda", index=0)
     with pytest.raises(NotImplementedError, match="SM90"):
         fused_marlin_moe(
             hs, w, w, None, None, None, None, None, None, QUANT_TYPE_FP8_E4M3
@@ -1659,6 +1659,127 @@ def test_fused_marlin_moe_w8a16_inference_updates(
             kwargs[updated_tensor].zero_()
         actual = flaggems_vllm.fused_marlin_moe(**kwargs)
         gems_assert_equal(actual, torch.zeros_like(hs))
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MUSA small grouping"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+def test_fused_marlin_moe_small_grouped_musa(dtype, apply_router_weight_on_input):
+    _check_w4a16_int4((8, 8, 4096, 1024, 2), dtype, apply_router_weight_on_input)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads" or not _runs_quantized_moe(),
+    reason="MUSA bounded workspace",
+)
+@pytest.mark.parametrize("precision", ["int4", "fp8"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("destination", ["allocate", "output", "inplace", "shifted"])
+def test_fused_marlin_moe_workspace_chunks(monkeypatch, precision, dtype, destination):
+    make_inputs, quant_type = {
+        "int4": (_make_inputs_w4a16_int4, QUANT_TYPE_UINT4B8),
+        "fp8": (_make_inputs_fp8_weight, QUANT_TYPE_FP8_E4M3),
+    }[precision]
+    hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
+        1031, 4, 128, 256, 2, dtype, flaggems_vllm.device
+    )
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+
+    def call(x, **kwargs):
+        return flaggems_vllm.fused_marlin_moe(
+            x, w1, w2, None, None, s1, s2, tw, ti, quant_type, **kwargs
+        )
+
+    reference = call(hs)
+    # Four full chunks and a three-token tail exercise different dispatch paths.
+    budget = 4 * 25 + 8 * 320 + 4096 + 257 * 2 * (384 * 2 + 8)
+    monkeypatch.setattr(backend, "_MAX_WORKSPACE_BYTES", budget)
+    # Compile/autotune all chunk geometries before checking allocated memory.
+    call(hs)
+    if destination in ("inplace", "shifted"):
+        call(hs.clone(), inplace=True)
+    kwargs = {}
+    if destination == "output":
+        kwargs["output"] = torch.empty_like(hs)
+    elif destination == "inplace":
+        kwargs["inplace"] = True
+    elif destination == "shifted":
+        storage = torch.empty(
+            (hs.shape[0] + 1, hs.shape[1]), dtype=dtype, device=hs.device
+        )
+        storage[:-1].copy_(hs)
+        hs = storage[:-1]
+        kwargs["output"] = storage[1:]
+    torch_device_fn.synchronize()
+    initial = torch_device_fn.memory_allocated()
+    torch_device_fn.reset_peak_memory_stats()
+    actual = call(hs, **kwargs)
+    torch_device_fn.synchronize()
+    # Only the caller-visible allocating output is outside the workspace budget.
+    output_bytes = hs.numel() * hs.element_size() if destination == "allocate" else 0
+    assert torch_device_fn.max_memory_allocated() - initial <= budget + output_bytes
+    assert torch.isfinite(actual).all()
+    assert compute_max_diff(actual.float(), reference.float()) < 0.04
+    if destination == "inplace":
+        assert actual.data_ptr() == hs.data_ptr()
+    elif "output" in kwargs:
+        assert actual.data_ptr() == kwargs["output"].data_ptr()
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads" or not _runs_quantized_moe(),
+    reason="MUSA graph replay",
+)
+@pytest.mark.parametrize("precision", ["int4", "fp8"])
+@pytest.mark.parametrize("updated_tensor", ["w1", "w2", "w1_scale", "w2_scale"])
+@pytest.mark.parametrize("num_tokens", [33, 1031])
+def test_fused_marlin_moe_graph_weight_updates(
+    monkeypatch, precision, updated_tensor, num_tokens
+):
+    make_inputs, quant_type = {
+        "int4": (_make_inputs_w4a16_int4, QUANT_TYPE_UINT4B8),
+        "fp8": (_make_inputs_fp8_weight, QUANT_TYPE_FP8_E4M3),
+    }[precision]
+    if num_tokens == 1031:
+        backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+        monkeypatch.setattr(
+            backend,
+            "_MAX_WORKSPACE_BYTES",
+            1 << 20,
+        )
+    with torch.inference_mode():
+        hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
+            num_tokens, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+        )
+        output = torch.empty_like(hs)
+
+        def call():
+            return flaggems_vllm.fused_marlin_moe(
+                hs, w1, w2, None, None, s1, s2, tw, ti, quant_type, output=output
+            )
+
+        call()
+        torch_device_fn.synchronize()
+        graph_type = torch_device_fn.MUSAGraph
+        graph = graph_type()
+        with torch_device_fn.graph(graph):
+            call()
+        graph.replay()
+        torch_device_fn.synchronize()
+        assert output.abs().max() > 0
+        tensor = {"w1": w1, "w2": w2, "w1_scale": s1, "w2_scale": s2}[updated_tensor]
+        if updated_tensor in ("w1", "w2"):
+            tensor.view(torch.uint8).fill_({"int4": 0x88, "fp8": 0}[precision])
+        else:
+            tensor.zero_()
+        graph.replay()
+        torch_device_fn.synchronize()
+        gems_assert_equal(output, torch.zeros_like(hs))
 
 
 @pytest.mark.fused_marlin_moe_w8a16

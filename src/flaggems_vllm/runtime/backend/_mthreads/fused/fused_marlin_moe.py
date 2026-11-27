@@ -30,6 +30,7 @@ from flaggems_vllm import runtime
 from flaggems_vllm.ops.moe_align_block_size import (
     moe_align_block_size_no_tle,
     moe_align_block_size_singleton,
+    moe_align_block_size_small_grouped,
 )
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.runtime.backend._mthreads.fused.moe_sum import moe_sum as _moe_sum
@@ -42,10 +43,12 @@ def _zero_workspace(X, N: tl.constexpr, B: tl.constexpr):
     tl.store(X + offsets, 0, offsets < N)
 
 
-def _align_routes(ids, bm, experts):
+def _align_routes(ids, bm, experts, group_small=False):
     """Reuse the four-stage aligner with Triton-initialized scratch storage."""
     routes = ids.numel()
     if routes <= 16:
+        if group_small and routes > experts:
+            return moe_align_block_size_small_grouped(ids, experts, bm)
         return moe_align_block_size_singleton(ids, bm)
     workspace = torch.empty(
         ((experts + 1) * (experts + 1),), device=ids.device, dtype=torch.int32
@@ -432,6 +435,64 @@ def fused_marlin_moe(
         out = torch.empty_like(hidden_states)
     if m == 0:
         return out
+    chunk_tokens = _workspace_tokens(m, k, n, e, topk, hidden_states.element_size())
+    # The down projection stages all reads for a chunk before moe_sum writes
+    # output. Reverse traversal protects future inputs for shifted aliases.
+    starts = range(0, m, chunk_tokens)
+    if (
+        out.untyped_storage().data_ptr() == hidden_states.untyped_storage().data_ptr()
+        and out.data_ptr() > hidden_states.data_ptr()
+    ):
+        starts = reversed(starts)
+    for start in starts:
+        stop = min(start + chunk_tokens, m)
+        _run_chunk(
+            hidden_states[start:stop],
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights[start:stop],
+            topk_ids[start:stop],
+            quant_type_id,
+            group_size,
+            apply_router_weight_on_input,
+            out[start:stop],
+        )
+    return out
+
+
+_MAX_WORKSPACE_BYTES = 2 << 30
+
+
+def _workspace_tokens(m, k, n, e, topk, element_size):
+    # Intermediate and down projection, route IDs, expert IDs and the aligner's
+    # (E + 1)^2 INT32 workspace. Reserve 64 rows of padding per expert and
+    # allocator alignment for the small buffers. Inputs and output are excluded.
+    fixed = 4 * (e + 1) ** 2 + 8 * (64 * e + 64) + 4096
+    per_token = topk * ((n + k) * element_size + 8)
+    tokens = (_MAX_WORKSPACE_BYTES - fixed) // per_token
+    if tokens < 1:
+        raise ValueError("MUSA Marlin MoE workspace budget is too small")
+    return min(m, tokens)
+
+
+def _run_chunk(
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    topk_weights,
+    topk_ids,
+    quant_type_id,
+    group_size,
+    apply_router_weight_on_input,
+    out,
+):
+    m, k = hidden_states.shape
+    e, n2, _ = w1.shape
+    n, topk = n2 // 2, topk_ids.shape[1]
     r = m * topk
     # Reuse decoded weights across more rows when routing is dense.
     bm = 16 if r < e * 16 else 64
@@ -442,7 +503,11 @@ def fused_marlin_moe(
             m <= 4 or (quant_type_id == 2 and r <= e)
         )
         if not direct:
-            routes, experts, padded = _align_routes(topk_ids, bm, e)
+            # Group repeated experts when large projections amortize the
+            # single-CTA grouping cost; keep singleton routing for small tiles.
+            routes, experts, padded = _align_routes(
+                topk_ids, bm, e, group_small=k >= 4096 and n >= 1024
+            )
         intermediate = torch.empty((r, n), device=out.device, dtype=out.dtype)
         result = torch.empty((m, topk, k), device=out.device, dtype=out.dtype)
         for a, w, s, c, first, nk, kk in (
@@ -476,7 +541,6 @@ def fused_marlin_moe(
                     )
                 ](*prefix, routes, experts, padded, *suffix, bm)
         _moe_sum(result, out)
-    return out
 
 
 def fused_marlin_moe_w4a16_int4(
