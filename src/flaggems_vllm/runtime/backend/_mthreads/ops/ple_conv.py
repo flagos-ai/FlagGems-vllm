@@ -7,6 +7,11 @@ launch. Decode updates the cache in the main kernel; prefill and spec write
 it back afterwards. MUSA has no programmatic dependent launch, so
 ``launch_pdl`` stays false. Missing ``gdc_wait`` / ``gdc_launch_dependents``
 symbols are left as None.
+
+When FlagTree TLE is available, the main-kernel reuse path stages the
+channel-weight tile (and the live state window when smem allows) through
+``tle.gpu.alloc`` / ``local_ptr`` so dilation taps do not re-gather from
+global memory. Tile selection and the writeback split stay as before.
 """
 
 from __future__ import annotations
@@ -16,6 +21,24 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm.utils.triton_version_utils import has_triton_tle
+
+if has_triton_tle(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
+    except ImportError:
+        tle = None
+else:
+    tle = None
+
+HAS_TLE = bool(
+    tle is not None
+    and hasattr(tle, "gpu")
+    and hasattr(tle.gpu, "alloc")
+    and hasattr(tle.gpu, "local_ptr")
+    and hasattr(tle.gpu, "smem")
+)
 
 NULL_BLOCK_ID = 0
 
@@ -30,7 +53,7 @@ except ImportError:
 
 # Dilated short convolution
 @triton.jit(do_not_specialize=["num_reqs", "bs_iters", "has_token_map"])
-def _ple_conv_kernel(
+def _ple_conv_kernel_baseline(
     x_ptr,
     state_ptr,
     w_ptr,
@@ -59,6 +82,9 @@ def _ple_conv_kernel(
     NULL_STATE_ID: tl.constexpr,
     FUSE_RESIDUAL: tl.constexpr,
     WRITE_TAIL: tl.constexpr,
+    KERNEL_SIZE_SMEM: tl.constexpr,
+    STATE_LEN_P2: tl.constexpr,
+    STAGE_STATE: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     t = tl.program_id(0)
@@ -224,6 +250,267 @@ def _ple_conv_kernel(
                 next_state,
                 mask=c_mask & state_ok,
             )
+
+
+if HAS_TLE:
+    # Dilated short convolution with TLE smem reuse for weights / state.
+    @triton.jit(do_not_specialize=["num_reqs", "bs_iters", "has_token_map"])
+    def _ple_conv_kernel_tle(
+        x_ptr,
+        state_ptr,
+        w_ptr,
+        residual_ptr,
+        outer_residual_ptr,
+        state_idx_ptr,
+        qsl_ptr,
+        num_acc_ptr,
+        has_init_ptr,
+        token_idx_ptr,
+        has_token_map,
+        num_reqs,
+        bs_iters,
+        state_idx_stride,
+        state_bs,
+        state_ws,
+        state_cs,
+        C: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        STATE_LEN: tl.constexpr,
+        DILATION: tl.constexpr,
+        KERNEL_SIZE: tl.constexpr,
+        SPEC_QUERY_LEN: tl.constexpr,
+        MODE: tl.constexpr,
+        HAS_INIT: tl.constexpr,
+        NULL_STATE_ID: tl.constexpr,
+        FUSE_RESIDUAL: tl.constexpr,
+        WRITE_TAIL: tl.constexpr,
+        KERNEL_SIZE_SMEM: tl.constexpr,
+        STATE_LEN_P2: tl.constexpr,
+        STAGE_STATE: tl.constexpr,
+        launch_pdl: tl.constexpr,
+    ):
+        t = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < C
+        c_local = tl.arange(0, BLOCK_C)
+
+        # Stage the channel x kernel weight tile once; every dilation tap
+        # reuses the same smem row instead of re-gathering from global.
+        w_smem = tle.gpu.alloc(
+            [BLOCK_C, KERNEL_SIZE_SMEM],
+            dtype=tl.float32,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
+        )
+        for k0 in tl.static_range(0, KERNEL_SIZE):
+            w0 = tl.load(
+                w_ptr + c_offs * KERNEL_SIZE + k0,
+                mask=c_mask,
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(
+                tle.gpu.local_ptr(w_smem, (c_local, tl.full([BLOCK_C], k0, tl.int32))),
+                w0,
+                mask=c_mask,
+            )
+        if STAGE_STATE:
+            s_smem = tle.gpu.alloc(
+                [BLOCK_C, STATE_LEN_P2],
+                dtype=tl.float32,
+                layout=None,
+                scope=tle.gpu.smem,
+                nv_mma_shared_layout=False,
+            )
+
+        if launch_pdl:
+            gdc_wait()
+
+        output_t = tl.load(token_idx_ptr + t, mask=has_token_map, other=t).to(tl.int64)
+
+        if MODE == "decode":
+            r = t
+            q_start = t
+            j = tl.full([], 0, tl.int32)
+            slot_off = tl.full([], 0, tl.int32)
+            in_range = True
+        else:
+            lo = tl.full([], 1, tl.int32)
+            hi = tl.full([], num_reqs + 1, tl.int32)
+            for _ in range(bs_iters):
+                mid = (lo + hi) // 2
+                qmid = tl.load(qsl_ptr + mid, mask=mid <= num_reqs, other=0)
+                pred = qmid <= t
+                lo = tl.where(pred, mid + 1, lo)
+                hi = tl.where(pred, hi, mid)
+            r = tl.minimum(lo - 1, num_reqs - 1)
+            q_start = tl.load(qsl_ptr + r)
+            j = (t - q_start).to(tl.int32)
+            total_real = tl.load(qsl_ptr + num_reqs)
+            in_range = t < total_real
+            if MODE == "spec":
+                num_acc = tl.load(num_acc_ptr + r)
+                slot_off = tl.minimum(
+                    tl.maximum(num_acc - 1, 0), SPEC_QUERY_LEN - 1
+                ).to(tl.int32)
+            else:
+                slot_off = tl.full([], 0, tl.int32)
+
+        sid = tl.load(state_idx_ptr + r * state_idx_stride).to(tl.int64)
+        state_ok = sid != NULL_STATE_ID
+        sid_safe = tl.where(state_ok, sid, 0)
+        if HAS_INIT:
+            has_init = tl.load(has_init_ptr + r, mask=state_ok, other=0) != 0
+        else:
+            has_init = state_ok
+        if MODE == "spec":
+            read_state = state_ok
+            out_ok = in_range
+        else:
+            read_state = state_ok & has_init
+            out_ok = in_range & state_ok
+
+        base_state = state_ptr + sid_safe * state_bs
+        if STAGE_STATE:
+            for wi in tl.static_range(0, STATE_LEN):
+                s0 = tl.load(
+                    base_state + (wi + slot_off) * state_ws + c_offs * state_cs,
+                    mask=c_mask & read_state,
+                    other=0.0,
+                ).to(tl.float32)
+                tl.store(
+                    tle.gpu.local_ptr(
+                        s_smem, (c_local, tl.full([BLOCK_C], wi, tl.int32))
+                    ),
+                    s0,
+                    mask=c_mask,
+                )
+
+        acc = tl.zeros([BLOCK_C], tl.float32)
+        for k in tl.static_range(0, KERNEL_SIZE):
+            h = j + DILATION * k
+            from_state = h <= STATE_LEN - 1
+            if from_state:
+                if STAGE_STATE:
+                    tap = tl.load(
+                        tle.gpu.local_ptr(
+                            s_smem, (c_local, tl.full([BLOCK_C], h, tl.int32))
+                        ),
+                        mask=c_mask & read_state,
+                        other=0.0,
+                    )
+                else:
+                    tap = tl.load(
+                        base_state + (h + slot_off) * state_ws + c_offs * state_cs,
+                        mask=c_mask & read_state,
+                        other=0.0,
+                    ).to(tl.float32)
+            else:
+                input_t = q_start + h - STATE_LEN
+                input_t = tl.load(
+                    token_idx_ptr + input_t,
+                    mask=has_token_map & out_ok,
+                    other=input_t,
+                ).to(tl.int64)
+                tap = tl.load(
+                    x_ptr + input_t * C + c_offs,
+                    mask=c_mask & out_ok,
+                    other=0.0,
+                ).to(tl.float32)
+            weight = tl.load(
+                tle.gpu.local_ptr(w_smem, (c_local, tl.full([BLOCK_C], k, tl.int32))),
+                mask=c_mask,
+                other=0.0,
+            )
+            acc += weight * tap
+
+        conv = acc.to(residual_ptr.dtype.element_ty).to(tl.float32)
+        y = conv * tl.sigmoid(conv).to(residual_ptr.dtype.element_ty)
+        conv_output = tl.where(out_ok, y, 0.0).to(residual_ptr.dtype.element_ty)
+        ple_output = conv_output
+        if FUSE_RESIDUAL:
+            residual = tl.load(
+                residual_ptr + output_t * C + c_offs,
+                mask=c_mask,
+                other=0.0,
+            )
+            ple_output = (residual + conv_output).to(residual_ptr.dtype.element_ty)
+            outer_residual = tl.load(
+                outer_residual_ptr + output_t * C + c_offs,
+                mask=c_mask,
+                other=0.0,
+            )
+            ple_output = outer_residual.to(tl.float32) + ple_output.to(tl.float32)
+        if launch_pdl:
+            gdc_launch_dependents()
+        tl.store(
+            residual_ptr + output_t * C + c_offs,
+            ple_output,
+            mask=c_mask,
+        )
+
+        if WRITE_TAIL:
+            q_end = tl.load(qsl_ptr + r + 1)
+            qlen = (q_end - q_start).to(tl.int32)
+            col = j - (qlen - STATE_LEN)
+            in_tail = (col >= 0) & (col < STATE_LEN) & state_ok
+            col_safe = tl.maximum(col, 0)
+            tail = tl.load(
+                x_ptr + output_t * C + c_offs,
+                mask=c_mask & in_tail,
+                other=0.0,
+            )
+            tl.store(
+                base_state + col_safe * state_ws + c_offs * state_cs,
+                tail,
+                mask=c_mask & in_tail,
+            )
+
+        if MODE == "decode":
+            decode_input = tl.load(
+                x_ptr + output_t * C + c_offs,
+                mask=c_mask & state_ok,
+                other=0.0,
+            )
+            if STAGE_STATE:
+                for i in tl.static_range(0, STATE_LEN):
+                    if i < STATE_LEN - 1:
+                        next_state = tl.load(
+                            tle.gpu.local_ptr(
+                                s_smem, (c_local, tl.full([BLOCK_C], i + 1, tl.int32))
+                            ),
+                            mask=c_mask & state_ok & has_init,
+                            other=0.0,
+                        )
+                    else:
+                        next_state = decode_input.to(tl.float32)
+                    tl.store(
+                        base_state + i * state_ws + c_offs * state_cs,
+                        next_state.to(state_ptr.dtype.element_ty),
+                        mask=c_mask & state_ok,
+                    )
+            else:
+                for i in tl.static_range(0, STATE_LEN):
+                    if i < STATE_LEN - 1:
+                        next_state = tl.load(
+                            base_state + (i + 1) * state_ws + c_offs * state_cs,
+                            mask=c_mask & state_ok & has_init,
+                            other=0.0,
+                        )
+                    else:
+                        next_state = decode_input
+                    tl.store(
+                        base_state + i * state_ws + c_offs * state_cs,
+                        next_state,
+                        mask=c_mask & state_ok,
+                    )
+
+
+if HAS_TLE:
+    _ple_conv_kernel = _ple_conv_kernel_tle
+else:
+    _ple_conv_kernel = _ple_conv_kernel_baseline
 
 
 # Contiguous [channel, window] writeback. Threads walk the flattened slot so
@@ -485,7 +772,11 @@ def ple_conv(
     kernel_spec_query_len = spec_query_len if mode == "spec" else 1
     T, C = inputs.shape
     K = conv_weights.shape[1]
+    # Power-of-two smem rows so TLE alloc accepts the tile without padding
+    # past the live kernel / state length (extra columns hurt occupancy).
+    kernel_size_smem = triton.next_power_of_2(max(K, 1))
     state_len = (K - 1) * dilation
+    state_len_p2 = triton.next_power_of_2(max(state_len, 1))
     state_width = state_len + kernel_spec_query_len - 1
     if token_indices is not None:
         T = token_indices.numel()
@@ -547,11 +838,19 @@ def ple_conv(
         and num_reqs == 1
         and state_len <= T < 128
     )
+    # TLE weight / state staging wins on the latency-bound decode and short
+    # prefill shapes. Long prefill and both spec sizes keep the baseline
+    # kernel: staging regresses the writeback-dominated grids, and small
+    # batch spec is already bound by the second launch under the 0.9 bar.
+    stage_state_bytes = block_c * (kernel_size_smem + state_len_p2) * 4
+    stage_state = HAS_TLE and mode == "decode" and stage_state_bytes <= 49152
+    use_tle = HAS_TLE and (mode == "decode" or (mode == "prefill" and T < 128))
+    main_kernel = _ple_conv_kernel_tle if use_tle else _ple_conv_kernel_baseline
 
     # Constexpr flags eliminate accesses to optional None arguments. Absent
     # pointers reuse a device-resident dummy so Triton always receives an address.
     dummy = inputs
-    _ple_conv_kernel[(T, triton.cdiv(C, block_c))](
+    main_kernel[(T, triton.cdiv(C, block_c))](
         inputs,
         conv_state,
         conv_weights,
@@ -580,6 +879,9 @@ def ple_conv(
         FUSE_RESIDUAL=outer_residual is not None,
         NULL_STATE_ID=NULL_BLOCK_ID,
         WRITE_TAIL=write_tail,
+        KERNEL_SIZE_SMEM=kernel_size_smem,
+        STATE_LEN_P2=state_len_p2,
+        STAGE_STATE=stage_state,
         launch_pdl=launch_pdl,
         num_warps=num_warps,
     )

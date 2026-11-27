@@ -73,6 +73,10 @@ VENV_DIR="${VENV_DIR:-.venv}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-}"
 FLAG_GEMS_VERSION="${FLAG_GEMS_VERSION:-}"
 FLAG_GEMS_INDEX="${FLAG_GEMS_INDEX:-}"
+FLAG_GEMS_FALLBACK_INDEX="${FLAG_GEMS_FALLBACK_INDEX:-}"
+# Extra pip flags for --no-venv, filled in by detect_pip_system_flags.
+PIP_INSTALL_FLAGS=()
+PIP_UNINSTALL_FLAGS=()
 VLLM_VERSION="${VLLM_VERSION:-}"
 VLLM_PACKAGE="${VLLM_PACKAGE:-}"
 FLAGTREE_VERSION="${FLAGTREE_VERSION:-}"
@@ -92,6 +96,7 @@ STRICT_PIP_CHECK="${STRICT_PIP_CHECK:-0}"
 UV_REFRESH="${UV_REFRESH:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 VENV_CREATED=0
+PYTHON_PREFERENCE="only-managed"
 BACKEND_ARG=""
 BACKEND=""
 BACKEND_VENDOR=""
@@ -147,8 +152,8 @@ Options:
   -h, --help            Show this help and exit.
   --list                List backend profiles and exit.
   --no-venv             Install into the current Python environment instead
-                        of creating a virtual environment. Vendor deps and the
-                        compiler are left untouched by default.
+                        of creating a virtual environment. Vendor deps are left
+                        untouched. FlagTree is installed unless already present.
   --skip-vllm           Do not install vLLM. Useful when the vendor image
                         already provides it.
   --skip-compiler       Do not replace/install Triton or FlagTree.
@@ -167,12 +172,15 @@ Environment:
                         Pin flag-gems; empty uses the registry default.
   FLAG_GEMS_INDEX=${FLAG_GEMS_INDEX:-<from registry>}
                         Index that publishes flag-gems.
+  FLAG_GEMS_FALLBACK_INDEX=${FLAG_GEMS_FALLBACK_INDEX:-<from registry>}
+                        Searched when FLAG_GEMS_INDEX lacks the pinned release.
   VLLM_VERSION=${VLLM_VERSION:-<from backend>}
                         Override the backend's 'vllm==...' pin.
   VLLM_PACKAGE=${VLLM_PACKAGE:-<from backend>}
                         Complete vLLM requirement (may be a wheel URL). Wins
                         over VLLM_VERSION.
   COMPILER=${COMPILER:-<auto>}         flagtree | triton | keep.
+                        Auto: FlagTree unless it is already installed.
   USE_FLAGTREE=${USE_FLAGTREE:-<auto>}  1 = force FlagTree, 0 = force Triton.
   FLAGTREE_VERSION=${FLAGTREE_VERSION:-<from backend>}
                         Override the FlagTree version.
@@ -334,16 +342,31 @@ install_uv() {
 }
 
 install_python() {
-  printf "Installing Python ${PYTHON_VERSION} ..."
+  printf "Installing Python ${PYTHON_VERSION} ...\n"
   if [ "${DRY_RUN}" = "1" ]; then
     printf " [dry-run] uv python install %s\n" "${PYTHON_VERSION}"
     return 0
   fi
-  UV_PYTHON_INSTALL_MIRROR="${UV_PYTHON_INSTALL_MIRROR}" \
-    uv python install "${PYTHON_VERSION}" \
-      --python-preference only-managed -q \
-    || die "unable to install Python ${PYTHON_VERSION}"
-  ok
+  if UV_PYTHON_INSTALL_MIRROR="${UV_PYTHON_INSTALL_MIRROR}" \
+      uv python install "${PYTHON_VERSION}" \
+        --python-preference only-managed; then
+    ok
+    return 0
+  fi
+  warn "Python mirror ${UV_PYTHON_INSTALL_MIRROR} failed; retrying default uv source"
+  if env -u UV_PYTHON_INSTALL_MIRROR \
+      uv python install "${PYTHON_VERSION}" \
+        --python-preference only-managed; then
+    ok
+    return 0
+  fi
+  if uv python find "${PYTHON_VERSION}" --python-preference system >/dev/null 2>&1; then
+    warn "falling back to system Python ${PYTHON_VERSION}"
+    PYTHON_PREFERENCE="system"
+    ok
+    return 0
+  fi
+  die "unable to install Python ${PYTHON_VERSION}"
 }
 
 create_venv() {
@@ -354,7 +377,7 @@ create_venv() {
   fi
   uv venv "${VENV_DIR}" \
     --python "${PYTHON_VERSION}" \
-    --python-preference only-managed \
+    --python-preference "${PYTHON_PREFERENCE}" \
     --seed \
     -q \
     || die "unable to create virtual environment at ${VENV_DIR}"
@@ -400,9 +423,14 @@ install_packages() {
     if [ "${index_mode}" = "flagos" ]; then
       index_args=(--index-url "${FLAGOS_PYPI}" --extra-index-url "${MIRROR}")
     elif [ "${index_mode}" = "flag-gems" ]; then
-      index_args=(--index-url "${FLAG_GEMS_INDEX}" --extra-index-url "${MIRROR}")
+      index_args=(--index-url "${FLAG_GEMS_INDEX}")
+      if [ -n "${FLAG_GEMS_FALLBACK_INDEX}" ]; then
+        index_args+=(--extra-index-url "${FLAG_GEMS_FALLBACK_INDEX}")
+      fi
+      index_args+=(--extra-index-url "${MIRROR}")
     fi
     "${PYTHON_BIN}" -m pip install --disable-pip-version-check \
+      "${PIP_INSTALL_FLAGS[@]+"${PIP_INSTALL_FLAGS[@]}"}" \
       "${index_args[@]}" \
       "${extra[@]+"${extra[@]}"}" \
       "${args[@]}"
@@ -422,10 +450,11 @@ install_packages() {
         --default-index "${MIRROR}"
       )
     elif [ "${index_mode}" = "flag-gems" ]; then
-      index_args=(
-        --index "${FLAG_GEMS_INDEX}"
-        --default-index "${MIRROR}"
-      )
+      index_args=(--index "${FLAG_GEMS_INDEX}")
+      if [ -n "${FLAG_GEMS_FALLBACK_INDEX}" ]; then
+        index_args+=(--index "${FLAG_GEMS_FALLBACK_INDEX}")
+      fi
+      index_args+=(--default-index "${MIRROR}")
     fi
     uv pip install --python "${PYTHON_BIN}" --no-config \
       "${index_args[@]}" \
@@ -442,7 +471,9 @@ uninstall_packages() {
   local pkg
   for pkg in "$@"; do
     if [ "${NO_VENV}" = "1" ]; then
-      "${PYTHON_BIN}" -m pip uninstall -y "${pkg}" >/dev/null 2>&1 || true
+      "${PYTHON_BIN}" -m pip uninstall -y \
+        "${PIP_UNINSTALL_FLAGS[@]+"${PIP_UNINSTALL_FLAGS[@]}"}" \
+        "${pkg}" >/dev/null 2>&1 || true
     else
       uv pip uninstall --python "${PYTHON_BIN}" --no-config "${pkg}" \
         >/dev/null 2>&1 || true
@@ -450,9 +481,136 @@ uninstall_packages() {
   done
 }
 
+# Work out the pip flags --no-venv needs on this interpreter, so users do not
+# have to export PIP_BREAK_SYSTEM_PACKAGES / PIP_USER themselves:
+#   * an externally managed Python (PEP 668, e.g. Debian/Ubuntu system Python)
+#     refuses installs unless --break-system-packages is given;
+#   * a site-packages directory the current user cannot write to needs --user.
+# Neither applies inside a virtual environment.
+detect_pip_system_flags() {
+  local flags
+  flags="$("${PYTHON_BIN}" - <<'PY' 2>/dev/null || true
+import os
+import sys
+import sysconfig
+
+if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+    sys.exit(0)  # inside a virtual environment
+flags = []
+marker = os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED")
+if os.path.exists(marker):
+    flags.append("--break-system-packages")
+if not os.access(sysconfig.get_path("purelib"), os.W_OK):
+    flags.append("--user")
+print(" ".join(flags))
+PY
+)"
+  PIP_INSTALL_FLAGS=()
+  PIP_UNINSTALL_FLAGS=()
+  case " ${flags} " in
+    *" --break-system-packages "*)
+      PIP_INSTALL_FLAGS+=(--break-system-packages)
+      PIP_UNINSTALL_FLAGS+=(--break-system-packages)
+      ;;
+  esac
+  case " ${flags} " in
+    *" --user "*) PIP_INSTALL_FLAGS+=(--user) ;;
+  esac
+  if [ "${#PIP_INSTALL_FLAGS[@]}" -gt 0 ]; then
+    printf "pip: %s (externally managed or read-only Python)\n" \
+      "${PIP_INSTALL_FLAGS[*]}"
+  fi
+}
+
+# Report whether the installed flag_gems satisfies the pinned FLAG_GEMS_VERSION.
+# Prints "ok|<version>" (installed, and not older than the pin), "old|<version>"
+# or "none|".
+flag_gems_state() {
+  "${PYTHON_BIN}" - "${FLAG_GEMS_VERSION}" <<'PY' 2>/dev/null || echo "none|"
+import importlib.metadata as md
+import re
+import sys
+
+pin = sys.argv[1] if len(sys.argv) > 1 else ""
+
+
+def parse(version):
+    return tuple(int(n) for n in re.findall(r"\d+", version.split("+")[0])[:4])
+
+
+installed = ""
+for name in ("flag-gems", "flag_gems"):
+    try:
+        installed = md.version(name)
+        break
+    except md.PackageNotFoundError:
+        continue
+if not installed:
+    print("none|")
+elif pin and parse(installed) < parse(pin):
+    print(f"old|{installed}")
+else:
+    print(f"ok|{installed}")
+PY
+}
+
+# Report whether the installed flagtree satisfies the pinned BACKEND_FLAGTREE.
+# Prints "ok|<version>" (installed, and not older than the pin), "old|<version>"
+# or "none|".
+flagtree_version_state() {
+  local pin="$1"
+  "${PYTHON_BIN}" - "${pin}" <<'PY' 2>/dev/null || echo "none|"
+import re
+import sys
+
+pin_spec = sys.argv[1] if len(sys.argv) > 1 else ""
+
+def parse(version):
+    return tuple(int(n) for n in re.findall(r"\d+", version.split("+")[0])[:4])
+
+def parse_spec(spec):
+    # Extract version from "flagtree==0.7.0" or "flagtree==0.7.0+vendor"
+    match = re.search(r"==([0-9.]+(?:\+[^,\s]+)?)", spec)
+    return match.group(1) if match else ""
+
+installed = ""
+try:
+    import importlib.metadata as md
+    installed = md.version("flagtree")
+except Exception:
+    pass
+
+if not installed:
+    print("none|")
+elif not pin_spec:
+    print(f"ok|{installed}")
+else:
+    pin_version = parse_spec(pin_spec)
+    if pin_version and parse(installed) < parse(pin_version):
+        print(f"old|{installed}")
+    else:
+        print(f"ok|{installed}")
+PY
+}
+
+# True when FlagTree is already installed in the target Python environment.
+flagtree_installed() {
+  "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+import importlib.metadata as md
+import sys
+
+try:
+    md.distribution("flagtree")
+except md.PackageNotFoundError:
+    sys.exit(1)
+PY
+}
+
 # Report which compiler the current environment actually provides, and whether
-# it can run the TLE (warp-specialized) kernels. COMPILER=keep is the default
-# in --no-venv mode, so without this the user is told only "compiler left
+# it can run the TLE (warp-specialized) kernels. COMPILER=keep is used when
+# the caller sets --skip-compiler, when --no-venv finds an up-to-date flagtree
+# (or the caller sets COMPILER=triton/keep), or when FlagTree is already
+# present in a fresh venv; without this the user is told only "compiler left
 # untouched" and has no way to tell that they are on stock Triton and losing
 # the TLE fast paths (for example sparse FlashMLA prefill is roughly 2x slower
 # on stock Triton than on FlagTree).
@@ -959,6 +1117,9 @@ main() {
     FLAG_GEMS_INDEX="$(global_value flag_gems_index)"
   fi
   [ -n "${FLAG_GEMS_INDEX}" ] || FLAG_GEMS_INDEX="${FLAGOS_PYPI}"
+  if [ -z "${FLAG_GEMS_FALLBACK_INDEX}" ]; then
+    FLAG_GEMS_FALLBACK_INDEX="$(global_value flag_gems_fallback_index)"
+  fi
 
   printf "Backend: ${CYAN}%s${NC} (vendor: %s, python: %s)" \
     "${BACKEND}" "${BACKEND_VENDOR}" "${PYTHON_VERSION}"
@@ -972,6 +1133,7 @@ main() {
       || die "Python interpreter not found: ${PYTHON_BIN}"
     printf "Mode: current environment (%s)\n" \
       "$("${PYTHON_BIN}" -c 'import sys; print(sys.executable)' 2>/dev/null || echo "${PYTHON_BIN}")"
+    detect_pip_system_flags
     if ! "${PYTHON_BIN}" -c 'import yaml' >/dev/null 2>&1; then
       printf "PyYAML is missing; installing it first ..."
       install_packages "PyYAML>=6.0"
@@ -1025,12 +1187,20 @@ main() {
     ok
   fi
 
+  local fg_state="none|"
+  if [ "${NO_VENV}" = "1" ] && [ "${SKIP_FLAGGEMS}" != "1" ]; then
+    fg_state="$(flag_gems_state)"
+  fi
   if [ "${SKIP_FLAGGEMS}" = "1" ]; then
     warn "skipping flag-gems installation (SKIP_FLAGGEMS=1)"
-  elif [ "${NO_VENV}" = "1" ] && "${PYTHON_BIN}" -c 'import flag_gems' >/dev/null 2>&1; then
-    printf "flag_gems already available in the current environment"
+  elif [ "${fg_state%%|*}" = "ok" ]; then
+    printf "flag_gems %s already installed" "${fg_state#*|}"
     ok
   else
+    if [ "${fg_state%%|*}" = "old" ]; then
+      printf "flag_gems %s is older than the required %s; upgrading\n" \
+        "${fg_state#*|}" "${FLAG_GEMS_VERSION}"
+    fi
     printf "Installing FlagGems%s ..." \
       "${FLAG_GEMS_VERSION:+==${FLAG_GEMS_VERSION}}"
     # --no-deps keeps flag-gems' strict transitive pins (numpy, packaging,
@@ -1104,12 +1274,26 @@ main() {
     COMPILER="keep"
   fi
   if [ -z "${COMPILER}" ]; then
-    if [ "${NO_VENV}" = "1" ]; then
-      COMPILER="keep"
-    elif [ "${USE_FLAGTREE}" = "0" ]; then
+    if [ "${USE_FLAGTREE}" = "0" ]; then
       COMPILER="triton"
     elif [ "${USE_FLAGTREE}" = "1" ]; then
       COMPILER="flagtree"
+    elif [ "${NO_VENV}" = "1" ]; then
+      # In --no-venv mode, compare the environment's flagtree against the
+      # backend pin and upgrade if older. The caller can set COMPILER=triton
+      # or COMPILER=keep to override.
+      local ft_state
+      ft_state="$(flagtree_version_state "${BACKEND_FLAGTREE}")"
+      if [ "${ft_state%%|*}" = "old" ] && [ -n "${BACKEND_FLAGTREE}" ]; then
+        printf "flagtree %s is older than the backend pin; upgrading\n" \
+          "${ft_state#*|}"
+        COMPILER="flagtree"
+      else
+        COMPILER="keep"
+      fi
+    elif flagtree_installed; then
+      # FlagTree is already present in a fresh venv: leave it alone.
+      COMPILER="keep"
     elif [ -n "${BACKEND_FLAGTREE}" ]; then
       COMPILER="flagtree"
     elif [ -n "${BACKEND_TRITON}" ]; then
@@ -1199,6 +1383,11 @@ main() {
   printf "\n${GREEN}FlagGems-vllm setup complete for %s.${NC}\n" "${BACKEND}"
   if [ "${NO_VENV}" = "1" ]; then
     printf "Installed into the current Python environment.\n"
+    if [ "${DRY_RUN}" != "1" ] && flagtree_installed; then
+      # The variable only lives in this script's process, so a new shell needs it.
+      printf "On CUDA 13 hosts, add this to your shell profile so FlagTree imports:\n"
+      printf "  export USE_FLAGCX=OFF\n"
+    fi
     printf "Run tests with: PYTHONPATH=%s/src python -m pytest tests -q --quick\n" \
       "${REPO_ROOT}"
   else

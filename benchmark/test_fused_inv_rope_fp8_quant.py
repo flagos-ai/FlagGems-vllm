@@ -273,6 +273,10 @@ class FusedInvRopeFP8QuantBenchmark(base.GenericBenchmark):
     vllm_fused_inv_rope_fp8_quant is None,
     reason="vLLM fused_inv_rope_fp8_quant not installed",
 )
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "enflame",
+    reason="vLLM native ref is unsupported on enflame",
+)
 def test_fused_inv_rope_fp8_quant(monkeypatch):
     _prepare_vllm_baseline_pdl(monkeypatch)
     bench = FusedInvRopeFP8QuantBenchmark(
