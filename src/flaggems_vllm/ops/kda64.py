@@ -29,12 +29,25 @@ def _kernel(module, name, required):
     return original
 
 
+def _fla_module(name):
+    """Resolve vLLM's namespace move without hiding broken module imports."""
+    current = f"vllm.third_party.flash_linear_attention.ops.{name}"
+    try:
+        return import_module(current)
+    except ModuleNotFoundError as error:
+        if error.name is None or not (
+            current == error.name or current.startswith(error.name + ".")
+        ):
+            raise
+    return import_module(f"vllm.model_executor.layers.fla.ops.{name}")
+
+
 @lru_cache(maxsize=1)
 def _prefill_core():
     """Resolve stable kernel capabilities before submitting any computation."""
-    kda = import_module("vllm.model_executor.layers.fla.ops.kda")
-    utils = import_module("vllm.model_executor.layers.fla.ops.solve_tril")
-    delta_h = import_module("vllm.model_executor.layers.fla.ops.chunk_delta_h")
+    kda = _fla_module("kda")
+    utils = _fla_module("solve_tril")
+    delta_h = _fla_module("chunk_delta_h")
     kernels = (
         _kernel(
             kda,
@@ -72,7 +85,7 @@ def _prefill_core():
 
 @lru_cache(maxsize=1)
 def _recurrent_core():
-    kda = import_module("vllm.model_executor.layers.fla.ops.kda")
+    kda = _fla_module("kda")
     return _kernel(
         kda,
         "fused_recurrent_gated_delta_rule_fwd_kernel",

@@ -1,14 +1,81 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM bounded KDA regressions against the unchanged vLLM FLA core."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.ops import kda64
 from flaggems_vllm.ops import kda_bounded as bounded
+from flaggems_vllm.ops.kda64 import _fla_module
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def test_fla_namespace_prefers_current(monkeypatch):
+    result = object()
+    importer = Mock(return_value=result)
+    monkeypatch.setattr(kda64, "import_module", importer)
+    assert _fla_module("kda") is result
+    importer.assert_called_once_with("vllm.third_party.flash_linear_attention.ops.kda")
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "vllm.third_party.flash_linear_attention.ops.kda",
+        "vllm.third_party.flash_linear_attention.ops",
+        "vllm.third_party.flash_linear_attention",
+    ],
+)
+def test_fla_namespace_falls_back_only_when_current_missing(monkeypatch, missing):
+    result = object()
+    importer = Mock(
+        side_effect=[ModuleNotFoundError("missing namespace", name=missing), result]
+    )
+    monkeypatch.setattr(kda64, "import_module", importer)
+    assert _fla_module("kda") is result
+    assert [call.args[0] for call in importer.call_args_list] == [
+        "vllm.third_party.flash_linear_attention.ops.kda",
+        "vllm.model_executor.layers.fla.ops.kda",
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ModuleNotFoundError("missing internal dependency", name="native_dependency"),
+        ImportError("broken import"),
+        RuntimeError("broken native initialization"),
+        OSError("broken shared object"),
+    ],
+)
+def test_fla_namespace_preserves_internal_import_errors(monkeypatch, error):
+    importer = Mock(side_effect=error)
+    monkeypatch.setattr(kda64, "import_module", importer)
+    with pytest.raises(type(error)) as caught:
+        _fla_module("kda")
+    assert caught.value is error
+    importer.assert_called_once_with("vllm.third_party.flash_linear_attention.ops.kda")
+
+
+def test_fla_namespace_preserves_legacy_error(monkeypatch):
+    current = "vllm.third_party.flash_linear_attention.ops.kda"
+    legacy = "vllm.model_executor.layers.fla.ops.kda"
+    error = ModuleNotFoundError("missing legacy namespace", name=legacy)
+    importer = Mock(
+        side_effect=[
+            ModuleNotFoundError("missing current namespace", name=current),
+            error,
+        ]
+    )
+    monkeypatch.setattr(kda64, "import_module", importer)
+    with pytest.raises(ModuleNotFoundError) as caught:
+        _fla_module("kda")
+    assert caught.value is error
 
 
 @triton.jit
@@ -78,8 +145,8 @@ def reference_cumsum(raw, a, bias, cu=None, indices=None):
 
 
 def metadata(lengths):
-    from vllm.model_executor.layers.fla.ops.chunk_delta_h import prepare_chunk_offsets
-    from vllm.model_executor.layers.fla.ops.kda import prepare_chunk_indices
+    prepare_chunk_offsets = _fla_module("chunk_delta_h").prepare_chunk_offsets
+    prepare_chunk_indices = _fla_module("kda").prepare_chunk_indices
 
     cu = torch.tensor(
         [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
@@ -107,7 +174,7 @@ def test_gate_cumsum_preserves_original_dot_order(dtype, varlen):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tokens", [1, 63, 64, 65, 129])
 def test_prefill_matches_original_64_core(dtype, tokens, key_dim=64, value_dim=32):
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = _fla_module("kda")
 
     torch.manual_seed(454 + tokens)
     q = torch.randn((1, tokens, 2, key_dim), dtype=dtype, device="cuda")
@@ -152,7 +219,7 @@ def test_prefill_matches_original_64_core(dtype, tokens, key_dim=64, value_dim=3
 
 @pytest.mark.parametrize("beta_value", [0.0, 1.0])
 def test_prefill_varlen_keeps_activated_beta_and_vk_state(beta_value):
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = _fla_module("kda")
 
     torch.manual_seed(534)
     dtype = torch.bfloat16
@@ -198,7 +265,7 @@ def test_prefill_varlen_keeps_activated_beta_and_vk_state(beta_value):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("inplace", [False, True])
 def test_decode_matches_vllm_vk_state_slots(dtype, inplace, dim=32):
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = _fla_module("kda")
 
     torch.manual_seed(136)
     q = torch.randn((1, 3, 2, dim), dtype=dtype, device="cuda")
@@ -369,7 +436,7 @@ def test_multi_token_decode_rejects_1d_slots_before_core(monkeypatch):
 
 
 def test_model_decode_one_token_requests_preserve_1d_slots():
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = _fla_module("kda")
 
     q = torch.randn((1, 2, 2, 128), device="cuda", dtype=torch.bfloat16)
     k, v = torch.randn_like(q), torch.randn_like(q)
@@ -405,7 +472,7 @@ def test_model_decode_one_token_requests_preserve_1d_slots():
 
 
 def test_decode_preserves_padded_mamba_cache_slot_stride():
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = _fla_module("kda")
 
     torch.manual_seed(341)
     h, dim, slots, padding = 2, 128, 5, 256
@@ -454,7 +521,7 @@ def test_decode_preserves_padded_mamba_cache_slot_stride():
 
 
 def test_prefill_materializes_padded_initial_state_like_original():
-    from vllm.model_executor.layers.fla.ops import kda
+    kda = _fla_module("kda")
 
     torch.manual_seed(642)
     q = torch.randn((1, 66, 2, 64), device="cuda", dtype=torch.bfloat16)
