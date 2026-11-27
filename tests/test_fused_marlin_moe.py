@@ -1668,6 +1668,46 @@ def test_fused_marlin_moe_w8a16_inference_updates(
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend FP16 INT8 projections"
+)
+@pytest.mark.parametrize("tokens", [1, 513])
+def test_fused_marlin_moe_w8a16_projection_cancellation(tokens):
+    device = flaggems_vllm.device
+    k = n = 1024
+    experts = 4
+    x = torch.full((tokens, k), 2, device=device, dtype=torch.float16)
+    # Opposite K halves exceed FP16 range separately. Their sums are 10 and
+    # 4, so SwiGLU rounds to 40 at the FP16 activation boundary.
+    w1 = torch.full((experts, 2 * n, k), 28, device=device, dtype=torch.uint8)
+    w1[:, :, : k // 2] = 228
+    w1[:, :n, -1] = 33
+    w1[:, n:, -1] = 30
+    w2 = torch.full((experts, k, n), 64, device=device, dtype=torch.uint8)
+    w2[:, :, : n // 2] = 192
+    for expert in range(experts):
+        w2[expert, :, -1] = 65 + expert
+    s1 = torch.ones((experts, 2 * n, k // 128), device=device, dtype=x.dtype)
+    s2 = torch.ones((experts, k, n // 128), device=device, dtype=x.dtype)
+    ids = torch.tensor([[1, 0, 1]], device=device, dtype=torch.int64).repeat(tokens, 1)
+    weights = torch.tensor(
+        [[0.25, 0.5, 0.25]], device=device, dtype=torch.float32
+    ).repeat(tokens, 1)
+    if tokens > 1:
+        # A seven-row tail, repeated routes, and an empty fourth expert.
+        ids[:7, 2] = 2
+    actual = flaggems_vllm.fused_marlin_moe(
+        x, w1, w2, None, None, s1, s2, weights, ids, QUANT_TYPE_UINT8B128
+    )
+    expected = (
+        (40 * ((ids + 1) * weights).sum(dim=1, keepdim=True))
+        .to(x.dtype)
+        .expand_as(actual)
+    )
+    gems_assert_equal(actual, expected)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
     flaggems_vllm.vendor_name != "ascend", reason="Ascend workspace bound"
 )
 @pytest.mark.parametrize(("hidden_size", "workspace_mib"), [(1024, 24), (2048, 40)])

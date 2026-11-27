@@ -210,9 +210,11 @@ def dot_resident_pairs(
     BN: tl.constexpr,
     PANEL_N: tl.constexpr = 0,
     STREAM_FIRST: tl.constexpr = False,
+    acc=None,
 ):
     zero = pid * 0
-    acc = tl.full((BM, BN), 0, tl.float32)
+    if acc is None:
+        acc = tl.full((BM, BN), 0, tl.float32)
     for pair in range(K // 256):
         a0 = tle.dsa.extract_slice(a_all, [zero, pair * 256], [BM, 128], [1, 1])
         b0 = load_cube_weight_stage(Work, pid, iteration, BN, PANEL_N, STREAM_FIRST)
@@ -302,6 +304,26 @@ def cube_tile_pair(
         acc, iteration = dot_resident_pairs(
             a_all, Work, pid, iteration, K, BM, BN, PANEL_N, STREAM_FIRST
         )
+    elif (
+        A.dtype.element_ty == tl.float16
+        and BM == 64
+        and BN == 512
+        and not PANEL_N
+        and not STAGE_N
+        and K % 1024 == 0
+        and N % 1024 == 0
+    ):
+        acc = tl.full((BM, BN), 0, tl.float32)
+        for slab in range(K // 1024):
+            kk = slab * 1024 + tl.arange(0, 1024)
+            ptr = A + (row + mi[:, None]) * K + kk[None, :]
+            if RowEnd is None:
+                a_slab = tl.load(ptr)
+            else:
+                a_slab = tl.load(ptr, row + mi[:, None] < RowEnd, other=0)
+            acc, iteration = dot_resident_pairs(
+                a_slab, Work, pid, iteration, 1024, BM, BN, acc=acc
+            )
     else:
         acc = tl.full((BM, BN), 0, tl.float32)
         for pair in range(K // 256):
@@ -889,8 +911,20 @@ def decode_ub_tile(q, s):
 
 @triton.jit
 def dequantize_fp16_wide(
-    Q, S, Work, expert, col, pid, sub, iteration, N: tl.constexpr, K: tl.constexpr
+    Q,
+    S,
+    Work,
+    expert,
+    col,
+    pid,
+    sub,
+    iteration,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    groups=None,
 ):
+    if groups is None:
+        groups = K // 128
     q0 = tle.dsa.alloc((128, 128), tl.uint8, tle.dsa.ascend.UB)
     q1 = tle.dsa.alloc((128, 128), tl.uint8, tle.dsa.ascend.UB)
     s0 = tle.dsa.alloc((128, 1), tl.float16, tle.dsa.ascend.UB)
@@ -900,7 +934,7 @@ def dequantize_fp16_wide(
     ix = tl.arange(0, 128)[:, None] * 128 + tl.arange(0, 128)[None, :]
     copy_decode_input(Q, q0, first, 128)
     copy_decode_input(S, s0, first, 1)
-    for kb in range(K // 128):
+    for kb in range(groups):
         row = first + kb * N
         copy_decode_input(Q, q1, row + 128, 128)
         copy_decode_input(S, s1, row + 128, 1)
@@ -909,7 +943,7 @@ def dequantize_fp16_wide(
             sync_ring_wait("cube", "vector", 3)
         dest = Work + ((pid * 4 + (iteration & 3)) * 512 + sub * 256) * 128
         tl.store(dest + ix, h0)
-        if kb + 1 < K // 128:
+        if kb + 1 < groups:
             copy_decode_input(Q, q0, row + N, 128)
             copy_decode_input(S, s0, row + N, 1)
         h1 = decode_ub_tile(q1, s1)
@@ -1373,12 +1407,87 @@ def expert_panel_kernel(
     GRID: tl.constexpr,
     STAGES: tl.constexpr = 1,
     EXPERT_OUTER: tl.constexpr = False,
+    GateCache=None,
 ):
     pid = tl.program_id(0)
     COLS: tl.constexpr = N // BN
     with tle.scope(core_mode="cube"):
         cube_iteration = 0
-        if BM == 32:
+        if GateCache is not None:
+            # A panel contains matching gate/up columns. Vector consumes one
+            # projection tile while Cube writes the next into the other slot.
+            projection_tile = 0
+            for task in range(pid, E * COLS, GRID):
+                expert = task // COLS
+                count = tl.load(Counts + expert)
+                if count > 0:
+                    begin = tl.load(Offsets + expert)
+                    panel = Work + pid * BN * K
+                    for start in range(0, count, 128):
+                        if projection_tile >= 2:
+                            tle.dsa.ascend.sync_block_wait(
+                                "vector",
+                                "cube",
+                                6,
+                                sender_pipe=al.PIPE.PIPE_MTE2,
+                                receiver_pipe=al.PIPE.PIPE_FIX,
+                            )
+                        cache_tile = (
+                            GateCache + (pid * 2 + (projection_tile & 1)) * 128 * BN
+                        )
+                        inputs = A + (begin + start) * K
+                        if start == 0:
+                            cube_tile_pair(
+                                inputs,
+                                panel,
+                                cache_tile,
+                                pid * 0,
+                                0,
+                                pid,
+                                pid * 0,
+                                K,
+                                BN,
+                                128,
+                                BN,
+                                count - start,
+                                BN,
+                                True,
+                            )
+                        else:
+                            cube_tile_pair(
+                                inputs,
+                                panel,
+                                cache_tile,
+                                pid * 0,
+                                0,
+                                pid,
+                                pid * 0,
+                                K,
+                                BN,
+                                128,
+                                BN,
+                                count - start,
+                                BN,
+                                False,
+                            )
+                        tle.dsa.ascend.sync_block_set(
+                            "cube",
+                            "vector",
+                            5,
+                            sender_pipe=al.PIPE.PIPE_FIX,
+                            receiver_pipe=al.PIPE.PIPE_MTE2,
+                        )
+                        projection_tile += 1
+                    sync_ring_set("cube", "vector", 3)
+            for _ in range(tl.minimum(projection_tile, 2)):
+                tle.dsa.ascend.sync_block_wait(
+                    "vector",
+                    "cube",
+                    6,
+                    sender_pipe=al.PIPE.PIPE_MTE2,
+                    receiver_pipe=al.PIPE.PIPE_FIX,
+                )
+        elif BM == 32:
             # Consume only this expert's 32-row-aligned range.
             for task in range(pid, E * COLS, GRID):
                 expert = task // COLS
@@ -1642,9 +1751,13 @@ def expert_panel_kernel(
                             sync_ring_wait("cube", "vector", 4)
                         vector_iteration += 1
         else:
+            projection_tile = 0
             for vector_task in range(pid, E * COLS, GRID):
                 vector_expert = vector_task // COLS
-                vector_col = vector_task % COLS * BN + sub * VBN
+                if GateCache is not None:
+                    vector_col = vector_task % COLS * VBN + sub * (N // 2)
+                else:
+                    vector_col = vector_task % COLS * BN + sub * VBN
                 vector_count = tl.load(Counts + vector_expert)
                 if vector_count > 0:
                     if vector_iteration >= STAGES:
@@ -1676,6 +1789,41 @@ def expert_panel_kernel(
                     for _ in range(tl.minimum(K // 128, 2)):
                         sync_ring_wait("cube", "vector", 4)
                     vector_iteration += 1
+                    if GateCache is not None:
+                        begin = tl.load(Offsets + vector_expert)
+                        col = vector_task % COLS * VBN
+                        rows = sub * 64 + tl.arange(0, 64)
+                        tile_offsets = rows[:, None] * BN + ns[None, :]
+                        for start in range(0, vector_count, 128):
+                            tle.dsa.ascend.sync_block_wait(
+                                "cube",
+                                "vector",
+                                5,
+                                sender_pipe=al.PIPE.PIPE_FIX,
+                                receiver_pipe=al.PIPE.PIPE_MTE2,
+                            )
+                            cache_tile = (
+                                GateCache + (pid * 2 + (projection_tile & 1)) * 128 * BN
+                            )
+                            gate = tl.load(cache_tile + tile_offsets).to(tl.float32)
+                            up = tl.load(cache_tile + tile_offsets + VBN).to(tl.float32)
+                            activated = gate / (1 + tl.exp(-gate)) * up
+                            tle.dsa.ascend.sync_block_set(
+                                "vector",
+                                "cube",
+                                6,
+                                sender_pipe=al.PIPE.PIPE_MTE2,
+                                receiver_pipe=al.PIPE.PIPE_FIX,
+                            )
+                            tl.store(
+                                Output
+                                + (begin + start + rows[:, None]) * (N // 2)
+                                + col
+                                + ns[None, :],
+                                activated.to(tl.float16),
+                                start + rows[:, None] < vector_count,
+                            )
+                            projection_tile += 1
         drain_weight_ring(vector_iteration, STAGES)
 
 
@@ -1693,12 +1841,15 @@ def grouped_quantized_gemm(
     expert_panel=False,
     routes=None,
     topk=1,
+    fuse_swiglu=False,
 ):
     n, k = out.shape[1], a.shape[1]
     cores = triton.runtime.driver.active.utils.get_device_properties(a.device.index)[
         "num_aicore"
     ]
     if expert_panel:
+        if fuse_swiglu:
+            n *= 2
         panel_bn = 256
         expert_outer = k <= 512 and bm != 32
         panel_stages = 2 if expert_outer else 1
@@ -1707,6 +1858,11 @@ def grouped_quantized_gemm(
         )
         panel_work = torch.empty(
             panel_grid * panel_stages * panel_bn * k, device=a.device, dtype=a.dtype
+        )
+        gate_cache = (
+            torch.empty((panel_grid, 2, 128, panel_bn), device=a.device, dtype=a.dtype)
+            if fuse_swiglu
+            else None
         )
         expert_panel_kernel[(panel_grid,)](
             a,
@@ -1725,6 +1881,7 @@ def grouped_quantized_gemm(
             panel_grid,
             panel_stages,
             expert_outer,
+            GateCache=gate_cache,
             disable_auto_inject_block_sync=True,
             num_warps=1,
             enable_fp_fusion=False,
@@ -2000,6 +2157,160 @@ def small_fused_kernel(
             tle.dsa.ascend.sync_block_all("all", 10)
 
 
+@triton.jit
+def project_route_intervals(
+    A,
+    Q,
+    S,
+    IDs,
+    Work,
+    Partial,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    R: tl.constexpr,
+    TOP: tl.constexpr,
+    GRID: tl.constexpr,
+    VECTOR: tl.constexpr,
+):
+    # Partition the flattened (route, output tile, K pair) space across cores.
+    # A core writes one FP32 fragment for each output tile its interval touches.
+    pid = tl.program_id(0)
+    pairs: tl.constexpr = K // 256
+    tiles: tl.constexpr = R * (N // 512)
+    total: tl.constexpr = tiles * pairs
+    start = pid * total // GRID
+    stop = (pid + 1) * total // GRID
+    iteration = 0
+    for tile in range(start // pairs, tl.cdiv(stop, pairs)):
+        route = tile // (N // 512)
+        first_pair = tl.maximum(0, start - tile * pairs)
+        stop_pair = tl.minimum(pairs, stop - tile * pairs)
+        if VECTOR:
+            col = (tile % (N // 512)) * 512
+            expert = tl.load(IDs + route)
+            offset = first_pair * 2 * N
+            iteration = dequantize_fp16_wide(
+                Q + offset * 128,
+                S + offset,
+                Work,
+                expert,
+                col,
+                pid,
+                tle.dsa.ascend.sub_vec_id(),
+                iteration,
+                N,
+                K,
+                2 * (stop_pair - first_pair),
+            )
+        else:
+            row = A + (route // TOP) * K
+            k_offsets = tl.arange(0, 128)[None, :]
+            acc = tl.full((1, 512), 0, tl.float32)
+            for pair in range(first_pair, stop_pair):
+                a0 = tl.load(row + pair * 256 + k_offsets)
+                b0 = load_cube_weight_stage(Work, pid, iteration, 512)
+                a1 = tl.load(row + pair * 256 + 128 + k_offsets)
+                b1 = load_cube_weight_stage(Work, pid, iteration + 1, 512)
+                acc = tl.dot(a0, b0, acc)
+                acc = tl.dot(a1, b1, acc)
+                iteration += 2
+            tl.store(Partial + (tile + pid) * 512 + tl.arange(0, 512)[None, :], acc)
+    if VECTOR:
+        drain_weight_ring(iteration, 4)
+
+
+@triton.jit
+def read_route_projection(
+    Partial, tile, lanes, K: tl.constexpr, TILES: tl.constexpr, GRID: tl.constexpr
+):
+    # Invert the integer interval partition. Fragments for a tile are adjacent
+    # at tile + core_id and are added in their original K order.
+    pairs: tl.constexpr = K // 256
+    total: tl.constexpr = TILES * pairs
+    first = tl.cdiv((tile * pairs + 1) * GRID, total) - 1
+    last = tl.cdiv((tile + 1) * pairs * GRID, total) - 1
+    offset = Partial + (tile + first) * 512 + lanes
+    value = tl.load(offset)
+    for fragment in range(1, last - first + 1):
+        value += tl.load(offset + fragment * 512)
+    return value.to(tl.float16).to(tl.float32)
+
+
+@triton.jit
+def small_route_interval_kernel(
+    X,
+    Q1,
+    S1,
+    Q2,
+    S2,
+    IDs,
+    Probabilities,
+    Work,
+    GateUp,
+    Activated,
+    Projected,
+    Output,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    M: tl.constexpr,
+    T: tl.constexpr,
+    GRID: tl.constexpr,
+):
+    routes: tl.constexpr = M * T
+    with tle.scope(core_mode="cube"):
+        project_route_intervals(
+            X, Q1, S1, IDs, Work, GateUp, K, 2 * N, routes, T, GRID, False
+        )
+        tle.dsa.ascend.sync_block_all("all", 10)
+        tle.dsa.ascend.sync_block_all("all", 10)
+        project_route_intervals(
+            Activated, Q2, S2, IDs, Work, Projected, N, K, routes, 1, GRID, False
+        )
+        tle.dsa.ascend.sync_block_all("all", 10)
+    with tle.scope(core_mode="vector"):
+        vector_id = 2 * tl.program_id(0) + tle.dsa.ascend.sub_vec_id()
+        project_route_intervals(
+            X, Q1, S1, IDs, Work, GateUp, K, 2 * N, routes, T, GRID, True
+        )
+        tle.dsa.ascend.sync_block_all("all", 10)
+        lanes = tl.arange(0, 256)
+        for block in range(vector_id, routes * (N // 256), 2 * GRID):
+            route = block // (N // 256)
+            col = block % (N // 256) * 256
+            tile = route * (2 * N // 512) + col // 512
+            gate = read_route_projection(
+                GateUp, tile, col % 512 + lanes, K, routes * (2 * N // 512), GRID
+            )
+            up = read_route_projection(
+                GateUp,
+                tile + N // 512,
+                col % 512 + lanes,
+                K,
+                routes * (2 * N // 512),
+                GRID,
+            )
+            tl.store(
+                Activated + route * N + col + lanes, gate / (1 + tl.exp(-gate)) * up
+            )
+        tle.dsa.ascend.sync_block_all("all", 10)
+        project_route_intervals(
+            Activated, Q2, S2, IDs, Work, Projected, N, K, routes, 1, GRID, True
+        )
+        tle.dsa.ascend.sync_block_all("all", 10)
+        for block in range(vector_id, M * (K // 256), 2 * GRID):
+            row = block // (K // 256)
+            col = block % (K // 256) * 256
+            acc = tl.full((256,), 0, tl.float32)
+            for slot in range(T):
+                route = row * T + slot
+                tile = route * (K // 512) + col // 512
+                value = read_route_projection(
+                    Projected, tile, col % 512 + lanes, N, routes * (K // 512), GRID
+                )
+                acc += value * tl.load(Probabilities + route).to(tl.float32)
+            tl.store(Output + row * K + col + lanes, acc)
+
+
 @lru_cache(maxsize=128)
 def small_route_workspace_sizes(m, k, n, t, g, bits, first_columns, second_columns):
     r = m * t
@@ -2027,12 +2338,50 @@ def small_route_moe(x, w1, w2, s1, s2, p, ids, out, bits):
     fp16_int8 = bits == 8 and x.dtype == torch.float16
     split_projection = fp16_int8 and k == 4096 and n == 256
     wide_projection = fp16_int8 and k % 1024 == 0 and n % 1024 == 0
+    if wide_projection:
+        routes = m * t
+        g = min(
+            g, routes * (2 * n // 512) * (k // 256), routes * (k // 512) * (n // 256)
+        )
+        # Each of the G-1 interval boundaries adds at most one extra fragment.
+        gate_up = torch.empty(
+            routes * 2 * n + (g - 1) * 512, device=x.device, dtype=torch.float32
+        )
+        projected = torch.empty(
+            routes * k + (g - 1) * 512, device=x.device, dtype=torch.float32
+        )
+        activated = torch.empty((routes, n), device=x.device, dtype=x.dtype)
+        decode_buffer = torch.empty(g * 4 * 512 * 128, device=x.device, dtype=x.dtype)
+        small_route_interval_kernel[(g,)](
+            x,
+            w1,
+            s1,
+            w2,
+            s2,
+            ids,
+            p,
+            decode_buffer,
+            gate_up,
+            activated,
+            projected,
+            out,
+            k,
+            n,
+            m,
+            t,
+            g,
+            disable_auto_inject_block_sync=True,
+            num_warps=1,
+            enable_fp_fusion=False,
+            multibuffer=False,
+        )
+        return
     first_columns = (
         512
-        if wide_projection or (split_projection and m * t > g // 2)
+        if split_projection and m * t > g // 2
         else (256 if bits == 8 or k > 4096 else GROUP_SIZE)
     )
-    second_columns = min(k & -k, 512 if wide_projection or split_projection else 256)
+    second_columns = min(k & -k, 512 if split_projection else 256)
     sizes = small_route_workspace_sizes(
         m, k, n, t, g, bits, first_columns, second_columns
     )
@@ -2670,8 +3019,15 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
             decode_bytes = (
                 cores * (256 * max(k, n, 1024) if panel else 4 * 512 * GROUP_SIZE) * 2
             )
+            # Retain only activated rows when many routes reuse each decoded panel.
+            fuse_up = (
+                panel and bm == 32 and k % 1024 == 0 and n % 1024 == 0 and r > e * 256
+            )
+            if fuse_up:
+                # Two 128x256 FP16 projection tiles per Cube core.
+                decode_bytes += cores * 2 * 128 * 256 * 2
             workspace = (
-                padded * (k + 3 * n) * 2
+                padded * (k + (n if fuse_up else 3 * n)) * 2
                 + decode_bytes
                 + 4
                 * (
@@ -2739,6 +3095,7 @@ def run_quantized_moe(x, w1, w2, s1, s2, topk_weights, topk_ids, bits):
                 route_block,
                 need_routes,
                 panel,
+                fuse_up,
             )
         del ids
         start = end
@@ -2768,6 +3125,16 @@ def grouped_route_geometry(m, t, e, k, n, bits, dtype):
         or (n > 4096 and r >= e * 64)
         else 64 if m >= 1024 or r >= e * 64 else 32 if m > 32 else 16
     )
+    # Sparse routes need only a few aligned rows per expert. Skewed experts
+    # can occupy multiple consecutive tiles.
+    if (
+        bits == 8
+        and dtype == torch.float16
+        and k % 1024 == 0
+        and n % 1024 == 0
+        and r <= e
+    ):
+        bm = 4
     use_small_m = (
         bits == 8
         and dtype == torch.float16
@@ -2798,6 +3165,7 @@ def grouped_route_moe(
     route_block,
     need_routes,
     panel,
+    fuse_up,
 ):
     m, k = x.shape
     e, _, n2, _ = w1.shape
@@ -2817,7 +3185,6 @@ def grouped_route_moe(
         if use_small_m
         else torch.empty((padded, k), device=x.device, dtype=x.dtype)
     )
-    h = torch.empty((padded, 2 * n), device=x.device, dtype=x.dtype)
     if not use_small_m:
         if bits == 8 and k == 4096:
             if bm not in (32, 64) and not panel:
@@ -2829,6 +3196,7 @@ def grouped_route_moe(
             )
         else:
             pack_hidden_states(x, routes, counts, offsets, experts, packed_x, bm, t)
+    h = torch.empty((padded, n if fuse_up else 2 * n), device=x.device, dtype=x.dtype)
     if use_small_m:
         grouped_quantized_gemm(
             x,
@@ -2847,20 +3215,34 @@ def grouped_route_moe(
         grouped_quantized_gemm(packed_x, w1, s1, experts, h, bm, bits, counts, offsets)
     elif panel or (bits == 8 and k == 4096 and n == 256 and bm == 128):
         grouped_quantized_gemm(
-            packed_x, w1, s1, experts, h, bm, bits, counts, offsets, True, panel
+            packed_x,
+            w1,
+            s1,
+            experts,
+            h,
+            bm,
+            bits,
+            counts,
+            offsets,
+            True,
+            panel,
+            fuse_swiglu=fuse_up,
         )
     else:
         grouped_quantized_gemm(packed_x, w1, s1, experts, h, bm, bits, offsets=offsets)
     del routes
-    a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
-    apply_swiglu(
-        h,
-        a,
-        offsets,
-        tile_experts=experts if panel else None,
-        counts=counts if panel else None,
-        bm=bm,
-    )
+    if fuse_up:
+        a = h
+    else:
+        a = torch.empty((padded, n), device=x.device, dtype=x.dtype)
+        apply_swiglu(
+            h,
+            a,
+            offsets,
+            tile_experts=experts if panel else None,
+            counts=counts if panel else None,
+            bm=bm,
+        )
     del h
     z = (
         packed_x
