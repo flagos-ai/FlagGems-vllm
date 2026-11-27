@@ -1,0 +1,3 @@
+# Independent main export-order repair #1504
+
+PR1504, head0613bb0a on main a7809702, moves one A5 __all__ entry into the required case-insensitive order. Imports, all five unique exported names and all other ASTs remain identical. The original whole-tree validator failure from main #1496 was reproduced; all13 export files then passed, as did export registration, changed-file compute policy, Black/isort/flake8 and diffcheck. No operator implementation or runtime/provider pin changed, so no new numerical/performance claim is made. Formal rule-check has passed; required H20 completion and human review are separate.

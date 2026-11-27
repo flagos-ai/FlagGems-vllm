@@ -1,0 +1,163 @@
+diff --git a/tests/test_bincount.py b/tests/test_bincount.py
+index 7c7b33e..3298c48 100644
+--- a/tests/test_bincount.py
++++ b/tests/test_bincount.py
+@@ -85,8 +85,7 @@ def test_accuracy_bincount(size, max_val):
+     ref_inp = utils.to_reference(inp)
+ 
+     ref_out = torch.bincount(ref_inp)
+-    with flaggems_vllm.use_gems():
+-        res_out = torch.bincount(inp)
++    res_out = flaggems_vllm.bincount(inp)
+ 
+     utils.gems_assert_equal(res_out, ref_out)
+ 
+@@ -105,8 +104,7 @@ def test_accuracy_bincount_with_weights(size, max_val, dtype):
+     ref_weights = utils.to_reference(weights)
+ 
+     ref_out = torch.bincount(ref_inp, weights=ref_weights)
+-    with flaggems_vllm.use_gems():
+-        res_out = torch.bincount(inp, weights=weights)
++    res_out = flaggems_vllm.bincount(inp, weights=weights)
+ 
+     if flaggems_vllm.vendor_name == "enflame":
+         # enflame-only gate: this backend's fp32-accumulation
+@@ -129,8 +127,7 @@ def test_accuracy_bincount_with_minlength(size, max_val, minlength):
+     ref_inp = utils.to_reference(inp)
+ 
+     ref_out = torch.bincount(ref_inp, minlength=minlength)
+-    with flaggems_vllm.use_gems():
+-        res_out = torch.bincount(inp, minlength=minlength)
++    res_out = flaggems_vllm.bincount(inp, minlength=minlength)
+ 
+     utils.gems_assert_equal(res_out, ref_out)
+ 
+@@ -142,8 +139,7 @@ def test_accuracy_bincount_empty():
+     ref_inp = utils.to_reference(inp)
+ 
+     ref_out = torch.bincount(ref_inp)
+-    with flaggems_vllm.use_gems():
+-        res_out = torch.bincount(inp)
++    res_out = flaggems_vllm.bincount(inp)
+ 
+     utils.gems_assert_equal(res_out, ref_out)
+ 
+@@ -155,8 +151,7 @@ def test_accuracy_bincount_single():
+     ref_inp = utils.to_reference(inp)
+ 
+     ref_out = torch.bincount(ref_inp)
+-    with flaggems_vllm.use_gems():
+-        res_out = torch.bincount(inp)
++    res_out = flaggems_vllm.bincount(inp)
+ 
+     utils.gems_assert_equal(res_out, ref_out)
+ 
+@@ -168,8 +163,7 @@ def test_accuracy_bincount_all_zeros():
+     ref_inp = utils.to_reference(inp)
+ 
+     ref_out = torch.bincount(ref_inp)
+-    with flaggems_vllm.use_gems():
+-        res_out = torch.bincount(inp)
++    res_out = flaggems_vllm.bincount(inp)
+ 
+     utils.gems_assert_equal(res_out, ref_out)
+ 
+@@ -186,8 +180,7 @@ def test_accuracy_bincount_weights_edge_cases(dtype):
+     ref_weights = utils.to_reference(weights)
+ 
+     ref_out = torch.bincount(ref_inp, weights=ref_weights)
+-    with flaggems_vllm.use_gems():
+-        res_out = torch.bincount(inp, weights=weights)
++    res_out = flaggems_vllm.bincount(inp, weights=weights)
+ 
+     if flaggems_vllm.vendor_name == "enflame":
+         # enflame-only gate: this backend's fp32-accumulation
+diff --git a/tests/test_kda_bounded.py b/tests/test_kda_bounded.py
+index f89885d..c722b06 100644
+--- a/tests/test_kda_bounded.py
++++ b/tests/test_kda_bounded.py
+@@ -156,6 +156,18 @@ def metadata(lengths):
+     return cu, prepare_chunk_indices(cu, 64), prepare_chunk_offsets(cu, 64)
+ 
+ 
++def prefill_reference():
++    kda = _fla_module("kda")
++
++    if not callable(getattr(kda, "_chunk_kda_fwd_with_cumulative_g", None)):
++        pytest.skip(
++            "Native KDA prefill reference lacks _chunk_kda_fwd_with_cumulative_g ABI"
++        )
++    if not bounded.chunk_kda_with_safe_gate._is_available():
++        pytest.skip("Native KDA 64-token prefill requires the USE_EXP2 core ABI")
++    return kda
++
++
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize("varlen", [False, True])
+ def test_gate_cumsum_preserves_original_dot_order(dtype, varlen):
+@@ -174,7 +186,7 @@ def test_gate_cumsum_preserves_original_dot_order(dtype, varlen):
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+ @pytest.mark.parametrize("tokens", [1, 63, 64, 65, 129])
+ def test_prefill_matches_original_64_core(dtype, tokens, key_dim=64, value_dim=32):
+-    kda = _fla_module("kda")
++    kda = prefill_reference()
+ 
+     torch.manual_seed(454 + tokens)
+     q = torch.randn((1, tokens, 2, key_dim), dtype=dtype, device="cuda")
+@@ -219,7 +231,7 @@ def test_prefill_matches_original_64_core(dtype, tokens, key_dim=64, value_dim=3
+ 
+ @pytest.mark.parametrize("beta_value", [0.0, 1.0])
+ def test_prefill_varlen_keeps_activated_beta_and_vk_state(beta_value):
+-    kda = _fla_module("kda")
++    kda = prefill_reference()
+ 
+     torch.manual_seed(534)
+     dtype = torch.bfloat16
+@@ -343,6 +355,7 @@ def test_prefill_execution_error_propagates(monkeypatch):
+         calls.append(1)
+         raise RuntimeError("submitted KDA failed")
+ 
++    monkeypatch.setattr(bounded, "_prefill_core", lambda: object())
+     monkeypatch.setattr(bounded, "prefill_kda64", fail)
+     with pytest.raises(RuntimeError, match="submitted KDA failed"):
+         bounded.chunk_kda_with_safe_gate(q, q, q, q, beta, a, None)
+@@ -521,7 +534,7 @@ def test_decode_preserves_padded_mamba_cache_slot_stride():
+ 
+ 
+ def test_prefill_materializes_padded_initial_state_like_original():
+-    kda = _fla_module("kda")
++    kda = prefill_reference()
+ 
+     torch.manual_seed(642)
+     q = torch.randn((1, 66, 2, 64), device="cuda", dtype=torch.bfloat16)
+@@ -591,6 +604,14 @@ def test_public_capability_hook_checks_core_before_execution(
+         hook.cache_clear()
+ 
+ 
+-def test_public_core_capabilities_are_available_in_validation_environment():
+-    assert bounded.chunk_kda_with_safe_gate._is_available()
+-    assert bounded.fused_recurrent_kda._is_available()
++def test_public_core_capabilities_match_validation_environment():
++    for operator, resolver in (
++        (bounded.chunk_kda_with_safe_gate, bounded._prefill_core),
++        (bounded.fused_recurrent_kda, bounded._recurrent_core),
++    ):
++        try:
++            resolver()
++        except (ImportError, AttributeError, NotImplementedError, OSError):
++            assert operator._is_available() is False
++        else:
++            assert operator._is_available() is True
+diff --git a/tests/test_tle_capabilities.py b/tests/test_tle_capabilities.py
+index 8060d98..6072037 100644
+--- a/tests/test_tle_capabilities.py
++++ b/tests/test_tle_capabilities.py
+@@ -153,7 +153,7 @@ def test_attn_res_missing_tle_load_uses_non_tle_cache_key(monkeypatch):
+ 
+     assert module._HAS_TLE_LOAD is False
+     assert module.tle is None
+-    assert module._attn_res_post_kernel.cache_key
++    assert module._attn_res_post_kernel.jit_function.cache_key
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

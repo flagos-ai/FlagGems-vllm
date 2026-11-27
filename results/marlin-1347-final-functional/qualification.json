@@ -1,0 +1,78 @@
+{
+  "status": "G5_PASS",
+  "candidate_head": "c237ed4689172a0e8a421a04c588a129447851c6",
+  "full_original_module_plus_strict_stage_test_completed": true,
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "original_PRhead": "e5c1a998ff233a0e5ab09f861fcb150ce4c11f7a",
+  "tree": "4be9e45c28f1dfa34b382d8425c3f291a16ea463",
+  "physicalGPU": 6,
+  "collected": 659,
+  "passed": 483,
+  "failed": 0,
+  "skipped": 176,
+  "skips_by_reason": {
+    "T-Head split GEMV": 17,
+    "T-Head bounded dense path": 22,
+    "T-Head dispatch is only available on T-Head devices": 1,
+    "W8A16 FP8 specialization is only available on T-Head PPU": 48,
+    "T-Head dense path": 18,
+    "T-Head FP8 graph replay": 4,
+    "T-Head MXFP4": 18,
+    "T-Head E4M3 byte decoding": 40,
+    "T-Head grouped/reduce-direct coverage": 8
+  },
+  "failures": [],
+  "context": {
+    "conftest": "/candidate/tests/conftest.py",
+    "device_context_poisoned": false,
+    "pytest_exitstatus": 0
+  },
+  "state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-11-27T11:01:56.887543072Z",
+    "FinishedAt": "2026-11-27T11:35:17.914175571Z"
+  },
+  "natural_exit": true,
+  "source_after_host": {
+    "source": "sources/marlin",
+    "files": 1808,
+    "passed": true
+  },
+  "positive_CID_absence": true,
+  "afterGPUidle_noPID": true,
+  "raw_archive": "D:\\Codex\\work\\fgv-revalidation-20261127\\nvidia\\marlin-g5-testfix-complete-raw-v2.tar.gz",
+  "raw_sha256": "9fbb861eafa3f3053fef7ba0ffbf1f116b6c23499e5430d6e7a7e0c7c42a15b6",
+  "raw_bytes": 110922,
+  "old_full_G5_1F_preserved": "marlin-g5-qualification-v1.json",
+  "G6_diagnostic_result": "9/14 performance pass; full 14 numerical pass; gate remains failed",
+  "G6_production_identity": {
+    "src/flaggems_vllm/ops/fused_marlin_moe.py": {
+      "raw_git_blob": "16ddd941b57b1c25c4144747603d09897eec7e8b",
+      "sha256": "5e0af468904be2907d325aa1172ceb54545377bf18363cfe083a074bb32ecebd",
+      "unchanged_from_original_G6": true
+    },
+    "src/flaggems_vllm/runtime/backend/_nvidia/hopper/tune_configs.yaml": {
+      "raw_git_blob": "525fd630bade75084e2ef4f018e0111cf66457d7",
+      "sha256": "d045934b7cfa768fb62a3e723ba069812d93f54e5540fb9e5c6b87c639b760f6",
+      "unchanged_from_original_G6": true
+    },
+    "benchmark/test_fused_marlin_moe_w8a16_int8.py": {
+      "raw_git_blob": "9505377f50b7e26333fc1b5a1fa80cda2215c42d",
+      "sha256": "c65ba0b30ee2e916084f799e5dc782f5c3ebb64f9ebb65f38cef9f3848cfa37b",
+      "unchanged_from_original_G6": true
+    },
+    "benchmark/test_fused_marlin_moe_w8a16_fp8.py": {
+      "raw_git_blob": "78bd4d694524ee7324b1915814eacf203e204f76",
+      "sha256": "01b8427aee2b654c911a27a8b91e07fa1053deda1975e60a827a2925f958a983",
+      "unchanged_from_original_G6": true
+    }
+  }
+}

@@ -1,0 +1,136 @@
+[
+  {
+    "name": "check-init-exports",
+    "command": [
+      "C:\\Users\\BAAI\\miniconda3\\python.exe",
+      "-X",
+      "utf8",
+      "-B",
+      "tools/ci_checks/check_init_exports.py"
+    ],
+    "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+    "exit": 0,
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\a5-export-order\\check-init-exports.log",
+    "raw_sha256": "777c3597548743b8ccb784c159f6d7479e77fc70ee4a06401139f1cd1b1ada30",
+    "output_tail": " passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_ascend\\ops\\__init__.py...\r\n  __all__ has 73 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_enflame\\ops\\__init__.py...\r\n  __all__ has 172 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_hygon\\ops\\__init__.py...\r\n  __all__ has 37 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_iluvatar\\ops\\__init__.py...\r\n  __all__ has 11 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_kunlunxin\\ops\\__init__.py...\r\n  __all__ has 3 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_metax\\ops\\__init__.py...\r\n  __all__ has 25 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_mthreads\\ops\\__init__.py...\r\n  __all__ has 32 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_nvidia\\ampere\\ops\\__init__.py...\r\n  __all__ not found (skipping __all__ checks)\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_nvidia\\hopper\\ops\\__init__.py...\r\n  __all__ has 2 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_nvidia\\ops\\__init__.py...\r\n  __all__ has 2 entries\r\n  \u2705 All checks passed\r\n\r\nChecking src\\flaggems_vllm\\runtime\\backend\\_thead\\ops\\__init__.py...\r\n  __all__ has 24 entries\r\n  \u2705 All checks passed\r\n\r\n======================================================================\r\n\u2705 All 13 file(s) passed all checks.\r\n"
+  },
+  {
+    "name": "check-export-registry",
+    "command": [
+      "C:\\Users\\BAAI\\miniconda3\\python.exe",
+      "-X",
+      "utf8",
+      "-B",
+      "tools/ci_checks/check_exported_ops_registered.py"
+    ],
+    "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+    "exit": 0,
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\a5-export-order\\check-export-registry.log",
+    "raw_sha256": "107fa684af70db69d8750b073a5c2658016ad05da90b4993043a8b412dfc42c5",
+    "output_tail": "\u2705 221 exported op(s) checked, 74 pre-existing baseline exemption(s).\r\n"
+  },
+  {
+    "name": "check-no-torch-fallback",
+    "command": [
+      "C:\\Users\\BAAI\\miniconda3\\python.exe",
+      "-X",
+      "utf8",
+      "-B",
+      "tools/ci_checks/check_no_torch_fallback.py",
+      "src/flaggems_vllm/runtime/backend/_ascend/a5/ops/__init__.py"
+    ],
+    "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+    "exit": 0,
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\a5-export-order\\check-no-torch-fallback.log",
+    "raw_sha256": "85a31b093b5b0f8a685287e3008b7051cafb68c8882d491c8e2ea3620c17345f",
+    "output_tail": "checked 1 files, 0 violation(s)\r\n"
+  },
+  {
+    "name": "black-original-version",
+    "command": [
+      "C:\\Users\\BAAI\\miniconda3\\python.exe",
+      "-X",
+      "utf8",
+      "-B",
+      "-m",
+      "black",
+      "--check",
+      "--diff",
+      "src/flaggems_vllm/runtime/backend/_ascend/a5/ops/__init__.py"
+    ],
+    "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+    "exit": 0,
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\a5-export-order\\black-original-version.log",
+    "raw_sha256": "b746261942fbf2a3759f07dc70d3825a6fc444269a620032fadcdd3ac05eb2e4",
+    "output_tail": "All done! \u2728 \ud83c\udf70 \u2728\r\n1 file would be left unchanged.\r\n"
+  },
+  {
+    "name": "isort-original-version",
+    "command": [
+      "C:\\Users\\BAAI\\miniconda3\\python.exe",
+      "-X",
+      "utf8",
+      "-B",
+      "-m",
+      "isort",
+      "--check-only",
+      "--diff",
+      "--profile",
+      "black",
+      "src/flaggems_vllm/runtime/backend/_ascend/a5/ops/__init__.py"
+    ],
+    "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+    "exit": 0,
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\a5-export-order\\isort-original-version.log",
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "output_tail": ""
+  },
+  {
+    "name": "flake8-original-version",
+    "command": [
+      "C:\\Users\\BAAI\\miniconda3\\python.exe",
+      "-X",
+      "utf8",
+      "-B",
+      "-m",
+      "flake8",
+      "--ignore=F405,E731,W503,E203,E704",
+      "--max-line-length=120",
+      "src/flaggems_vllm/runtime/backend/_ascend/a5/ops/__init__.py"
+    ],
+    "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+    "exit": 0,
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\a5-export-order\\flake8-original-version.log",
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "output_tail": ""
+  },
+  {
+    "name": "git-diff-check",
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+    "exit": 0,
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\a5-export-order\\git-diff-check.log",
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "output_tail": ""
+  },
+  {
+    "name": "style-tool-versions",
+    "command": [
+      "C:\\Users\\BAAI\\miniconda3\\python.exe",
+      "-X",
+      "utf8",
+      "-B",
+      "-c",
+      "from importlib.metadata import version; import json; print(json.dumps({x:version(x) for x in ['black','isort','flake8']}))"
+    ],
+    "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+    "exit": 0,
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\a5-export-order\\style-tool-versions.log",
+    "raw_sha256": "44b037b737c973789245fb70c2dd6546b5be1dfea4b15c1494c2e68d0b92b90e",
+    "output_tail": "{\"black\": \"24.8.0\", \"isort\": \"5.12.0\", \"flake8\": \"7.1.0\"}\r\n"
+  }
+]

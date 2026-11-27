@@ -1,0 +1,357 @@
+{
+  "head": "a497988d866ee8527d434a315c2cf1bbb18654a3",
+  "tree": "d25451e07ec424fb6c8a0d7c9934e29a53d3a397",
+  "source": {
+    "pr": 1356,
+    "head": "a497988d866ee8527d434a315c2cf1bbb18654a3",
+    "tree": "d25451e07ec424fb6c8a0d7c9934e29a53d3a397",
+    "path": "D:/Codex/workspaces/FlagGems-vllm-ci-1356-shared-range-20261127",
+    "previous_published_head": "541a13c849a5ff90fe2345a61089b9b807769508",
+    "all_raw_git_blobs_matched": true,
+    "raw_blob_count": 1810,
+    "source_archive_sha256": "ff7f7fa045a3c215af97a63fec7a3dfa19e31618bebb267b462ebd7188eb97e8",
+    "pushed": false
+  },
+  "raw_sha256": "2fae84b1bf4fa838d94a8619c0287bb8234b3e501768c60e6e7714d889ed543c",
+  "counts": {
+    "all-ci-helpers": {
+      "passed": 98,
+      "skipped": 0,
+      "failed": 0
+    },
+    "workflow-policy-tests": {
+      "passed": 10,
+      "skipped": 0,
+      "failed": 0
+    }
+  },
+  "all_8_real_git_tests_executed": [
+    "test_pr_checks_exclude_stale_base_and_merge_only_files (test_ci_rule_check_ranges.RuleCheckRangesTest.test_pr_checks_exclude_stale_base_and_merge_only_files) ... ok",
+    "test_pr_forbidden_compute_is_still_rejected (test_ci_rule_check_ranges.RuleCheckRangesTest.test_pr_forbidden_compute_is_still_rejected) ... ok",
+    "test_push_ranges_and_all_file_precommit_are_unchanged (test_ci_rule_check_ranges.RuleCheckRangesTest.test_push_ranges_and_all_file_precommit_are_unchanged) ... ok",
+    "test_selected_file_is_checked_in_merged_checkout (test_ci_rule_check_ranges.RuleCheckRangesTest.test_selected_file_is_checked_in_merged_checkout) ... ok",
+    "test_unexpected_pr_checkout_is_rejected (test_ci_rule_check_ranges.RuleCheckRangesTest.test_unexpected_pr_checkout_is_rejected) ... ok",
+    "test_unittest_collects_only_pr_paths_with_nul_delimiters (test_ci_rule_check_ranges.RuleCheckRangesTest.test_unittest_collects_only_pr_paths_with_nul_delimiters) ... ok",
+    "test_unittest_push_collection_keeps_previous_ranges (test_ci_rule_check_ranges.RuleCheckRangesTest.test_unittest_push_collection_keeps_previous_ranges) ... ok",
+    "test_unittest_rejects_unexpected_pr_checkout (test_ci_rule_check_ranges.RuleCheckRangesTest.test_unittest_rejects_unexpected_pr_checkout) ... ok"
+  ],
+  "phases": [
+    {
+      "phase": "lint-dependencies",
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "pip",
+        "install",
+        "--no-index",
+        "--no-deps",
+        "--target",
+        "/tmp/ci-lint",
+        "/wheels/black-24.8.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl",
+        "/wheels/click-8.5.1-py3-none-any.whl",
+        "/wheels/flake8-7.1.0-py2.py3-none-any.whl",
+        "/wheels/isort-5.12.0-py3-none-any.whl",
+        "/wheels/mccabe-0.7.0-py2.py3-none-any.whl",
+        "/wheels/mypy_extensions-1.2.0-py3-none-any.whl",
+        "/wheels/packaging-26.4-py3-none-any.whl",
+        "/wheels/pathspec-1.1.1-py3-none-any.whl",
+        "/wheels/platformdirs-4.14.8-py3-none-any.whl",
+        "/wheels/pycodestyle-2.12.1-py2.py3-none-any.whl",
+        "/wheels/pyflakes-3.2.0-py2.py3-none-any.whl"
+      ],
+      "exit": 0,
+      "bytes": 1346,
+      "sha256": "d0dbf01456344b71762c799c96a1b0b60e90b05e37fe915b90b1d0f7263ebfec"
+    },
+    {
+      "phase": "bash-syntax",
+      "argv": [
+        "bash",
+        "-n",
+        "/source/tools/resolve-ci-pr-range.sh"
+      ],
+      "exit": 0,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "all-ci-helpers",
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools",
+        "-p",
+        "test_ci_*.py",
+        "-v"
+      ],
+      "exit": 0,
+      "bytes": 14371,
+      "sha256": "c7457db3e82f66f0d49ba0521492fa61143ed9a435d2c5e6331744f2bd9bab67"
+    },
+    {
+      "phase": "workflow-policy",
+      "argv": [
+        "/usr/bin/python3",
+        "tools/ci_checks/check_workflow_policy.py"
+      ],
+      "exit": 0,
+      "bytes": 20,
+      "sha256": "e15baa69c0681983b8738a786b3f78903f655aa7ae590c81243e5fec2be8c556"
+    },
+    {
+      "phase": "workflow-policy-tests",
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/ci_checks",
+        "-p",
+        "test_check_workflow_policy.py",
+        "-v"
+      ],
+      "exit": 0,
+      "bytes": 1321,
+      "sha256": "9d6b7b8c6d3cf22ac429851bf6be7aff2f7c4811e89018120b30bef22062b492"
+    },
+    {
+      "phase": "no-torch-fallback",
+      "argv": [
+        "/usr/bin/python3",
+        "tools/ci_checks/check_no_torch_fallback.py",
+        "tools/select_tests.py",
+        "tools/test_ci_helpers.py",
+        "tools/test_ci_rule_check_ranges.py"
+      ],
+      "exit": 0,
+      "bytes": 32,
+      "sha256": "81ac98e2a7dad0375ff4be40a2090526a4ff78f9af574f9138a5c168965212de"
+    },
+    {
+      "phase": "init-exports",
+      "argv": [
+        "/usr/bin/python3",
+        "tools/ci_checks/check_init_exports.py"
+      ],
+      "exit": 0,
+      "bytes": 2562,
+      "sha256": "1e35fcd2ff767b61692c30a4b9079f53d490aa1f0c6c23444ea26c4fbdfc0383"
+    },
+    {
+      "phase": "export-registry",
+      "argv": [
+        "/usr/bin/python3",
+        "tools/ci_checks/check_exported_ops_registered.py"
+      ],
+      "exit": 0,
+      "bytes": 71,
+      "sha256": "4ee484a98971ae10d23378351160aebf10e599932d78e4281a331a1377b226d4"
+    },
+    {
+      "phase": "black",
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "black",
+        "--check",
+        "--diff",
+        "tools/select_tests.py",
+        "tools/test_ci_helpers.py",
+        "tools/test_ci_rule_check_ranges.py"
+      ],
+      "exit": 0,
+      "bytes": 56,
+      "sha256": "45a468fa6205768496f23f1716ebb7575e9b723449d2099b88bf2afef60b721f"
+    },
+    {
+      "phase": "isort",
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "isort",
+        "--check-only",
+        "--diff",
+        "--profile",
+        "black",
+        "tools/select_tests.py",
+        "tools/test_ci_helpers.py",
+        "tools/test_ci_rule_check_ranges.py"
+      ],
+      "exit": 0,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "flake8",
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "flake8",
+        "--ignore=F405,E731,W503,E203,E704",
+        "--max-line-length=120",
+        "tools/select_tests.py",
+        "tools/test_ci_helpers.py",
+        "tools/test_ci_rule_check_ranges.py"
+      ],
+      "exit": 0,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "phase": "baseline-selector-negative",
+      "argv": [
+        "/usr/bin/python3",
+        "/negative-control.py"
+      ],
+      "exit": 0,
+      "bytes": 2144,
+      "sha256": "3bf90156cffbbe548a403c72e8bc0f039d0eb6f7d4da063634d212476377fad8"
+    },
+    {
+      "phase": "baseline-workflow-negative",
+      "argv": [
+        "/usr/bin/python3",
+        "/workflow-negative.py"
+      ],
+      "exit": 0,
+      "bytes": 1028,
+      "sha256": "2000b19337445b6e96905fb43a1ff9e4473966f629d7f0a645e8f84e826f98ba"
+    },
+    {
+      "phase": "baseline-unit-workflow-negative",
+      "argv": [
+        "/usr/bin/python3",
+        "/unit-workflow-negative.py"
+      ],
+      "exit": 0,
+      "bytes": 1566,
+      "sha256": "e15ae140997a4f9786da96a268b179dcc5687689d06815b4fdc0b174582ed9aa"
+    }
+  ],
+  "negative_controls": {
+    "baseline-selector-negative": {
+      "baseline": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+      "matched_expected_failure": true,
+      "tests": 1,
+      "failures": 2,
+      "errors": 0
+    },
+    "baseline-workflow-negative": {
+      "old_workflow_head": "317282b1b2db9647fc4f4267b0ea8288de1d5984",
+      "matched_expected_failure": true,
+      "tests": 1,
+      "failures": 1,
+      "errors": 0,
+      "skipped": 0,
+      "stale_common_and_merge_only_files_wrongly_checked": true
+    },
+    "baseline-unit-workflow-negative": {
+      "old_workflow_head": "541a13c849a5ff90fe2345a61089b9b807769508",
+      "matched_expected_failure": true,
+      "tests": 1,
+      "failures": 1,
+      "errors": 0,
+      "skipped": 0,
+      "stale_common_main_and_vendor_paths_wrongly_selected": true
+    }
+  },
+  "admission": {
+    "cid": "f8bd4495224115fd9a42cb07b0e01d6dd565be6180ef7fc6de098233f79c2968",
+    "label": "fgv-ci-shared-range-1356-v1",
+    "image": "sha256:c7b68ce18668b8f796b112a9632f32898f4aed802f078288077bbfe32309fd0e",
+    "runtime": "runc",
+    "network": "none",
+    "readonly_root": true,
+    "cap_drop": [
+      "ALL"
+    ],
+    "devices": [],
+    "device_requests": null,
+    "privileged": false,
+    "mounts": [
+      {
+        "target": "/verify-source.py",
+        "rw": false
+      },
+      {
+        "target": "/baseline-selector.py",
+        "rw": false
+      },
+      {
+        "target": "/wheels",
+        "rw": false
+      },
+      {
+        "target": "/negative-control.py",
+        "rw": false
+      },
+      {
+        "target": "/baseline-conftest.py",
+        "rw": false
+      },
+      {
+        "target": "/baseline-unittest.yaml",
+        "rw": false
+      },
+      {
+        "target": "/source-manifest.json",
+        "rw": false
+      },
+      {
+        "target": "/baseline-rule-check.yaml",
+        "rw": false
+      },
+      {
+        "target": "/workflow-negative.py",
+        "rw": false
+      },
+      {
+        "target": "/run-cpu.py",
+        "rw": false
+      },
+      {
+        "target": "/results",
+        "rw": true
+      },
+      {
+        "target": "/source",
+        "rw": false
+      },
+      {
+        "target": "/unit-workflow-negative.py",
+        "rw": false
+      }
+    ]
+  },
+  "cleanup": {
+    "cid": "f8bd4495224115fd9a42cb07b0e01d6dd565be6180ef7fc6de098233f79c2968",
+    "positive_absence": true,
+    "natural_exit": true,
+    "exit": 0
+  },
+  "source_before": {
+    "source": "/source",
+    "files": 1810,
+    "passed": true
+  },
+  "source_after": {
+    "source": "/source",
+    "files": 1810,
+    "passed": true
+  },
+  "runtime": {
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "packages": {
+      "pytest": "9.1.1",
+      "PyYAML": "6.0.1"
+    },
+    "gpu_test": false,
+    "scope": "CPU helpers, policy, style and a real pytest subprocess with a stub device backend"
+  },
+  "normal_fast_forward_from_published_head": true,
+  "pushed": false
+}

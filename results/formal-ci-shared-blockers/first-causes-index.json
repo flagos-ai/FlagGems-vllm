@@ -1,0 +1,159 @@
+[
+  {
+    "pr": 1356,
+    "pushed_head": "317282b1b2db9647fc4f4267b0ea8288de1d5984",
+    "job_id": 140453968961,
+    "category": "source-main-export-order",
+    "cause": "A5 __all__ position3 unsorted after merged #1496; noTorch11files0viol / original precommit and CI helper tests passed",
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\formal-ci-triage\\pr1356\\job140453968961.log",
+    "raw_sha256": "d7ff5b207a9550493a2040515801ff8245ca38aaba4b6e28111a5f1f8c7dc2da",
+    "checkout_evidence": {
+      "line": 183,
+      "text": "2026-11-27T10:38:14.2298352Z HEAD is now at 3d55cfd Merge 317282b1b2db9647fc4f4267b0ea8288de1d5984 into a7809702b6139269841bcb9d0b396a1a0a9384c1"
+    },
+    "checkout_full_sha_evidence": [
+      "2026-11-27T10:38:14.2365018Z 3d55cfd79751a576704eff5fb0bad4e697a2d7ff"
+    ]
+  },
+  {
+    "pr": 1345,
+    "pushed_head": "1dac29044ec44e0064f83baaf022cf2199a164dc",
+    "job_id": 140458859099,
+    "category": "ci-stale-diff-baseline",
+    "cause": "eventbase5d8e4917 vs current synthetic merge causes277files/49 inherited noTorch violations; own change relative12210 only3files",
+    "raw_log": "D:\\Codex\\work\\fgv-revalidation-20261127\\vendors\\formal-ci-triage\\pr1345\\job140458859099.log",
+    "raw_sha256": "836036a6a4173905ece7c641548174bd4fcc27c81c13bd073a8d1c257b40c8f7",
+    "checkout_evidence": {
+      "line": 183,
+      "text": "2026-11-27T10:48:35.3371257Z HEAD is now at 39ed5e8 Merge 1dac29044ec44e0064f83baaf022cf2199a164dc into a7809702b6139269841bcb9d0b396a1a0a9384c1"
+    },
+    "checkout_full_sha_evidence": [
+      "2026-11-27T10:48:35.3453233Z 39ed5e875ed5e2641b0849821934aa5273fc6e62"
+    ]
+  },
+  {
+    "pr": "pr1356",
+    "job": 140454136169,
+    "name": "nvidia container smoke test",
+    "runner_name": "nvidia-a100-1-jvtxl-runner-4ztj5",
+    "first_error": [
+      {
+        "line": 24,
+        "text": "2026-11-27T10:40:00.3453849Z ##[error]Error: failed to create job pod: Error: HTTP-Code: 400"
+      },
+      {
+        "line": 26,
+        "text": "Body: \"{\\\"kind\\\":\\\"Status\\\",\\\"apiVersion\\\":\\\"v1\\\",\\\"metadata\\\":{},\\\"status\\\":\\\"Failure\\\",\\\"message\\\":\\\"admission webhook \\\\\\\"validatepod.volcano.sh\\\\\\\" denied the request: unable to find job queue: queues.scheduling.volcano.sh \\\\\\\"58542a0d-3b41-4f96-b6ce-33e65729b54e\\\\\\\" not found;\\\",\\\"code\\\":400}\\n\""
+      },
+      {
+        "line": 28,
+        "text": "2026-11-27T10:40:00.3608170Z ##[error]Process completed with exit code 1."
+      },
+      {
+        "line": 29,
+        "text": "2026-11-27T10:40:00.3738197Z ##[error]Executing the custom container implementation failed. Please contact your self hosted runner administrator."
+      }
+    ],
+    "checkout_executed": false
+  },
+  {
+    "pr": "pr1345",
+    "job": 140459226019,
+    "name": "nvidia container smoke test",
+    "runner_name": "nvidia-a100-1-jvtxl-runner-xbwjf",
+    "first_error": [
+      {
+        "line": 24,
+        "text": "2026-11-27T10:50:18.3827502Z ##[error]Error: failed to create job pod: Error: HTTP-Code: 400"
+      },
+      {
+        "line": 26,
+        "text": "Body: \"{\\\"kind\\\":\\\"Status\\\",\\\"apiVersion\\\":\\\"v1\\\",\\\"metadata\\\":{},\\\"status\\\":\\\"Failure\\\",\\\"message\\\":\\\"admission webhook \\\\\\\"validatepod.volcano.sh\\\\\\\" denied the request: unable to find job queue: queues.scheduling.volcano.sh \\\\\\\"58542a0d-3b41-4f96-b6ce-33e65729b54e\\\\\\\" not found;\\\",\\\"code\\\":400}\\n\""
+      },
+      {
+        "line": 28,
+        "text": "2026-11-27T10:50:18.4011556Z ##[error]Process completed with exit code 1."
+      },
+      {
+        "line": 29,
+        "text": "2026-11-27T10:50:18.4136007Z ##[error]Executing the custom container implementation failed. Please contact your self hosted runner administrator."
+      }
+    ],
+    "checkout_executed": false
+  },
+  {
+    "pr": "pr1345",
+    "job": 140459226038,
+    "name": "hygon container smoke test",
+    "runner_name": "hygon-bw1000-1-dj4gf-runner-9wxtr",
+    "first_error": [
+      {
+        "line": 24,
+        "text": "2026-11-27T10:54:52.7482054Z ##[error]Error: failed to create job pod: Error: HTTP-Code: 400"
+      },
+      {
+        "line": 26,
+        "text": "Body: \"{\\\"kind\\\":\\\"Status\\\",\\\"apiVersion\\\":\\\"v1\\\",\\\"metadata\\\":{},\\\"status\\\":\\\"Failure\\\",\\\"message\\\":\\\"admission webhook \\\\\\\"validatepod.volcano.sh\\\\\\\" denied the request: unable to find job queue: queues.scheduling.volcano.sh \\\\\\\"eb2d00b3-7a21-4e09-937a-6a892a82ac6e\\\\\\\" not found;\\\",\\\"code\\\":400}\\n\""
+      },
+      {
+        "line": 28,
+        "text": "2026-11-27T10:54:52.7558101Z ##[error]Process completed with exit code 1."
+      },
+      {
+        "line": 29,
+        "text": "2026-11-27T10:54:52.7712340Z ##[error]Executing the custom container implementation failed. Please contact your self hosted runner administrator."
+      }
+    ],
+    "checkout_executed": false
+  },
+  {
+    "pr": "pr1345",
+    "job": 140459226096,
+    "name": "metax container smoke test",
+    "runner_name": "metax-mxc550-1-q9d9g-runner-hswxh",
+    "first_error": [
+      {
+        "line": 24,
+        "text": "2026-11-27T10:50:14.1657054Z ##[error]Error: failed to create job pod: Error: HTTP-Code: 400"
+      },
+      {
+        "line": 26,
+        "text": "Body: \"{\\\"kind\\\":\\\"Status\\\",\\\"apiVersion\\\":\\\"v1\\\",\\\"metadata\\\":{},\\\"status\\\":\\\"Failure\\\",\\\"message\\\":\\\"admission webhook \\\\\\\"validatepod.volcano.sh\\\\\\\" denied the request: unable to find job queue: queues.scheduling.volcano.sh \\\\\\\"65c75d14-b952-4510-a9d7-43f114f98335\\\\\\\" not found;\\\",\\\"code\\\":400}\\n\""
+      },
+      {
+        "line": 28,
+        "text": "2026-11-27T10:50:14.1708355Z ##[error]Process completed with exit code 1."
+      },
+      {
+        "line": 29,
+        "text": "2026-11-27T10:50:14.1814390Z ##[error]Executing the custom container implementation failed. Please contact your self hosted runner administrator."
+      }
+    ],
+    "checkout_executed": false
+  },
+  {
+    "pr": "pr1345",
+    "job": 140459226119,
+    "name": "mthreads container smoke test",
+    "runner_name": "mthreads-s5000-1-sh7t8-runner-9hrq8",
+    "first_error": [
+      {
+        "line": 24,
+        "text": "2026-11-27T10:52:49.7973088Z ##[error]Error: failed to create job pod: Error: HTTP-Code: 400"
+      },
+      {
+        "line": 26,
+        "text": "Body: \"{\\\"kind\\\":\\\"Status\\\",\\\"apiVersion\\\":\\\"v1\\\",\\\"metadata\\\":{},\\\"status\\\":\\\"Failure\\\",\\\"message\\\":\\\"admission webhook \\\\\\\"validatepod.volcano.sh\\\\\\\" denied the request: unable to find job queue: queues.scheduling.volcano.sh \\\\\\\"f26eb574-1cd4-4bd4-9b9e-f9061b5707fe\\\\\\\" not found;\\\",\\\"code\\\":400}\\n\""
+      },
+      {
+        "line": 28,
+        "text": "2026-11-27T10:52:49.8009932Z ##[error]Process completed with exit code 1."
+      },
+      {
+        "line": 29,
+        "text": "2026-11-27T10:52:49.8109573Z ##[error]Executing the custom container implementation failed. Please contact your self hosted runner administrator."
+      }
+    ],
+    "checkout_executed": false
+  }
+]

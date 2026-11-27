@@ -1,0 +1,11 @@
+{
+  "command": [
+    "C:\\Users\\BAAI\\miniconda3\\python.exe",
+    "-X",
+    "utf8",
+    "tools/ci_checks/check_init_exports.py"
+  ],
+  "cwd": "D:\\Codex\\workspaces\\FlagGems-vllm-a5-export-order-20261127",
+  "exit": 1,
+  "raw_log_sha256": "9c3fd9c4aa3ac94753b62b418733043a38455be555e1e785efd6283571693d6e"
+}

@@ -1,0 +1,15 @@
+{
+  "pr": 1347,
+  "head": "c237ed4689172a0e8a421a04c588a129447851c6",
+  "tree": "4be9e45c28f1dfa34b382d8425c3f291a16ea463",
+  "original_head": "e5c1a998ff233a0e5ab09f861fcb150ce4c11f7a",
+  "base": "12210ab628e0b8f5beed55791958e3bd57accb2b",
+  "remote_branch": "codex/marlin-hopper-ci-20261119",
+  "branch": "codex/fgv-marlin-sync-20261127",
+  "normal_fast_forward": true,
+  "only_test_changed_from_g6_tree": true,
+  "production_and_benchmark_bytes_identical": true,
+  "pushed": true,
+  "remote_ref_verified": true,
+  "g6_still_failed": true
+}
