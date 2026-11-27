@@ -115,6 +115,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.persistent_topk import persistent
 from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
+from flaggems_vllm.runtime.backend._ascend.ops.qsa_prepare import qsa_prepare
 from flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer import (
     quant_lightning_indexer,
 )
@@ -201,6 +202,7 @@ __all__ = [
     "persistent_topk",
     "ple_state_scatter_",
     "prepare_compressor_workspace",
+    "qsa_prepare",
     "quant_lightning_indexer",
     "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
