@@ -1,6 +1,6 @@
-#Enflame override for apply_trace_tokens.
-#Work around the observed GCU300 pointer-analysis failure for arith.maxsi.
-#Use tl.where to preserve valid indices; invalid-lane reads remain masked.
+# Enflame override for apply_trace_tokens.
+# Work around the observed GCU300 pointer-analysis failure for arith.maxsi.
+# Use tl.where to preserve valid indices; invalid-lane reads remain masked.
 
 
 
