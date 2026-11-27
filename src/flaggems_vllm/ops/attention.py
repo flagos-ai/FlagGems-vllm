@@ -1479,6 +1479,14 @@ def flash_attn_varlen_func(
 
             specialized_attention = thead_attention.flash_attn_varlen_func_w8a8_int8
 
+    elif runtime.device.vendor_name == "hygon" and q.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        from flaggems_vllm.runtime.backend._hygon.ops.flash_attention import (
+            launch_attention as specialized_attention,
+        )
+
     elif runtime.device.vendor_name == "thead":
         from flaggems_vllm.runtime.backend._thead.ops.flash_attention import (
             launch_attention as specialized_attention,

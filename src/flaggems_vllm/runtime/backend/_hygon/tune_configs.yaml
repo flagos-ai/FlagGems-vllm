@@ -822,6 +822,145 @@ chunk_kda_fwd_intra_token_parallel:
     stages:
       - 1
 
+hygon_attention_direct:
+  - gen: true
+    param_map:
+      META: tiles
+      num_warps: [4, 8]
+      num_stages: [1, 2]
+    tiles:
+      - {BM: 16, BN: 32}
+      - {BM: 16, BN: 64}
+      - {BM: 16, BN: 128}
+      - {BM: 32, BN: 32}
+      - {BM: 32, BN: 64}
+      - {BM: 32, BN: 128}
+      - {BM: 64, BN: 32}
+      - {BM: 64, BN: 64}
+
+hygon_attention_paged:
+  - gen: true
+    param_map:
+      META:
+        BM: [32, 64]
+        BN: [32, 64]
+        ORDER: [0]
+        REVERSE: [false]
+        kpack: [1]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+  - gen: true
+    param_map:
+      META:
+        BM: [32, 64]
+        BN: [32, 64]
+        ORDER: [1]
+        REVERSE: [false]
+        kpack: [1]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+  - gen: true
+    param_map:
+      META:
+        BM: [32, 64]
+        BN: [32, 64]
+        ORDER: [0]
+        REVERSE: [true]
+        kpack: [1]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+  - gen: true
+    param_map:
+      META:
+        BM: [32, 64]
+        BN: [32, 64]
+        ORDER: [0]
+        REVERSE: [false]
+        kpack: [2]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+  - gen: true
+    param_map:
+      META:
+        BM: [64]
+        BN: [64]
+        ORDER: [1]
+        REVERSE: [true]
+        kpack: [1]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+  - gen: true
+    param_map:
+      META:
+        BM: [64]
+        BN: [64]
+        ORDER: [1]
+        REVERSE: [false]
+        kpack: [2]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+
+hygon_attention_prefill:
+  - gen: true
+    param_map:
+      META:
+        BM: [32, 64]
+        BN: [32, 64]
+        ORDER: [0]
+        REVERSE: [false]
+        kpack: [1]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+  - gen: true
+    param_map:
+      META:
+        BM: [32, 64]
+        BN: [32, 64]
+        ORDER: [1]
+        REVERSE: [false]
+        kpack: [1]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+  - gen: true
+    param_map:
+      META:
+        BM: [32, 64]
+        BN: [32, 64]
+        ORDER: [1]
+        REVERSE: [true]
+        kpack: [2]
+        sched_latency: ["none"]
+      num_warps: [4, 8]
+      num_stages: [1]
+  - gen: true
+    param_map:
+      META:
+        BM: [32, 64]
+        BN: [32, 64]
+        ORDER: [1]
+        REVERSE: [true]
+        kpack: [2]
+        sched_latency: ["mmac5-ds6"]
+      num_warps: [4, 8]
+      num_stages: [1]
+
+hygon_attention_decode:
+  - gen: true
+    param_map:
+      META:
+        BM: [16, 32, 64]
+        BN: [32, 64]
+      num_warps: [4, 8]
+      num_stages: [1]
+
 fused_kimi_k3_mla_kv_concat:
   - META: {BLOCK: 1, ROW_LAYOUT: false}
     num_warps: 4
