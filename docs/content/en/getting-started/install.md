@@ -152,7 +152,8 @@ All defaults come from `src/flaggems_vllm/backends.yaml` and can be overridden:
 | `VENV_DIR` | Virtual environment directory (default `.venv`). |
 | `PIP_INDEX_URL` | Primary package index (default: PyPI; use a regional mirror if needed). |
 | `FLAG_GEMS_VERSION` | Override the registry's `flag-gems` pin (default 5.4.0). |
-| `FLAG_GEMS_INDEX` | Index that publishes `flag-gems` (default: FlagOS daily index). |
+| `FLAG_GEMS_INDEX` | Index that publishes `flag-gems` (default: FlagOS hosted index). |
+| `FLAG_GEMS_FALLBACK_INDEX` | Searched when `FLAG_GEMS_INDEX` lacks the pinned release (default: FlagOS daily index). |
 | `VLLM_VERSION` | Override a profile whose vLLM pin is `vllm==...` (NVIDIA). |
 | `VLLM_PACKAGE` | Full vLLM requirement or wheel URL; wins over `VLLM_VERSION`. |
 | `COMPILER` | `flagtree`, `triton` or `keep`. |
@@ -186,6 +187,29 @@ defaults. Opt in explicitly when the image does not provide them:
 SKIP_BACKEND_DEPS=0 VLLM_PACKAGE="vllm-ascend==0.24.0rc1" \
   bash tools/setup.sh --no-venv ascend
 ```
+
+The script also adapts to the interpreter, so none of the following needs to
+be set:
+
+- **Externally managed Python** (PEP 668, the system Python on Debian/Ubuntu):
+  the script passes `--break-system-packages` to pip by itself.
+- **Read-only site-packages**: it adds `--user`, so packages go to
+  `~/.local` and you do not need `sudo`. Do not run the script with `sudo`;
+  root has a different `HOME` and installs into the system directories.
+- **FlagGems version**: an existing `flag-gems` older than the pin in
+  `backends.yaml` is upgraded (with `--no-deps`, so the vendor torch, numpy and
+  vLLM are not touched). A newer or equal version is kept. The pinned release is
+  looked up in `FLAG_GEMS_INDEX` first, then in `FLAG_GEMS_FALLBACK_INDEX`.
+- **FlagTree**: in venv mode, installed by default unless FlagTree is already
+  present in the new venv (set `USE_FLAGTREE=0` for stock Triton, or
+  `--skip-compiler` to leave the compiler alone). In `--no-venv` mode the
+  script compares the environment's FlagTree version against the backend pin
+  and upgrades if older; set `COMPILER=triton` to preserve the image's Triton,
+  or `COMPILER=keep` to skip the check. Installing FlagTree replaces the
+  existing `triton`, so skip it when your vLLM requires the image's Triton.
+
+The only setting a new shell still needs is `export USE_FLAGCX=OFF` on CUDA 13
+hosts (see the troubleshooting entry below). The script prints a reminder.
 
 ## Manual Installation Without a Venv
 
@@ -435,7 +459,9 @@ The NVIDIA profiles in `src/flaggems_vllm/backends.yaml` already set this, so
 environments built by `tools/setup.sh` inherit it from the venv activation
 script. Export it yourself in a manual install. `tools/setup.sh` also reports
 the compiler and TLE status when it leaves the compiler untouched
-(`COMPILER=keep`, the default for `--no-venv`).
+(`COMPILER=keep`, chosen when the caller sets `--skip-compiler`, when
+`--no-venv` finds an up-to-date FlagTree or the caller sets `COMPILER=triton`,
+or when FlagTree is already present in a fresh venv).
 
 ### Triton Version Mismatch
 

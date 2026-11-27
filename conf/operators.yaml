@@ -912,6 +912,19 @@ ops:
   stages:
   - stable: '2.0'
   cpp: '4.0'
+- id: fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert
+  description: Apply optional per-head RMSNorm and GPT-J RoPE to DeepSeek V4 queries
+    and insert rotated KV rows into a paged BF16 full cache.
+  for:
+  - torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
   description: 'Horizontally-fused DeepseekV4-MLA full-cache path.
 
@@ -1034,6 +1047,45 @@ ops:
   - Quantization
   stages:
   - beta: '5.4'
+- id: fused_kimi_k3_mla_decode_q_concat_ds_mla_insert
+  description: Concatenate Kimi-K3 decode queries and store scaled E4M3FN latent
+    groups, four FP32 scales and the positional key in a 656-byte paged cache row.
+  for:
+  - _C.fused_kimi_k3_mla_decode_q_concat_ds_mla_insert
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - beta: '0.3'
+- id: fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
+  description: Concatenate Kimi-K3 decode queries and insert each valid token's latent
+    key into the paged cache, optionally applying interleaved RoPE. Supports BF16
+    and FP16.
+  for:
+  - _C.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '0.3'
+- id: fused_kimi_k3_mla_key_concat_kv_cache_insert
+  description: >-
+    Assemble per-head Kimi-K3 prefill keys and insert shared latent keys into the
+    paged cache. Optionally rotate the query and key tails with interleaved RoPE.
+  for:
+  - _C.fused_kimi_k3_mla_key_concat_kv_cache_insert
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '0.3'
 - id: fused_kimi_k3_mla_kv_concat
   description: 'Copy Kimi-K3 NoPE keys and broadcast the shared PE component into a
 
@@ -1051,6 +1103,21 @@ ops:
   - DataMovement
   stages:
   - beta: '5.4'
+- id: fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  description: |
+    Compress overlapping four-token groups in the DeepSeek V4 paged state cache,
+    apply weighted RMSNorm and interleaved RoPE, and write packed or full keys
+    to the destination cache.
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
 - id: fused_marlin_moe_w4a16
   description: 'Fused mixture-of-experts computation with 4-bit weights and 16-bit
 
@@ -1117,6 +1184,18 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: fused_moe_lora
+  description: Apply expert- and adapter-specific LoRA updates to routed MoE outputs.
+  for:
+  - vllm.lora.ops.triton_ops.fused_moe_lora_op.fused_moe_lora
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: fused_q
   description: |
     Fuse MQA query RoPE and FP8 packing with indexer query RoPE,
@@ -1686,6 +1765,28 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: lora_expand
+  description: Project grouped token rows through per-adapter LoRA B weights into output slices.
+  for:
+  - vllm.lora.ops.triton_ops.lora_expand
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
+- id: lora_shrink
+  description: Project hidden states into each token's LoRA rank space and write the scaled results in place.
+  for:
+  - vllm.lora.ops.triton_ops.lora_shrink_op.lora_shrink
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - BLAS
+  stages:
+  - beta: '0.3'
 - id: mamba_mixer
   description: Triton implementation of the Mamba mixer operator for vLLM inference.
   for:
@@ -1741,6 +1842,19 @@ ops:
   - MoE
   stages:
   - alpha: '5.5'
+- id: megapreattention
+  description: >-
+    BF16 tensor-parallel AllGather and gated QKV projection with Gemma
+    RMSNorm, interleaved MRoPE, and in-place paged KV insertion on PPU.
+  for:
+  - None
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - alpha: '5.4'
 - id: mhc_bwd
   description: 'The backward case for MHC (Manifold-Constrained Hyper-Connections).
 
@@ -2146,6 +2260,18 @@ ops:
   stages:
   - alpha: '4.2'
   - beta: '5.3'
+- id: rejection_sample
+  description: 'Ordinary chain speculative decoding rejection verification with residual and bonus sampling.'
+  for:
+  - vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils.rejection_sample
+  labels:
+  - fused
+  - vLLM
+  - speculative-decoding
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.5'
 - id: reshape_and_cache
   description: Store the key/value token states into the pre-allcated kv_cache buffers
     of paged attention.
@@ -2396,6 +2522,19 @@ ops:
   stages:
   - beta: '5.0'
   - stable: '5.3'
+- id: split_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  description: Compress 128 paged DeepSeek-V4 state rows into the caller's FP32
+    workspace, apply weighted RMSNorm and RoPE, and write packed or full KV cache.
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl.split_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: stage_deepseek_v4_mega_moe_inputs
   description: 'Stages DeepSeekV4 Mega-MoE inputs by quantizing hidden states to FP8
 
@@ -2424,6 +2563,33 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '5.0'
+- id: swiglu_group_quant
+  description: 'SwiGLU fused with block-wise FP8 quantization for Ascend 950DT
+
+    (A5 / arch35). The implementation lives under
+
+    `runtime/backend/_ascend/a5/ops/` and targets the CANN
+
+    `aclnnSwigluGroupQuant` interface: BF16/FP16 input, E4M3/E5M2 output,
+
+    optional per-token FP32 weight, clamp and group_index, and MX E8M0 scales
+
+    or block FP32 scales. Quant modes 0 and 1 are supported; HiFloat8 modes
+
+    2 and 3 are not available through Triton and raise an explicit error.
+
+    '
+  for:
+  - swiglu_group_quant
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  - MoE
+  kind:
+  - Quantization
+  stages:
+  - beta: '0.3'
 - id: top_k_per_row_decode
   description: 'Triton top-K per row for DeepSeek V4 decode-phase token selection.
 
@@ -2572,6 +2738,18 @@ ops:
   - Attention
   stages:
   - alpha: '0.1'
+- id: triton_reshape_and_cache_flash_per_token_head_quant
+  description: Quantize paged K and V per token and KV head, updating separate
+    data and FP32 scale caches in place.
+  for:
+  - triton_reshape_and_cache_flash_per_token_head_quant
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
 - id: unpack_seq_triton
   description: Unpack a packed sequence tensor back to its original variable-length
     form.

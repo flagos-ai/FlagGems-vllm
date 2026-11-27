@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flaggems_vllm.runtime.backend._nvidia.ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
+)
 from flaggems_vllm.runtime.backend._nvidia.ops.hc_combine import hc_combine
 
-__all__ = ["hc_combine"]
+__all__ = ["fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl", "hc_combine"]

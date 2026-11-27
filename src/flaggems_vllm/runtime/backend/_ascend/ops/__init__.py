@@ -55,6 +55,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_indexer_weight_scale import
 from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import (
     fused_inv_rope_int8_quant,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
@@ -107,6 +110,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.matmul_persistent import (
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_post import mhc_post
 from flaggems_vllm.runtime.backend._ascend.ops.mhc_pre import npu_mhc_pre_clamp_sinkhorn
 from flaggems_vllm.runtime.backend._ascend.ops.pack_seq import pack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.pad_indexer_heads import (
+    pad_indexer_heads,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.paged_scatter import paged_scatter_triton
 from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
@@ -119,6 +125,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.qsa_mqa import qwen4_qsa_mqa_page
 from flaggems_vllm.runtime.backend._ascend.ops.quant_lightning_indexer import (
     quant_lightning_indexer,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.rejection_sampler import rejection_sample
 from flaggems_vllm.runtime.backend._ascend.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
@@ -152,10 +159,13 @@ from flaggems_vllm.runtime.backend._ascend.ops.top_k_top_p import top_k_top_p
 from flaggems_vllm.runtime.backend._ascend.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.trace_replay import apply_trace_tokens
 from flaggems_vllm.runtime.backend._ascend.ops.unpack_seq import unpack_seq_triton
+from flaggems_vllm.runtime.backend._ascend.ops.watermark import draft_watermarking_mask
 
 __all__ = [
     "add_rms_norm",
+    "apply_trace_tokens",
     "build_compressor_metadata",
     "causal_conv1d_fn",
     "causal_conv1d_update",
@@ -169,10 +179,12 @@ __all__ = [
     "cp_gather_indexer_k_quant_cache",
     "deep_gemm_fp8_o_proj",
     "dequantize_and_gather_k_cache",
+    "draft_watermarking_mask",
     "fused_add_rms_norm",
     "fused_experts_impl",
     "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
+    "fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "fused_marlin_moe",
     "fused_q",
     "fused_q_kv_rmsnorm",
@@ -198,6 +210,7 @@ __all__ = [
     "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
     "pack_seq_triton",
+    "pad_indexer_heads",
     "paged_scatter_triton",
     "per_token_group_quant_fp8",
     "persistent_topk",
@@ -209,6 +222,7 @@ __all__ = [
     "qwen4_hc_inject_combine",
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
+    "rejection_sample",
     "scaled_int8_quant",
     "scatter_conv_state",
     "scatter_kda_state",

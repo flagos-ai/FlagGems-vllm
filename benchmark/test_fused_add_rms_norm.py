@@ -32,6 +32,38 @@ VLLM_NATIVE_VENDORS = {
 }
 
 
+def _vllm_native_usable(ops):
+    """True only if vllm._C is built and has a CUDA kernel for the op.
+
+    Does not execute any kernel.
+    """
+    if ops is None or not callable(getattr(ops, "fused_add_rms_norm", None)):
+        return False
+
+    try:
+        import vllm._C  # noqa: F401
+    except Exception as e:
+        warnings.warn(f"vllm._C is unavailable ({type(e).__name__}: {e}).")
+        return False
+
+    try:
+        dev_type = torch.device(flaggems_vllm.device).type
+    except Exception:
+        dev_type = "cuda"
+
+    if dev_type == "cuda":
+        try:
+            return bool(
+                torch._C._dispatch_has_kernel_for_dispatch_key(
+                    "_C::fused_add_rms_norm", "CUDA"
+                )
+            )
+        except Exception:
+            return True  # internal API changed; trust the import check
+
+    return True
+
+
 # -----------------------------------------------------------------------------
 # Vendor-specific baseline import
 #
@@ -267,7 +299,7 @@ def _get_baseline_op():
     "vs Base" comparison still works via --base-data.
     """
     if VENDOR in VLLM_NATIVE_VENDORS:
-        if callable(getattr(vendor_ops, "fused_add_rms_norm", None)):
+        if _vllm_native_usable(vendor_ops):
             return _vllm_native_op
         return None
 
