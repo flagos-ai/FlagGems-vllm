@@ -4832,6 +4832,7 @@ def _short_softmax(
     WIDTH: tl.constexpr,
     SPLIT_PADDED_WIDTH: tl.constexpr = False,
     FIRST_VALID: tl.constexpr = 0,
+    Q_HEADS: tl.constexpr = 1,
 ):
     with tle.scope(core_mode="vector"):
         vec = sub_vec_id().to(tl.int32)
@@ -4856,7 +4857,9 @@ def _short_softmax(
             rows = vec * (BM // 2) + i + tl.arange(0, VM)
             offsets = rows[:, None] * W + col[None, :]
             val = tl.load(ta + offsets, col[None, :] < limit, 0, volatile=True)
-            row_end = tl.minimum(limit, load_qr + rows[:, None] + klen - qlen + 1)
+            row_end = tl.minimum(
+                limit, load_qr + rows[:, None] // Q_HEADS + klen - qlen + 1
+            )
             keep = col[None, :] < row_end
             val = tl.where(keep, val * SCALE, -float("inf"))
             maximum = tl.max(val, 1)
@@ -5707,6 +5710,52 @@ def short_prefill_output(q, k, v, used, table, max_q, max_k, scale, device):
     w, workers = scalars[5], scalars[10]
     key = (index, q.dtype, max_q, w, page, h, hk, scale, workers)
     out = torch.empty_like(q)
+    if fused and h in (4, 8) and hk == 1 and 1024 < max_q == max_k:
+        bm, bn = (128 if h == 8 else 64), 256
+        tasks = (max_q * h + bm - 1) // bm
+        w = ((max_k + bn - 1) // bn) * bn
+        # Two per-worker Score and P banks let Softmax overlap the prior PV.
+        score_elems = workers * bm * w
+        # The second launch reads a tile-private FP32 PV and normalization factor.
+        scratch = torch.empty(
+            2 * score_elems + tasks * bm * 257, device=device, dtype=torch.float32
+        )
+        packed = torch.empty(2 * w * 256, device=device, dtype=q.dtype)
+        prob = torch.empty(2 * score_elems, device=device, dtype=q.dtype)
+        with torch.npu.device(device):
+            _token_major_prefill[compute_grid](
+                q,
+                k,
+                v,
+                used,
+                table,
+                scratch,
+                packed,
+                prob,
+                scale,
+                max_q,
+                h,
+                w,
+                tasks,
+                page,
+                workers,
+                8,
+                bm,
+                enable_fp_fusion=False,
+                disable_auto_inject_block_sync=True,
+                multibuffer=False,
+            )
+            _token_major_prefill_output[(min(tasks, workers * 2),)](
+                scratch[2 * score_elems :],
+                out,
+                used,
+                max_q,
+                h,
+                tasks,
+                16,
+                bm,
+            )
+        return out
     if fused:
         active = torch.npu.current_device() == index
         get_stream = _raw_stream_nowait or driver.active.get_current_stream
@@ -5776,3 +5825,350 @@ def short_prefill_output(q, k, v, used, table, max_q, max_k, scale, device):
                 compute[compute_grid],
             )
     return out
+
+
+@triton.jit
+def _token_major_prefill_output(
+    TMP,
+    OUT,
+    USED,
+    QLEN: tl.constexpr,
+    H: tl.constexpr,
+    TASKS: tl.constexpr,
+    VM: tl.constexpr,
+    BM: tl.constexpr,
+):
+    ROWS: tl.constexpr = BM // H
+    klen = tl.load(USED)
+    cols = tl.arange(0, 256)
+    for ticket in range(tl.program_id(0), TASKS, tl.num_programs(0)):
+        qr = ticket * ROWS
+        limit = tl.minimum(klen, qr + ROWS + klen - QLEN)
+        load_qr = tl.minimum(qr, QLEN - ROWS)
+        tmp = TMP + ticket * BM * 257
+        for begin in range(0, BM, VM):
+            rows = begin + tl.arange(0, VM)
+            result = tl.zeros((VM, 256), tl.float32)
+            if limit > 0:
+                result = tl.load(tmp + rows[:, None] * 256 + cols[None, :])
+                result = result / tl.load(tmp + BM * 256 + rows)[:, None]
+            row = load_qr * H + rows
+            tl.store(
+                OUT + row[:, None] * 256 + cols[None, :],
+                result,
+                ((row >= qr * H) & (row < QLEN * H))[:, None],
+            )
+
+
+@triton.jit
+def _token_major_prefill_qk(
+    Q,
+    K,
+    ta,
+    qb,
+    kb,
+    load_qr,
+    limit,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    BN: tl.constexpr,
+    BM: tl.constexpr,
+):
+    qp = tl.make_block_ptr(
+        Q + load_qr.to(tl.int64) * H * 256,
+        (BM, 256),
+        (256, 1),
+        (0, 0),
+        (BM, 256),
+        (1, 0),
+    )
+    tle.dsa.copy(qp, qb, [BM, 256])
+    query = tle.dsa.to_tensor(qb, writable=False)
+    for start in range(0, limit, BN):
+        kp = tl.make_block_ptr(
+            K + start * 256,
+            (BN, 256),
+            (256, 1),
+            (0, 0),
+            (BN, 256),
+            (1, 0),
+        )
+        tle.dsa.copy(kp, kb, [BN, 256])
+        score = tl.dot(query, tl.trans(tle.dsa.to_tensor(kb, writable=False)))
+        tl.store(
+            ta + tl.arange(0, BM)[:, None] * W + start + tl.arange(0, BN)[None, :],
+            score,
+        )
+
+
+@triton.jit
+def _token_major_prefill_softmax(
+    ta,
+    pa,
+    row_norm,
+    limit,
+    load_qr,
+    qlen,
+    klen,
+    SCALE: tl.constexpr,
+    BN: tl.constexpr,
+    W: tl.constexpr,
+    BM: tl.constexpr,
+    VM: tl.constexpr,
+    H: tl.constexpr,
+):
+    # A causal tile only needs the rounded-up visible KV prefix.
+    if limit <= 256:
+        _short_softmax(
+            ta,
+            pa,
+            row_norm,
+            limit,
+            load_qr,
+            qlen,
+            klen,
+            SCALE,
+            BN,
+            W,
+            BM,
+            VM,
+            256,
+            SPLIT_PADDED_WIDTH=True,
+            Q_HEADS=H,
+        )
+    elif limit <= 512:
+        _short_softmax(
+            ta,
+            pa,
+            row_norm,
+            limit,
+            load_qr,
+            qlen,
+            klen,
+            SCALE,
+            BN,
+            W,
+            BM,
+            VM,
+            512,
+            SPLIT_PADDED_WIDTH=True,
+            Q_HEADS=H,
+        )
+    elif limit <= 1024 or W == 1024:
+        _short_softmax(
+            ta,
+            pa,
+            row_norm,
+            limit,
+            load_qr,
+            qlen,
+            klen,
+            SCALE,
+            BN,
+            W,
+            BM,
+            VM,
+            1024,
+            SPLIT_PADDED_WIDTH=True,
+            Q_HEADS=H,
+        )
+    else:
+        _short_softmax(
+            ta,
+            pa,
+            row_norm,
+            limit,
+            load_qr,
+            qlen,
+            klen,
+            SCALE,
+            BN,
+            W,
+            BM,
+            VM,
+            W,
+            SPLIT_PADDED_WIDTH=True,
+            Q_HEADS=H,
+        )
+
+
+@triton.jit
+def _token_major_prefill_pv(
+    V,
+    pa,
+    wa,
+    vb,
+    pb,
+    limit,
+    release,
+    slot,
+    W: tl.constexpr,
+    BN: tl.constexpr,
+    BM: tl.constexpr,
+):
+    acc = tl.full((BM, 256), 0.0, tl.float32)
+    for start in range(0, limit, BN):
+        vp = tl.make_block_ptr(
+            V + start * 256,
+            (BN, 256),
+            (256, 1),
+            (0, 0),
+            (BN, 256),
+            (1, 0),
+        )
+        pp = tl.make_block_ptr(
+            pa + start,
+            (BM, BN),
+            (W, 1),
+            (0, 0),
+            (BM, BN),
+            (1, 0),
+        )
+        tle.dsa.copy(vp, vb, [BN, 256])
+        tle.dsa.copy(pp, pb, [BM, BN])
+        acc = tl.dot(
+            tle.dsa.to_tensor(pb, writable=False),
+            tle.dsa.to_tensor(vb, writable=False),
+            acc,
+        )
+
+    if release:
+        # PV will use its L1 operands and L0C after this shared GM bank is freed.
+        sync_block_set("cube", "vector", 8 + slot, PIPE.PIPE_MTE2, PIPE.PIPE_S)
+    tl.store(wa + tl.arange(0, BM)[:, None] * 256 + tl.arange(0, 256)[None, :], acc)
+
+
+@triton.jit
+def _token_major_prefill_ticket(
+    wave,
+    worker,
+    klen,
+    QLEN: tl.constexpr,
+    ROWS: tl.constexpr,
+    TASKS: tl.constexpr,
+    WORKERS: tl.constexpr,
+):
+    ticket_wave = wave
+    if WORKERS == 20 and triton.cdiv(TASKS, WORKERS) == 4:
+        # Start the pipeline with a short QK so its probability work can
+        # overlap the longest QK. Leave each worker's last, sparse wave alone.
+        ticket_wave = tl.where(wave == 0, 2, tl.where(wave < 3, wave - 1, wave))
+    lane = tl.where(ticket_wave % 2 == 0, worker, WORKERS - 1 - worker)
+    ticket = TASKS - 1 - ticket_wave * WORKERS - lane
+    qr = ticket * ROWS
+    limit = tl.minimum(klen, qr + ROWS + klen - QLEN)
+    return ticket, tl.minimum(qr, QLEN - ROWS), limit
+
+
+@triton.jit
+def _token_major_prefill(
+    Q,
+    K,
+    V,
+    USED,
+    TABLE,
+    WORK,
+    KV,
+    PROBS,
+    SCALE: tl.constexpr,
+    QLEN: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    TASKS: tl.constexpr,
+    PAGE: tl.constexpr,
+    WORKERS: tl.constexpr,
+    VM: tl.constexpr,
+    BM: tl.constexpr,
+):
+    BN: tl.constexpr = 256
+    ROWS: tl.constexpr = BM // H
+    WAVES: tl.constexpr = (TASKS + WORKERS - 1) // WORKERS
+    worker = tl.program_id(0).to(tl.int32)
+    klen = tl.load(USED)
+    packed_v = KV + W * 256
+    with tle.scope(core_mode="vector"):
+        pack_lane = worker * 2 + sub_vec_id()
+        pages = tl.cdiv(klen, BN) * (BN // PAGE)
+        for page in range(pack_lane, pages, WORKERS * 2):
+            _pack_page(K, V, TABLE, klen, KV, packed_v, page, 0, 1, PAGE, W)
+    tle.dsa.ascend.sync_block_all("all", 0)
+    # Prior QK can be consumed while the next Score bank is filled.
+    score = WORK + worker.to(tl.int64) * 2 * W * BM
+    prob = PROBS + worker.to(tl.int64) * 2 * W * BM
+    partial = WORK + 2 * WORKERS * W * BM
+    qb = tle.dsa.alloc([BM, 256], Q.dtype.element_ty, tle.dsa.ascend.L1)
+    kb = tle.dsa.alloc([BN, 256], Q.dtype.element_ty, tle.dsa.ascend.L1)
+    vb = tle.dsa.alloc([BN, 256], Q.dtype.element_ty, tle.dsa.ascend.L1)
+    pb = tle.dsa.alloc([BM, BN], Q.dtype.element_ty, tle.dsa.ascend.L1)
+    with tle.scope(core_mode="cube"):
+        for wave in range(WAVES + 1):
+            if wave < WAVES:
+                t, qr, end = _token_major_prefill_ticket(
+                    wave, worker, klen, QLEN, ROWS, TASKS, WORKERS
+                )
+                if (t >= 0) & (end > 0):
+                    slot = wave % 2
+                    _token_major_prefill_qk(
+                        Q, KV, score + slot * W * BM, qb, kb, qr, end, H, W, BN, BM
+                    )
+                    sync_block_set(
+                        "cube", "vector", 12 + slot, PIPE.PIPE_FIX, PIPE.PIPE_S
+                    )
+            if wave > 0:
+                pt, _, pend = _token_major_prefill_ticket(
+                    wave - 1, worker, klen, QLEN, ROWS, TASKS, WORKERS
+                )
+                if (pt >= 0) & (pend > 0):
+                    pv_slot = (wave - 1) % 2
+                    sync_block_wait(
+                        "vector", "cube", 6 + pv_slot, PIPE.PIPE_MTE3, PIPE.PIPE_S
+                    )
+                    dst = partial + pt.to(tl.int64) * BM * 257
+                    _token_major_prefill_pv(
+                        packed_v,
+                        prob + pv_slot * W * BM,
+                        dst,
+                        vb,
+                        pb,
+                        pend,
+                        wave + 1 < WAVES,
+                        pv_slot,
+                        W,
+                        BN,
+                        BM,
+                    )
+    with tle.scope(core_mode="vector"):
+        for wave in range(WAVES):
+            slot = wave % 2
+            if wave > 1:
+                previous, _, prior_end = _token_major_prefill_ticket(
+                    wave - 2, worker, klen, QLEN, ROWS, TASKS, WORKERS
+                )
+                # Drain the release even when this ticket has no active rows.
+                if (previous >= 0) & (prior_end > 0):
+                    sync_block_wait(
+                        "cube", "vector", 8 + slot, PIPE.PIPE_MTE2, PIPE.PIPE_S
+                    )
+            t, qr, end = _token_major_prefill_ticket(
+                wave, worker, klen, QLEN, ROWS, TASKS, WORKERS
+            )
+            if (t >= 0) & (end > 0):
+                sync_block_wait("cube", "vector", 12 + slot, PIPE.PIPE_FIX, PIPE.PIPE_S)
+                src = score + slot * W * BM
+                norms = partial + t.to(tl.int64) * BM * 257 + BM * 256
+                _token_major_prefill_softmax(
+                    src,
+                    prob + slot * W * BM,
+                    norms,
+                    end,
+                    qr,
+                    QLEN,
+                    klen,
+                    SCALE,
+                    BN,
+                    W,
+                    BM,
+                    VM,
+                    H,
+                )
+                sync_block_set("vector", "cube", 6 + slot, PIPE.PIPE_MTE3, PIPE.PIPE_S)
