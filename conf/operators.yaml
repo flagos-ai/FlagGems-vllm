@@ -1047,6 +1047,18 @@ ops:
   - Quantization
   stages:
   - beta: '5.4'
+- id: fused_kimi_k3_mla_decode_q_concat_ds_mla_insert
+  description: Concatenate Kimi-K3 decode queries and store scaled E4M3FN latent
+    groups, four FP32 scales and the positional key in a 656-byte paged cache row.
+  for:
+  - _C.fused_kimi_k3_mla_decode_q_concat_ds_mla_insert
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Quantization
+  stages:
+  - beta: '0.3'
 - id: fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
   description: Concatenate Kimi-K3 decode queries and insert each valid token's latent
     key into the paged cache, optionally applying interleaved RoPE. Supports BF16
@@ -1055,6 +1067,20 @@ ops:
   - _C.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
   labels:
   - fused
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '0.3'
+- id: fused_kimi_k3_mla_key_concat_kv_cache_insert
+  description: >-
+    Assemble per-head Kimi-K3 prefill keys and insert shared latent keys into the
+    paged cache. Optionally rotate the query and key tails with interleaved RoPE.
+  for:
+  - _C.fused_kimi_k3_mla_key_concat_kv_cache_insert
+  labels:
+  - fused
+  - Attention
   - vLLM
   kind:
   - DataMovement
@@ -1748,6 +1774,17 @@ ops:
   - vLLM
   kind:
   - NeuralNetwork
+  stages:
+  - beta: '0.3'
+- id: lora_shrink
+  description: Project hidden states into each token's LoRA rank space and write the scaled results in place.
+  for:
+  - vllm.lora.ops.triton_ops.lora_shrink_op.lora_shrink
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - BLAS
   stages:
   - beta: '0.3'
 - id: mamba_mixer
@@ -2460,6 +2497,19 @@ ops:
   stages:
   - beta: '5.0'
   - stable: '5.3'
+- id: split_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  description: Compress 128 paged DeepSeek-V4 state rows into the caller's FP32
+    workspace, apply weighted RMSNorm and RoPE, and write packed or full KV cache.
+  for:
+  - vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl.split_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: stage_deepseek_v4_mega_moe_inputs
   description: 'Stages DeepSeekV4 Mega-MoE inputs by quantizing hidden states to FP8
 

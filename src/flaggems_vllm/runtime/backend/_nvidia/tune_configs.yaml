@@ -1498,6 +1498,17 @@ concat_mla_q:
     num_warps: 8
     num_stages: 1
 
+fused_kimi_k3_mla_key_concat_kv_cache_insert:
+  - META: {HEADS_PER_PROGRAM: 1}
+    num_warps: 4
+    num_stages: 1
+  - META: {HEADS_PER_PROGRAM: 4}
+    num_warps: 4
+    num_stages: 1
+  - META: {HEADS_PER_PROGRAM: 8}
+    num_warps: 4
+    num_stages: 1
+
 # Bad-words keeps semantic tile selection in its host dispatch.  These
 # candidates are reserved for the libtuner integration and only vary launch
 # resources, so autotuning cannot select a tile that changes the dispatch
@@ -1547,6 +1558,28 @@ fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl:
     num_stages: 1
   - META: {}
     num_warps: 4
+    num_stages: 1
+
+split_kv_compress_norm_rope_insert_sparse_attn_cutedsl:
+  - META: {BLOCK_D: 8}
+    num_warps: 2
+    num_stages: 1
+  - META: {BLOCK_D: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 32}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_D: 64}
+    num_warps: 8
+    num_stages: 1
+
+split_kv_compress_norm_rope_insert_sparse_attn_cutedsl_store:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
     num_stages: 1
 
 flash_mla_fp8_copy_table:
@@ -1814,6 +1847,11 @@ lora_expand_wide_gemv:
 
 lora_expand_grouped:
   - META: {BLOCK_M: 32, BLOCK_N: 64}
+    num_warps: 4
+    num_stages: 1
+
+fused_kimi_k3_mla_decode_q_concat_ds_mla_insert:
+  - META: {}
     num_warps: 4
     num_stages: 1
 
@@ -2093,5 +2131,43 @@ flash_mla_sparse_fwd:
 
 fused_kimi_k3_mla_decode_q_concat_kv_cache_insert:
   - META: {}
+    num_warps: 4
+    num_stages: 1
+
+lora_shrink_zero:
+  - META: {BLOCK: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 1024}
+    num_warps: 4
+    num_stages: 1
+
+lora_shrink_gemv:
+  - META: {BLOCK_R: 4, BLOCK_K: 256}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_R: 1, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_R: 4, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+
+lora_shrink_grouped:
+  - META: {BLOCK_M: 16, BLOCK_R: 16, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16, BLOCK_R: 16, BLOCK_K: 128}
+    num_warps: 4
+    num_stages: 2
+  - META: {BLOCK_M: 32, BLOCK_R: 32, BLOCK_K: 64}
+    num_warps: 4
+    num_stages: 3
+
+lora_shrink_reduce:
+  - META: {BLOCK_M: 8, BLOCK_R: 16}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK_M: 16, BLOCK_R: 32}
     num_warps: 4
     num_stages: 1
