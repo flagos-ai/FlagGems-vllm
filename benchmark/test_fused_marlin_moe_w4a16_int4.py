@@ -51,6 +51,11 @@ from flaggems_vllm.runtime import torch_device_fn
 
 from . import base
 
+if flaggems_vllm.vendor_name == "mthreads" and HAS_VLLM_FUSED_EXPERTS:
+    # Match the vendor's model initialization for the native baseline.
+    import vllm._moe_C  # noqa: F401
+    import vllm_musa.model_executor.layers.fused_moe.fused_moe  # noqa: F401
+
 
 def is_supported_device():
     if flaggems_vllm.vendor_name in ("hygon", "mthreads"):
