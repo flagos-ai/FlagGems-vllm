@@ -1665,6 +1665,17 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: layer_norm_fwd_npu
+  description: Gated layer/RMS normalization with optional bias and a preallocated output on Atlas A5.
+  for:
+  - layer_norm_fwd_npu
+  labels:
+  - non-aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: lightning_indexer
   description: 'TLE implementation of the Ascend paged-attention Lightning Indexer:
 
