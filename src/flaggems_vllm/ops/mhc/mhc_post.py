@@ -382,10 +382,18 @@ def mhc_post(
         # configs the sustained sweep showed to be fastest. Our configs are
         # validated through the raw JIT path (no aabs), so disable the
         # rewrite for this launch only and restore it afterwards.
-        autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
-        _aabs = getattr(autotuning, "adjust_block_size", None)
-        if _aabs is not None:
-            autotuning.adjust_block_size = False
+        #
+        # The knob only exists on FlagTree builds that ship aabs.  Older /
+        # vendor FlagTree builds (e.g. the Ascend 3.5 backend) do not have it,
+        # and reading the attribute unconditionally used to raise AttributeError
+        # before reaching the kernel.
+        _autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
+        _has_aabs = _autotuning is not None and hasattr(
+            _autotuning, "adjust_block_size"
+        )
+        _aabs = _autotuning.adjust_block_size if _has_aabs else None
+        if _has_aabs:
+            _autotuning.adjust_block_size = False
         try:
             try:
                 from triton._flagtree_backend import FLAGTREE_BACKEND
@@ -406,8 +414,8 @@ def mhc_post(
                     a, b, c, d, out, a_sn, a_sj, a_si, H=H
                 )
         finally:
-            if _aabs is not None:
-                autotuning.adjust_block_size = _aabs
+            if _has_aabs:
+                _autotuning.adjust_block_size = _aabs
     else:
 
         def grid_generic(META):

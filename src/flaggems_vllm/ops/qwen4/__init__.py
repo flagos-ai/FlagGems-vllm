@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.ops.qwen4.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
+from flaggems_vllm import runtime as _runtime
 from flaggems_vllm.ops.qwen4.hc_combine import hc_combine
 from flaggems_vllm.ops.qwen4.hc_down_silu import hc_down_silu
 from flaggems_vllm.ops.qwen4.hyperconnection import (
@@ -50,6 +50,11 @@ from flaggems_vllm.ops.qwen4.qsa_prepare import qsa_prepare
 from flaggems_vllm.ops.qwen4.qsa_sparse_paged_attention import (
     qsa_sparse_paged_attention,
 )
+
+if _runtime.device.vendor_name == "thead":
+    from flaggems_vllm.runtime.backend._thead.ops import grouped_gemma_rmsnorm
+else:
+    from flaggems_vllm.ops.qwen4.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
 
 __all__ = [
     "grouped_gemma_rmsnorm",

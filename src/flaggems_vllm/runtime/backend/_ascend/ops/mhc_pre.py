@@ -343,6 +343,10 @@ _TLE_NC = 32
 # proj: 128 is the best tile at 4096 tokens (46.5us at 4096x1280, the same as
 # the token-major tile); smaller token counts shrink it so the K loop still
 # spreads over every AI core.
+# Re-swept on 910B4 at 20480x3584 with a cleared ~/.triton/cache (see the note
+# on the reduce tiles below): 128 is still the optimum - 256 overflows UB once
+# the sumsq loop is present and 64 drops to 797 GB/s (737us vs 597us) - and
+# BLOCK_K 128/256/512/1024 all land within noise (594-598us), so 512 stands.
 _TLE_PROJ_BLOCK_M = 128
 _TLE_PROJ_BLOCK_K = 512
 _TLE_PROJ_BLOCK_K_SQ = 256
@@ -353,6 +357,18 @@ _TLE_MIX_BLOCK_T = 256
 # tile buys occupancy (16x256 = five 16-bit tiles + the f32 accumulator fits
 # comfortably in UB, and 256 programs at 4096 tokens fill the vector cores).
 # Short sequences already have few token blocks, so they keep the wider tile.
+#
+# Re-swept at 4096 and 20480 tokens: BLOCK_T x BLOCK_D over {4,8,16} x
+# {128,256,512,1024} puts every viable pair within ~5% of the rest, 16/256 is
+# the best at 20480 (671us = 1093 GB/s, the machine's copy bandwidth) and 8/512
+# leads at 4096 (116us vs 120us).  Kept as shipped; no headroom left here.
+#
+# Measure with `rm -rf ~/.triton/cache` first.  The Ascend backend retries a
+# UB-overflowing compile with code-motion / auto-multi-buffer disabled, and a
+# stale cache can serve such an artefact: kernels then run at an impossible
+# bandwidth because only the first wave of blocks executes (with BLOCK_T=16,
+# BLOCK_D=256 that looked like "tokens >= 640 never written"), or silently
+# miscompute.  With a clean cache every configuration above is correct.
 _TLE_REDUCE_BLOCK_T = 16
 _TLE_REDUCE_BLOCK_T_SHORT = 32
 _TLE_REDUCE_BLOCK_D = 256
@@ -850,8 +866,15 @@ def _mhc_pre_tle_4(
     mix_stride = t_pad
 
     bt = _get_bt_padded_cached(fn)
-    # Padded to the mix tile: the mix stage reads whole BLOCK_T tiles.
-    sq = torch.zeros(t_pad, dtype=torch.float32, device=device)
+    # Padded to the mix tile because the mix stage copies whole BLOCK_T tiles.
+    # The projection writes every lane when num_tokens is a whole number of
+    # tiles (the common case, so nothing is left uninitialised); otherwise the
+    # lanes past num_tokens stay whatever empty() returned, but they are
+    # unobservable - the mix kernel masks all three stores on
+    # `t < num_tokens`, the reduce kernel masks its read of `pre`, and every
+    # op between is per-token with no cross-lane term.  Skipping the zero-fill
+    # also skips a kernel launch, worth ~20us of host time per call.
+    sq = torch.empty(t_pad, dtype=torch.float32, device=device)
     # Only the first num_tokens columns are written by the projection; the
     # padding lanes are masked on store and never read back.
     mix_t = torch.empty(_TLE_NC, mix_stride, dtype=torch.float32, device=device)

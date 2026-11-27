@@ -32,7 +32,7 @@ try:
     )
 
     HAS_VLLM = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_VLLM = False
 
 # Every operator is taken from the package namespace, never from its module path:
@@ -271,7 +271,12 @@ def mhc_split_sinkhorn_torch_ref(
         2
     ] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
 
-    row_max = comb.max(dim=-1, keepdim=True).values
+    if flaggems_vllm.vendor_name == "enflame":
+        # Tensor.max(dim) emits an int64 index output that topsatenMax rejects
+        # on GCU; amax returns the same values without the index tensor.
+        row_max = torch.amax(comb, dim=-1, keepdim=True)
+    else:
+        row_max = comb.max(dim=-1, keepdim=True).values
     comb = (comb - row_max).exp()
     comb = comb / comb.sum(dim=-1, keepdim=True) + eps
     comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)

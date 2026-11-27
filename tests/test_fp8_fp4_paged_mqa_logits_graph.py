@@ -134,3 +134,54 @@ def test_graph_logits_empty_and_unsupported_dtype():
     args[0] = (args[0][0].float(), None)
     with pytest.raises(NotImplementedError, match="FP8 e4m3fn"):
         fp8_fp4_paged_mqa_logits_graph(*args, None, 4096)
+
+
+@pytest.mark.fp8_fp4_paged_mqa_logits_graph
+@pytest.mark.parametrize("large_offset", [False, True])
+def test_graph_logits_padded_page_bounds(large_offset):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Requires FP8 tensor cores")
+    if large_offset and torch.cuda.mem_get_info()[0] < 3 * 1024**3:
+        pytest.skip("Requires 3 GiB of free CUDA memory")
+
+    page_size, head_dim, heads = 64, 128, 16
+    bytes_per_page = page_size * (head_dim + 4)
+    page_stride = 294912 if large_offset else bytes_per_page + 16
+    last_page = 2**31 // page_stride + 1 if large_offset else 1
+    cache = torch.empty_strided(
+        (last_page + 1, page_size, 1, head_dim + 4),
+        (page_stride, head_dim + 4, head_dim + 4, 1),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    for page, value in ((0, 1.0), (last_page, 2.0)):
+        raw = cache[page].view(-1)
+        raw[: page_size * head_dim].view(torch.float8_e4m3fn).fill_(value)
+        raw[page_size * head_dim :].view(torch.float32).fill_(1.0)
+    q = torch.ones((1, 1, heads, head_dim), device="cuda").to(torch.float8_e4m3fn)
+    weights = torch.full((1, heads), 1 / heads, device="cuda")
+    lengths = torch.full((1,), page_size, device="cuda", dtype=torch.int32)
+    table = torch.full((1, 1), last_page, device="cuda", dtype=torch.int32)
+
+    def run():
+        return fp8_fp4_paged_mqa_logits_graph(
+            (q, None), cache, weights, lengths, table, None, 3 * page_size, True
+        )
+
+    expected = torch.full((1, 3 * page_size), -torch.inf, device="cuda")
+    expected[:, :page_size] = 2 * head_dim
+    torch.testing.assert_close(run(), expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    for page, length, value in (
+        (last_page, page_size, 2),
+        (0, 3 * page_size, 1),
+        (last_page, page_size, 2),
+    ):
+        table.fill_(page)
+        lengths.fill_(length)
+        out.fill_(float("nan"))
+        expected[:, :page_size] = value * head_dim
+        graph.replay()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)

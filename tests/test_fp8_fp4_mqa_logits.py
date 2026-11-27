@@ -26,10 +26,14 @@ except ImportError:
     VLLM_AVAILABLE = False
     SM90_AVAILABLE = False
 
-from vllm.third_party.deep_gemm.utils.math import (
-    cast_back_from_fp4,
-    per_token_cast_to_fp4,
-)
+try:
+    from vllm.third_party.deep_gemm.utils.math import (
+        cast_back_from_fp4,
+        per_token_cast_to_fp4,
+    )
+except ImportError:
+    pass
+
 
 import flaggems_vllm
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
@@ -211,14 +215,15 @@ def test_fp8_fp4_mqa_logits(M, N, clean_logits, use_fp4):
         )
         ref_out = to_reference(ref_out)
 
-    res_out = fp8_fp4_mqa_logits(
-        q=(q_values, q_scale),
-        kv=(k_fp8, k_scale),
-        weights=weights,
-        cu_seqlen_ks=ks,
-        cu_seqlen_ke=ke,
-        clean_logits=clean_logits,
-    )
+    with flaggems_vllm.use_gems():
+        res_out = fp8_fp4_mqa_logits(
+            q=(q_values, q_scale),
+            kv=(k_fp8, k_scale),
+            weights=weights,
+            cu_seqlen_ks=ks,
+            cu_seqlen_ke=ke,
+            clean_logits=clean_logits,
+        )
 
     # FP4 has lower precision than FP8, so use a wider tolerance
     atol = 0.15 if use_fp4 else 5e-2

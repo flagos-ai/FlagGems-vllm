@@ -331,8 +331,10 @@ def _cooperative_topk_impl(
     ``max_seq_len`` is ignored, as in vLLM. NaNs
     outrank +inf; tie indices and output order are unspecified. Forward only.
     """
-    if logits.device.type not in ("cuda", "npu"):
-        raise NotImplementedError("cooperative_topk requires a CUDA or NPU device")
+    if logits.device.type not in ("cuda", "musa", "npu"):
+        raise NotImplementedError(
+            "cooperative_topk requires a CUDA, MUSA or NPU device"
+        )
     if logits.dtype != torch.float32:
         raise NotImplementedError("cooperative_topk supports only float32 logits")
     if logits.layout != torch.strided:

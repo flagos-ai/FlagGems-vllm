@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 
 import torch
 import triton
@@ -14,6 +15,11 @@ from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 
 logger = logging.getLogger(__name__)
+
+# Triton 3.6 passes constexprs to the compiled CUDA launcher.
+_HOPPER_LAUNCH = (
+    runtime.device.vendor_name == "nvidia" and triton.__version__.startswith("3.6.")
+)
 
 
 @triton.jit
@@ -171,6 +177,25 @@ def _hc_down_silu_wide_gemv(
     tl.store(O + row * N + columns, value, columns < RANK + HC)
 
 
+@lru_cache(maxsize=256)
+def _hopper_dense_launcher(device, m, k, n, rank, hc, sx, sw):
+    # Limit the specialization to short dense projections. Keep arbitrary
+    # strides, wide addresses and larger prefill workloads on their old paths.
+    if not (
+        sx == sw == k
+        and k % 8 == 0
+        and m * n < 2**31
+        and ((k == 10240 and rank + hc == 324) or (k <= 4096 and rank + hc <= 64))
+        and torch.cuda.get_device_capability(device) == (9, 0)
+    ):
+        return None
+    from flaggems_vllm.runtime.backend._nvidia.hopper.ops.hc_down_silu import (
+        make_dense_launcher,
+    )
+
+    return make_dense_launcher(device, m, k, n, rank, hc)
+
+
 def hc_down_silu(
     x: torch.Tensor, weight: torch.Tensor, rank: int, hc: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -187,6 +212,10 @@ def hc_down_silu(
     contiguous native workload. Empty M also preserves these packed views.
     """
     logger.debug("GEMS HC_DOWN_SILU")
+    return _hc_down_silu(x, weight, rank, hc, _launch)
+
+
+def _hc_down_silu(x, weight, rank, hc, launch):
     if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
         raise TypeError("hc_down_silu requires tensor inputs")
     if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
@@ -197,7 +226,8 @@ def hc_down_silu(
         raise ValueError("hc_down_silu requires rank-2 inputs")
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise TypeError("hc_down_silu supports only bfloat16 inputs")
-    if x.device != weight.device:
+    device = x.device
+    if device != weight.device:
         raise ValueError("hc_down_silu requires same-device inputs")
     if x.layout != torch.strided or weight.layout != torch.strided:
         raise ValueError("hc_down_silu requires strided inputs")
@@ -210,9 +240,25 @@ def hc_down_silu(
     sx, sw = x.stride(), weight.stride()
     if sx[1] != 1 or sw[1] != 1 or sx[0] < 0 or sw[0] < 0:
         raise ValueError("hc_down_silu requires unit inner and nonnegative row strides")
-    if x.device.type in ("cpu", "meta"):
+    if device.type in ("cpu", "meta"):
         raise NotImplementedError("hc_down_silu requires accelerator inputs")
-    output = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    output = torch.empty((m, n), dtype=x.dtype, device=device)
+    if (
+        _HOPPER_LAUNCH
+        and 0 < m <= 48
+        and device.type == "cuda"
+        and device.index == torch.cuda.current_device()
+        and (x.data_ptr() | weight.data_ptr() | output.data_ptr()) % 16 == 0
+    ):
+        hopper_launch = _hopper_dense_launcher(
+            device.index, m, k, n, rank, hc, sx[0], sw[0]
+        )
+        if hopper_launch is not None:
+            hopper_launch(x, weight, output)
+            return (
+                output.as_strided((m, rank), (n, 1), 0),
+                output.as_strided((m, hc), (n, 1), rank),
+            )
     activation, injection_logits = output[:, :rank], output[:, rank : rank + hc]
     if m == 0:
         return activation, injection_logits
@@ -224,6 +270,14 @@ def hc_down_silu(
         )
         > 2**31 - 1
     )
+    dimensions = (m, k, n, rank, hc, sx[0], sw[0])
+    with runtime.torch_device_fn.device(x.device.index):
+        launch(x, weight, output, dimensions, wide)
+    return activation, injection_logits
+
+
+def _launch(x, weight, output, dimensions, wide):
+    m, k, _, rank, hc, _, _ = dimensions
     use_gemv = m <= 4 or k < 2048
     # Measured crossovers at the model workload: H20 favors vectors through
     # M=16, while S5000 favors them throughout the fused model domain and M=49.
@@ -233,21 +287,19 @@ def hc_down_silu(
             use_gemv = m <= 16
         elif runtime.device.vendor_name == "mthreads":
             use_gemv = m <= 49
-    shape = (m, k, n, rank, hc, sx[0], sw[0], int(use_gemv))
-    with runtime.torch_device_fn.device(x.device.index):
-        if wide:
-            _hc_down_silu_wide_gemv[
-                lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))
-            ](x, weight, output, (m, k, n, rank, hc, sx[0], sw[0], 2))
-        elif use_gemv:
-            _hc_down_silu_gemv[
-                lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))
-            ](x, weight, output, shape)
-        else:
-            _hc_down_silu_gemm[
-                lambda meta: (
-                    triton.cdiv(m, meta["BLOCK_M"]),
-                    triton.cdiv(rank + hc, meta["BLOCK_N"]),
-                )
-            ](x, weight, output, shape)
-    return activation, injection_logits
+    shape = (*dimensions, int(use_gemv))
+    if wide:
+        _hc_down_silu_wide_gemv[
+            lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))
+        ](x, weight, output, (*dimensions, 2))
+    elif use_gemv:
+        _hc_down_silu_gemv[lambda meta: (m, triton.cdiv(rank + hc, meta["BLOCK_N"]))](
+            x, weight, output, shape
+        )
+    else:
+        _hc_down_silu_gemm[
+            lambda meta: (
+                triton.cdiv(m, meta["BLOCK_M"]),
+                triton.cdiv(rank + hc, meta["BLOCK_N"]),
+            )
+        ](x, weight, output, shape)

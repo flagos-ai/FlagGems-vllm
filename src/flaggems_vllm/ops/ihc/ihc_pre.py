@@ -446,7 +446,16 @@ def ihc_pre(
 
 
 def _ihc_pre(
-    x, weight, scale, base, magnitude, hc_eps, norm_eps, *, _pipeline_stages=None
+    x,
+    weight,
+    scale,
+    base,
+    magnitude,
+    hc_eps,
+    norm_eps,
+    *,
+    _pipeline_stages=None,
+    _launcher=None,
 ):
     if not (
         isinstance(x, torch.Tensor)
@@ -492,12 +501,13 @@ def _ihc_pre(
         # Direct family imports also preserve the legacy entry on Ascend.
         _pipeline_stages = 1 if runtime.device.vendor_name == "ascend" else _NUM_STAGES
 
+    launch = _launch_ihc_pre if _launcher is None else _launcher
     if runtime.torch_device_fn.current_device() == device.index:
-        return _launch_ihc_pre(
+        return launch(
             x, weight, scale, base, magnitude, hc_eps, norm_eps, _pipeline_stages
         )
     with runtime.torch_device_fn.device(device.index):
-        return _launch_ihc_pre(
+        return launch(
             x, weight, scale, base, magnitude, hc_eps, norm_eps, _pipeline_stages
         )
 
