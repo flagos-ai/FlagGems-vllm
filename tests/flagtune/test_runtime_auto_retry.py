@@ -351,6 +351,26 @@ class PortTests(unittest.TestCase):
             tuner.get_benchmark_key({"M": 33}), tuner.get_benchmark_key({"M": 34})
         )
 
+    def test_composite_benchmark_keys_are_sql_scalars(self):
+        tuner = self.make()
+        tuner.keys = ["M", "dtype", "SHAPE", "STRIDES"]
+        args = {
+            "M": 33,
+            "dtype": ("float16", "float16"),
+            "SHAPE": (3, 11),
+            "STRIDES": [11, 1],
+        }
+        key = tuner.get_benchmark_key(args)
+
+        self.assertEqual(key[0], 33)
+        self.assertTrue(all(isinstance(value, str) for value in key[1:4]))
+        self.assertEqual(key, tuner.get_benchmark_key(dict(args, STRIDES=[11, 1])))
+        self.assertNotEqual(key, tuner.get_benchmark_key(dict(args, SHAPE=(11, 3))))
+        self.assertNotEqual(key, tuner.get_benchmark_key(dict(args, STRIDES=[1, 3])))
+        self.assertNotEqual(
+            key, tuner.get_benchmark_key(dict(args, dtype=("bfloat16", "float16")))
+        )
+
     def test_variant_and_native_protocol_cache_separation(self):
         a = self.make()
         b = self.make("swap")
