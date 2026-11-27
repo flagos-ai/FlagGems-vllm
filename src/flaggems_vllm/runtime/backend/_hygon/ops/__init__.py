@@ -31,8 +31,6 @@ from flaggems_vllm.runtime.backend._hygon.ops.fused_indexer_weight_scale import 
 )
 from flaggems_vllm.runtime.backend._hygon.ops.fused_moe import (  # noqa: F401
     fused_experts_impl,
-    inplace_fused_experts,
-    outplace_fused_experts,
 )
 from flaggems_vllm.runtime.backend._hygon.ops.gate_sigmoid_mul import gate_sigmoid_mul
 from flaggems_vllm.runtime.backend._hygon.ops.gdn_w8a16 import (
@@ -91,12 +89,10 @@ __all__ = [
     "gdn_w8a16",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
-    "inplace_fused_experts",
     "int8_einsum",
     "mamba_mixer",
     "megamoe_int8",
     "mhc_pre_broadcast",
-    "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
     "ple_state_scatter_",

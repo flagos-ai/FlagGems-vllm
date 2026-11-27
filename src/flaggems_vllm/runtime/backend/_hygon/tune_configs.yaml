@@ -986,3 +986,22 @@ mhc_shifted_project_coeff_hygon:
   - META: {BLOCK_M: 64, BLOCK_K: 256, BLOCK_N: 32}
     num_warps: 8
     num_stages: 3
+
+# Qwen3.6-35B-A3B W16A16 prefill tiling measured on gfx936.
+hygon_fused_moe_qwen_small:
+  - META:
+      BLOCK_SIZE_M: 64
+      BLOCK_SIZE_N: 128
+      BLOCK_SIZE_K: 64
+      GROUP_SIZE_M: 1
+    num_warps: 8
+    num_stages: 2
+
+hygon_fused_moe_qwen_large:
+  - META:
+      BLOCK_SIZE_M: 128
+      BLOCK_SIZE_N: 128
+      BLOCK_SIZE_K: 64
+      GROUP_SIZE_M: 1
+    num_warps: 8
+    num_stages: 2

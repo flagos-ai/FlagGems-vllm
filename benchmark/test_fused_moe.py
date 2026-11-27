@@ -12,7 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Benchmark FlagGems fused_experts_impl against each platform MoE baseline.
+
+Production entries are used on every vendor. NVIDIA uses the same FusedMoE
+execution path as the other platforms instead of the functional reference.
+"""
+
+import gc
 import inspect
+import json
+import os
+import tempfile
 
 import pytest
 import torch
@@ -21,144 +31,644 @@ import flaggems_vllm
 
 from . import base
 
-try:
-    from vllm.model_executor.layers.fused_moe.fused_moe import (
-        fused_experts_impl as vllm_fused_experts_impl,
+VENDOR = flaggems_vllm.vendor_name
+
+# (num_tokens, num_experts, hidden_size, intermediate_size, topk)
+_SHAPES = [
+    # Mixtral-like
+    (1, 8, 4096, 14336, 2),
+    (4, 8, 4096, 14336, 2),
+    (16, 8, 4096, 14336, 2),
+    (64, 8, 4096, 14336, 2),
+    (128, 8, 4096, 14336, 2),
+    (256, 8, 4096, 14336, 2),
+    (512, 8, 4096, 14336, 2),
+    # DeepSeek-V3-like (TP=8 shard)
+    (1, 256, 7168, 2048, 8),
+    (4, 256, 7168, 2048, 8),
+    (16, 256, 7168, 2048, 8),
+    (64, 256, 7168, 2048, 8),
+    (128, 256, 7168, 2048, 8),
+    (256, 256, 7168, 2048, 8),
+    # Qwen3.6-35B-A3B, real prefill chunks from the p1024/p4096/p32768 runs.
+    (1036, 256, 2048, 128, 8),
+    (4435, 256, 2048, 128, 8),
+    (4108, 256, 2048, 128, 8),
+    (13422, 256, 2048, 128, 8),
+    (16384, 256, 2048, 128, 8),
+    (1036, 256, 2048, 512, 8),
+    (4435, 256, 2048, 512, 8),
+    (4108, 256, 2048, 512, 8),
+    (13422, 256, 2048, 512, 8),
+    (16384, 256, 2048, 512, 8),
+    # 285B profiling shapes from #1265: prefill M=8192, decode M=1.
+    (8192, 256, 4096, 4096, 8),
+    (1, 256, 4096, 4096, 8),
+]
+
+
+def _get_supported_dtypes():
+    if VENDOR == "thead":
+        # The PPU DeepGEMM expert path only accepts bfloat16 weights.
+        return [torch.bfloat16]
+    if VENDOR == "mthreads":
+        # The two 285B shapes do not fit in fp16: the production path keeps
+        # ~27 GiB resident and the fp16 weights need 25.8 GB, so a default
+        # (both dtype) run cannot finish. Gate the op to bf16 until the
+        # production entry can release that memory.
+        return [torch.bfloat16]
+    return [torch.bfloat16, torch.float16]
+
+
+def _input_fn(shape, dtype, device):
+    num_tokens, num_experts, hidden_size, intermediate_size, topk = shape
+    hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    w1 = torch.randn(
+        num_experts, intermediate_size * 2, hidden_size, dtype=dtype, device=device
     )
+    w2 = torch.randn(
+        num_experts, hidden_size, intermediate_size, dtype=dtype, device=device
+    )
+    gating = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
+    topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    # topk_weights stays float32 for every backend: this is the production
+    # router contract, and mctlass stage2 also reads float32 weights.
+    assert topk_weights.dtype == torch.float32
+    assert topk_ids.dtype == torch.int32
+    yield hidden_states, w1, w2, topk_weights, topk_ids
 
-    HAS_VLLM_FUSED_MOE = True
-except ImportError:
-    HAS_VLLM_FUSED_MOE = False
+
+# Production baseline used by this benchmark and by the accuracy tests.
+# Kept in the benchmark module so the vLLM entry point being measured is
+# visible here instead of hidden in a library testing helper.
+_CACHE = {"key": None, "layer": None, "workspace_ready": False}
 
 
-def _supports_keyword(op, keyword):
+def _build_layer(num_experts, hidden_size, intermediate_size, topk, dtype):
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    # vLLM 0.32 replaced the FusedMoE constructor with FusedMoEFactory.
     try:
-        parameters = inspect.signature(op).parameters
-    except (TypeError, ValueError):
-        return False
-    return keyword in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE as _moectl
+    except ImportError:
+        from vllm.model_executor.layers.fused_moe.layer import (
+            FusedMoEFactory as _moectl,
+        )
+    try:
+        from vllm.v1.worker.workspace import init_workspace_manager
+    except ImportError:  # vLLM 0.32 dropped this helper
+        init_workspace_manager = None
+
+    if init_workspace_manager is not None and not _CACHE["workspace_ready"]:
+        init_workspace_manager(torch.device("cuda"))
+        _CACHE["workspace_ready"] = True
+    ctx = VllmConfig()
+    previous = torch.get_default_device()
+    torch.set_default_device("cuda")
+    try:
+        with set_current_vllm_config(ctx):
+            layer = _moectl(
+                num_experts,
+                topk,
+                hidden_size,
+                intermediate_size,
+                params_dtype=dtype,
+                quant_config=None,
+                tp_size=1,
+                dp_size=1,
+                pcp_size=1,
+            )
+    finally:
+        torch.set_default_device(previous)
+    # vLLM 0.25 moved the expert weights onto a nested RoutedExperts module.
+    _CACHE.update(layer=layer, experts=getattr(layer, "routed_experts", layer), ctx=ctx)
+
+
+def thead_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Run vLLM's production PPU expert method on the given top-k inputs."""
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+
+    _, hidden_size = hidden_states.shape
+    num_experts = w1.shape[0]
+    intermediate_size = w2.shape[2]
+    topk = topk_ids.shape[1]
+    key = (
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        hidden_states.dtype,
+        w1.data_ptr(),
+        w2.data_ptr(),
+    )
+    if key != _CACHE["key"]:
+        _CACHE["layer"] = None
+        torch.cuda.empty_cache()
+        _build_layer(
+            num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
+        )
+        _CACHE["key"] = key
+        experts = _CACHE["experts"]
+        with set_current_vllm_config(_CACHE["ctx"]):
+            experts.w13_weight.data.copy_(w1)
+            experts.w2_weight.data.copy_(w2)
+            experts.quant_method.process_weights_after_loading(experts)
+
+    experts = _CACHE["experts"]
+    ctx = _CACHE["ctx"]
+    # Call the production expert method with the same top-k inputs as the
+    # FlagGems op, so neither side pays for router reconstruction.
+    with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
+        return experts.quant_method.apply(
+            layer=experts,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+        )
+
+
+def _build_metax_layer(num_experts, hidden_size, intermediate_size, topk, dtype):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    if not _CACHE["workspace_ready"]:
+        init_workspace_manager(torch.device("cuda"))
+        _CACHE["workspace_ready"] = True
+    ctx = VllmConfig()
+    previous = torch.get_default_device()
+    torch.set_default_device("cuda")
+    try:
+        with set_current_vllm_config(ctx):
+            runner = FusedMoEFactory(
+                num_experts,
+                topk,
+                hidden_size,
+                intermediate_size,
+                params_dtype=dtype,
+                quant_config=None,
+                tp_size=1,
+                dp_size=1,
+                pcp_size=1,
+            )
+    finally:
+        torch.set_default_device(previous)
+    _CACHE.update(layer=runner, experts=runner.routed_experts, ctx=ctx)
+
+
+def nvidia_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Run vLLM's production NVIDIA unquantized MoE method.
+
+    Keep ``moe_backend`` at its default ``auto`` value so the production
+    oracle, not the benchmark, selects the backend.
+    """
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+
+    torch.set_default_device(hidden_states.device)
+    _, hidden_size = hidden_states.shape
+    num_experts = w1.shape[0]
+    intermediate_size = w2.shape[2]
+    topk = topk_ids.shape[1]
+
+    key = (
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        hidden_states.dtype,
+        w1.data_ptr(),
+        w2.data_ptr(),
+    )
+    if key != _CACHE.get("nvidia_key"):
+        _CACHE["layer"] = None
+        torch.cuda.empty_cache()
+        _build_layer(
+            num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
+        )
+        _CACHE["nvidia_key"] = key
+        experts = _CACHE["experts"]
+        with set_current_vllm_config(_CACHE["ctx"]):
+            experts.w13_weight.data.copy_(w1)
+            experts.w2_weight.data.copy_(w2)
+            experts.quant_method.process_weights_after_loading(experts)
+
+    experts = _CACHE["experts"]
+    ctx = _CACHE["ctx"]
+    qm = experts.quant_method
+    params = inspect.signature(qm.apply).parameters
+    kwargs = {
+        "layer": experts,
+        "x": hidden_states,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+    }
+    if "shared_experts" in params:
+        kwargs["shared_experts"] = None
+    if "shared_experts_input" in params:
+        kwargs["shared_experts_input"] = None
+
+    with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
+        return qm.apply(**kwargs)
+
+
+def metax_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Run vLLM-MetaX's production unquantized MoE method."""
+    assert (
+        topk_weights.dtype == torch.float32
+    ), "MetaX mctlass baseline expects float32 topk_weights"
+    assert (
+        topk_ids.dtype == torch.int32
+    ), "MetaX mctlass baseline expects int32 topk_ids"
+    import vllm_metax
+    import vllm_metax.patch.enhancement.utils  # noqa: F401
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory  # noqa: F401
+
+    if not _CACHE.get("metax_registered"):
+        vllm_metax._out_of_tree()
+        _CACHE["metax_registered"] = True
+
+    # Keep subsequent FlagGems allocations on the same device; _build_layer
+    # constructs the vLLM layer under an explicit default device.
+    torch.set_default_device(hidden_states.device)
+
+    num_experts = w1.shape[0]
+    intermediate_size = w2.shape[2]
+    hidden_size = w2.shape[1]
+    topk = topk_ids.shape[1]
+    topk_ids = topk_ids.to(torch.int32)
+    struct_key = (
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        topk,
+        hidden_states.dtype,
+    )
+    # Reuse the layer for every token count sharing the same expert geometry;
+    # rebuilding it per shape retains too much vLLM workspace on 64 GiB C550s.
+    if struct_key != _CACHE.get("metax_struct"):
+        _CACHE["layer"] = None
+        torch.cuda.empty_cache()
+        _build_metax_layer(
+            num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
+        )
+        _CACHE["metax_struct"] = struct_key
+        _CACHE["metax_weight_key"] = None
+
+    experts = _CACHE["experts"]
+    weight_key = (w1.data_ptr(), w2.data_ptr(), hidden_states.dtype)
+    if weight_key != _CACHE.get("metax_weight_key"):
+        with set_current_vllm_config(_CACHE["ctx"]):
+            experts.w13_weight.data = w1
+            experts.w2_weight.data = w2
+            experts.quant_method.process_weights_after_loading(experts)
+            experts._ensure_moe_quant_config_init()
+        _CACHE["metax_weight_key"] = weight_key
+
+    ctx = _CACHE["ctx"]
+    with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
+        return experts.quant_method.apply(
+            layer=experts,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+        )
+
+
+def mthreads_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Run vLLM-MUSA's production MoE method on the given top-k inputs."""
+    # vLLM's model executor must be imported before vllm_musa so the vendor
+    # patch and the MusaUnquantizedFusedMoEMethod OOT registration are active.
+    import vllm.model_executor.layers.fused_moe.fused_moe  # noqa: F401
+    import vllm_musa  # noqa: F401
+    import vllm_musa.model_executor  # noqa: F401
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+
+    # Keep subsequent FlagGems allocations on the same device; _build_layer
+    # constructs the vLLM layer under an explicit default device.
+    torch.set_default_device(hidden_states.device)
+
+    try:  # MoE custom ops live in the in-tree extension on MUSA.
+        import vllm._moe_C  # noqa: F401
+    except ImportError:  # pragma: no cover - non-MUSA builds
+        pass
+
+    _, hidden_size = hidden_states.shape
+    num_experts = w1.shape[0]
+    intermediate_size = w2.shape[2]
+    topk = topk_ids.shape[1]
+    # Production passes int32 routing ids; the DeepGEMM gate rejects int64.
+    topk_ids = topk_ids.to(torch.int32)
+    struct_key = (
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        topk,
+        hidden_states.dtype,
+    )
+    # Reuse the layer for every token count sharing the same expert geometry;
+    # rebuilding it per shape retains too much vLLM workspace on MUSA.
+    if struct_key != _CACHE.get("mthreads_struct"):
+        _CACHE["layer"] = None
+        torch.musa.empty_cache()
+        _build_layer(
+            num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
+        )
+        _CACHE["mthreads_struct"] = struct_key
+        _CACHE["mthreads_weight_key"] = None
+
+    experts = _CACHE["experts"]
+    weight_key = (w1.data_ptr(), w2.data_ptr(), hidden_states.dtype)
+    if weight_key != _CACHE.get("mthreads_weight_key"):
+        with set_current_vllm_config(_CACHE["ctx"]):
+            experts.w13_weight.data = w1
+            experts.w2_weight.data = w2
+            experts.quant_method.process_weights_after_loading(experts)
+            if hasattr(experts, "ensure_moe_quant_config_init"):
+                experts.ensure_moe_quant_config_init()
+        _CACHE["mthreads_weight_key"] = weight_key
+
+    ctx = _CACHE["ctx"]
+    with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
+        return experts.quant_method.forward_oot(
+            experts,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            None,
+            None,
+        )
+
+
+_HYGON_PRODUCTION_AVAILABLE = None
+
+
+def _hygon_production_available():
+    """Return whether the vLLM-HCU production plugin can be imported."""
+    global _HYGON_PRODUCTION_AVAILABLE
+    if _HYGON_PRODUCTION_AVAILABLE is None:
+        # The HCU production recipe selects AITER explicitly. Set the flags
+        # before the first vLLM import so vllm.envs sees them.
+        os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")
+        os.environ.setdefault("VLLM_ROCM_USE_AITER_MOE", "1")
+        try:
+            import vllm_hcu  # noqa: F401
+
+            _HYGON_PRODUCTION_AVAILABLE = True
+        except Exception:
+            _HYGON_PRODUCTION_AVAILABLE = False
+    return _HYGON_PRODUCTION_AVAILABLE
+
+
+def _hygon_make_vllm_config():
+    """Build a synthetic vLLM config for the Hygon production layer.
+
+    vLLM-HCU validates ``VllmConfig.model_config`` during construction even
+    when only the FusedMoE layer is needed. A tiny synthetic Llama config
+    satisfies that contract without downloading or loading real weights.
+    """
+    if "hygon_vllm_config" in _CACHE:
+        return _CACHE["hygon_vllm_config"]
+
+    from vllm.config import ModelConfig, VllmConfig
+
+    model_dir = tempfile.mkdtemp(prefix="flaggems-vllm-hygon-")
+    with open(os.path.join(model_dir, "config.json"), "w") as config_file:
+        json.dump(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 4,
+                "vocab_size": 128,
+                "max_position_embeddings": 128,
+                "rms_norm_eps": 1e-6,
+                "torch_dtype": "bfloat16",
+            },
+            config_file,
+        )
+    model_config = ModelConfig(
+        model=model_dir,
+        tokenizer=model_dir,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        trust_remote_code=True,
+    )
+    _CACHE["hygon_model_dir"] = model_dir
+    _CACHE["hygon_vllm_config"] = VllmConfig(model_config=model_config)
+    return _CACHE["hygon_vllm_config"]
+
+
+def _release_hygon_layer():
+    """Drop the previous synthetic layer from vLLM's layer registry."""
+    layer = _CACHE.get("layer")
+    ctx = _CACHE.get("ctx")
+    if layer is not None and ctx is not None:
+        compilation = getattr(ctx, "compilation_config", None)
+        name = getattr(layer, "layer_name", "")
+        if compilation is not None and name:
+            compilation.static_forward_context.pop(name, None)
+            try:
+                compilation.static_all_moe_layers.remove(name)
+            except ValueError:
+                pass
+    _CACHE["layer"] = None
+    _CACHE["experts"] = None
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _build_hygon_layer(num_experts, hidden_size, intermediate_size, topk, dtype):
+    from vllm.config import set_current_vllm_config
+
+    try:
+        from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+    except ImportError:
+        FusedMoEFactory = None
+    if FusedMoEFactory is None:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+    try:
+        from vllm.v1.worker.workspace import init_workspace_manager
+    except ImportError:
+        init_workspace_manager = None
+    if init_workspace_manager is not None and not _CACHE["workspace_ready"]:
+        init_workspace_manager(torch.device("cuda"))
+        _CACHE["workspace_ready"] = True
+
+    ctx = _hygon_make_vllm_config()
+    # vLLM 0.29 exposes the backend on KernelConfig; older releases use the
+    # AITER environment flags set by _hygon_production_available().
+    if hasattr(ctx, "kernel_config"):
+        try:
+            ctx.kernel_config.moe_backend = "aiter"
+        except Exception:
+            pass
+
+    previous = torch.get_default_device()
+    torch.set_default_device("cuda")
+    layer_id = _CACHE.get("hygon_layer_id", 0)
+    _CACHE["hygon_layer_id"] = layer_id + 1
+    prefix = f"hygon_moe_{layer_id}"
+    try:
+        with set_current_vllm_config(ctx):
+            if FusedMoEFactory is not None:
+                layer = FusedMoEFactory(
+                    num_experts,
+                    topk,
+                    hidden_size,
+                    intermediate_size,
+                    params_dtype=dtype,
+                    quant_config=None,
+                    tp_size=1,
+                    dp_size=1,
+                    pcp_size=1,
+                    prefix=prefix,
+                )
+            else:
+                layer = FusedMoE(
+                    num_experts,
+                    topk,
+                    hidden_size,
+                    intermediate_size,
+                    params_dtype=dtype,
+                    quant_config=None,
+                    tp_size=1,
+                    dp_size=1,
+                    pcp_size=1,
+                    prefix=prefix,
+                )
+    finally:
+        torch.set_default_device(previous)
+    _CACHE.update(
+        layer=layer,
+        experts=getattr(layer, "routed_experts", layer),
+        ctx=ctx,
     )
 
 
-# vLLM versions differ: newer ones require ``inplace`` (no default), older ones
-# do not accept the keyword at all.
-VLLM_FUSED_MOE_SUPPORTS_INPLACE = HAS_VLLM_FUSED_MOE and _supports_keyword(
-    vllm_fused_experts_impl, "inplace"
-)
+def hygon_fused_moe_op(hidden_states, w1, w2, topk_weights, topk_ids):
+    """Run vLLM-HCU's production AITER MoE method."""
+    if not _hygon_production_available():
+        raise RuntimeError("vLLM-HCU production plugin is not available")
+
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+
+    torch.set_default_device(hidden_states.device)
+    num_experts = w1.shape[0]
+    hidden_size = w2.shape[1]
+    intermediate_size = w2.shape[2]
+    topk = topk_ids.shape[1]
+    topk_ids = topk_ids.to(torch.int32)
+
+    struct_key = (
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        topk,
+        hidden_states.dtype,
+    )
+    if struct_key != _CACHE.get("hygon_struct"):
+        _release_hygon_layer()
+        _build_hygon_layer(
+            num_experts, hidden_size, intermediate_size, topk, hidden_states.dtype
+        )
+        _CACHE["hygon_struct"] = struct_key
+        _CACHE["hygon_weight_key"] = None
+
+    experts = _CACHE["experts"]
+    weight_key = (w1.data_ptr(), w2.data_ptr(), hidden_states.dtype)
+    if weight_key != _CACHE.get("hygon_weight_key"):
+        with set_current_vllm_config(_CACHE["ctx"]):
+            experts.w13_weight.data = w1
+            experts.w2_weight.data = w2
+            experts.quant_method.process_weights_after_loading(experts)
+            if hasattr(experts, "ensure_moe_quant_config_init"):
+                experts.ensure_moe_quant_config_init()
+        _CACHE["hygon_weight_key"] = weight_key
+
+    ctx = _CACHE["ctx"]
+    qm = experts.quant_method
+    params = inspect.signature(qm.apply).parameters
+    kwargs = {
+        "layer": experts,
+        "x": hidden_states,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+    }
+    if "shared_experts" in params:
+        kwargs["shared_experts"] = None
+    if "shared_experts_input" in params:
+        kwargs["shared_experts_input"] = None
+    with torch.no_grad(), set_current_vllm_config(ctx), set_forward_context(None, ctx):
+        return qm.apply(**kwargs)
 
 
-class FusedMoEBenchmark(base.Benchmark):
-    """
-    Benchmark for fused_experts_impl comparing FlagGems Triton kernel vs vLLM.
+# Vendors whose production MoE is not the stock vLLM fused_experts_impl.
+PRODUCTION_MOE_VENDORS = {
+    "thead": thead_fused_moe_op,
+    "metax": metax_fused_moe_op,
+    "mthreads": mthreads_fused_moe_op,
+    "hygon": hygon_fused_moe_op,
+    "nvidia": nvidia_fused_moe_op,
+}
 
-    Measures latency of the full fused MoE pipeline:
-      moe_align_block_size → GEMM1(up+gate) → SiLU+Mul → GEMM2(down) → moe_sum
-    """
 
-    def __init__(self, op_name, torch_op, dtypes):
-        super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
+def production_moe_op(vendor_name):
+    """Return the platform production fused MoE callable, or None."""
+    if vendor_name == "hygon" and not _hygon_production_available():
+        return None
+    return PRODUCTION_MOE_VENDORS.get(vendor_name)
+
+
+_PRODUCTION_BASELINE_VENDORS = {"thead", "metax", "mthreads", "hygon", "nvidia"}
+
+
+def _get_baseline_op():
+    if VENDOR in _PRODUCTION_BASELINE_VENDORS:
+        return production_moe_op(VENDOR)
+    return None
+
+
+class FusedMoEBenchmark(base.GenericBenchmarkExcluse1D):
+    DEFAULT_SHAPE_DESC = "num_tokens, num_experts, hidden_size, intermediate_size, topk"
+
+    def init_user_config(self):
+        super().init_user_config()
+        if self.torch_op is None:
+            self.to_bench_metrics = [
+                metric
+                for metric in self.to_bench_metrics
+                if metric not in ("latency_base", "speedup")
+            ]
 
     def set_shapes(self, shape_file_path=None):
-        # (num_tokens, num_experts, hidden_size, intermediate_size, topk)
-        self.shapes = [
-            # Mixtral-like shapes
-            (1, 8, 4096, 14336, 2),
-            (4, 8, 4096, 14336, 2),
-            (16, 8, 4096, 14336, 2),
-            (64, 8, 4096, 14336, 2),
-            (128, 8, 4096, 14336, 2),
-            (256, 8, 4096, 14336, 2),
-            (512, 8, 4096, 14336, 2),
-            # DeepSeek-V3-like shapes (TP=8 shard)
-            (1, 256, 7168, 2048, 8),
-            (4, 256, 7168, 2048, 8),
-            (16, 256, 7168, 2048, 8),
-            (64, 256, 7168, 2048, 8),
-            (128, 256, 7168, 2048, 8),
-            (256, 256, 7168, 2048, 8),
-            # Qwen3.6-35B-A3B (real production shapes, representative subset)
-            (1, 256, 2048, 128, 8),
-            (16, 256, 2048, 128, 8),
-            (64, 256, 2048, 128, 8),
-            (512, 256, 2048, 128, 8),
-            (1035, 256, 2048, 128, 8),
-            # 285B profiling shapes: prefill M=8192, decode M=1; 256 experts, topk=8
-            # CSV: fused_moe_kernel shape1 [[8192,4096],...] and [[1],...]
-            (8192, 256, 4096, 4096, 8),
-            (1, 256, 4096, 4096, 8),
-        ]
-
-    def get_input_iter(self, cur_dtype):
-        for config in self.shapes:
-            yield from self._fused_moe_input_fn(config, cur_dtype)
-
-    def _fused_moe_input_fn(self, config, dtype):
-        num_tokens, num_experts, hidden_size, intermediate_size, topk = config
-        device = flaggems_vllm.device
-
-        hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-        w1 = torch.randn(
-            num_experts,
-            intermediate_size * 2,
-            hidden_size,
-            device=device,
-            dtype=dtype,
-        )
-        w2 = torch.randn(
-            num_experts,
-            hidden_size,
-            intermediate_size,
-            device=device,
-            dtype=dtype,
-        )
-
-        gating = torch.randn(
-            num_tokens, num_experts, device=device, dtype=torch.float32
-        )
-        topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.to(dtype)
-
-        yield (hidden_states, w1, w2, topk_weights, topk_ids)
-
-
-def _vllm_fused_moe_wrapper(hidden_states, w1, w2, topk_weights, topk_ids):
-    """Wrapper to call vllm fused_experts_impl."""
-    kwargs = {"inplace": False} if VLLM_FUSED_MOE_SUPPORTS_INPLACE else {}
-    return vllm_fused_experts_impl(
-        hidden_states.clone(),
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        activation="silu",
-        **kwargs,
-    )
-
-
-def _gems_fused_moe_wrapper(hidden_states, w1, w2, topk_weights, topk_ids):
-    """Wrapper to call FlagGems fused_experts_impl."""
-    return flaggems_vllm.ops_experts_impl(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-    )
+        _ = shape_file_path
+        self.shapes = list(_SHAPES)
 
 
 @pytest.mark.fused_experts_impl
-@pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
-def test_fused_moe_impl_gems_vs_vllm():
-    """
-    Benchmark FlagGems fused_experts_impl vs vLLM fused_experts_impl (bf16/fp16).
-    """
+def test_fused_moe():
     bench = FusedMoEBenchmark(
+        input_fn=_input_fn,
         op_name="fused_experts_impl",
-        torch_op=_vllm_fused_moe_wrapper,
-        dtypes=[torch.bfloat16, torch.float16],
+        torch_op=_get_baseline_op(),
+        gems_op=flaggems_vllm.fused_experts_impl,
+        dtypes=_get_supported_dtypes(),
     )
-    bench.set_gems(_gems_fused_moe_wrapper)
     bench.run()
