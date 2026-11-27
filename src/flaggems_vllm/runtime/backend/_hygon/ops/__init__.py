@@ -63,6 +63,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.runtime.backend._hygon.ops.persistent_topk import (  # noqa: F401
     persistent_topk,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.ple_conv import ple_conv
 from flaggems_vllm.runtime.backend._hygon.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
@@ -99,6 +100,7 @@ __all__ = [
     "outplace_fused_experts",
     "per_token_group_quant_fp8",
     "persistent_topk",
+    "ple_conv",
     "ple_state_scatter_",
     "qsa_prepare",
     "quantize_gdn_state_int8",
