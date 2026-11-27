@@ -427,7 +427,9 @@ ops:
 
     over complete compression groups through dedicated prefill and decode
 
-    paths.
+    paths. Also supports explicit device metadata for paged state writes
+
+    and outputs on Ascend.
 
     '
   for:
