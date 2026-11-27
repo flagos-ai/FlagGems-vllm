@@ -24,6 +24,56 @@ BINCOUNT_SIZES = [16, 100, 1024, 10000] if not QUICK_MODE else [100, 1024]
 BINCOUNT_MAXVALS = [10, 100, 1000] if not QUICK_MODE else [100]
 
 
+def _half_ulp(values, dtype):
+    """ULP of non-negative fp64 values in a half-precision dtype."""
+    finfo = torch.finfo(dtype)
+    rounded = values.clamp(min=0.0, max=finfo.max / 2).to(dtype)
+    upper = torch.nextafter(
+        rounded, torch.full_like(rounded, float("inf"), dtype=dtype)
+    )
+    return upper.to(torch.float64) - rounded.to(torch.float64)
+
+
+def _assert_bincount_weights_close(res, ref, ref_inp, ref_weights):
+    """Compare weighted bincount outputs across accumulation domains.
+
+    FlagGems' bincount follows the official generic semantics on every
+    backend: weights are upcast to fp32, accumulated, and rounded to the
+    weights dtype exactly once at the end. torch's own bincount accumulates
+    fp16/bf16 weights in a different domain: aten (CPU and CUDA) converts
+    every non-fp32 weights tensor to double before accumulating
+    (SummaryOps dispatches through ``.to(kDouble)``), while the GCU native
+    op (topsatenBincount) atomically adds in the half domain itself. The
+    two sides disagree by cross-domain rounding noise that grows with the
+    per-bin accumulation length, which the plain ``gems_assert_close``
+    tolerance (atol=1e-4 + dtype rtol) does not model.
+
+    """
+    dtype = ref_weights.dtype
+    assert res.dtype == dtype
+    if dtype not in (torch.float16, torch.bfloat16):
+        utils.gems_assert_close(res, ref, dtype)
+        return
+
+    inp_cpu = ref_inp.cpu()
+    weights_cpu = ref_weights.cpu()
+    counts = torch.bincount(inp_cpu).to(torch.float64)
+    l1 = torch.bincount(inp_cpu, weights=weights_cpu.to(torch.float64).abs())
+    tol = (counts + 1.0) * 0.5 * _half_ulp(l1, dtype) + counts * l1 * 2.0**-23
+
+    diff = (res.cpu().to(torch.float64) - ref.cpu().to(torch.float64)).abs()
+    if tol.numel() < diff.numel():
+        pad = torch.zeros(diff.numel() - tol.numel(), dtype=torch.float64)
+        tol = torch.cat([tol, pad])
+    tol = tol[: diff.numel()]
+    ok = diff <= tol
+    assert bool(ok.all()), (
+        f"weighted bincount mismatch beyond cross-accumulation bound: "
+        f"max|res-ref|={diff.max().item():.6g}, "
+        f"bound={tol.max().item():.6g}, dtype={dtype}, n={ref_inp.numel()}"
+    )
+
+
 @pytest.mark.bincount
 @pytest.mark.parametrize("size", BINCOUNT_SIZES)
 @pytest.mark.parametrize("max_val", BINCOUNT_MAXVALS)
@@ -35,7 +85,8 @@ def test_accuracy_bincount(size, max_val):
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp)
-    res_out = torch.bincount(inp)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -54,9 +105,16 @@ def test_accuracy_bincount_with_weights(size, max_val, dtype):
     ref_weights = utils.to_reference(weights)
 
     ref_out = torch.bincount(ref_inp, weights=ref_weights)
-    res_out = torch.bincount(inp, weights=weights)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp, weights=weights)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    if flaggems_vllm.vendor_name == "enflame":
+        # enflame-only gate: this backend's fp32-accumulation
+        # semantics diverge from native half-domain accumulation; use the
+        # noise-model tolerance + CPU-copy compare instead of the default.
+        _assert_bincount_weights_close(res_out, ref_out, ref_inp, ref_weights)
+    else:
+        utils.gems_assert_close(res_out, ref_out, dtype)
 
 
 @pytest.mark.bincount
@@ -71,7 +129,8 @@ def test_accuracy_bincount_with_minlength(size, max_val, minlength):
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp, minlength=minlength)
-    res_out = torch.bincount(inp, minlength=minlength)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp, minlength=minlength)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -83,7 +142,8 @@ def test_accuracy_bincount_empty():
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp)
-    res_out = torch.bincount(inp)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -95,7 +155,8 @@ def test_accuracy_bincount_single():
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp)
-    res_out = torch.bincount(inp)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -107,7 +168,8 @@ def test_accuracy_bincount_all_zeros():
     ref_inp = utils.to_reference(inp)
 
     ref_out = torch.bincount(ref_inp)
-    res_out = torch.bincount(inp)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
@@ -124,6 +186,13 @@ def test_accuracy_bincount_weights_edge_cases(dtype):
     ref_weights = utils.to_reference(weights)
 
     ref_out = torch.bincount(ref_inp, weights=ref_weights)
-    res_out = torch.bincount(inp, weights=weights)
+    with flaggems_vllm.use_gems():
+        res_out = torch.bincount(inp, weights=weights)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    if flaggems_vllm.vendor_name == "enflame":
+        # enflame-only gate: this backend's fp32-accumulation
+        # semantics diverge from native half-domain accumulation; use the
+        # noise-model tolerance + CPU-copy compare instead of the default.
+        _assert_bincount_weights_close(res_out, ref_out, ref_inp, ref_weights)
+    else:
+        utils.gems_assert_close(res_out, ref_out, dtype)

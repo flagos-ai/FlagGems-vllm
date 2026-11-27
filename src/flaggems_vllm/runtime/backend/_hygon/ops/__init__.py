@@ -52,6 +52,7 @@ from flaggems_vllm.runtime.backend._hygon.ops.gemma_rms_norm import (  # noqa: F
 from flaggems_vllm.runtime.backend._hygon.ops.hyperconnection import (
     qwen4_hc_inject_combine,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.ihc_pre import ihc_pre, triton_ihc_pre
 from flaggems_vllm.runtime.backend._hygon.ops.int8_einsum import int8_einsum
 from flaggems_vllm.runtime.backend._hygon.ops.mamba_mixer import mamba_mixer
 from flaggems_vllm.runtime.backend._hygon.ops.megamoe import megamoe_int8
@@ -92,6 +93,7 @@ __all__ = [
     "gdn_w8a16",
     "gdn_w8a16_int8",
     "gemma_rms_norm",
+    "ihc_pre",
     "inplace_fused_experts",
     "int8_einsum",
     "mamba_mixer",
@@ -111,6 +113,7 @@ __all__ = [
     "scaled_int8_quant",
     "SUPPORTED_FP8_DTYPE",
     "topk_softplus_sqrt",
+    "triton_ihc_pre",
     "triton_scaled_mm",
     "w8a8_block_int8_bmm",
     "w8a8_block_matmul",
