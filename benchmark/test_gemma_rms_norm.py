@@ -69,6 +69,14 @@ try:
             gemma_rms_norm(out, x, w, eps)
             return out
 
+    elif vendor == "enflame":
+
+        def baseline_op(x, w, eps=1e-5):
+            x = x.to(dtype=torch.float32)
+            w = w.to(dtype=torch.float32)
+            rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
+            return (1 + w) * x * rrms
+
 except Exception as e:
     # Fall back to vllm.model_executor.layers.layernorm.GemmaRMSNorm when
     # the vendor-specific library (flashinfer, lightop, etc.) is absent.
