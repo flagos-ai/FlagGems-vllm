@@ -1,6 +1,20 @@
-# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+"""CUDA Graph benchmarks for Hopper TLE MiniMax Lightning Attention kernels."""
+
+import gc
 import json
 import statistics
 
@@ -19,8 +33,6 @@ from tests.test_linear_attention import (
     make_qkv,
     make_slope,
     make_state,
-    native_decode_reason,
-    native_prefix_reason,
     prefix_reference,
 )
 
@@ -72,7 +84,9 @@ def _measure(fns, reset, repeats):
 
 
 def benchmark_case(case, native, candidates, include_torch=True):
-    """Measure the same tensors, layouts and state-update contract for every provider."""
+    """Measure identical tensors, layouts, and state-update contract across providers."""
+    gc.collect()
+    torch.cuda.empty_cache()
     torch.manual_seed(932)
     device = flaggems_vllm.device
     q, k, v = make_qkv(case, device)
@@ -82,7 +96,6 @@ def benchmark_case(case, native, candidates, include_torch=True):
         phase = "prefix"
         initial = make_initial(case, device)
         slope = make_slope(case, device)
-        native_reason = native_prefix_reason(case)
         if include_torch:
 
             def torch_prefix():
@@ -90,32 +103,29 @@ def benchmark_case(case, native, candidates, include_torch=True):
                 return y.to(q.dtype), states
 
             fns["torch"] = torch_prefix
-        if native_reason is None:
-            fns["vllm"] = lambda: native.lightning_attention(
-                q, k, v, slope, kv_history=initial
-            )
+        fns["vllm"] = lambda: native.lightning_attention(
+            q, k, v, slope, kv_history=initial
+        )
         for name, (prefix, _) in candidates.items():
             fns[name] = lambda prefix=prefix: prefix(q, k, v, slope, kv_history=initial)
         calls = 12 if case.t < 4096 else 6
     else:
         phase = "decode"
         slope, slots, initial = make_decode_inputs(case, device)
-        native_reason = native_decode_reason((q, k, v), slope, slots)
 
-        # All graphs replay serially on the same physical cache address. A separate
-        # allocation per provider can change bandwidth on sparse slot patterns.
+        # Replay all graphs serially on the same physical cache buffer so L2/DRAM
+        # footprint is identical across providers.
         cache = make_state(case, initial.size(0), device)
 
         def reset():
             cache.copy_(initial)
 
         if include_torch:
-            # Valid rows are fixed for benchmarking. Prepare indices outside capture.
             rows = (slots >= 0).nonzero().flatten()
             ids = slots.index_select(0, rows).long()
 
             def torch_decode():
-                state = cache.index_select(0, ids)
+                state = cache.index_select(0, ids).float()
                 ks = k.index_select(0, rows)[:, :, 0, :, None].float()
                 vs = v.index_select(0, rows)[:, :, 0, None, :].float()
                 state = torch.exp(-slope.reshape(1, -1, 1, 1)) * state + ks * vs
@@ -128,10 +138,9 @@ def benchmark_case(case, native, candidates, include_torch=True):
                 return y
 
             fns["torch"] = torch_decode
-        if native_reason is None:
-            fns["vllm"] = lambda: native.linear_decode_forward_triton(
-                q, k, v, cache, slope, slots, case.block
-            )
+        fns["vllm"] = lambda: native.linear_decode_forward_triton(
+            q, k, v, cache, slope, slots, case.block
+        )
         for name, (_, decode) in candidates.items():
             fns[name] = lambda decode=decode: decode(
                 q, k, v, cache, slope, slots, case.block
@@ -147,7 +156,8 @@ def benchmark_case(case, native, candidates, include_torch=True):
         phase=phase,
         group=case.group,
         median_us=times,
-        native_unavailable=native_reason,
+        vllm_over_tle=times["vllm"] / times["tle"],
+        torch_over_tle=times["torch"] / times["tle"] if "torch" in times else None,
     )
 
 

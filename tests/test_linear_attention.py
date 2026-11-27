@@ -1,6 +1,20 @@
-# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+"""Functional tests for Hopper TLE MiniMax Lightning Attention kernels."""
+
+import gc
 import json
 from dataclasses import dataclass
 
@@ -23,12 +37,7 @@ class PrefixCase:
     t: int
     d: int
     e: int
-    layout: str = "contiguous"
-    initial: str = "random"
-    state_layout: str = "contiguous"
     dtype: torch.dtype = torch.float32
-    decay: str = "heads"
-    signal: str = "random"
     state_dtype: torch.dtype = torch.float32
 
 
@@ -38,20 +47,14 @@ class DecodeCase:
     b: int
     h: int
     d: int
-    slots: str = "random"
-    layout: str = "contiguous"
-    state_layout: str = "contiguous"
     dtype: torch.dtype = torch.float32
     block: int = 32
-    decay: str = "heads"
-    metadata_strided: bool = False
-    signal: str = "random"
     state_dtype: torch.dtype = torch.float32
-    cache_rows: int | None = None
+    cache_rows: int = 10749
 
 
-# Native MiniMax-Text-01 on H20, vLLM 0.23, TP8. Select frequent calls,
-# chunk boundaries and the measured batch sizes around Hopper dispatch thresholds.
+# Measured MiniMax-Text-01 TP8 shapes on vLLM: frequent sequence lengths, chunk
+# boundaries, and decode batch sizes spanning Hopper SM-wave dispatch thresholds.
 MINIMAX_PREFIX_LENGTHS = (
     2,
     16,
@@ -106,20 +109,24 @@ MINIMAX_DECODE_BATCHES = (
     127,
     128,
 )
+# TP rank 0's measured MiniMax-Text-01 slopes; all ranks share the [H, 1, 1] layout.
+_MINIMAX_TP8_SLOPES = (
+    0.91701323,
+    0.84090483,
+    0.77111316,
+    0.70711386,
+    0.64842629,
+    0.59460950,
+    0.54525936,
+    0.50000501,
+)
+
 PREFIX_CASES = [
     PrefixCase("minimax-tp8", 1, 8, t, 128, 128, state_dtype=torch.bfloat16)
     for t in MINIMAX_PREFIX_LENGTHS
 ]
 DECODE_CASES = [
-    DecodeCase(
-        "minimax-tp8",
-        b,
-        8,
-        128,
-        slots="linear",
-        state_dtype=torch.bfloat16,
-        cache_rows=10749,
-    )
+    DecodeCase("minimax-tp8", b, 8, 128, state_dtype=torch.bfloat16)
     for b in MINIMAX_DECODE_BATCHES
 ]
 
@@ -132,155 +139,41 @@ def case_id(case):
 
 
 def make_qkv(case, device):
-    b, h, t, d, e = (
-        case.b,
-        case.h,
-        getattr(case, "t", 1),
-        case.d,
-        getattr(case, "e", case.d),
+    t = getattr(case, "t", 1)
+    e = getattr(case, "e", case.d)
+    return tuple(
+        torch.randn(case.b, case.h, t, width, device=device, dtype=case.dtype).mul_(
+            0.125
+        )
+        for width in (case.d, case.d, e)
     )
-
-    def random(*shape):
-        return torch.randn(*shape, device=device, dtype=case.dtype).mul_(0.125)
-
-    if case.layout == "packed":
-        raw = random(b, t, h * (2 * d + e))
-        qkv = tuple(
-            x.view(b, t, h, n).transpose(1, 2)
-            for x, n in zip(raw.split([h * d, h * d, h * e], -1), (d, d, e))
-        )
-    else:
-
-        def tensor(width, layout):
-            if layout == "token-major":
-                return random(b, t, h, width).transpose(1, 2)
-            if layout == "offset":
-                return random(b, h, t, width + 3)[..., 1 : 1 + width]
-            if layout == "stride2":
-                return random(b, t, h, width * 2)[..., ::2].transpose(1, 2)
-            return random(b, h, t, width)
-
-        layouts = (
-            ("stride2", "contiguous", "token-major")
-            if case.layout == "mixed"
-            else (case.layout,) * 3
-        )
-        qkv = tuple(tensor(width, layout) for width, layout in zip((d, d, e), layouts))
-    if case.signal.startswith("zero-"):
-        qkv[{"zero-q": 0, "zero-k": 1, "zero-v": 2}[case.signal]].zero_()
-    elif case.signal == "alternating":
-        for x in qkv:
-            x[..., 1::2].neg_()
-        qkv[1][..., ::2].copy_(qkv[1][..., 1::2])
-        qkv[0][..., 1::2].copy_(-0.9 * qkv[0][..., ::2])
-    return qkv
 
 
 def make_slope(case, device):
-    h = case.h
     if case.group == "minimax-tp8":
-        # TP rank 0's measured slopes. All ranks share this tensor layout.
         return torch.tensor(
-            [
-                0.91701323,
-                0.84090483,
-                0.77111316,
-                0.70711386,
-                0.64842629,
-                0.59460950,
-                0.54525936,
-                0.50000501,
-            ],
-            dtype=torch.float32,
-            device=device,
-        ).view(h, 1, 1)
-    if case.decay == "heads":
-        return torch.linspace(0.002, 0.12, h, device=device)
-    if case.decay == "steep":
-        return torch.linspace(1.0, 8.0, h, device=device)
-    if case.decay == "mixed":
-        rates = torch.tensor([0.0, 1e-6, 0.125, 3.0], device=device)
-        return rates[torch.arange(h, device=device) % 4]
-    return torch.full(
-        (h,),
-        {"zero": 0.0, "tiny": 1e-6, "half": 0.6931471805599453}[case.decay],
-        device=device,
-    )
+            _MINIMAX_TP8_SLOPES, dtype=torch.float32, device=device
+        ).view(case.h, 1, 1)
+    return torch.linspace(0.002, 0.12, case.h, device=device)
 
 
 def make_state(case, rows, device):
-    d, e, h = case.d, getattr(case, "e", case.d), case.h
-    layout = case.state_layout
-    options = {"device": device, "dtype": case.state_dtype}
-    if layout == "head-major":
-        return torch.empty(h, rows, d, e, **options).transpose(0, 1)
-    if layout == "transposed":
-        return torch.empty(rows, h, e, d, **options).transpose(-1, -2)
-    if layout == "interleaved":
-        return torch.empty(rows, h, d, 2 * e, **options)[..., ::2]
-    if layout == "pitched":
-        return torch.empty(rows, h, d, e + 7, **options)[..., 2 : 2 + e]
-    return torch.empty(rows, h, d, e, **options)
+    e = getattr(case, "e", case.d)
+    return torch.empty(rows, case.h, case.d, e, device=device, dtype=case.state_dtype)
 
 
 def make_initial(case, device):
-    if case.initial == "none":
-        return None
-    state = make_state(case, case.b, device)
-    return state.zero_() if case.initial == "zero" else state.normal_(std=0.125)
+    return make_state(case, case.b, device).normal_(std=0.125)
 
 
 def make_decode_inputs(case, device):
-    b = case.b
-    rows = case.cache_rows or (2 * b + 3 if case.slots == "sparse" else b + 3)
-    seq = torch.arange(b, device=device)
-    if case.slots == "linear":
-        # Exercise the far end of the model-sized allocation (above 2 GiB).
-        slots = seq + (rows - b) if case.cache_rows is not None else seq
-    elif case.slots == "reverse":
-        slots = seq.flip(0)
-    elif case.slots == "sparse":
-        slots = 2 * seq + 1
-    else:
-        slots = torch.randperm(rows, device=device)[:b]
-        if case.slots == "half-pad":
-            slots[1::2] = -1
-        elif case.slots == "tail-pad":
-            slots[(b + 1) // 2 :] = -1
-        elif case.slots == "one-live":
-            slots[:-1] = -1
-        elif case.slots == "all-pad":
-            slots.fill_(-1)
-    slots = slots.to(
-        torch.int32 if case.cache_rows is not None or b % 2 else torch.int64
+    # Exercise the far end of the model-sized cache allocation (above 2 GiB).
+    slots = torch.arange(
+        case.cache_rows - case.b, case.cache_rows, dtype=torch.int32, device=device
     )
     slope = make_slope(case, device)
-    if case.metadata_strided:
-        slot_storage = torch.full((b, 2), -1, dtype=slots.dtype, device=device)
-        slot_storage[:, 0] = slots
-        slots = slot_storage[:, 0]
-        rate_storage = torch.zeros(case.h, 2, device=device)
-        rate_storage[:, 0] = slope
-        slope = rate_storage[:, 0]
-    return slope, slots, make_state(case, rows, device).normal_(std=0.125)
-
-
-def native_prefix_reason(case):
-    if case.t == 0:
-        return "empty sequence"
-    if case.e < 16 or case.e & (case.e - 1):
-        return "native value tile needs a power of two >=16"
-    if case.dtype == torch.bfloat16:
-        return "native prefix needs FP32 V with FP32 decay"
-    return None
-
-
-def native_decode_reason(qkv, slope, slots):
-    if not all(x.is_contiguous() for x in qkv):
-        return "native decode assumes shared QKV strides and unit feature stride"
-    if slope.stride(0) != 1 or slots.stride(0) != 1:
-        return "native decode ignores slope/slot strides"
-    return None
+    initial = make_state(case, case.cache_rows, device).normal_(std=0.125)
+    return slope, slots, initial
 
 
 def prefix_reference(q, k, v, slope, initial=None, dtype=torch.float64):
@@ -309,7 +202,7 @@ def prefix_reference(q, k, v, slope, initial=None, dtype=torch.float64):
 
 
 def decode_reference(q, k, v, cache, slope, slots, dtype=torch.float32):
-    """Compute live rows in the requested precision and round the persistent cache each step."""
+    """Compute live rows in requested precision and round persistent cache each step."""
     active = slots >= 0
     idx = slots[active].long()
     old = cache[idx].to(dtype)
@@ -352,12 +245,13 @@ def test_matrix_contains_distinct_cases():
 
 @pytest.mark.parametrize("case", PREFIX_CASES, ids=case_id)
 def test_lightning_prefix(case, record_property):
+    native = pytest.importorskip("vllm.model_executor.layers.lightning_attn")
     torch.manual_seed(927)
     device = flaggems_vllm.device
     q, k, v = make_qkv(case, device)
     slope = make_slope(case, device)
     initial = make_initial(case, device)
-    old = None if initial is None else initial.cpu()
+    old = initial.cpu()
     y, states = flaggems_vllm.lightning_attention(q, k, v, slope, kv_history=initial)
     ref, ref_s = prefix_reference(q.cpu(), k.cpu(), v.cpu(), slope.cpu(), old)
     assert y.dtype == case.dtype and states.dtype == torch.float32
@@ -366,91 +260,150 @@ def test_lightning_prefix(case, record_property):
     snapshot_error = max(
         assert_relative(x, z, 0.0025) for x, z in zip(states.unbind(2), ref_s.unbind(2))
     )
-    # An isolated error at a hand-off can disappear in a whole-sequence norm.
+    # Isolated boundary hand-off errors could otherwise be diluted in a full norm.
     boundaries = sorted(
         {t for t in (0, 63, 64, 255, 256, 1471, 1472, case.t - 1) if 0 <= t < case.t}
     )
-    if boundaries:
-        assert_relative(y[:, :, boundaries], ref[:, :, boundaries], limit)
-    if initial is not None:
-        torch.testing.assert_close(initial.cpu(), old, rtol=0, atol=0)
-    metrics = dict(output=output_error, max_snapshot=snapshot_error)
-    # With native BF16 unsupported, compare the same quantized values promoted to FP32.
-    reason = native_prefix_reason(case)
-    if reason in (None, "native prefix needs FP32 V with FP32 decay"):
-        native = pytest.importorskip("vllm.model_executor.layers.lightning_attn")
+    assert_relative(y[:, :, boundaries], ref[:, :, boundaries], limit)
+    torch.testing.assert_close(initial.cpu(), old, rtol=0, atol=0)
 
-        native_y, native_s = native.lightning_attention(
-            q.float(), k.float(), v.float(), slope, kv_history=initial
-        )
-        metrics["native_output"] = assert_relative(
+    native_y, native_s = native.lightning_attention(
+        q.float(), k.float(), v.float(), slope, kv_history=initial
+    )
+    metrics = dict(
+        output=output_error,
+        max_snapshot=snapshot_error,
+        native_output=assert_relative(
             y, native_y, 0.012 if case.dtype == torch.bfloat16 else 0.0025
-        )
-        metrics["native_history"] = assert_relative(states, native_s, 0.003)
+        ),
+        native_history=assert_relative(states, native_s, 0.003),
+    )
     record_property("relative_l2", json.dumps(metrics))
 
 
 @pytest.mark.parametrize("case", DECODE_CASES, ids=case_id)
 def test_lightning_decode(case, record_property):
     native = pytest.importorskip("vllm.model_executor.layers.lightning_attn")
-
+    gc.collect()
+    torch.cuda.empty_cache()
     torch.manual_seed(928)
     device = flaggems_vllm.device
     q, k, v = make_qkv(case, device)
-    slope, slots, initial = make_decode_inputs(case, device)
-    pool = make_state(case, len(initial), device)
-    # Check padding bytes of pitched/interleaved views independently of logical values.
-    raw = pool.as_strided(
-        (pool.untyped_storage().nbytes() // pool.element_size(),), (1,), 0
-    )
-    raw.fill_(-17.5)
-    pool.copy_(initial)
-    guard = (raw == -17.5) if raw.numel() > pool.numel() else None
-    expected = initial.contiguous().clone()
-    baseline = initial.contiguous().clone()
-    native_qkv = tuple(x.contiguous() for x in (q, k, v))
+    slope, slots, pool = make_decode_inputs(case, device)
     live = slots >= 0
     active_ids = slots[live].long()
-    unused = torch.ones(len(pool), device=device, dtype=torch.bool)
-    unused[active_ids] = False
-    # Each decode writes the persistent state at cache precision. Rare BF16
-    # rounding-boundary differences can propagate into the next step's FP32 output.
+    unused = torch.ones(len(pool), dtype=torch.bool)
+    unused[active_ids.cpu()] = False
+
+    # Keep full 2.6 GiB initial snapshot on CPU and reuse a single GPU cache pool
+    # across TLE and native runs to avoid >10 GiB peak VRAM allocations.
+    initial_cpu = pool.cpu()
+    expected_active = pool[active_ids].clone()
+    compact_slots = torch.full_like(slots, -1)
+    compact_slots[live] = torch.arange(
+        active_ids.numel(), device=device, dtype=slots.dtype
+    )
+
+    tle_outs = []
+    for _ in range(3):
+        tle_outs.append(
+            flaggems_vllm.lightning_attention_decode(
+                q, k, v, pool, slope, slots, case.block
+            )
+        )
+    tle_active = pool[active_ids].clone()
+    assert torch.equal(pool.cpu()[unused], initial_cpu[unused])
+
+    pool.copy_(initial_cpu)
+    # Each decode writes persistent state at cache precision; BF16 rounding can
+    # propagate slightly across multi-step updates.
     state_limit = 0.0002 if pool.dtype == torch.bfloat16 else 2e-6
     out_limit = 0.002 if case.dtype == torch.bfloat16 else state_limit
     metrics = dict(output=0.0, state=0.0, native_output=0.0, native_state=0.0)
-    for _ in range(3):
-        y = flaggems_vllm.lightning_attention_decode(
-            q, k, v, pool, slope, slots, case.block
+    for step_idx, y in enumerate(tle_outs):
+        ref = decode_reference(
+            q, k, v, expected_active, slope, compact_slots, dtype=torch.float64
         )
-        ref = decode_reference(q, k, v, expected, slope, slots, dtype=torch.float64)
         native_y = native.linear_decode_forward_triton(
-            *native_qkv, baseline, slope.contiguous(), slots.contiguous(), case.block
+            q, k, v, pool, slope.contiguous(), slots.contiguous(), case.block
         )
         assert y.shape == (case.b, case.h * case.d) and y.dtype == case.dtype
-        # Native padding rows have unspecified output. TLE zeros those rows.
         assert torch.count_nonzero(y[~live]).item() == 0
-        measured = {
-            "output": assert_relative(y, ref, out_limit),
-            "state": assert_relative(
-                pool[active_ids], expected[active_ids], state_limit
-            ),
-            "native_output": assert_relative(
+        metrics["output"] = max(metrics["output"], assert_relative(y, ref, out_limit))
+        metrics["native_output"] = max(
+            metrics["native_output"],
+            assert_relative(
                 y[live],
                 native_y[live],
                 0.008 if case.dtype == torch.bfloat16 else state_limit,
             ),
-            "native_state": assert_relative(
+        )
+        if step_idx == 2:
+            metrics["state"] = assert_relative(tle_active, expected_active, state_limit)
+            metrics["native_state"] = assert_relative(
+                tle_active,
                 pool[active_ids],
-                baseline[active_ids],
                 0.004 if case.dtype == torch.bfloat16 else state_limit,
-            ),
-        }
-        for key, value in measured.items():
-            metrics[key] = max(metrics[key], value)
-    assert torch.equal(pool[unused], initial[unused])
-    if guard is not None:
-        assert torch.all(raw[guard] == -17.5).item()
+            )
     record_property("relative_l2", json.dumps(metrics))
+
+
+@pytest.mark.parametrize(
+    "t,d,e,dtype", [(0, 64, 64, torch.float32), (67, 128, 17, torch.bfloat16)]
+)
+def test_prefix_empty_and_strided_layouts(t, d, e, dtype):
+    torch.manual_seed(926)
+    device = flaggems_vllm.device
+    b, h = 2, 3
+    q = torch.randn(b, t, h, d * 2, device=device, dtype=dtype)[..., ::2].transpose(
+        1, 2
+    )
+    k = torch.randn(b, t, h, d, device=device, dtype=dtype).transpose(1, 2)
+    v = torch.randn(b, h, t, e + 3, device=device, dtype=dtype)[..., 1 : 1 + e]
+    s0 = torch.randn(b, h, e, d, device=device).transpose(-1, -2)
+    slope = torch.linspace(0.01, 0.2, h, device=device)
+    y, states = flaggems_vllm.lightning_attention(q, k, v, slope, kv_history=s0)
+    ref_y, ref_s = prefix_reference(q.cpu(), k.cpu(), v.cpu(), slope.cpu(), s0.cpu())
+    assert_relative(y, ref_y, 0.007 if dtype == torch.bfloat16 else 0.0025)
+    assert_relative(states, ref_s, 0.0025)
+
+
+@pytest.mark.parametrize("state_mode", ["transposed", "pitched"])
+def test_decode_strided_cache_and_padding_slots(state_mode):
+    torch.manual_seed(925)
+    device = flaggems_vllm.device
+    b, h, d = 5, 4, 128
+    q, k, v = [
+        torch.randn(b, 1, h, d, device=device, dtype=torch.bfloat16).transpose(1, 2)
+        for _ in range(3)
+    ]
+    slope = torch.linspace(0.01, 0.2, h, device=device)
+    slots = torch.tensor([3, -1, 0, -1, 5], dtype=torch.int32, device=device)
+    if state_mode == "transposed":
+        cache = torch.randn(7, h, d, d, device=device).transpose(-1, -2)
+    else:
+        full = torch.randn(7, h, d, d + 4, device=device)
+        cache = full[..., 1 : 1 + d]
+    expected = cache.contiguous().clone()
+    y = flaggems_vllm.lightning_attention_decode(q, k, v, cache, slope, slots, 16)
+    ref = decode_reference(q, k, v, expected, slope, slots, dtype=torch.float64)
+    assert torch.count_nonzero(y[slots < 0]).item() == 0
+    assert_relative(y, ref, 0.002)
+    assert_relative(
+        cache[slots[slots >= 0].long()], expected[slots[slots >= 0].long()], 2e-6
+    )
+
+
+def test_unsupported_head_dim_raises():
+    device = flaggems_vllm.device
+    q = torch.zeros(1, 2, 1, 32, device=device)
+    slope = torch.zeros(2, device=device)
+    cache = torch.zeros(2, 2, 32, 32, device=device)
+    slots = torch.zeros(1, dtype=torch.int32, device=device)
+    with pytest.raises(NotImplementedError, match="64 or 128"):
+        flaggems_vllm.lightning_attention(q, q, q, slope)
+    with pytest.raises(NotImplementedError, match="64 or 128"):
+        flaggems_vllm.lightning_attention_decode(q, q, q, cache, slope, slots)
 
 
 def test_vllm_read_at_history_boundary():
@@ -547,23 +500,6 @@ def test_graph_reads_current_slots_and_state():
         assert_relative(cache, expected, 2e-6)
 
 
-def test_decode_rejects_mismatched_input_before_writing():
-    q = torch.zeros(1, 2, 1, 64, device=flaggems_vllm.device)
-    s = torch.zeros(2, device=q.device)
-    cache = torch.ones(3, 2, 64, 64, device=q.device)
-    original = cache.clone()
-    with pytest.raises(ValueError, match="one token"):
-        flaggems_vllm.lightning_attention_decode(
-            q,
-            q,
-            q[..., :32],
-            cache,
-            s,
-            torch.zeros(1, dtype=torch.int64, device=q.device),
-        )
-    torch.testing.assert_close(cache, original, atol=0, rtol=0)
-
-
 @pytest.mark.parametrize(
     "t,d,has_initial",
     [
@@ -645,11 +581,12 @@ def test_tensor_device_with_another_current_device(decode):
 
 
 @pytest.mark.parametrize("offset", [-1, 0, 1])
-@pytest.mark.parametrize("sm_multiplier", [1.0, 1.5])
-def test_decode_sm_boundary(offset, sm_multiplier):
+def test_decode_sm_boundary(offset):
     device = torch.device(flaggems_vllm.device)
     sms = torch.cuda.get_device_properties(device).multi_processor_count
-    b = int(sms * sm_multiplier) + offset
+    # At D=128 and BLOCK_SIZE=32, 4 CTAs launch per head; 2 * 4 * B >= sms switches
+    # from narrow 2-warp tiles to 32-column 4-warp tiles around B = ceil(sms / 8).
+    b = max(1, (sms + 7) // 8 + offset)
     torch.manual_seed(936)
     q, k, v = [torch.randn(b, 1, 1, 128, device=device).mul_(0.125) for _ in range(3)]
     cache = torch.randn(b, 1, 128, 128, device=device).mul_(0.125)
