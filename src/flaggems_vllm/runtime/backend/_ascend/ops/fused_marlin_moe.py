@@ -52,7 +52,7 @@ GROUP_SIZE = 128
 MAX_EXPERTS = 512
 MAX_HIDDEN_SIZE = 7168
 MAX_INTERMEDIATE_SIZE = 14336
-# Per grouped batch, excluding caller inputs, the returned output and allocator reservations.
+# Temporary tensor payloads per grouped batch, excluding inputs, output and allocator rounding.
 GROUPED_WORKSPACE_BYTES = 2 << 30
 
 
@@ -1366,6 +1366,7 @@ def expert_panel_kernel(
     Output,
     K: tl.constexpr,
     N: tl.constexpr,
+    WEIGHT_N: tl.constexpr,
     E: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
@@ -1621,7 +1622,7 @@ def expert_panel_kernel(
                                 vector_expert,
                                 vector_col,
                                 kb,
-                                N,
+                                WEIGHT_N,
                                 K,
                                 VBN,
                                 8,
@@ -1656,7 +1657,7 @@ def expert_panel_kernel(
                             vector_expert,
                             vector_col,
                             kb,
-                            N,
+                            WEIGHT_N,
                             K,
                             VBN,
                             8,
@@ -1717,6 +1718,7 @@ def grouped_quantized_gemm(
             out,
             k,
             n,
+            s.stride(1),
             w.shape[0],
             bm,
             panel_bn,
@@ -2138,6 +2140,7 @@ def combine_kernel(
     Inv,
     O,
     K: tl.constexpr,
+    OUTPUT_STRIDE: tl.constexpr,
     T: tl.constexpr,
     M: tl.constexpr,
     B: tl.constexpr,
@@ -2156,7 +2159,7 @@ def combine_kernel(
             prob = tl.load(P + route).to(tl.float32)
             a = tl.load(A + pos * K + cols, cols < K, other=0).to(tl.float32)
             acc += a * prob
-        tl.store(O + row * K + cols, acc, cols < K)
+        tl.store(O + row * OUTPUT_STRIDE + cols, acc, cols < K)
 
 
 def apply_swiglu(h, out, off=None, b=32, tile_experts=None, counts=None, bm=128):
@@ -2185,6 +2188,7 @@ def combine_expert_outputs(a, p, out, inv=None, b=4096):
         inv if inv is not None else p,
         out,
         out.shape[1],
+        out.stride(0),
         p.shape[1],
         out.shape[0],
         min(b, triton.next_power_of_2(out.shape[1])),
@@ -2405,6 +2409,9 @@ def clip_expert_ranges(
 def segmented_expert_moe(x, w1, w2, s1, s2, probabilities, ids, out, cores):
     """Process contiguous expert rows so a token batch split does not reread all experts."""
     m, k = x.shape
+    # Token-row offsets in pack and combine are signed 32-bit element indices.
+    if x.numel() > 2**31:
+        return False
     e, _, gate_up, _ = w1.shape
     n = gate_up // 2
     routes_total = ids.numel()
@@ -2415,8 +2422,7 @@ def segmented_expert_moe(x, w1, w2, s1, s2, probabilities, ids, out, cores):
     )
     block = 1024
     chunks = triton.cdiv(routes_total, block)
-    # Reserve the routed output and metadata. The two projections reuse the
-    # same decode budget; packed inputs can be released before SwiGLU.
+    # Both projections reuse the same decode workspace.
     metadata_bytes = 4 * (
         padded
         + padded // align
@@ -2426,9 +2432,28 @@ def segmented_expert_moe(x, w1, w2, s1, s2, probabilities, ids, out, cores):
         + 2
     )
     panel_bytes = cores * 256 * max(k, n) * 2
-    available = GROUPED_WORKSPACE_BYTES - padded * k * 2 - metadata_bytes - panel_bytes
+    available = GROUPED_WORKSPACE_BYTES - metadata_bytes - panel_bytes
     bytes_per_row = 2 * max(k + 2 * n, 3 * n)
-    step = min(padded, (available // bytes_per_row // align) * align)
+    step = min(padded, (available - 2 * padded * k) // bytes_per_row // align * align)
+    # Keeping SwiGLU outputs instead of projected rows can leave room for much
+    # larger up-projection segments. The down projection then runs in column
+    # strips, visiting all experts once per strip.
+    strip_budget = available - 2 * padded * n
+    up_step = min(padded, strip_budget // (2 * (k + 2 * n)) // align * align)
+    # A 1024-column strip keeps each top-k gather contiguous and bounds its working set.
+    strip_width = min(k, 1024, strip_budget // (2 * padded) // 256 * 256)
+    use_strips = (
+        n < k
+        and up_step >= align
+        and strip_width >= 256
+        and (
+            step < align
+            or triton.cdiv(padded, step)
+            >= 2 * (triton.cdiv(padded, up_step) + triton.cdiv(k, strip_width))
+        )
+    )
+    if use_strips:
+        step = up_step
     if step < align:
         return False
     if ids.dtype == torch.int64:
@@ -2440,7 +2465,9 @@ def segmented_expert_moe(x, w1, w2, s1, s2, probabilities, ids, out, cores):
     routes, counts, offsets, experts, inverse = route_experts(
         ids, e, align, padded, block, True
     )
-    routed_out = torch.empty((padded, k), device=x.device, dtype=x.dtype)
+    saved = torch.empty(
+        (padded, n if use_strips else k), device=x.device, dtype=x.dtype
+    )
     local_counts = torch.empty_like(counts)
     local_offsets = torch.empty_like(offsets)
     for start in range(0, padded, step):
@@ -2481,7 +2508,11 @@ def segmented_expert_moe(x, w1, w2, s1, s2, probabilities, ids, out, cores):
             expert_panel=True,
         )
         del packed
-        activated = torch.empty((rows, n), device=x.device, dtype=x.dtype)
+        activated = (
+            saved.narrow(0, start, rows)
+            if use_strips
+            else torch.empty((rows, n), device=x.device, dtype=x.dtype)
+        )
         apply_swiglu(
             hidden,
             activated,
@@ -2491,20 +2522,42 @@ def segmented_expert_moe(x, w1, w2, s1, s2, probabilities, ids, out, cores):
             bm=align,
         )
         del hidden
-        grouped_quantized_gemm(
-            activated,
-            w2,
-            s2,
-            tiles,
-            routed_out.narrow(0, start, rows),
-            align,
-            8,
-            local_counts,
-            local_offsets,
-            expert_panel=True,
-        )
+        if not use_strips:
+            grouped_quantized_gemm(
+                activated,
+                w2,
+                s2,
+                tiles,
+                saved.narrow(0, start, rows),
+                align,
+                8,
+                local_counts,
+                local_offsets,
+                expert_panel=True,
+            )
         del activated
-    combine_expert_outputs(routed_out, probabilities, out, inverse)
+    if use_strips:
+        for col in range(0, k, strip_width):
+            width = min(k - col, strip_width)
+            projected = torch.empty((padded, width), device=x.device, dtype=x.dtype)
+            grouped_quantized_gemm(
+                saved,
+                w2.narrow(2, col, width),
+                s2.narrow(2, col, width),
+                experts,
+                projected,
+                align,
+                8,
+                counts,
+                offsets,
+                expert_panel=True,
+            )
+            combine_expert_outputs(
+                projected, probabilities, out.narrow(1, col, width), inverse
+            )
+            del projected
+    else:
+        combine_expert_outputs(saved, probabilities, out, inverse)
     return True
 
 

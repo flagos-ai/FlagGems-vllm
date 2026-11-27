@@ -1670,12 +1670,16 @@ def test_fused_marlin_moe_w8a16_inference_updates(
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "ascend", reason="Ascend workspace bound"
 )
-def test_fused_marlin_moe_w8a16_segmented_experts(monkeypatch):
+@pytest.mark.parametrize(("hidden_size", "workspace_mib"), [(1024, 24), (2048, 40)])
+def test_fused_marlin_moe_w8a16_segmented_experts(
+    monkeypatch, hidden_size, workspace_mib
+):
     # The hot expert spans several workspace segments. Other experts can be empty.
     backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
-    monkeypatch.setattr(backend, "GROUPED_WORKSPACE_BYTES", 24 << 20)
+    # With the wider output, the down projection needs several column strips.
+    monkeypatch.setattr(backend, "GROUPED_WORKSPACE_BYTES", workspace_mib << 20)
     hs, w1, w2, ref1, ref2, probs, ids, s1, s2 = _make_inputs_w8a16_int8(
-        1057, 32, 1024, 1024, 4, torch.float16, flaggems_vllm.device
+        1057, 32, hidden_size, 1024, 4, torch.float16, flaggems_vllm.device
     )
     ids = ids.to(torch.int64) % 16
     ids[:, 0] = 0
