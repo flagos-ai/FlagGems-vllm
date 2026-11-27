@@ -1724,6 +1724,17 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: lora_expand
+  description: Project grouped token rows through per-adapter LoRA B weights into output slices.
+  for:
+  - vllm.lora.ops.triton_ops.lora_expand
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: mamba_mixer
   description: Triton implementation of the Mamba mixer operator for vLLM inference.
   for:
