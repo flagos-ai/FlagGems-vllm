@@ -879,3 +879,10 @@ matmul_persistent:
     - [2, 32, 64, 5, 1, 2, 2, 64, 16]
     - [5, 1, 2, 2, 32, 64, 2, 64, 16]
     - [5, 1, 2, 4, 32, 64, 5, 1, 2, 4, 64, 16]
+
+fused_gdn_gating:
+  shapes:
+    - [1, 16]
+    - [1024, 16]
+    - [31, 16]
+  shape_desc: "model dimensions"

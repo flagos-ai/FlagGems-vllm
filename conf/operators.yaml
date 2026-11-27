@@ -962,6 +962,17 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: fused_gdn_gating
+  description: Compute the GDN decay and sigmoid gate from BF16 activations on Atlas A5.
+  for:
+  - fused_gdn_gating
+  labels:
+  - non-aten
+  - fused
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: fused_indexer_k_norm
   description: 'GLM5Next indexer FP32 LayerNorm with FP32 weight and bias, followed
     by
