@@ -61,7 +61,6 @@ L0C_BYTES = 256 * 1024
 
 __all__ = [
     "grouped_matmul_swiglu_quant_v2",
-    "grouped_matmul_swiglu_quant_v2_ref",
     "MX_BLOCK",
 ]
 
@@ -624,75 +623,3 @@ def grouped_matmul_swiglu_quant_v2(
     if dump:
         return y, ys.reshape(M, nblk // 2, 2), dg, du
     return y, ys.reshape(M, nblk // 2, 2)
-
-
-def grouped_matmul_swiglu_quant_v2_ref(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    x_scale: torch.Tensor,
-    group_list: torch.Tensor,
-    group_list_type: int = 0,
-    scale_alg: int = 0,
-):
-    """Pure-torch fp32 reference implementation for accuracy comparison.
-
-    Scale index layout follows the same conventions as the kernel:
-    x_scale is flat; weight_scale has a truly-interleaved trailing-2 dimension.
-    """
-    M, K = x.shape
-    E, _, N = weight.shape
-    NH = N // 2
-    nkb = K // MX_BLOCK
-
-    sa = x_scale.reshape(M, nkb)
-    sa = (sa.view(torch.uint8) if sa.dtype != torch.uint8 else sa).to(torch.int32)
-    sa_f = torch.where(
-        sa == 0,
-        torch.zeros_like(sa, dtype=torch.float32),
-        torch.pow(2.0, sa.float() - 127.0),
-    )
-
-    sb = (
-        weight_scale.view(torch.uint8)
-        if weight_scale.dtype != torch.uint8
-        else weight_scale
-    )
-    sb = sb.reshape(E, nkb // 2, N, 2).to(torch.int32)
-    sb = sb.permute(0, 1, 3, 2).reshape(E, nkb, N)  # (b//2, b%2) -> b
-    sb_f = torch.where(
-        sb == 0,
-        torch.zeros_like(sb, dtype=torch.float32),
-        torch.pow(2.0, sb.float() - 127.0),
-    )
-
-    xf = x.to(torch.float32) * sa_f.repeat_interleave(MX_BLOCK, dim=1)
-    wf = weight.to(torch.float32) * sb_f.repeat_interleave(MX_BLOCK, dim=1)
-
-    gl = group_list.tolist()
-    c = torch.zeros((M, N), device=x.device, dtype=torch.float32)
-    start = 0
-    for e in range(E):
-        end = gl[e] if group_list_type == 0 else start + gl[e]
-        if end > start:
-            c[start:end] = xf[start:end] @ wf[e]
-        start = end
-    valid = start
-
-    act, gate = c[:, :NH], c[:, NH:]
-    s = torch.nn.functional.silu(act) * gate
-
-    # MX quant: round to bf16 first, then block-quantise in groups of 32
-    sbf = s.to(torch.bfloat16).to(torch.float32)
-    blk = sbf.reshape(M, NH // MX_BLOCK, MX_BLOCK)
-    amax = blk.abs().amax(dim=-1)
-    bits = amax.view(torch.int32)
-    eb = ((bits >> 23) & 0xFF) - E4M3_EMAX
-    if scale_alg == 1:
-        eb = eb + ((bits & 0x7FFFFF) > 0x600000).to(torch.int32)
-    ebs = torch.clamp(eb, min=0)
-    ebs = torch.where(amax == 0, torch.zeros_like(ebs), ebs)
-    rc = torch.pow(2.0, -(ebs.float() - 127.0)).unsqueeze(-1)
-    q = torch.clamp(blk * rc, -448.0, 448.0)
-    yq = q.reshape(M, NH).to(torch.float8_e4m3fn)
-    return yq, ebs.to(torch.uint8), valid

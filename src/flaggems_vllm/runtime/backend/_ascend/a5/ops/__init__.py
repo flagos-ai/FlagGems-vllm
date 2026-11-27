@@ -23,7 +23,6 @@ from flaggems_vllm.runtime.backend._ascend.a5.ops.flash_attention_bnsd import (
 )
 from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_swiglu_quant_v2 import (
     grouped_matmul_swiglu_quant_v2,
-    grouped_matmul_swiglu_quant_v2_ref,
 )
 from flaggems_vllm.runtime.backend._ascend.a5.ops.swiglu_group_quant import (
     swiglu_group_quant,
@@ -35,5 +34,4 @@ __all__ = [
     "flash_attention_fwd",
     "swiglu_group_quant",
     "grouped_matmul_swiglu_quant_v2",
-    "grouped_matmul_swiglu_quant_v2_ref",
 ]

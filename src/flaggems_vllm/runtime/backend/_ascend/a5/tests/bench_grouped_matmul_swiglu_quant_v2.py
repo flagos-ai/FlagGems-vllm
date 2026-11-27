@@ -26,7 +26,6 @@ Usage:
       src/flaggems_vllm/runtime/backend/_ascend/a5/tests/bench_grouped_matmul_swiglu_quant_v2.py
   ... --shape qwen
   ... --block-n 256
-  ... --skip-ref
 """
 
 import argparse
@@ -47,7 +46,6 @@ import torch_npu  # noqa: F401
 from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_swiglu_quant_v2 import (
     MX_BLOCK,
     grouped_matmul_swiglu_quant_v2,
-    grouped_matmul_swiglu_quant_v2_ref,
 )
 
 DEV = "npu"
@@ -218,11 +216,6 @@ def main():
         action="store_true",
         help="force ND layout (default: NZ, the deployment layout)",
     )
-    ap.add_argument(
-        "--skip-ref",
-        action="store_true",
-        help="skip torch reference (GLM fp32 expansion ~1.5 GB)",
-    )
     ap.add_argument("--iters", type=int, default=20)
     args = ap.parse_args()
 
@@ -235,9 +228,6 @@ def main():
     )
 
     x, w, sb, sa, gl = build_inputs(M, K, N, E)
-    # torch reference requires ND: NZ tensors raise on .to(fp32) with
-    # "copy_ operator with internal format tensors is not supported on Ascend950"
-    w_nd = w
     if not args.nd:
         w = torch_npu.npu_format_cast(w, 29, customize_dtype=torch.float8_e4m3fn)
         assert torch_npu.get_npu_format(w) == 29
@@ -264,15 +254,6 @@ def main():
         print(f"  FAILED: {type(err).__name__}: {err}")
         raise
     ok = compare("triton vs vendor", ty, tys, vy, vys, valid, NH)
-
-    if not args.skip_ref:
-        ry, rys, rvalid = grouped_matmul_swiglu_quant_v2_ref(
-            x, w_nd, sb, sa, gl, group_list_type=0, scale_alg=args.scale_alg
-        )
-        compare("vendor vs torch", vy, vys, ry, rys, min(valid, rvalid), NH)
-        compare("triton vs torch", ty, tys, ry, rys, min(valid, rvalid), NH)
-        del ry, rys
-        torch.npu.empty_cache()
 
     # ---- performance ----
     tv, kv = device_time_us(lambda: vendor(x, w, sb, sa, gl), iters=args.iters)
