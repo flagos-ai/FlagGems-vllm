@@ -464,6 +464,20 @@ def test_flash_attn_varlen_func(monkeypatch):
     elif vendor_name == "iluvatar":
         # iluvatar does not have updated vllm_flash_attn, use conversion wrapper
         flash_attn_varlen_func = flash_attn_varlen_legacy
+    elif vendor_name == "enflame":
+        # vLLM 0.20.0's flash-attn extensions are CUDA-only and cannot be
+        # imported on GCU. No independent native reference exists on this
+        # backend (the flash_attn package is absent and the naive torch
+        # paged-attention reference from the accuracy tests OOMs on the
+        # long-context core shapes), so per the skip-preferred reference-leg
+        # policy the benchmark is skipped instead of timing a
+        # self-referential leg.
+        pytest.skip(
+            "enflame GCU has no runnable independent reference: vLLM native"
+            " flash-attn extensions are CUDA-only, the flash_attn package is"
+            " absent, and the naive torch reference OOMs on long-context core"
+            " shapes."
+        )
     else:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 

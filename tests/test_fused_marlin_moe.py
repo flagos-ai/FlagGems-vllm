@@ -454,7 +454,14 @@ def _quantize_mxfp4(w_2d, group_size):
     wn = wg / scale
     sign = wn < 0
     a = wn.abs().clamp(max=_E2M1_MAX)
-    mag = torch.bucketize(a, torch.tensor(_E2M1_MID, device=device))  # 0..7
+    boundaries = torch.tensor(_E2M1_MID, device=device)
+    if flaggems_vllm.vendor_name == "enflame":
+        # torch_gcu topsaten bucketize rejects the default int64 output with a
+        # hard process abort (P21); counting the strictly-lower boundaries in
+        # int32 is bit-identical for this sorted boundary list.
+        mag = (a.unsqueeze(-1) > boundaries).sum(dim=-1, dtype=torch.int32)
+    else:
+        mag = torch.bucketize(a, boundaries)  # 0..7
     q = torch.tensor(_E2M1_POS, device=device)[mag]
     ref = torch.where(sign, -q, q) * scale
     nibbles = (sign.to(torch.uint8) * 8 + mag.to(torch.uint8)).reshape(out_dim, in_dim)

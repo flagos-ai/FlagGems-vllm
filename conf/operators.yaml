@@ -912,6 +912,19 @@ ops:
   stages:
   - stable: '2.0'
   cpp: '4.0'
+- id: fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert
+  description: Apply optional per-head RMSNorm and GPT-J RoPE to DeepSeek V4 queries
+    and insert rotated KV rows into a paged BF16 full cache.
+  for:
+  - torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert
+  labels:
+  - fused
+  - vLLM
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert
   description: 'Horizontally-fused DeepseekV4-MLA full-cache path.
 
@@ -1034,6 +1047,19 @@ ops:
   - Quantization
   stages:
   - beta: '5.4'
+- id: fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
+  description: Concatenate Kimi-K3 decode queries and insert each valid token's latent
+    key into the paged cache, optionally applying interleaved RoPE. Supports BF16
+    and FP16.
+  for:
+  - _C.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - DataMovement
+  stages:
+  - beta: '0.3'
 - id: fused_kimi_k3_mla_kv_concat
   description: 'Copy Kimi-K3 NoPE keys and broadcast the shared PE component into a
 
@@ -1117,6 +1143,18 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: fused_moe_lora
+  description: Apply expert- and adapter-specific LoRA updates to routed MoE outputs.
+  for:
+  - vllm.lora.ops.triton_ops.fused_moe_lora_op.fused_moe_lora
+  labels:
+  - fused
+  - vLLM
+  - MoE
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: fused_q
   description: |
     Fuse MQA query RoPE and FP8 packing with indexer query RoPE,
@@ -1686,6 +1724,17 @@ ops:
   - Attention
   stages:
   - alpha: '5.4'
+- id: lora_expand
+  description: Project grouped token rows through per-adapter LoRA B weights into output slices.
+  for:
+  - vllm.lora.ops.triton_ops.lora_expand
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: mamba_mixer
   description: Triton implementation of the Mamba mixer operator for vLLM inference.
   for:
@@ -2424,6 +2473,33 @@ ops:
   - NeuralNetwork
   stages:
   - stable: '5.0'
+- id: swiglu_group_quant
+  description: 'SwiGLU fused with block-wise FP8 quantization for Ascend 950DT
+
+    (A5 / arch35). The implementation lives under
+
+    `runtime/backend/_ascend/a5/ops/` and targets the CANN
+
+    `aclnnSwigluGroupQuant` interface: BF16/FP16 input, E4M3/E5M2 output,
+
+    optional per-token FP32 weight, clamp and group_index, and MX E8M0 scales
+
+    or block FP32 scales. Quant modes 0 and 1 are supported; HiFloat8 modes
+
+    2 and 3 are not available through Triton and raise an explicit error.
+
+    '
+  for:
+  - swiglu_group_quant
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  - MoE
+  kind:
+  - Quantization
+  stages:
+  - beta: '0.3'
 - id: top_k_per_row_decode
   description: 'Triton top-K per row for DeepSeek V4 decode-phase token selection.
 
@@ -2572,6 +2648,18 @@ ops:
   - Attention
   stages:
   - alpha: '0.1'
+- id: triton_reshape_and_cache_flash_per_token_head_quant
+  description: Quantize paged K and V per token and KV head, updating separate
+    data and FP32 scale caches in place.
+  for:
+  - triton_reshape_and_cache_flash_per_token_head_quant
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
 - id: unpack_seq_triton
   description: Unpack a packed sequence tensor back to its original variable-length
     form.
