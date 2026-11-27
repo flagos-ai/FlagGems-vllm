@@ -92,7 +92,7 @@ mthreads = [
     # tvm_ffi imports ml_dtypes from its Cython init without declaring it, and
     # ml_dtypes 0.7 is built against the NumPy 2 C-API: 0.6 is the newest build
     # that loads on the NumPy 1.26 every MUSA image runs.
-    "ml_dtypes<0.7",
+    "ml_dtypes<0.8",
     "vllm-musa",
     "scikit-learn>=1.4,<2.0",
     "xgboost==3.2.0; python_version < '3.12'",
