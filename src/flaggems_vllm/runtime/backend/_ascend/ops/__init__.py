@@ -97,6 +97,10 @@ from flaggems_vllm.runtime.backend._ascend.ops.kpool_state_compress import (
 from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
     kv_rmsnorm_rope_cache,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.lightning_attention import (
+    lightning_attention,
+    lightning_attention_decode,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
@@ -190,6 +194,8 @@ __all__ = [
     "kda_gate_cumsum_triton",
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
+    "lightning_attention",
+    "lightning_attention_decode",
     "lightning_indexer",
     "matmul_persistent",
     "mhc_post",
