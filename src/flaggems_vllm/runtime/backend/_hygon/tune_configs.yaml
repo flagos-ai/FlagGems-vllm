@@ -986,3 +986,13 @@ mhc_shifted_project_coeff_hygon:
   - META: {BLOCK_M: 64, BLOCK_K: 256, BLOCK_N: 32}
     num_warps: 8
     num_stages: 3
+
+lora_shrink_gemv:
+  - META: {BLOCK_R: 1, BLOCK_K: 1024}
+    num_warps: 4
+    num_stages: 1
+
+lora_shrink_grouped:
+  - META: {BLOCK_M: 16, BLOCK_R: 16, BLOCK_K: 256}
+    num_warps: 4
+    num_stages: 1
