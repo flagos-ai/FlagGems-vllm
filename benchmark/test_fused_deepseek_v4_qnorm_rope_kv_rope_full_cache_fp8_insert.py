@@ -26,13 +26,15 @@ from . import base
 
 torch_device_fn = flaggems_vllm.runtime.torch_device_fn
 
-SUPPORTED_VENDORS = frozenset({"nvidia", "mthreads", "hygon", "metax", "thead"})
+SUPPORTED_VENDORS = frozenset(
+    {"nvidia", "mthreads", "hygon", "metax", "thead", "ascend"}
+)
 
 OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert"
 VENDOR = flaggems_vllm.vendor_name
 
 
-UINT8_CONTAINER_VENDORS = frozenset({"hygon", "metax", "thead"})
+UINT8_CONTAINER_VENDORS = frozenset({"hygon", "metax", "thead", "ascend"})
 FP8_STORE_DTYPE = torch.float8_e4m3fn
 HEAD_DIM = 512
 ROPE_DIM = 64
@@ -229,6 +231,8 @@ class FusedDeepseekV4QnormRopeKVRopeFullCacheFp8InsertBenchmark(base.Benchmark):
                 131072,
             ]
             for num_heads in [64, 128]
+            # These two sizes OOM on Ascend; keep them for every other vendor.
+            if VENDOR != "ascend" or num_tokens not in (98304, 131072)
         ]
 
     @staticmethod
@@ -263,16 +267,17 @@ class FusedDeepseekV4QnormRopeKVRopeFullCacheFp8InsertBenchmark(base.Benchmark):
 
         num_blocks = (num_tokens + block_size - 1) // block_size + 1
         slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
-        # Ascend's aclnnInplaceZero does not implement float8_e4m3fn. Initialize
-        # the storage as uint8, then view it as FP8 for the native/generic API;
-        # uint8-container Triton ports already view it back in _run_gems.
+        # Avoid unsupported FP8 zero/view operations on uint8-container ports.
+        # Other platforms still pass an FP8 cache to their native/generic API.
         k_cache = torch.zeros(
             num_blocks,
             block_size,
             HEAD_DIM,
             dtype=torch.uint8,
             device=device,
-        ).view(FP8_STORE_DTYPE)
+        )
+        if VENDOR not in UINT8_CONTAINER_VENDORS:
+            k_cache = k_cache.view(FP8_STORE_DTYPE)
         fp8_scale = torch.ones(1, dtype=torch.float32, device=device)
         q_fp8_scale_inv = torch.ones(1, dtype=torch.float32, device=device)
 
