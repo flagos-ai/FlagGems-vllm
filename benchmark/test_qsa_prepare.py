@@ -14,17 +14,16 @@
 
 """Performance of the QSA fused prepare operator.
 
-On CUDA builds the baseline is the upstream vLLM operator, driven with
-identical inputs. Ascend has no equivalent fused operator, so the Ascend
-baseline composes the vllm-ascend operators that cover the same work: the main
-split/norm/rope kernel, ``_gemma_rmsnorm``, ``apply_qsa_rope``,
-``qsa_compress_groups_with_ratio`` and ``qsa_store_cache_rows`` for every cache
-store (main K/V per head, raw ring, ring rope tail). Only metadata preparation
-and the ``.contiguous()`` the vendor kernel requires stay on torch - the same
-split the cross-validated baseline uses. Set ``QSA_ASCEND_BASELINE_IO=torch``
-to write those stores with torch indexing instead (the older, slower form).
-That row is still an ***approximate*** baseline; the reported speedup uses it
-as the denominator and is labelled ``baseline=composed``.
+On CUDA builds the baseline is the upstream vLLM operator, driven with identical
+inputs. Ascend has no equivalent fused operator, so the Ascend baseline composes
+the vllm-ascend operators covering the same work: the main split/norm/rope
+kernel, the fused indexer norm+RoPE (``triton_qsa_rmsnorm_mrope``), the group
+compressor and ``qsa_store_cache_rows`` for every cache store (main K/V per
+head, raw ring and its rope tail). Only metadata preparation and the
+``.contiguous()`` the vendor kernels require stay on torch. Set
+``QSA_ASCEND_BASELINE_IO=torch`` to write those stores with torch indexing
+instead (the older, slower form). The reported speedup uses that composition as
+the denominator and is labelled ``baseline=composed``.
 """
 
 from __future__ import annotations
@@ -45,6 +44,39 @@ from tests.test_qsa_prepare import (
 )
 
 from . import base
+
+VENDOR = flaggems_vllm.vendor_name
+# Only the NVIDIA build ships an upstream qwen4_exp implementation today.
+VLLM_NATIVE_VENDORS = {"nvidia"}
+
+_BASELINE_IO = os.environ.get("QSA_ASCEND_BASELINE_IO", "vendor").strip().lower()
+
+
+def _get_baseline_op():
+    """Return the vendor-native implementation, or None when there is none."""
+
+    if VENDOR == "ascend":
+        # vllm-ascend has no single fused operator: compose the operators that
+        # cover the same work. A vendor build missing any piece yields None, and
+        # the run then reports absolute latency instead of a ratio.
+        return build_ascend_baseline(_BASELINE_IO != "torch")
+    if VENDOR in VLLM_NATIVE_VENDORS:
+        module = base.import_vllm_benchmark_baseline(
+            "vllm.models.qwen4_exp.nvidia.ops.qsa_prepare"
+        )
+        return module.qsa_prepare
+    return None
+
+
+def _baseline_kind(op):
+    """Label the denominator printed with each result row."""
+
+    if op is None:
+        return "none"
+    if VENDOR == "ascend":
+        return "composed" if _BASELINE_IO != "torch" else "composed-torch"
+    return "native"
+
 
 # Each entry is a batch scenario, not a tensor size: _input_fn expands one entry
 # into about two dozen operands whose shapes are unrelated to each other, from
@@ -111,41 +143,6 @@ SHAPES = [
 if not HAS_NATIVE_FP8:
     SHAPES = [shape for shape in SHAPES if shape[3].get("indexer_dtype") is not FP8]
 
-# ------------------------------------------------------------------ baselines
-HAS_VLLM_NATIVE = False
-try:  # upstream vLLM ships the fused operator on CUDA builds only
-    from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import (
-        qsa_prepare as _vllm_qsa_prepare,
-    )
-
-    HAS_VLLM_NATIVE = True
-except Exception:  # noqa: BLE001 - any import failure means "not available"
-    _vllm_qsa_prepare = None
-
-
-_BASELINE_IO = os.environ.get("QSA_ASCEND_BASELINE_IO", "vendor").strip().lower()
-_composed_baseline = build_ascend_baseline(_BASELINE_IO != "torch")
-
-if VENDOR == "ascend":
-    # vLLM's native qsa_prepare kernel is CUDA-only, and newer vendor builds drop
-    # _gemma_rmsnorm, so the composition may be unavailable: report absolute
-    # latency instead of falling back to the unrunnable native baseline.
-    if _composed_baseline is not None:
-        BASELINE_KIND = "composed" if _BASELINE_IO != "torch" else "composed-torch"
-        BASELINE_OP = _composed_baseline
-    else:
-        BASELINE_KIND = "none"
-        BASELINE_OP = None
-elif HAS_VLLM_NATIVE:
-    BASELINE_KIND = "native"
-    BASELINE_OP = _vllm_qsa_prepare
-elif _composed_baseline is not None:
-    BASELINE_KIND = "composed" if _BASELINE_IO != "torch" else "composed-torch"
-    BASELINE_OP = _composed_baseline
-else:
-    BASELINE_KIND = "none"
-    BASELINE_OP = None
-
 
 class QsaPrepareBenchmark(base.GenericBenchmark):
     """Use the common runner with the QSA prepare batch layouts."""
@@ -166,7 +163,7 @@ class QsaPrepareBenchmark(base.GenericBenchmark):
             "tokens": int(query.shape[0]),
             "query": list(query.shape),
             "main_qkv": list(kwargs["main_qkv"].shape),
-            "baseline": BASELINE_KIND,
+            "baseline": _baseline_kind(self.torch_op),
         }
         if int(state_cache.shape[1]) != 4:
             reported["state_size"] = int(state_cache.shape[1])
@@ -205,7 +202,7 @@ def test_qsa_prepare():
     bench = QsaPrepareBenchmark(
         input_fn=_input_fn,
         op_name="qsa_prepare",
-        torch_op=BASELINE_OP,
+        torch_op=_get_baseline_op(),
         gems_op=qsa_prepare,
         dtypes=[torch.bfloat16],
     )
