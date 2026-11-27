@@ -14,7 +14,7 @@
 
 import logging
 import math
-from functools import partial
+from functools import lru_cache, partial
 from numbers import Integral
 
 import flag_gems
@@ -31,6 +31,61 @@ from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.shape_utils import broadcasted_stride
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _ascend_varlen_missing_tle():
+    """Check the compiler before importing any Ascend varlen kernel."""
+    try:
+        import triton.experimental.tle as tle_api
+        from triton._C.libtriton import tle as tle_ir
+        from triton._flagtree_backend import FLAGTREE_BACKEND
+        from triton.experimental.tle.language import dsa
+        from triton.experimental.tle.language.dsa import ascend
+    except (ImportError, RuntimeError) as exc:
+        return (str(exc),)
+
+    if FLAGTREE_BACKEND != "ascend":
+        return ("Ascend FlagTree backend",)
+
+    dsa_ops = (
+        "alloc",
+        "copy",
+        "extract_slice",
+        "insert_slice",
+        "subview",
+        "to_buffer",
+        "to_tensor",
+    )
+    sync_ops = ("sub_vec_id", "sync_block_all", "sync_block_set", "sync_block_wait")
+    missing = [f"dsa.{op}" for op in dsa_ops if not callable(getattr(dsa, op, None))]
+    missing += [
+        f"dsa.ascend.{op}" for op in sync_ops if not callable(getattr(ascend, op, None))
+    ]
+    missing += [
+        f"dsa.ascend.{name}"
+        for name in ("L1", "UB", "PIPE")
+        if not hasattr(ascend, name)
+    ]
+    if not callable(getattr(tle_api, "scope", None)):
+        missing.append('tle.scope(core_mode="cube"/"vector")')
+
+    # The registry lists the DSA operations; legacy core scopes and Ascend
+    # synchronization intrinsics are not registry entries.
+    features = tuple(f"dsa.{op}" for op in dsa_ops)
+    is_tle_supported = getattr(tle_api, "is_tle_supported", None)
+    if callable(is_tle_supported):
+        if not is_tle_supported(features):
+            missing += [name for name in features if not is_tle_supported((name,))]
+            if not missing:
+                missing.append("combined DSA operations")
+    # Older Ascend FlagTree builds have no registry API. Require the actual
+    # CommonIR DSA bindings in addition to the Python surface on those builds.
+    elif not callable(
+        getattr(getattr(tle_ir, "dsa_ir", None), "load_tile_dialects", None)
+    ):
+        missing.append("CommonIR DSA compiler bindings")
+    return tuple(dict.fromkeys(missing))
 
 
 # Modified from Triton tutorial: https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html
@@ -1573,6 +1628,12 @@ def flash_attn_varlen_func(
         if out is not None:
             assert out.device == q.device
     elif is_ascend:
+        missing_tle = _ascend_varlen_missing_tle()
+        if missing_tle:
+            raise NotImplementedError(
+                "Ascend varlen FlashAttention requires FlagTree TLE support; "
+                f"missing: {', '.join(missing_tle)}"
+            )
         if fa_version != 2:
             raise NotImplementedError("Ascend varlen attention supports fa_version=2")
         if dropout_p != 0:
