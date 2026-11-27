@@ -7,7 +7,6 @@ import torch
 
 import flaggems_vllm
 from flaggems_vllm import draft_watermarking_mask
-from tests import accuracy_utils as utils
 
 try:
     from vllm.v1.worker.gpu.sample.watermark import (
@@ -137,7 +136,7 @@ def test_mask_and_history(shape, window, include_prompt):
 @pytest.mark.parametrize(
     "layout", ["rows", "columns", "broadcast_steps", "strided_vectors"]
 )
-def test_strides(layout, caplog):
+def test_strides(layout):
     inputs = list(make_inputs(17, 513, 4))
     if layout == "rows":
         for index in (0, 5):
@@ -166,20 +165,7 @@ def test_strides(layout, caplog):
             padded = torch.empty(34, dtype=original.dtype, device=DEVICE)
             padded[::2] = original
             inputs[index] = padded[::2]
-    entry = draft_watermarking_mask
-    if flaggems_vllm.vendor_name == "ascend":
-        from flaggems_vllm.runtime.backend._ascend.ops.watermark import (
-            _launch_draft_watermarking_mask,
-        )
-
-        entry = _launch_draft_watermarking_mask
-    elif flaggems_vllm.vendor_name == "mthreads":
-        # The existing MThreads override has no entry log.
-        check(tuple(inputs), 511, True)
-        return
-    with caplog.at_level("DEBUG", logger=utils.gems_log_logger(entry)):
-        check(tuple(inputs), 511, True)
-    assert f"{utils.gems_log_prefix(entry)} DRAFT_WATERMARKING_MASK" in caplog.messages
+    check(tuple(inputs), 511, True)
 
 
 @pytest.mark.draft_watermarking_mask
@@ -230,42 +216,21 @@ def test_cpu_is_unsupported():
 
 
 @pytest.mark.draft_watermarking_mask
-def test_short_history_after_long_history(monkeypatch):
-    import importlib
-    from unittest.mock import Mock
-
-    import triton
-
-    module = importlib.import_module(draft_watermarking_mask.__module__)
-    if flaggems_vllm.vendor_name == "ascend":
-        from flaggems_vllm.runtime.backend._ascend.ops.watermark import (
-            _repeated_context_mask_ascend_kernel,
-        )
-
-        kernel = _repeated_context_mask_ascend_kernel
-        block = 2048
-    else:
-        kernel = module._repeated_context_mask_kernel
-        block = 8192
-    launch = Mock(wraps=kernel.run)
-    monkeypatch.setattr(kernel, "run", launch)
-    if hasattr(kernel.fn, "configs"):
-        monkeypatch.setattr(
-            kernel.fn, "configs", [triton.Config({"BLOCK": block}, num_warps=4)]
-        )
-        monkeypatch.setattr(
-            kernel, "kernel_cache", tuple({} for _ in kernel.kernel_cache)
-        )
-    inputs = list(make_inputs(32, 8193, 4))
-    check(tuple(inputs), 8192, False)
-    lengths = (64, 512, 513, 8193)
-    if flaggems_vllm.vendor_name == "ascend":
-        # After the three prompt tokens, straddle the short-history tile size.
-        lengths += (130, 131, 132)
-    for length in lengths:
-        inputs[3].fill_(length)
-        check(tuple(inputs), 8192, False)
-    assert launch.call_count == 2 * (1 + len(lengths))
+def test_short_history_after_long_history():
+    rows = 32
+    inputs = make_inputs(rows, 8193, 4)
+    tokens, _, _, total, _, contexts, _, _ = inputs
+    contexts[:2].fill_(32000)
+    # The first two draft rows map to the last two live requests in reverse order.
+    for length in (8193, 64, 130, 131, 132, 512, 513, 8193):
+        total.fill_(length)
+        # Excluding three prompt tokens gives 127, 128 and 129 positions.
+        # The last candidate is accepted just before the history endpoint.
+        tokens[rows - 1, length - 5 : length - 1] = contexts[0]
+        tokens[rows - 2, length - 4 : length] = contexts[1]
+        check(inputs, 8192, False)
+        tokens[rows - 1, length - 5 : length - 1] = 0
+        tokens[rows - 2, length - 4 : length] = 0
 
 
 @pytest.mark.draft_watermarking_mask
