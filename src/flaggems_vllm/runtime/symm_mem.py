@@ -23,6 +23,15 @@ _OP_NAME = "fused_matmul_reduce_scatter"
 _IMPL_KEY = f"symm_mem/{_OP_NAME}/CUDA"
 
 
+def supports_symm_mem_override():
+    """Check the installed API, including vendor and prerelease Torch builds."""
+    try:
+        parameters = inspect.signature(torch.library.Library.impl).parameters
+    except (TypeError, ValueError):
+        return False
+    return "allow_override" in parameters
+
+
 def _acquire():
     global _LIBRARY, _REFERENCES
     with _LOCK:
@@ -34,10 +43,7 @@ def _acquire():
             # Load PyTorch's schema and original implementations first. Defining
             # a second schema would conflict with later imports by vLLM/PyTorch.
             importlib.import_module("torch.distributed._symmetric_memory")
-            if (
-                "allow_override"
-                not in inspect.signature(torch.library.Library.impl).parameters
-            ):
+            if not supports_symm_mem_override():
                 raise NotImplementedError(
                     "this PyTorch build does not support Library.impl(allow_override=True); "
                     "use a build with this API, or call flaggems_vllm.fused_matmul_reduce_scatter directly"
