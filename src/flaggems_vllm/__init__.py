@@ -52,6 +52,7 @@ for _alias, _target in _COMPAT_OP_ALIASES.items():
 __all__ = [
     "disable_symm_mem",
     "enable_symm_mem",
+    "fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "SUPPORTED_FP8_DTYPE",
     "gumbel_sample",
     "lora_expand",
