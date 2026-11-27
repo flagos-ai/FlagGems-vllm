@@ -29,6 +29,7 @@ pytest.importorskip("torch_npu")
 import torch.nn.functional as F  # noqa: E402
 
 import flaggems_vllm  # noqa: E402
+from baseline import native_api  # noqa: E402
 
 from . import base  # noqa: E402
 
@@ -169,16 +170,177 @@ def _causal_conv1d_gems(
     )
 
 
+def _native_fn():
+    """The platform's native causal_conv1d_fn, with its layout convention.
+
+    ``native_api`` keeps the vendor split in one place: Ascend resolves the
+    AscendC kernel (``fla_npu``) or vllm-ascend's entry, every other backend
+    resolves vLLM's own op. Only the AscendC kernel uses kernel layouts.
+    """
+    return native_api.causal_conv1d_fn()
+
+
+NATIVE_FN, NATIVE_FN_SOURCE = _native_fn()
+_fla_npu_probe = None
+
+
+def _native_available():
+    """Whether the resolved native entry actually runs here.
+
+    AscendC needs one live call: importing it proves nothing, and the
+    argument layouts have to be the kernel's. The Python entries only need the
+    import.
+    """
+    global _fla_npu_probe
+    if _fla_npu_probe is None:
+        if NATIVE_FN is None:
+            _fla_npu_probe = (False, "no native causal_conv1d_fn on this platform")
+        elif NATIVE_FN_SOURCE != "fla_npu.ops.ascendc":
+            _fla_npu_probe = (True, None)
+        else:
+            try:
+                torch.manual_seed(0)
+                dev = flaggems_vllm.device
+                t, dim = 64, 128
+                dtype = torch.bfloat16
+                x = torch.randn(t, dim, device=dev, dtype=dtype)
+                weight = torch.randn(WIDTH, dim, device=dev, dtype=dtype)
+                states = torch.randn(8, WIDTH - 1, dim, device=dev, dtype=dtype)
+                NATIVE_FN(
+                    x,
+                    weight,
+                    None,
+                    conv_states=states,
+                    query_start_loc=torch.tensor([0, t], dtype=torch.int32, device=dev),
+                    cache_indices=torch.tensor([1], dtype=torch.int32, device=dev),
+                    has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
+                    activation="silu",
+                    pad_slot_id=PAD_SLOT_ID,
+                    null_block_id=PAD_SLOT_ID,
+                )
+                torch.npu.synchronize()
+                _fla_npu_probe = (True, None)
+            except Exception as exc:
+                _fla_npu_probe = (False, f"{type(exc).__name__}: {exc}")
+    return _fla_npu_probe
+
+
+def _causal_conv1d_native(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    cache_indices,
+    has_initial_state,
+    seqlens,
+    activation="silu",
+    pad_slot_id=PAD_SLOT_ID,
+):
+    """Native baseline, adapted to the resolved entry's layouts.
+
+    The AscendC kernel takes vLLM's kernel layouts, which differ from this
+    operator's contract in three places: ``x`` is token-major
+    ``[tokens, channels]``, ``weight`` is ``[width, channels]`` and
+    ``conv_states`` is ``[cache, state_len, channels]``. With those
+    conversions its output and updated state are bit-identical to this repo's
+    kernel. Every other entry takes the operator layouts directly.
+    """
+    _ = seqlens
+    if NATIVE_FN_SOURCE == "fla_npu.ops.ascendc":
+        return NATIVE_FN(
+            x.transpose(0, 1),
+            weight.transpose(0, 1).contiguous(),
+            bias,
+            conv_states=conv_states.transpose(1, 2),
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            null_block_id=PAD_SLOT_ID,
+        )
+    return NATIVE_FN(
+        x,
+        weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
+    )
+
+
+def _load_vllm_ascend_fn():
+    """vllm-ascend's own entry: Ascend only, and only as a fallback."""
+    if flaggems_vllm.vendor_name != "ascend":
+        return None
+    try:
+        from vllm_ascend.ops.causal_conv1d import causal_conv1d_fn as native
+    except Exception:  # ImportError, or an older tree that raises on import
+        return None
+    return native
+
+
+VLLM_ASCEND_FN = _load_vllm_ascend_fn()
+
+
+def _causal_conv1d_vllm_ascend(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    cache_indices,
+    has_initial_state,
+    seqlens,
+    activation="silu",
+    pad_slot_id=PAD_SLOT_ID,
+):
+    """vllm-ascend fallback. It also updates conv_states in place.
+
+    On parts other than 310P this is a per-sequence torch implementation, so
+    the SpeedUp compares against a reference path, not a kernel.
+    """
+    _ = seqlens
+    return VLLM_ASCEND_FN(
+        x,
+        weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
+    )
+
+
 def _conv1d_input_fn(shape, dtype, device):
     batch, seqlen, dim = shape
     yield _varlen_inputs(batch, seqlen, dim, dtype, device)
 
 
 def test_causal_conv1d_fn_perf():
+    # Prefer the AscendC kernel, then vllm-ascend's own API, then the local
+    # per-sequence F.conv1d loop.
+    if _native_available()[0]:
+        baseline = _causal_conv1d_native
+    elif VLLM_ASCEND_FN is not None:
+        baseline = _causal_conv1d_vllm_ascend
+    else:
+        baseline = _causal_conv1d_torch
+    if baseline is not _causal_conv1d_native:
+        print(
+            "[causal_conv1d_fn] native baseline unavailable: "
+            f"{_native_available()[1]}"
+        )
     bench = CausalConv1dBenchmark(
         input_fn=_conv1d_input_fn,
         op_name="causal_conv1d_fn",
-        torch_op=_causal_conv1d_torch,
+        torch_op=baseline,
         gems_op=_causal_conv1d_gems,
         dtypes=[torch.bfloat16],
     )

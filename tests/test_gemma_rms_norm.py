@@ -27,6 +27,43 @@ import flaggems_vllm  # noqa: E402
 from . import accuracy_utils as utils  # noqa: E402
 from . import conftest as cfg  # noqa: E402
 
+try:
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm as _VllmGemmaRMSNorm
+
+    _HAS_VLLM_GEMMA = True
+except ImportError:
+    _HAS_VLLM_GEMMA = False
+
+
+def _vllm_gemma_rms_norm(x, w, eps):
+    """Reference using vllm.model_executor.layers.layernorm.GemmaRMSNorm."""
+    # vLLM's CustomOp must be instantiated inside a vLLM config context;
+    # newer vLLM raises "Current vLLM config is not set" otherwise.
+    # CustomOp dispatch only reads .compilation_config, and constructing a
+    # full VllmConfig() lazily imports vllm.v1.executor -> ... -> xgrammar,
+    # which breaks on environments with a mismatched tvm-ffi/xgrammar pair,
+    # so use a minimal stand-in carrying only a CompilationConfig.
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationConfig, set_current_vllm_config
+
+    N = x.shape[-1]
+    minimal_config = SimpleNamespace(compilation_config=CompilationConfig())
+    with set_current_vllm_config(minimal_config):
+        norm = _VllmGemmaRMSNorm(hidden_size=N, eps=eps)
+    norm.weight = torch.nn.Parameter(w.float())
+    norm = norm.to(x.device)
+    with torch.inference_mode():
+        return norm(x)
+
+
+def _torch_gemma_rms_norm(x, w, eps):
+    x = x.to(dtype=torch.float32)
+    w = w.to(dtype=torch.float32)
+    rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
+    return (1 + w) * x * rrms
+
+
 # hidden_size of the gemma-3 series models
 _gemma_rms_norm_ns = [1152, 3840, 5376]
 # Batch size
@@ -45,13 +82,10 @@ def test_gemma_rms_norm(shape, dtype):
     w = torch.randn((N), dtype=dtype, device=flaggems_vllm.runtime.device.name)
     eps = 1e-5
 
-    def _torch_gemma_rms_norm(x, w, eps):
-        x = x.to(dtype=torch.float32)
-        w = w.to(dtype=torch.float32)
-        rrms = 1 / ((x**2).mean(dim=-1, keepdim=True) + eps).sqrt()
-        return (1 + w) * x * rrms
-
-    ref_out = _torch_gemma_rms_norm(x, w, eps)
+    if _HAS_VLLM_GEMMA:
+        ref_out = _vllm_gemma_rms_norm(x, w, eps)
+    else:
+        ref_out = _torch_gemma_rms_norm(x, w, eps)
 
     res_out = flaggems_vllm.gemma_rms_norm(x, w, eps)
 

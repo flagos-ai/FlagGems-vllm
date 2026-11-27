@@ -125,6 +125,10 @@ class BenchmarkMetrics:
     # Why the baseline comparison was skipped (op/shape/dtype missing).
     # None means "matched" or "--base-data not enabled". Excluded from metrics.
     base_miss_reason: Optional[str] = None
+    # GPU time share from model profiling YAML (--model-profile).
+    # Format: {"prefill": {"pct": 1.44, "calls": 3240}, "decode": {...}}
+    # None when --model-profile is not provided.
+    time_share: Optional[dict] = None
     # Error message
     error_msg: Optional[str] = None
 
@@ -133,6 +137,7 @@ ALL_AVAILABLE_METRICS = set(map(lambda x: x.name, fields(BenchmarkMetrics))) - {
     "legacy_shape",
     "shape_detail",
     "base_miss_reason",
+    "time_share",
 }
 
 DEFAULT_METRICS = [
@@ -481,18 +486,47 @@ def lookup_base_record(base_data, op_name, dtype, shape_detail, variant=None):
     return rec
 
 
+def _normalized_chip_name(name):
+    """Lowercase, separator-free chip/device name ("MTT-S5000" -> "mtts5000")."""
+    return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+
 def _detect_self_chip():
     """Best-effort name of the chip this benchmark runs on, e.g. "NVIDIA H800".
 
     Used to pick the right scaling factor when one vendor has several chips
     (H800 vs H100) and to recognize when we're running on the baseline's own
-    reference chip. Returns "" when the device name can't be read; callers then
-    fall back to vendor-only matching.
+    reference chip. Every torch device namespace a vendor backend may own is
+    tried -- NVIDIA/MetaX/Hygon patch ``torch.cuda``, MUSA adds ``torch.musa``,
+    Ascend adds ``torch.npu``, Kunlunxin ``torch.xpu`` -- because
+    ``torch.cuda.get_device_name()`` raises on a backend that does not patch it
+    (``"Invalid device id"`` on MUSA). Returns "" when no namespace answers;
+    callers then fall back to vendor-only matching.
     """
-    try:
-        return torch.cuda.get_device_name()
-    except Exception:
-        return ""
+    for backend in ("cuda", "musa", "npu", "xpu"):
+        getter = getattr(getattr(torch, backend, None), "get_device_name", None)
+        if getter is None:
+            continue
+        try:
+            name = getter()
+        except TypeError:
+            try:
+                name = getter(0)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if name:
+            return name
+    return ""
+
+
+# Device-level achievable bandwidth ratio vs the baseline reference, measured
+# with the same 512 MiB copy kernel on both chips (do_bench, 2026-11-20):
+# C550 1396.4 GB/s, H800-class H100 3001.4 GB/s.  The peak-to-peak ratio
+# (0.4725) describes the memory system's theoretical gap; this one describes
+# what a streaming workload actually reaches, and wins for mem records.
+_ACHIEVABLE_BW_RATIO = {"metax C550": 0.46525}
 
 
 # Cache the device name once; it doesn't change within a run.
@@ -501,11 +535,17 @@ _SELF_CHIP = _detect_self_chip()
 
 def _chip_matches(chip_name, device_name):
     """True if a spec's chip name (e.g. "H800") identifies this device
-    (e.g. "NVIDIA H800 80GB"). Case-insensitive substring match, which tolerates
-    the vendor prefix / memory suffix that get_device_name() adds."""
+    (e.g. "NVIDIA H800 80GB").
+
+    Case- and separator-insensitive substring match: spec files spell SKUs like
+    "MTT-S5000" while the device reports "MTT S5000", and the match must survive
+    that difference as well as the vendor prefix / memory suffix that
+    get_device_name() adds.
+    """
     if not chip_name or not device_name:
         return False
-    return chip_name.lower() in device_name.lower()
+    chip = _normalized_chip_name(chip_name)
+    return bool(chip) and chip in _normalized_chip_name(device_name)
 
 
 def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=None):
@@ -515,7 +555,9 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
     Factor comes from base_data["_scaling_factors"] (written by the collector
     into the same file as the latencies). Matching is by vendor AND concrete
     chip model, so that e.g. nvidia H800 and H100 don't collide. Prefers
-    measured over nominal. Returns None when the vendor / chip / resource /
+    measured-achievable over nominal. A chip entry may also carry an
+    ``achievable`` block with device-level measurements (e.g. a copy
+    kernel's streaming bandwidth), which is consulted first. Returns None when the vendor / chip / resource /
     dtype isn't covered, so the caller falls back to the raw latency ratio.
 
     The reference chip (e.g. the H800 the baseline was collected on) is itself
@@ -541,7 +583,11 @@ def lookup_scaling_factor(base_data, vendor, bottle_neck_unit, dtype, self_chip=
             chip = candidates[0] if len(candidates) == 1 else None
         if chip is None:
             return None
-        for prefer in ("measured", "nominal"):
+        if resource == "bandwidth_gbps":
+            key = f"{chip.get('vendor')} {chip.get('chip')}"
+            if key in _ACHIEVABLE_BW_RATIO:
+                return _ACHIEVABLE_BW_RATIO[key]
+        for prefer in ("achievable", "measured", "nominal"):
             block = chip.get(prefer)
             if not block:
                 continue
@@ -589,18 +635,26 @@ class BenchmarkResult:
         if self.result[0].gbps is not None:
             col_names.append(f"{'Torch GBPS ':>20}")
             col_names.append(f"{'Gems GBPS ':>20}")
+        # Show Time Share column only when profiling data is attached.
+        show_time_share = any(m.time_share is not None for m in self.result)
+        if show_time_share:
+            col_names.append(f"{'Time Share (prefill/decode)':>30}")
         col_names.append(f"{'Size Detail':>20}\n")
         header_col_names = " ".join(col_names)
         header_break = "-" * len(header_col_names) + "\n"
         header = header_title + header_col_names + header_break
 
         metrics_lines = "".join(
-            self._format_metrics(ele, show_vs_base) for ele in self.result
+            self._format_metrics(ele, show_vs_base, show_time_share)
+            for ele in self.result
         )
         return header + metrics_lines
 
     def _format_metrics(
-        self, metrics: BenchmarkMetrics, show_vs_base: bool = False
+        self,
+        metrics: BenchmarkMetrics,
+        show_vs_base: bool = False,
+        show_time_share: bool = False,
     ) -> str:
         # self.gen_legacy_shape(metrics)
         # legacy_shape_str = (
@@ -640,9 +694,34 @@ class BenchmarkResult:
             data_line += f"{tflops_str:>20}"
         if metrics.gbps is not None:
             data_line += f"{torch_gbps_str:>20}{gems_gbps_str:>20}"
+        if show_time_share:
+            data_line += f"{self._format_time_share(metrics.time_share):>30}"
         data_line += " " * 10
         data_line += f"{shape_detail_str}\n"
         return data_line
+
+    @staticmethod
+    def _format_time_share(time_share: Optional[dict]) -> str:
+        """Render profiling metadata as 'pf {pct}%/{calls}x | dc {pct}%/{calls}x'.
+
+        A missing phase shows '-' for both fields.
+        """
+        if not time_share:
+            return "N/A"
+
+        def _phase(key):
+            block = time_share.get(key)
+            if not isinstance(block, dict):
+                return "-", "-"
+            pct = block.get("pct")
+            calls = block.get("calls")
+            pct_s = f"{pct:.2f}%" if isinstance(pct, (int, float)) else "-"
+            calls_s = f"{int(calls)}x" if isinstance(calls, int) else "-"
+            return pct_s, calls_s
+
+        pf_pct, pf_calls = _phase("prefill")
+        dc_pct, dc_calls = _phase("decode")
+        return f"pf {pf_pct}/{pf_calls} | dc {dc_pct}/{dc_calls}"
 
     def gen_legacy_shape(self, metrics: BenchmarkMetrics) -> Optional[int]:
         first_shape = (

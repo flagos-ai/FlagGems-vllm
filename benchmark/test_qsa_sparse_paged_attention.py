@@ -29,16 +29,15 @@ pytestmark = pytest.mark.skipif(
     reason="T-Head retains the legacy QSA interface benchmarked in test_qsa_attention.py",
 )
 
-vendor_qsa = None
-if VENDOR == "nvidia":
-    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-        qsa_sparse_paged_attention as vendor_qsa,
-    )
-
 
 def _get_baseline_op():
     """Select the vendor-native baseline when one is configured."""
-    return vendor_qsa
+    if VENDOR == "nvidia":
+        module = base.import_vllm_benchmark_baseline(
+            "vllm.models.qwen4_exp.nvidia.ops.qsa"
+        )
+        return module.qsa_sparse_paged_attention
+    return None
 
 
 class QSASparsePagedAttentionBenchmark(base.Benchmark):
