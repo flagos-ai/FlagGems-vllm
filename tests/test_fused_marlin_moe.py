@@ -307,7 +307,14 @@ def _quantize_moe_weight_int8(w_fp, group_size):
 
 
 def _make_inputs_w4a16_int4(
-    num_tokens, num_experts, hidden_size, intermediate_size, topk, dtype, device
+    num_tokens,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    topk,
+    dtype,
+    device,
+    group_size=GROUP_SIZE,
 ):
     """
     Build all tensors for one test case.
@@ -348,8 +355,8 @@ def _make_inputs_w4a16_int4(
         / 10.0
     )
 
-    w1_q, w1_ref, w1_scale = _quantize_moe_weight(w1_fp, GROUP_SIZE)
-    w2_q, w2_ref, w2_scale = _quantize_moe_weight(w2_fp, GROUP_SIZE)
+    w1_q, w1_ref, w1_scale = _quantize_moe_weight(w1_fp, group_size)
+    w2_q, w2_ref, w2_scale = _quantize_moe_weight(w2_fp, group_size)
 
     gating = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(torch.softmax(gating, dim=-1), topk, dim=-1)
@@ -1678,7 +1685,9 @@ def test_fused_marlin_moe_small_grouped_musa(dtype, apply_router_weight_on_input
 )
 @pytest.mark.parametrize("precision", ["int4", "fp8"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("destination", ["allocate", "output", "inplace", "shifted"])
+@pytest.mark.parametrize(
+    "destination", ["allocate", "output", "inplace", "shifted", "shifted_back"]
+)
 def test_fused_marlin_moe_workspace_chunks(monkeypatch, precision, dtype, destination):
     make_inputs, quant_type = {
         "int4": (_make_inputs_w4a16_int4, QUANT_TYPE_UINT4B8),
@@ -1700,20 +1709,25 @@ def test_fused_marlin_moe_workspace_chunks(monkeypatch, precision, dtype, destin
     monkeypatch.setattr(backend, "_MAX_WORKSPACE_BYTES", budget)
     # Compile/autotune all chunk geometries before checking allocated memory.
     call(hs)
-    if destination in ("inplace", "shifted"):
+    if destination in ("inplace", "shifted", "shifted_back"):
         call(hs.clone(), inplace=True)
     kwargs = {}
     if destination == "output":
         kwargs["output"] = torch.empty_like(hs)
     elif destination == "inplace":
         kwargs["inplace"] = True
-    elif destination == "shifted":
+    elif destination in ("shifted", "shifted_back"):
         storage = torch.empty(
             (hs.shape[0] + 1, hs.shape[1]), dtype=dtype, device=hs.device
         )
-        storage[:-1].copy_(hs)
-        hs = storage[:-1]
-        kwargs["output"] = storage[1:]
+        source, target = (
+            (storage[:-1], storage[1:])
+            if destination == "shifted"
+            else (storage[1:], storage[:-1])
+        )
+        source.copy_(hs)
+        hs = source
+        kwargs["output"] = target
     torch_device_fn.synchronize()
     initial = torch_device_fn.memory_allocated()
     torch_device_fn.reset_peak_memory_stats()
@@ -1728,6 +1742,119 @@ def test_fused_marlin_moe_workspace_chunks(monkeypatch, precision, dtype, destin
         assert actual.data_ptr() == hs.data_ptr()
     elif "output" in kwargs:
         assert actual.data_ptr() == kwargs["output"].data_ptr()
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "mthreads", reason="MUSA group layout")
+@pytest.mark.parametrize(
+    "precision,group_size",
+    [(p, g) for p in ("int4", "fp8") for g in (32, 64, 96, 384)] + [("fp8", -1)],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [1, 33])
+def test_fused_marlin_moe_groups_musa(precision, group_size, dtype, num_tokens):
+    make_inputs = (
+        _make_inputs_w4a16_int4 if precision == "int4" else _make_inputs_fp8_weight
+    )
+    hs, w1, w2, r1, r2, tw, ti, s1, s2 = make_inputs(
+        num_tokens, 4, 384, 768, 2, dtype, flaggems_vllm.device, group_size
+    )
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs,
+        w1,
+        w2,
+        None,
+        None,
+        s1,
+        s2,
+        tw,
+        ti,
+        QUANT_TYPE_UINT4B8 if precision == "int4" else QUANT_TYPE_FP8_E4M3,
+        group_size=group_size,
+    )
+    reference = _reference_swiglu_moe(hs, r1, r2, tw, ti)
+    assert torch.isfinite(actual).all()
+    error = actual.float() - reference.float()
+    rms = error.square().mean().sqrt() / reference.float().square().mean().sqrt()
+    peak = error.abs().max() / reference.float().abs().max()
+    assert rms < 0.01 and peak < 0.02
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MUSA output storage"
+)
+@pytest.mark.parametrize("precision", ["int4", "fp8"])
+@pytest.mark.parametrize("aliased", ["w1", "w2", "s1", "s2", "tw", "ti"])
+@pytest.mark.parametrize("disjoint", [False, True])
+def test_fused_marlin_moe_rejects_output_storage_musa(precision, aliased, disjoint):
+    make_inputs = (
+        _make_inputs_w4a16_int4 if precision == "int4" else _make_inputs_fp8_weight
+    )
+    hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
+        1, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    tensors = dict(w1=w1, w2=w2, s1=s1, s2=s2, tw=tw, ti=ti)
+    tensor = tensors[aliased]
+    input_bytes = tensor.numel() * tensor.element_size()
+    output_bytes = hs.numel() * hs.element_size()
+    storage = torch.empty(
+        input_bytes + output_bytes, dtype=torch.uint8, device=hs.device
+    )
+    tensors[aliased] = storage[:input_bytes].view(tensor.dtype).view(tensor.shape)
+    tensors[aliased].copy_(tensor)
+    start = input_bytes if disjoint else 0
+    output = storage[start : start + output_bytes].view(hs.dtype).view(hs.shape)
+    with pytest.raises(
+        ValueError, match="Output must not alias weights, scales or routing"
+    ):
+        flaggems_vllm.fused_marlin_moe(
+            hs,
+            tensors["w1"],
+            tensors["w2"],
+            None,
+            None,
+            tensors["s1"],
+            tensors["s2"],
+            tensors["tw"],
+            tensors["ti"],
+            QUANT_TYPE_UINT4B8 if precision == "int4" else QUANT_TYPE_FP8_E4M3,
+            output=output,
+        )
+
+
+@pytest.mark.fused_marlin_moe_w4a16
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "mthreads", reason="MUSA group validation"
+)
+@pytest.mark.parametrize(
+    "precision,group_size",
+    [(p, g) for p in ("int4", "fp8") for g in (0, -2, 3.5, 50)] + [("int4", -1)],
+)
+def test_fused_marlin_moe_rejects_groups_musa(precision, group_size):
+    make_inputs = (
+        _make_inputs_w4a16_int4 if precision == "int4" else _make_inputs_fp8_weight
+    )
+    hs, w1, w2, _, _, tw, ti, s1, s2 = make_inputs(
+        1, 4, 128, 256, 2, torch.bfloat16, flaggems_vllm.device
+    )
+    with pytest.raises(ValueError if group_size == 50 else NotImplementedError):
+        flaggems_vllm.fused_marlin_moe(
+            hs,
+            w1,
+            w2,
+            None,
+            None,
+            s1,
+            s2,
+            tw,
+            ti,
+            QUANT_TYPE_UINT4B8 if precision == "int4" else QUANT_TYPE_FP8_E4M3,
+            group_size=group_size,
+        )
 
 
 @pytest.mark.fused_marlin_moe_w8a16
@@ -2014,12 +2141,13 @@ def test_fused_marlin_moe_mxfp4_alignment_ppu(hidden_size, intermediate_size):
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+    flaggems_vllm.vendor_name not in ("thead", "mthreads"),
+    reason="Native PPU/MUSA E4M3 byte decoding",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 33])
 @pytest.mark.parametrize("num_experts", [1, 16])
-def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens, num_experts):
+def test_fused_marlin_moe_w8a16_fp8_finite_codes_native(dtype, num_tokens, num_experts):
     hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(
         num_tokens, num_experts, 128, 128, 1, dtype, flaggems_vllm.device
     )
@@ -2044,14 +2172,15 @@ def test_fused_marlin_moe_w8a16_fp8_finite_codes_ppu(dtype, num_tokens, num_expe
 
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name != "thead", reason="T-Head E4M3 byte decoding"
+    flaggems_vllm.vendor_name not in ("thead", "mthreads"),
+    reason="Native PPU/MUSA E4M3 byte decoding",
 )
 @pytest.mark.parametrize("num_tokens,num_experts", [(1, 2), (33, 2), (1, 16), (4, 16)])
 @pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "special", ["weight_nan", "scale_inf", "scale_nan", "scale_large"]
 )
-def test_fused_marlin_moe_w8a16_fp8_special_values_ppu(
+def test_fused_marlin_moe_w8a16_fp8_special_values_native(
     num_tokens, num_experts, scale_dtype, special
 ):
     hs, w1, w2, _, _, tw, ti, s1, s2 = _make_inputs_fp8_weight(

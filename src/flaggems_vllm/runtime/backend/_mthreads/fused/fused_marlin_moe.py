@@ -384,7 +384,29 @@ def fused_marlin_moe(
     clamp_limit: Optional[float] = None,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """Evaluate native INT4/FP8 SwiGLU MoE without quantizing activations."""
+    """Evaluate local INT4/FP8 SwiGLU MoE with FP16/BF16 activations.
+
+    For hidden_states [M, K] and intermediate width N, plain output-major
+    weights have shapes [E, 2*N, K/pack] and [E, K, N/pack], where pack is
+    2 for UINT4B8 and 1 for E4M3FN. Group scales have shapes
+    [E, 2*N, K/group_size] and [E, K, N/group_size]. A positive group_size
+    must divide both K and N; FP8 also accepts -1 for one scale per output
+    channel (last scale dimension 1). K and N must be multiples of 32.
+    INT4 scales match the activation dtype; FP8 scales may also be FP32.
+
+    BF16 uses direct GEMV for M <= 4, or FP8 routes M*topk <= E; other
+    inputs use grouped GEMM. BM is 16 below 16*E routes and 64 otherwise.
+    These conditions apply independently to each workspace-bounded chunk.
+    Weights/scales are read on every call and graph replay without a cache.
+
+    Output may alias hidden_states, including shifted contiguous views.
+    Sharing any storage with weights, scales or routing is rejected, even
+    for disjoint views. Only hidden_states/output/routing must be contiguous.
+    global_num_experts must be -1 or the local E; activation is None/SiLU.
+    Biases, custom activation/reduction, expert maps, global scales, act-order,
+    zero points, external workspace/caches, input_dtype overrides, clipping and partial
+    K are rejected rather than silently ignored. This is inference-only.
+    """
     if quant_type_id not in (0, 2):
         raise NotImplementedError("Unsupported quant_type_id: MUSA supports INT4/FP8")
     activation_str = getattr(
