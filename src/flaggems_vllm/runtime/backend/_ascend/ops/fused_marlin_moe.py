@@ -1827,6 +1827,79 @@ def expert_panel_kernel(
         drain_weight_ring(vector_iteration, STAGES)
 
 
+@triton.jit
+def decode_expert_matrix(Q, S, B, Counts, expert, K: tl.constexpr, N: tl.constexpr):
+    if tl.load(Counts + expert) > 0:
+        index = tl.arange(0, 128)
+        for job in range(tl.program_id(0), (K // 128) * (N // 128), tl.num_programs(0)):
+            group = job // (N // 128)
+            col = job % (N // 128) * 128
+            weight = load_weight_tile(
+                Q, S, tl.cast(expert, tl.int64), col, group, N, K, 128, 8
+            )
+            tl.store(
+                B + (group * 128 + index[:, None]) * N + col + index[None, :],
+                tl.trans(weight),
+            )
+
+
+@triton.jit
+def expert_matrix_tile(
+    A, B, Output, row, col, valid, K: tl.constexpr, N: tl.constexpr, FULL: tl.constexpr
+):
+    rows = tl.arange(0, 128)
+    columns = tl.arange(0, 256)
+    reduction = tl.arange(0, 256)
+    acc = tl.full((128, 256), 0, tl.float32)
+    for block in tl.range(K // 256):
+        start = block * 256
+        ap = A + (row + rows[:, None]) * K + start + reduction[None, :]
+        if FULL:
+            a = tl.load(ap)
+        else:
+            tail = tl.make_block_ptr(
+                A + row * K, (valid, K), (K, 1), (0, start), (128, 256), (1, 0)
+            )
+            a = tl.load(tail, boundary_check=(0,), padding_option="zero")
+        b = tl.load(B + (start + reduction[:, None]) * N + col + columns[None, :])
+        al.compile_hint(a, "dot_pad_only_k")
+        al.compile_hint(b, "dot_pad_only_k")
+        acc = tl.dot(a, b, acc)
+    cp = Output + (row + rows[:, None]) * N + col + columns[None, :]
+    if FULL:
+        tl.store(cp, acc.to(tl.float16))
+    else:
+        tail = tl.make_block_ptr(
+            Output + row * N, (valid, N), (N, 1), (0, col), (128, 256), (1, 0)
+        )
+        tl.store(tail, acc.to(tl.float16), boundary_check=(0,))
+
+
+@triton.jit
+def project_expert_matrix(
+    A, B, Output, Counts, Offsets, expert, K: tl.constexpr, N: tl.constexpr
+):
+    with tle.scope(core_mode="cube"):
+        count = tl.load(Counts + expert)
+        start = tl.load(Offsets + expert)
+        tiles_m = tl.cdiv(count, 128)
+        tiles_n: tl.constexpr = N // 256
+        # Process up to four adjacent row tiles before moving to the next column.
+        for job in range(tl.program_id(0), tiles_m * tiles_n, tl.num_programs(0)):
+            first = job // (4 * tiles_n) * 4
+            height = tl.minimum(4, tiles_m - first)
+            local = job % (4 * tiles_n)
+            m = first + local % height
+            col = local // height * 256
+            remaining = count - m * 128
+            if remaining >= 128:
+                expert_matrix_tile(A, B, Output, start + m * 128, col, 128, K, N, True)
+            else:
+                expert_matrix_tile(
+                    A, B, Output, start + m * 128, col, remaining, K, N, False
+                )
+
+
 def grouped_quantized_gemm(
     a,
     w,
@@ -1856,6 +1929,41 @@ def grouped_quantized_gemm(
         panel_grid = min(
             w.shape[0] if expert_outer else w.shape[0] * (n // panel_bn), cores
         )
+        # For a long reduction with many rows per expert, the existing panel
+        # budget can hold one complete decoded matrix. Reuse it across row tiles.
+        if (
+            bm == 32
+            and not fuse_swiglu
+            and k >= 8192
+            and k % 256 == 0
+            and n % 256 == 0
+            and n == s.stride(1)
+            and w.shape[0] < cores
+            and a.shape[0] >= 512 * w.shape[0]
+            and n <= panel_grid * panel_bn
+            and bits == 8
+            and a.dtype == torch.float16
+        ):
+            matrix = torch.empty((k, n), device=a.device, dtype=a.dtype)
+            for expert in range(w.shape[0]):
+                decode_expert_matrix[(2 * cores,)](
+                    w, s, matrix, counts, expert, k, n, num_warps=1, multibuffer=False
+                )
+                project_expert_matrix[(cores,)](
+                    a,
+                    matrix,
+                    out,
+                    counts,
+                    offsets,
+                    expert,
+                    k,
+                    n,
+                    num_warps=1,
+                    multibuffer=True,
+                    enable_preload=True,
+                    enable_fp_fusion=False,
+                )
+            return
         panel_work = torch.empty(
             panel_grid * panel_stages * panel_bn * k, device=a.device, dtype=a.dtype
         )

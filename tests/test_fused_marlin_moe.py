@@ -1670,10 +1670,10 @@ def test_fused_marlin_moe_w8a16_inference_updates(
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "ascend", reason="Ascend FP16 INT8 projections"
 )
-@pytest.mark.parametrize("tokens", [1, 513])
-def test_fused_marlin_moe_w8a16_projection_cancellation(tokens):
+@pytest.mark.parametrize(("tokens", "n"), [(1, 1024), (513, 1024), (1025, 8192)])
+def test_fused_marlin_moe_w8a16_projection_cancellation(tokens, n):
     device = flaggems_vllm.device
-    k = n = 1024
+    k = 1024
     experts = 4
     x = torch.full((tokens, k), 2, device=device, dtype=torch.float16)
     # Opposite K halves exceed FP16 range separately. Their sums are 10 and
