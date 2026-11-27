@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
 
+from enum import IntEnum, auto
+
 import pytest
 import torch
 
@@ -10,6 +12,12 @@ from baseline.triton_reshape_and_cache_flash import backing
 from flaggems_vllm import (
     triton_reshape_and_cache_flash_per_token_head_quant as cache_kv,
 )
+
+
+class _KVQuantMode(IntEnum):
+    INT8_PER_TOKEN_HEAD = auto()
+    FP8_PER_TOKEN_HEAD = auto()
+    INT4_PER_TOKEN_HEAD = auto()
 
 
 def _inputs(shape, dtype, cache, **binding):
@@ -77,6 +85,67 @@ def test_reused_layout_writes_to_new_buffers(cache):
     _check(second)
     for out, expected in zip(cases.snapshot_outputs(first), saved):
         torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def _packed_views(storage, cache_dtype, layout):
+    # vLLM presents both physical layouts as [page, slot, head, bytes].
+    if layout == "HND":
+        storage = storage.transpose(1, 2)
+    k_bytes, v_bytes = storage.chunk(2, dim=-1)
+    return (
+        k_bytes.view(cache_dtype),
+        v_bytes.view(cache_dtype),
+        k_bytes.view(torch.float32)[..., -1],
+        v_bytes.view(torch.float32)[..., -1],
+    )
+
+
+@pytest.mark.parametrize("abi", ["seven", "positional", "keyword"])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("cache", ["int8", "fp8"])
+@pytest.mark.triton_reshape_and_cache_flash_per_token_head_quant
+def test_vllm_packed_scale_views(cache, layout, abi):
+    device = flaggems_vllm.device
+    cache_dtype = cases.cache_dtype({"cache": cache})
+    tokens, heads, width, page_size = 4, 3, 80, 7
+    # Retain untouched pages before and after the view to check storage offsets.
+    physical_dims = (heads, page_size) if layout == "HND" else (page_size, heads)
+    expected = torch.full((4, *physical_dims, 2 * (width + 4)), 0x55, dtype=torch.uint8)
+    actual = expected.to(device)
+    buffers = _packed_views(actual[1:-1], cache_dtype, layout)
+    key_ref, value_ref, k_scale_ref, v_scale_ref = _packed_views(
+        expected[1:-1], torch.uint8, layout
+    )
+    slots = torch.tensor([0, page_size - 1, page_size, -1])
+    pages, offsets = slots[:-1] // page_size, slots[:-1] % page_size
+    qmax = {torch.int8: 127, torch.float8_e4m3fn: 448, torch.float8_e4m3fnuz: 224}[
+        cache_dtype
+    ]
+    sources = []
+    for index, (data_ref, scale_ref) in enumerate(
+        ((key_ref, k_scale_ref), (value_ref, v_scale_ref))
+    ):
+        # Exactly representable codes and power-of-two scales allow a bytewise check.
+        codes = torch.arange(tokens * heads * width).view(tokens, heads, width) % 13 - 6
+        codes[..., 0] = qmax
+        if index == 1:
+            codes = -codes
+        scales = 2.0 ** ((torch.arange(tokens * heads).view(tokens, heads) % 4) + index)
+        sources.append((codes * scales[..., None]).to(device, dtype=torch.float16))
+        data_ref[pages, offsets, :, :width] = (
+            codes[:-1].to(cache_dtype).view(torch.uint8)
+        )
+        scale_ref[pages, offsets] = scales[:-1]
+
+    args = (*sources, *buffers, slots.to(device))
+    mode = _KVQuantMode[f"{cache.upper()}_PER_TOKEN_HEAD"]
+    if abi == "seven":
+        assert cache_kv(*args) is None
+    elif abi == "positional":
+        assert cache_kv(*args, mode) is None
+    else:
+        assert cache_kv(*args, kv_quant_mode=mode) is None
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", cases.DTYPES)
@@ -167,5 +236,17 @@ def test_invalid_metadata(cache):
         cache_kv(*args[:4], args[4][:, :, :1], *args[5:])
     with pytest.raises(ValueError, match="data caches"):
         cache_kv(*args[:3], args[3].view(torch.uint8), *args[4:])
+    with pytest.raises(ValueError, match="data cache shapes"):
+        cache_kv(*args[:2], args[2][..., :-1], *args[3:])
     with pytest.raises(ValueError, match="unit stride"):
         cache_kv(args[0].transpose(1, 2).contiguous().transpose(1, 2), *args[1:])
+
+
+@pytest.mark.triton_reshape_and_cache_flash_per_token_head_quant
+def test_invalid_quant_mode_with_warm_launcher():
+    args = _inputs((3, 3, 80, 128, 7), torch.float16, "int8")
+    _check(args)
+    with pytest.raises(ValueError, match="kv_quant_mode"):
+        cache_kv(*args, kv_quant_mode=_KVQuantMode.FP8_PER_TOKEN_HEAD)
+    with pytest.raises(NotImplementedError, match="kv_quant_mode"):
+        cache_kv(*args, kv_quant_mode=_KVQuantMode.INT4_PER_TOKEN_HEAD)

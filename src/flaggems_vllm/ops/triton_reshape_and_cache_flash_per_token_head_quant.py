@@ -200,11 +200,14 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     k_scale_cache: torch.Tensor,
     v_scale_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    kv_quant_mode=None,
 ) -> None:
     """Quantize each K/V token-head independently and update all four caches.
 
-    Data tensors have unit stride in the final dimension. Cache views must
-    have non-overlapping destinations and valid slots must be unique.
+    Data tensors have unit stride in the final dimension. Each data cache may
+    include a four-byte FP32 scale tail, which is written through its explicit
+    scale view. Write destinations must be disjoint and valid slots unique.
+    If omitted, the INT8 or FP8 mode is inferred from the data cache dtype.
     """
     logger.debug("GEMS TRITON_RESHAPE_AND_CACHE_FLASH_PER_TOKEN_HEAD_QUANT")
     device = key.device
@@ -212,6 +215,16 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     tensors = (key, value, *caches, slot_mapping)
     if device.type == "cpu" or any(t.device != device for t in tensors[1:]):
         raise ValueError("all tensors must be on the same accelerator device")
+
+    if kv_quant_mode is not None:
+        # Accept vLLM's enum without depending on its version or import path.
+        mode = getattr(kv_quant_mode, "name", None)
+        if mode not in ("INT8_PER_TOKEN_HEAD", "FP8_PER_TOKEN_HEAD"):
+            raise NotImplementedError(f"unsupported kv_quant_mode: {kv_quant_mode!r}")
+        if (mode == "INT8_PER_TOKEN_HEAD") != (key_cache.dtype == torch.int8):
+            raise ValueError(
+                f"kv_quant_mode {mode} does not match the data cache dtype"
+            )
 
     cache_key = None
     if _CACHE_LAUNCH and device.type == runtime.device.name:
@@ -255,16 +268,18 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     ):
         raise ValueError("slot_mapping must be int32/int64 with shape [T]")
     if key_cache.ndim != 4 or key_cache.shape[1] == 0:
-        raise ValueError("key_cache must be [P,S,H,Dk] with positive S")
+        raise ValueError("key_cache must be four-dimensional with positive S")
     pages, page_size = key_cache.shape[:2]
     cache_prefix = (pages, page_size, heads)
-    if key_cache.shape != (*cache_prefix, dk) or value_cache.shape != (
-        *cache_prefix,
-        dv,
-    ):
-        raise ValueError(
-            "data cache shapes must match P, S, H and their respective widths"
-        )
+    for cache, width in ((key_cache, dk), (value_cache, dv)):
+        if cache.shape[:-1] != cache_prefix or cache.shape[-1] not in (
+            width,
+            width + 4,
+        ):
+            raise ValueError(
+                "data cache shapes must match P, S, H and their respective widths "
+                "with an optional four-byte scale tail"
+            )
     if any(t.stride(-1) != 1 for t in (key, value, key_cache, value_cache)):
         raise ValueError(
             "input and cache data must have unit stride in the final dimension"
