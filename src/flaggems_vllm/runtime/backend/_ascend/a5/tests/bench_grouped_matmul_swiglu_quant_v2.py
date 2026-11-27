@@ -12,26 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""单用例调试脚本：GLM W8A8C8 档的 MXFP8 GroupedMatmulSwigluQuantV2。
+"""Single-shape debug script for MXFP8 GroupedMatmulSwigluQuantV2.
 
-按 remind.md 第 3 条，单用例用典型大模型 shape、用于迭代；多用例最终测试另行。
-默认取 GLM W8A8C8，因为这个算子在那档占 7.37%，shape 比 Qwen 大、更能反映
-带宽瓶颈。
+Default shape (GLM W8A8C8):
 
   x  [64, 2048]        fp8_e4m3fn
-  w  [32, 2048, 6144]  fp8_e4m3fn   gate|up 拼在一起，所以输出宽 3072
+  w  [32, 2048, 6144]  fp8_e4m3fn   gate|up concatenated, output width 3072
   y  [64, 3072]        fp8_e4m3fn
   ys [64, 48, 2]       e8m0
 
-性能口径：只看 device kernel 时间（host 时间会放大假差距），用 profiler 的
-kernel_details.csv 取 Duration 求和。比值必须取自同一次运行。
-
-用法:
+Usage:
   ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src python \\
       src/flaggems_vllm/runtime/backend/_ascend/a5/tests/bench_grouped_matmul_swiglu_quant_v2.py
   ... --shape qwen
-  ... --block-n 256      # 扫 tile
-  ... --skip-ref         # 显存紧时跳过 torch 参考
+  ... --block-n 256
+  ... --skip-ref
 """
 
 import argparse
@@ -41,8 +36,8 @@ import os
 import shutil
 import tempfile
 
-# /data 已满，TMPDIR 默认指向那里，profiler 落不了盘会导致 kernel_details.csv
-# 不生成、计时静默返回 None。必须在 import torch_npu 之前改。
+# TMPDIR must point to /tmp before importing torch_npu; otherwise the profiler
+# cannot write kernel_details.csv and device_time_us silently returns None.
 if not os.environ.get("TMPDIR", "").startswith("/tmp"):
     os.environ["TMPDIR"] = "/tmp"
 
@@ -57,8 +52,8 @@ from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_swiglu_quant_v2
 
 DEV = "npu"
 
-# w13_weight 的真实档位（K/N 都是 process_weights_after_loading 转置之后的值，
-# 即算子实际收到的）。N 是 gate|up 拼接，输出是 N/2。
+# K and N are post-transpose values as received by the operator (gate|up
+# concatenated along N; output width is N/2).
 SHAPES = {
     "glm_w8": dict(M=64, K=2048, N=6144, E=32, name="GLM W8A8C8 (7.37%)"),
     "qwen": dict(M=16, K=512, N=2048, E=128, name="Qwen3.6 (8.22%)"),
@@ -66,10 +61,11 @@ SHAPES = {
 
 
 def build_inputs(M, K, N, E, seed=0):
-    """造 MXFP8 输入。
+    """Build MXFP8 inputs via npu_dynamic_mx_quant.
 
-    用 npu_dynamic_mx_quant 生成，保证 scale 的指数分布与真实推理一致——自己
-    随便填 uint8 会得到不真实的指数范围，掩盖溢出和饱和问题。
+    Using the NPU quantisation op ensures that the scale exponent distribution
+    matches real inference; random uint8 scales can hide overflow/saturation
+    issues.
     """
     torch.manual_seed(seed)
     x_bf = torch.randn(M, K, device=DEV, dtype=torch.bfloat16)
@@ -77,9 +73,10 @@ def build_inputs(M, K, N, E, seed=0):
 
     x, sa = torch_npu.npu_dynamic_mx_quant(x_bf, dst_type=torch.float8_e4m3fn)
 
-    # weight 要按 K（倒数第二维）分块，而 npu_dynamic_mx_quant 按最后一维分，
-    # 所以先转置再量化再转回。torch.stack 不支持 fp8（aclnnStack 的 dtype 列表
-    # 里没有 DT_FLOAT8_E4M3FN），所以预分配后逐 expert 写。
+    # npu_dynamic_mx_quant scales along the last dim; weight must be scaled
+    # along K (second-to-last), so transpose, quantise, transpose back.
+    # torch.stack does not support fp8 (aclnnStack lacks DT_FLOAT8_E4M3FN),
+    # so pre-allocate and fill expert by expert.
     w = torch.empty(E, K, N, device=DEV, dtype=torch.float8_e4m3fn)
     sb_log = torch.empty(E, N, K // MX_BLOCK, device=DEV, dtype=torch.uint8)
     for e in range(E):
@@ -87,11 +84,13 @@ def build_inputs(M, K, N, E, seed=0):
         wq, sq = torch_npu.npu_dynamic_mx_quant(wt, dst_type=torch.float8_e4m3fn)
         w[e] = wq.t()
         sb_log[e] = sq.reshape(N, K // MX_BLOCK)
-    # [E, N, K/32] → 物理 [E, K/64, N, 2]：逻辑 b 落在 (b//2, n, b%2)
+    # [E, N, K/32] -> physical [E, K/64, N, 2]: logical index b maps to
+    # (b//2, n, b%2).
     sb = sb_log.permute(0, 2, 1).contiguous()
     sb = sb.reshape(E, K // 64, 2, N).permute(0, 1, 3, 2).contiguous()
 
-    # group_list：M 行均分到 E 个 expert。vllm 传 cumsum（type=0）。
+    # group_list: distribute M rows evenly across E experts; pass as cumsum
+    # (group_list_type=0, matching vllm usage).
     base, rem = M // E, M % E
     sizes = [base + (1 if i < rem else 0) for i in range(E)]
     gl_count = torch.tensor(sizes, device=DEV, dtype=torch.int64)
@@ -103,8 +102,7 @@ def build_inputs(M, K, N, E, seed=0):
 
 
 def vendor(x, w, sb, sa, gl):
-    """基线：vllm-ascend apply_gmm1_act_quant 的实际调用形态
-    （w8a8_mxfp8.py:562）。"""
+    """Vendor baseline matching vllm-ascend apply_gmm1_act_quant (w8a8_mxfp8.py:562)."""
     return torch_npu.npu_grouped_matmul_swiglu_quant_v2(
         x=x,
         weight=[w],
@@ -123,13 +121,19 @@ def vendor(x, w, sb, sa, gl):
 
 
 def as_u8(t):
-    """vendor 的 scale 是 float8_e8m0fnu，不能 .int()（aclnnInplaceCopy 报
-    561103）。它就是一个字节，view 成 uint8。"""
+    """View a float8_e8m0fnu scale tensor as uint8.
+
+    aclnnInplaceCopy (error 561103) rejects .int() on e8m0 tensors; a raw
+    byte view is safe.
+    """
     return t.view(torch.uint8) if t.dtype != torch.uint8 else t
 
 
 def device_time_us(fn, warmup=5, iters=20):
-    """用 profiler 取 device kernel 时间（us），返回 (总均值, kernel 名→均值)。"""
+    """Return mean device kernel time in us via the NPU profiler.
+
+    Returns (total_mean_us, {kernel_name: mean_us}).
+    """
     for _ in range(warmup):
         fn()
     torch.npu.synchronize()
@@ -172,7 +176,7 @@ def device_time_us(fn, warmup=5, iters=20):
 
 
 def compare(tag, y, ys, ry, rys, valid, nh):
-    """精度比对。判据是**逐位相等**：它同时证明走的是和厂商同一条硬件指令。"""
+    """Accuracy check: bitwise equality also confirms the same hardware path."""
     yf = y[:valid].float()
     rf = ry[:valid].float()
     dy = (yf - rf).abs().max().item()
@@ -181,10 +185,10 @@ def compare(tag, y, ys, ry, rys, valid, nh):
     b = as_u8(rys).reshape(rys.shape[0], -1)[:valid, : nh // MX_BLOCK].int()
     ds = (a - b).abs().max().item()
     sbad = (a != b).sum().item()
-    verdict = "逐位相等" if (nbad == 0 and sbad == 0) else "有差异"
+    verdict = "bitwise equal" if (nbad == 0 and sbad == 0) else "differ"
     print(
-        f"  {tag:20s} y max_absdiff {dy:<10g} y 不同 {nbad}/{yf.numel()}  "
-        f"scale max_absdiff {ds} 不同 {sbad}/{a.numel()}   {verdict}"
+        f"  {tag:20s} y max_absdiff {dy:<10g} y diff {nbad}/{yf.numel()}  "
+        f"scale max_absdiff {ds} diff {sbad}/{a.numel()}   {verdict}"
     )
     return nbad == 0 and sbad == 0
 
@@ -197,25 +201,27 @@ def main():
         "--block-n",
         type=int,
         default=None,
-        help="默认自动挑（两个累加器放得下 L0C 的最大值）",
+        help="default: largest value fitting two accumulators in L0C",
     )
     ap.add_argument(
         "--block-k",
         type=int,
         default=64,
-        help="必须是 64 的倍数（B 侧 scale 交错布局的约束）",
+        help="must be a multiple of 64 (B-side scale interleaved layout constraint)",
     )
     ap.add_argument("--cores", type=int, default=None)
     ap.add_argument(
-        "--scale-alg", type=int, default=0, help="0=OCP（vendor 实测用这个），1=cuBLAS"
+        "--scale-alg", type=int, default=0, help="0=OCP (vendor default), 1=cuBLAS"
     )
     ap.add_argument(
-        "--nd", action="store_true", help="强制走 ND（默认 NZ，那是默认部署布局）"
+        "--nd",
+        action="store_true",
+        help="force ND layout (default: NZ, the deployment layout)",
     )
     ap.add_argument(
         "--skip-ref",
         action="store_true",
-        help="跳过 torch 参考（GLM 档 fp32 展开约 1.5GB）",
+        help="skip torch reference (GLM fp32 expansion ~1.5 GB)",
     )
     ap.add_argument("--iters", type=int, default=20)
     args = ap.parse_args()
@@ -229,9 +235,9 @@ def main():
     )
 
     x, w, sb, sa, gl = build_inputs(M, K, N, E)
-    w_nd = w  # torch 参考要 ND：NZ 张量 .to(fp32) 报
-    # "copy_ operator with internal format tensors
-    #  is not supported on Ascend950"
+    # torch reference requires ND: NZ tensors raise on .to(fp32) with
+    # "copy_ operator with internal format tensors is not supported on Ascend950"
+    w_nd = w
     if not args.nd:
         w = torch_npu.npu_format_cast(w, 29, customize_dtype=torch.float8_e4m3fn)
         assert torch_npu.get_npu_format(w) == 29
@@ -244,10 +250,12 @@ def main():
         scale_alg=args.scale_alg,
     )
 
-    # ---- 正确성 ----
+    # ---- correctness ----
     vy, vys = vendor(x, w, sb, sa, gl)
     valid = int(gl[-1])
-    print(f"\n[精度] 有效行 [0,{valid})（grouplist 之外不更新也不初始化）")
+    print(
+        f"\n[accuracy] valid rows [0,{valid}) (rows outside group_list are not initialised)"
+    )
     try:
         ty, tys = grouped_matmul_swiglu_quant_v2(
             x, w, sb, sa, gl, group_list_type=0, **kw
@@ -266,7 +274,7 @@ def main():
         del ry, rys
         torch.npu.empty_cache()
 
-    # ---- 성능 ----
+    # ---- performance ----
     tv, kv = device_time_us(lambda: vendor(x, w, sb, sa, gl), iters=args.iters)
     tt, kt = device_time_us(
         lambda: grouped_matmul_swiglu_quant_v2(
@@ -275,9 +283,9 @@ def main():
         iters=args.iters,
     )
     if tv is None or tt is None:
-        print(f"\n[性能] profiler 没出 kernel_details.csv (v={tv}, t={tt})")
+        print(f"\n[perf] profiler did not produce kernel_details.csv (v={tv}, t={tt})")
         return
-    print(f"\n[性能] vendor {tv:.2f}us   triton {tt:.2f}us   " f"比值 {tv / tt:.3f}x")
+    print(f"\n[perf] vendor {tv:.2f}us   triton {tt:.2f}us   ratio {tv / tt:.3f}x")
     for tag, ks in (("vendor", kv), ("triton", kt)):
         for name, us in sorted(ks.items(), key=lambda kv2: -kv2[1])[:4]:
             print(f"   {tag:6s} {us:8.2f}us  {name}")
