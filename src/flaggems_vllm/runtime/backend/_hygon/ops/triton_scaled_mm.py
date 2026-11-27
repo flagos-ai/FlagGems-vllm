@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._triton_scaled_mm_async import get_async_config, scaled_mm_async_kernel
+
 logger = logging.getLogger(__name__)
 
 
@@ -206,6 +208,39 @@ def triton_scaled_mm(
     assert bias is None or bias.is_floating_point()
     assert is_weak_contiguous(input)
     assert is_weak_contiguous(weight)
+
+    if (
+        use_heuristic
+        and input.dtype == torch.float8_e4m3fn
+        and out_dtype == torch.bfloat16
+        and bias is None
+    ):
+        config = get_async_config(input, weight, scale_a, scale_b, M, N, K)
+        if config is not None:
+            (bm, bn, bk), stages, async_b = config
+            result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+            grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+            scaled_mm_async_kernel[grid](
+                input,
+                weight,
+                scale_a,
+                scale_b,
+                result,
+                M,
+                N,
+                K,
+                *input.stride(),
+                *weight.stride(),
+                *result.stride(),
+                BLOCK_SIZE_M=bm,
+                BLOCK_SIZE_N=bn,
+                BLOCK_SIZE_K=bk,
+                BLOCK_SIZE_SCALE_A=1 if M == 1 else bm,
+                BLOCK_SIZE_SCALE_B=bn,
+                ASYNC_B=async_b,
+                num_stages=stages,
+            )
+            return result
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
