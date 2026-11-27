@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import flaggems_vllm
+from tests import lightning_indexer_hygon_utils as hygon
 from tests.lightning_indexer_utils import (
     CASES,
     HAS_VLLM_ASCEND_REFERENCE,
@@ -32,8 +33,6 @@ _IS_ASCEND = (
     and torch.npu.is_available()
 )
 _LIGHTNING_INDEXER = getattr(flaggems_vllm, "lightning_indexer", None)
-
-pytestmark = pytest.mark.skipif(not _IS_ASCEND, reason="requires an Ascend NPU")
 
 
 def _reference_call(_case_index, **inputs):
@@ -89,3 +88,55 @@ class LightningIndexerBenchmark(base.Benchmark):
 def test_lightning_indexer_benchmark():
     assert callable(_LIGHTNING_INDEXER)
     LightningIndexerBenchmark().run()
+
+
+def _hygon_reference(_index, **kwargs):
+    return hygon.pytorch_indexer(**kwargs)
+
+
+class HygonLightningIndexerBenchmark(base.Benchmark):
+    def __init__(self):
+        super().__init__(
+            op_name="lightning_indexer",
+            torch_op=_hygon_reference,
+            dtypes=[torch.bfloat16, torch.float16],
+        )
+        self.set_gems(_candidate_call)
+        self.matrix = hygon.CASES_30
+        self.shape_desc = (
+            "case, layout_key, query, key, weights_dtype, sparse_count, "
+            "sparse_mode, return_value, local_q_lengths, key_lengths"
+        )
+
+    def set_shapes(self, shape_file_path=None):
+        del shape_file_path
+        self.shapes = list(self.matrix)
+
+    def get_input_iter(self, dtype):
+        for index, name in enumerate(self.shapes):
+            case = self.matrix[name]
+            if hygon.parse_dtype(case["query_dtype"]) != dtype:
+                continue
+            yield index, hygon.build_case_inputs(case, self.device)
+
+    def record_shapes(self, index, **kwargs):
+        name = self.shapes[index]
+        case = self.matrix[name]
+        return dict(
+            case=name,
+            layout_key=kwargs["layout_key"],
+            query=list(kwargs["query"].shape),
+            key=list(kwargs["key"].shape),
+            weights_dtype=str(kwargs["weights"].dtype).replace("torch.", ""),
+            sparse_count=kwargs["sparse_count"],
+            sparse_mode=kwargs["sparse_mode"],
+            return_value=kwargs["return_value"],
+            local_q_lengths=case["local_q_lengths"],
+            key_lengths=case["key_lengths"],
+        )
+
+
+@pytest.mark.lightning_indexer
+@pytest.mark.skipif(flaggems_vllm.vendor_name != "hygon", reason="requires Hygon")
+def test_lightning_indexer_hygon_benchmark():
+    HygonLightningIndexerBenchmark().run()

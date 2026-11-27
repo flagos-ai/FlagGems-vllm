@@ -145,6 +145,7 @@ from flaggems_vllm.ops.input_batch import get_num_sampled_and_rejected
 from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
+from flaggems_vllm.ops.lightning_indexer import lightning_indexer
 from flaggems_vllm.ops.logprob import compute_topk_scores
 from flaggems_vllm.ops.lora_expand import lora_expand
 from flaggems_vllm.ops.ihc import (
@@ -434,6 +435,7 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "lightning_indexer",
     "lora_expand",
     "lora_shrink",
     "mamba_mixer",
