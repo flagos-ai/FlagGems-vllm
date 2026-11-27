@@ -165,6 +165,7 @@ from flaggems_vllm.runtime.backend._enflame.ops.ihc import (
     ihc_pre,
     ihc_pre_ref,
 )
+from flaggems_vllm.runtime.backend._enflame.ops.logit_bias import apply_logit_bias
 from flaggems_vllm.runtime.backend._enflame.ops.mhc import (
     MixLayout,
     hc_head_fused_kernel,
@@ -351,6 +352,7 @@ if (
 __all__ = [
     "act_quant_triton",
     "add_rms_norm",
+    "apply_logit_bias",
     "apply_repetition_penalties",
     "apply_rotary_pos_emb",
     "attn_res",
