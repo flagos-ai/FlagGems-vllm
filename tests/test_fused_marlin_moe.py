@@ -1771,6 +1771,8 @@ def test_fused_marlin_moe_w8a16_workspace_chunks_ppu(
 @pytest.mark.fused_marlin_moe_w8a16
 @pytest.mark.skipif(flaggems_vllm.vendor_name != "thead", reason="T-Head FP8 overlap")
 def test_fused_marlin_moe_fp8_overlap_chunks_ppu(monkeypatch):
+    from flaggems_vllm.runtime.backend._thead.fused import marlin_dense
+
     backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
     hs, w1, w2, ref1, ref2, tw, ti, s1, s2 = _make_inputs_fp8_weight(
         24000, 128, 4096, 256, 6, torch.bfloat16, flaggems_vllm.device
@@ -1779,14 +1781,14 @@ def test_fused_marlin_moe_fp8_overlap_chunks_ppu(monkeypatch):
     budget = 440 << 20
     # 11444-token overlap chunks reuse one workspace; the 1112-token tail is ordinary.
     monkeypatch.setattr(backend, "_PPU_DENSE_MAX_WORKSPACE_BYTES", budget)
-    overlap = backend.run_fp8_ordered_overlap
+    overlap = marlin_dense.run_fp8_ordered_overlap
     overlap_chunks = []
 
     def count_overlap(*overlap_args):
         overlap_chunks.append(overlap_args[0].size(0))
         return overlap(*overlap_args)
 
-    monkeypatch.setattr(backend, "run_fp8_ordered_overlap", count_overlap)
+    monkeypatch.setattr(marlin_dense, "run_fp8_ordered_overlap", count_overlap)
     # Exclude one-time kernel tuning from the steady-state workspace bound.
     flaggems_vllm.fused_marlin_moe(*args)
     torch_device_fn.synchronize()

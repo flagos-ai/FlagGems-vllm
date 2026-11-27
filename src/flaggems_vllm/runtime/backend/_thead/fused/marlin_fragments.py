@@ -18,6 +18,23 @@ import triton
 import triton.language as tl
 from triton.language import core as tl_core
 
+from flaggems_vllm.ops.fused_marlin_moe import (
+    QUANT_TYPE_FP4_E2M1,
+    QUANT_TYPE_FP8_E4M3,
+    QUANT_TYPE_UINT4B8,
+    QUANT_TYPE_UINT8B128,
+)
+
+try:
+    from triton.experimental.tle import language as tle_async
+except ImportError:
+    tle_async = None
+
+_TL_QUANT_TYPE_UINT4B8 = tl.constexpr(QUANT_TYPE_UINT4B8)
+_TL_QUANT_TYPE_UINT8B128 = tl.constexpr(QUANT_TYPE_UINT8B128)
+_TL_QUANT_TYPE_FP4_E2M1 = tl.constexpr(QUANT_TYPE_FP4_E2M1)
+_TL_QUANT_TYPE_FP8_E4M3 = tl.constexpr(QUANT_TYPE_FP8_E4M3)
+
 
 @tl_core.extern
 def packed_u32(symbol, operands, _semantic=None):
@@ -139,3 +156,9 @@ def decode_mx_register(q, s0, s1, WIDE: tl.constexpr = False):
         multiply_bf16_pairs(byte_permute(low_bytes, high_bytes, 0x5140), s0),
         multiply_bf16_pairs(byte_permute(low_bytes, high_bytes, 0x7362), s1),
     )
+
+
+@triton.jit
+def e8m0_to_bf16_bits(byte):
+    bits = tl.where(byte == 0, 0x0040, byte << 7)
+    return tl.where(byte == 255, 0x7FC0, bits)
