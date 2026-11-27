@@ -156,11 +156,16 @@ def mhc_bwd_ref(
     x1 = torch.zeros_like(b1)
     x2 = torch.zeros_like(b2)
 
+    # Diagonal blocks: row and column sums of R (the identity only when R is
+    # doubly stochastic).
+    row_sum = R.sum(dim=-1)
+    col_sum = R.sum(dim=-2)
+
     def matvec(r, x1_in, x2_in):
-        # y1[i] = sum_j(R[i,j] * x2[j]) + x1[i]
-        y1 = (r * x2_in.unsqueeze(-2)).sum(dim=-1) + x1_in
-        # y2[j] = sum_i(R[i,j] * x1[i]) + x2[j]
-        y2 = (r * x1_in.unsqueeze(-1)).sum(dim=-2) + x2_in
+        # y1[i] = sum_j(R[i,j] * x2[j]) + rowsum(R)[i] * x1[i]
+        y1 = (r * x2_in.unsqueeze(-2)).sum(dim=-1) + row_sum * x1_in
+        # y2[j] = sum_i(R[i,j] * x1[i]) + colsum(R)[j] * x2[j]
+        y2 = (r * x1_in.unsqueeze(-1)).sum(dim=-2) + col_sum * x2_in
         return y1, y2
 
     # r = b - A*x (with x=0, r = b)
@@ -602,6 +607,29 @@ def test_mhc_bwd_vs_ref(seqlen, n_stream, sinkhorn_iters):
     out_ref = mhc_bwd_ref(R.cpu(), dR.cpu())
 
     torch.testing.assert_close(out_triton.cpu(), out_ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.mhc_bwd
+def test_mhc_bwd_unconverged():
+    """Test mhc_bwd against float64 autograd through the 20-step Sinkhorn forward.
+
+    After 20 iterations only the rows of R sum to 1, so the CG system must use the
+    row and column sums of R. The error left is the difference between the implicit
+    gradient and the gradient of the 20-step map (max 0.47 here); with identity
+    diagonal blocks the max is 96. The float64 reference runs on CPU, so the test
+    also holds on devices without FP64.
+    """
+    torch.manual_seed(0)
+    M = torch.randn(16384, 4, 4, dtype=torch.float64) * 2
+    M.requires_grad_(True)
+    R, _P = sinkhorn_forward_ref(M, iters=20)
+    dR = torch.randn_like(R)
+    (R * dR).sum().backward()
+
+    R32 = R.detach().float().to(flaggems_vllm.device)
+    out = mhc_bwd(R32, dR.float().to(flaggems_vllm.device)).cpu().double()
+    err = (out - M.grad).flatten(1).norm(dim=-1) / M.grad.flatten(1).norm(dim=-1)
+    assert err.max().item() < 1.0, err.max().item()
 
 
 MHC_HC_HEAD_FUSED_CONFIGS = [
