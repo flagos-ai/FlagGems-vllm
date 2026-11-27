@@ -98,6 +98,15 @@ runs:
             raise SystemExit(f"unexpected Python prefix: {actual} != {expected}")
         PY
 
+    - name: prepare the TLE raw CUDA compiler
+      if: inputs.backend == 'nvidia-cuda133' || inputs.backend == 'nvidia'
+      shell: bash
+      run: |
+        set -euo pipefail
+        compiler="$(bash "${GITHUB_WORKSPACE:?}/tools/setup-tle-clang.sh" \
+          "${RUNNER_TEMP:?}/flaggems-tle-clang")"
+        printf 'CLANG=%s\n' "${compiler}" >> "${GITHUB_ENV:?}"
+
     # tools/setup.sh has already installed the vendor torch stack, this
     # repository (editable, --no-deps) and the test dependencies. Only export
     # the environment for the following steps.
