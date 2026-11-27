@@ -531,7 +531,13 @@ class LibTuner(triton.runtime.Autotuner):
         return configs, expand_config["strategy"]
 
     def get_benchmark_key(self, args):
-        key = tuple(args[k] for k in self.keys if k in args)
+        # SQL cache columns require scalar keys. Encode composite arguments
+        # without applying the strategy's shape bucketing to measurements.
+        values = (args[k] for k in self.keys if k in args)
+        key = tuple(
+            repr(value) if isinstance(value, (tuple, list)) else value
+            for value in values
+        )
         key += tuple(str(dtype) for dtype in _infer_tensor_dtypes(args.values()))
         return key + tuple(self._benchmark_protocol)
 
