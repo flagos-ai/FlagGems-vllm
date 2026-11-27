@@ -19,6 +19,56 @@ import flaggems_vllm
 
 from . import base
 
+
+def _hygon_qsa_select_paged_prefill(
+    q,
+    k_cache,
+    page_table,
+    query_start_loc,
+    visible_blocks,
+    token_topk,
+    compress_ratio,
+    max_query_len,
+    block_indices,
+    max_seq_len,
+):
+    from vllm.models.qwen4_exp.amd.ops.qsa import qsa_mqa_paged
+    from vllm.platforms import current_platform
+
+    current_platform.import_kernels()
+    rows = q.shape[0]
+    num_requests = query_start_loc.numel() - 1
+    query_lens = torch.diff(query_start_loc).to(torch.int32)
+    token_to_req = torch.repeat_interleave(
+        torch.arange(num_requests, device=q.device, dtype=torch.int32),
+        query_lens,
+    )
+    query_positions = visible_blocks * compress_ratio - 1
+    sequence_lengths = torch.zeros(
+        num_requests, device=q.device, dtype=torch.int32
+    ).scatter_reduce(0, token_to_req.long(), visible_blocks, reduce="amax")
+    sequence_lengths = sequence_lengths * compress_ratio
+    logits, actual_visible = qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        1,
+        actual_visible,
+        block_indices,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        token_topk // compress_ratio,
+    )
+
+
 try:
     import vllm._custom_ops  # noqa: F401 - registers torch.ops._C on plugin platforms
 
@@ -26,6 +76,8 @@ try:
         from vllm_metax.models.qwen4_exp.metax.ops.qsa_indexer_fallback import (
             qsa_select_paged_prefill as vendor_qsa,
         )
+    elif flaggems_vllm.vendor_name == "hygon":
+        vendor_qsa = _hygon_qsa_select_paged_prefill
     else:
         from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer import (
             qsa_select_paged_prefill as vendor_qsa,

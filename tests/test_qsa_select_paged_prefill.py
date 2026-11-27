@@ -379,8 +379,61 @@ def assert_native_selection(logits, visible, actual, native, *, dtype, head_dim)
         )
 
 
+def _hygon_qsa_select_paged_prefill(
+    q,
+    k_cache,
+    page_table,
+    query_start_loc,
+    visible_blocks,
+    token_topk,
+    compress_ratio,
+    max_query_len,
+    block_indices,
+    max_seq_len,
+):
+    from vllm.models.qwen4_exp.amd.ops.qsa import qsa_mqa_paged
+    from vllm.platforms import current_platform
+
+    current_platform.import_kernels()
+    rows = q.shape[0]
+    num_requests = query_start_loc.numel() - 1
+    query_lens = torch.diff(query_start_loc).to(torch.int32)
+    token_to_req = torch.repeat_interleave(
+        torch.arange(num_requests, device=q.device, dtype=torch.int32),
+        query_lens,
+    )
+    query_positions = visible_blocks * compress_ratio - 1
+    sequence_lengths = torch.zeros(
+        num_requests, device=q.device, dtype=torch.int32
+    ).scatter_reduce(0, token_to_req.long(), visible_blocks, reduce="amax")
+    sequence_lengths = sequence_lengths * compress_ratio
+    logits, actual_visible = qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        1,
+        actual_visible,
+        block_indices,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        token_topk // compress_ratio,
+    )
+
+
 def vllm_reference():
     """Import vLLM's own QSA operator when it is available."""
+    if flaggems_vllm.vendor_name == "hygon":
+        from types import SimpleNamespace
+
+        return SimpleNamespace(qsa_select_paged_prefill=_hygon_qsa_select_paged_prefill)
     module = (
         "vllm_metax.models.qwen4_exp.metax.ops.qsa_indexer_fallback"
         if flaggems_vllm.vendor_name == "metax"
@@ -717,7 +770,8 @@ DTYPES = [
         torch.float8_e4m3fn,
         id="fp8",
         marks=pytest.mark.skipif(
-            flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax", "thead"),
+            flaggems_vllm.vendor_name
+            not in ("nvidia", "mthreads", "metax", "thead", "hygon"),
             reason="FP8 selection is currently validated on NVIDIA, MThreads, and MetaX",
         ),
     ),
@@ -761,7 +815,7 @@ def test_qsa_select_paged_prefill_matches_torch_reference(
 
 @pytest.mark.qsa_select_paged_prefill
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax", "thead")
+    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax", "thead", "hygon")
     or (
         flaggems_vllm.vendor_name == "nvidia"
         and (
@@ -789,7 +843,7 @@ def test_qsa_select_paged_prefill_matches_vllm(
         pytest.skip("Native cross-check is limited to validated head/dimension pairs")
     if dtype == torch.bfloat16 and case.q.shape[1:] == (8, 256):
         pytest.skip("Native BF16 H8/D256 resource guard")
-    if flaggems_vllm.vendor_name == "metax":
+    if flaggems_vllm.vendor_name in ("metax", "hygon"):
         monkeypatch.setenv(
             "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB",
             str(settings.get("budget_mb", 512)),
@@ -812,7 +866,7 @@ def test_qsa_select_paged_prefill_matches_vllm(
 
 @pytest.mark.qsa_select_paged_prefill
 @pytest.mark.skipif(
-    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax", "thead"),
+    flaggems_vllm.vendor_name not in ("nvidia", "mthreads", "metax", "thead", "hygon"),
     reason="NVIDIA/MThreads/MetaX wrapper error contract",
 )
 @pytest.mark.parametrize(

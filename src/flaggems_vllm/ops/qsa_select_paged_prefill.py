@@ -745,9 +745,12 @@ def _validate_inputs(
 ):
     tensors = (q, k_cache, page_table, query_start_loc, visible_blocks, block_indices)
     vendor = runtime.device.vendor_name
-    expected_device = {"nvidia": "cuda", "mthreads": "musa", "thead": "cuda"}.get(
-        vendor
-    )
+    expected_device = {
+        "nvidia": "cuda",
+        "mthreads": "musa",
+        "thead": "cuda",
+        "hygon": "cuda",
+    }.get(vendor)
     if expected_device is None or q.device.type != expected_device:
         raise NotImplementedError("QSA prefill requires NVIDIA SM90 or MThreads MUSA")
     if any(t.device != q.device for t in tensors):

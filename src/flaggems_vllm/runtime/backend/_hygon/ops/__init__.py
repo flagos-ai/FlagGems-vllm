@@ -65,6 +65,9 @@ from flaggems_vllm.runtime.backend._hygon.ops.ple_state import ple_state_scatter
 from flaggems_vllm.runtime.backend._hygon.ops.qsa import qwen4_store_qsa_kv_rows
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_mqa import qwen4_qsa_mqa_paged_dot
 from flaggems_vllm.runtime.backend._hygon.ops.qsa_prepare import qsa_prepare
+from flaggems_vllm.runtime.backend._hygon.ops.qsa_select_paged_prefill import (  # noqa: F401
+    qsa_select_paged_prefill,
+)
 from flaggems_vllm.runtime.backend._hygon.ops.scaled_int8_quant import scaled_int8_quant
 from flaggems_vllm.runtime.backend._hygon.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
@@ -96,6 +99,7 @@ __all__ = [
     "persistent_topk",
     "ple_state_scatter_",
     "qsa_prepare",
+    "qsa_select_paged_prefill",
     "quantize_gdn_state_int8",
     "qwen4_compress_norm_mrope_store_groups",
     "qwen4_hc_inject_combine",
