@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib
 import math
 import os
@@ -367,9 +368,11 @@ def make_vllm_metadata(
     device: torch.device,
     context_len: int = 512,
 ):
-    """Construct vLLM 0.24.0 Mamba1AttentionMetadata for pure prefill/decode."""
+    """Construct vLLM Mamba1AttentionMetadata for pure prefill/decode."""
     from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionMetadata
     from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+
+    valid_fields = {f.name for f in dataclasses.fields(Mamba1AttentionMetadata)}
 
     if mode == "prefill":
         query_start_loc_cpu = torch.arange(batch_size + 1, dtype=torch.int32) * seq_len
@@ -378,7 +381,7 @@ def make_vllm_metadata(
         nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
             query_start_loc_cpu, device=device
         )
-        return Mamba1AttentionMetadata(
+        kwargs = dict(
             num_prefills=batch_size,
             num_prefill_tokens=batch_size * seq_len,
             num_decodes=0,
@@ -395,6 +398,8 @@ def make_vllm_metadata(
             block_idx_first_scheduled_token_p=None,
             block_idx_last_computed_token=None,
             block_idx_last_scheduled_token_prev_step=None,
+            cu_chunk_seqlen_p=None,
+            last_chunk_indices_p=None,
             seq_lens=torch.full(
                 (batch_size,), seq_len, dtype=torch.int32, device=device
             ),
@@ -402,12 +407,15 @@ def make_vllm_metadata(
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        return Mamba1AttentionMetadata(
+            **{k: v for k, v in kwargs.items() if k in valid_fields}
+        )
 
     if mode == "decode":
-        # vLLM 0.24.0 stores decode state indices as [batch, 1] when
+        # vLLM stores decode state indices as [batch, 1] when
         # speculative decoding and cache-all are disabled.
         state_indices_d = cache_indices[:, None].contiguous()
-        return Mamba1AttentionMetadata(
+        kwargs = dict(
             num_prefills=0,
             num_prefill_tokens=0,
             num_decodes=batch_size,
@@ -424,9 +432,14 @@ def make_vllm_metadata(
             block_idx_first_scheduled_token_p=None,
             block_idx_last_computed_token=None,
             block_idx_last_scheduled_token_prev_step=None,
+            cu_chunk_seqlen_p=None,
+            last_chunk_indices_p=None,
             seq_lens=torch.full(
                 (batch_size,), context_len, dtype=torch.int32, device=device
             ),
+        )
+        return Mamba1AttentionMetadata(
+            **{k: v for k, v in kwargs.items() if k in valid_fields}
         )
 
     raise ValueError(f"unknown mode: {mode}")
@@ -635,13 +648,54 @@ def _gems_forward(workload: _Workload) -> None:
     )
 
 
+def _has_vllm_selective_scan() -> bool:
+    try:
+        import vllm._custom_ops  # noqa: F401 - loads torch.ops._C
+
+        return hasattr(torch.ops._C, "selective_scan_fwd")
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+
+
+def _torch_prefill_baseline_forward(workload: _Workload) -> None:
+    """Fallback prefill reference when vLLM._C.selective_scan_fwd is absent."""
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+    from tests.test_mamba_mixer import _vllm_prefill_reference
+
+    assert NULL_BLOCK_ID == workload.null_block_id
+    w = dict(workload.layer.weights)
+    if w["conv1d_weight"].ndim == 3:
+        w["conv1d_weight"] = w["conv1d_weight"].view(
+            w["conv1d_weight"].shape[0], w["conv1d_weight"].shape[2]
+        )
+    if w["dt_proj_bias"] is not None:
+        w["dt_proj_bias"] = w["dt_proj_bias"].float()
+    out = _vllm_prefill_reference(
+        workload.hidden_states,
+        w,
+        workload.baseline_cache.conv_state,
+        workload.baseline_cache.ssm_state,
+        workload.query_start_loc,
+        workload.cache_indices,
+        workload.has_initial_state,
+        use_rms_norm=workload.layer.use_rms_norm,
+        rms_norm_eps=workload.layer.rms_norm_eps,
+        activation="silu",
+    )
+    workload.baseline_output.copy_(out)
+
+
 def _validate_once(workload: _Workload) -> None:
     """Check outputs AND updated states before measuring a shape."""
     workload.baseline_cache.reset()
     workload.gems_cache.reset()
     with torch.inference_mode():
         with vllm_forward_context_for_benchmark(workload.layer, workload.metadata):
-            _baseline_forward(workload)
+            if workload.mode == "decode" or _has_vllm_selective_scan():
+                _baseline_forward(workload)
+            else:
+                _torch_prefill_baseline_forward(workload)
             _gems_forward(workload)
     torch.cuda.synchronize(workload.device)
     diffs = assert_correctness(
@@ -665,7 +719,9 @@ def _make_workload(
     from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-    from flaggems_vllm.ops.mamba_mixer import mamba_mixer
+    import flaggems_vllm
+
+    mamba_mixer = flaggems_vllm.mamba_mixer
 
     batch, seq_len, hidden_size, intermediate_size = shape
     # Match Mamba-1 defaults unless an environment override was given.
@@ -832,6 +888,12 @@ class MambaMixerBenchmark(base.Benchmark):
     def get_latency(self, op, *args, **kwargs):
         # Override the default timer because both implementations mutate caches.
         workload = kwargs["workload"]
+        if (
+            op is _baseline_forward
+            and workload.mode == "prefill"
+            and not _has_vllm_selective_scan()
+        ):
+            return None
         reset = (
             workload.baseline_cache.reset
             if op is _baseline_forward

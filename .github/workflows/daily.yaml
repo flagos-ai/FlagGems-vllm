@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nightly full-range validation on the H20 runner: every functional test plus
+# Daily full-range validation on the H20 runner: every functional test plus
 # every benchmark at core level, plus unit-test coverage. Pull requests only run the selected subset
 # (see unittest.yaml), so this catches regressions that path-based selection
 # misses.
+#
+# Triggered via workflow_dispatch from an internal control-plane server crontab
+# (10:43 CST via .github/scripts/trigger_workflow.sh) instead of GitHub's
+# built-in schedule, which can be delayed by several hours under load.
 
 name: daily
 
@@ -24,9 +28,6 @@ permissions:
 
 on:
   workflow_dispatch:
-  schedule:
-    # UTC; starts at 00:03 UTC+8.
-    - cron: '3 16 * * *'
 
 concurrency:
   group: daily
@@ -71,6 +72,7 @@ jobs:
       - run: nvidia-smi
 
       - name: install and activate python environment
+        id: setup-env
         run: |
           source tools/setup.sh
           source "${VENV_DIR}/bin/activate"
@@ -88,18 +90,19 @@ jobs:
           fi
 
       - name: run portable backend preflight
-        env:
-          TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+        id: preflight
         run: |
           source "${VENV_DIR}/bin/activate"
           python tools/check_backend_env.py --expected-vendor nvidia --require-flaggems
 
       - name: install coverage tooling
+        id: install-cov
         run: |
           source "${VENV_DIR}/bin/activate"
           uv pip install pytest-cov || python -m pip install pytest-cov
 
       - name: select all tests and benchmarks
+        id: select-targets
         run: |
           source "${VENV_DIR}/bin/activate"
           python - <<'PY' >> "$GITHUB_ENV"
@@ -119,6 +122,21 @@ jobs:
           print(f"BENCH_TARGETS_JSON={dump({**targets, 'tests': [], 'benchmarks': benchmarks})}")
           PY
 
+      - name: report setup failure
+        if: failure() && steps.select-targets.outcome != 'success'
+        run: |
+          echo "::error::Daily setup failed before tests started (setup-env=${{ steps.setup-env.outcome }}, preflight=${{ steps.preflight.outcome }}, install-cov=${{ steps.install-cov.outcome }}, select-targets=${{ steps.select-targets.outcome }}). Aborting tests, coverage, and benchmarks."
+          {
+            echo "## Daily setup failed"
+            echo
+            echo "Prerequisite setup did not succeed, so functional tests, coverage reporting, and benchmarks were stopped."
+            echo
+            echo "- \`install and activate python environment\`: \`${{ steps.setup-env.outcome }}\`"
+            echo "- \`run portable backend preflight\`: \`${{ steps.preflight.outcome }}\`"
+            echo "- \`install coverage tooling\`: \`${{ steps.install-cov.outcome }}\`"
+            echo "- \`select all tests and benchmarks\`: \`${{ steps.select-targets.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # Coverage covers the Python host code only; Triton kernels run on the
       # GPU and are not traced. Benchmarks are excluded from the measurement.
       - name: run functional tests with coverage
@@ -134,7 +152,7 @@ jobs:
             --capabilities .github/backend-capabilities.json
 
       - name: report coverage
-        if: always()
+        if: (success() || failure()) && steps.select-targets.outcome == 'success'
         run: |
           source "${VENV_DIR}/bin/activate"
           [[ -f .coverage ]] || { echo "No coverage data was produced."; exit 0; }
@@ -148,7 +166,7 @@ jobs:
           } | tee coverage/ut-summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: upload coverage
-        if: always()
+        if: (success() || failure()) && steps.select-targets.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ut-coverage-${{ needs.prepare.outputs.datetime }}-${{ github.run_id }}
@@ -157,9 +175,10 @@ jobs:
           retention-days: 30
 
       - name: run benchmarks
-        if: always()
+        if: (success() || failure()) && steps.select-targets.outcome == 'success'
         env:
           CI_TARGETS_JSON: ${{ env.BENCH_TARGETS_JSON }}
+          PYTEST_ADDOPTS: -rs
         run: |
           source "${VENV_DIR}/bin/activate"
           python tools/run_ci_targets.py \

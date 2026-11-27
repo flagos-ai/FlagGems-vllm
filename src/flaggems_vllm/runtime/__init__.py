@@ -18,7 +18,14 @@ from . import backend, error
 from .backend import SpecOpRegistrar
 from .backend.device_finder import DeviceDetector
 from .configloader import ConfigLoader
-from .flagtune import flagtune, flagtune_enabled  # noqa: F401
+from .flagtune import (
+    CostModelIntent,
+    TuningMode,
+    flagtune,
+    flagtune_enabled,
+    resolve_cost_model_intent,
+    resolve_tuning_mode,
+)
 
 config_loader = ConfigLoader()
 device = DeviceDetector()
@@ -85,6 +92,10 @@ def ops_get_configs(op_name, pre_hook=None, yaml_path=None):
 
 
 __all__ = [
+    "CostModelIntent",
+    "TuningMode",
+    "resolve_cost_model_intent",
+    "resolve_tuning_mode",
     "flagtune",
     "flagtune_enabled",
     "get_tuned_config",
