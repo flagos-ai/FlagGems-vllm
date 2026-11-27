@@ -33,7 +33,7 @@ FlagGems 的通用算子。请从 FlagOS 索引安装匹配的 `flag-gems`（当
 
 ```bash
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
 当厂商镜像已经提供 PyTorch/NumPy 时请使用 `--no-deps`。在干净环境中，请按下文
@@ -146,6 +146,7 @@ source tools/setup.sh nvidia
 | `PIP_INDEX_URL` | 主包索引（默认 PyPI；网络较慢时可改为国内镜像）。 |
 | `FLAG_GEMS_VERSION` | 覆盖 registry 中的 `flag-gems` 版本（默认 5.4.0）。 |
 | `FLAG_GEMS_INDEX` | 发布 `flag-gems` 的索引（默认 FlagOS hosted 索引）。 |
+| `FLAG_GEMS_FALLBACK_INDEX` | `FLAG_GEMS_INDEX` 中没有所需版本时的备用索引（默认 FlagOS daily 索引）。 |
 | `VLLM_VERSION` | 覆盖配置中 `vllm==...` 形式的版本（NVIDIA）。 |
 | `VLLM_PACKAGE` | 完整的 vLLM 依赖或 wheel URL，优先级高于 `VLLM_VERSION`。 |
 | `COMPILER` | `flagtree`、`triton` 或 `keep`。 |
@@ -180,6 +181,25 @@ SKIP_BACKEND_DEPS=0 VLLM_PACKAGE="vllm-ascend==0.24.0rc1" \
   bash tools/setup.sh --no-venv ascend
 ```
 
+脚本会自动适配当前解释器，下面这些情况都不需要手动设置环境变量：
+
+- **外部管理的 Python**（PEP 668，例如 Debian/Ubuntu 的系统 Python）：脚本自动给
+  pip 加上 `--break-system-packages`。
+- **只读的 site-packages**：自动加上 `--user`，包会装到 `~/.local`，无需 `sudo`。
+  不要用 `sudo` 运行脚本：root 的 `HOME` 不同，会装进系统目录。
+- **FlagGems 版本**：已安装的 `flag-gems` 低于 `backends.yaml` 中的固定版本时会
+  自动升级（使用 `--no-deps`，不会改动厂商的 torch、numpy 和 vLLM）；版本相同或更
+  新则保留。固定版本先在 `FLAG_GEMS_INDEX` 中查找，找不到再查
+  `FLAG_GEMS_FALLBACK_INDEX`。
+- **FlagTree**：venv 模式下默认安装，新 venv 中已有 FlagTree 时跳过（`USE_FLAGTREE=0`
+  使用纯 Triton，`--skip-compiler` 保持编译器不变）。`--no-venv` 模式下脚本会比对环境中
+  FlagTree 版本与后端固定版本，自动升级旧版本；设置 `COMPILER=triton` 保留镜像的 Triton，
+  或 `COMPILER=keep` 跳过检查。安装 FlagTree 会替换现有的 `triton`，如果 vLLM 需要
+  镜像自带的 Triton，请跳过。
+
+新开的 shell 唯一仍需要的设置是在 CUDA 13 主机上执行 `export USE_FLAGCX=OFF`
+（见下文故障排查），脚本结束时会提示。
+
 ## 不创建虚拟环境的手动安装
 
 当厂商镜像已经提供匹配的 Python、PyTorch、Triton/FlagTree 和 vLLM 时，推荐使用
@@ -209,7 +229,7 @@ python -m pip install "setuptools>=64,<82" wheel packaging pybind11 PyYAML sqlal
 
 # FlagGems 运行时
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 ```
 
 ### 3. 安装编译器（FlagTree 或 Triton）
@@ -357,7 +377,7 @@ python -m pytest tests -q --quick
 ```bash
 # 1. 安装 FlagGems（通用算子后端）
 python -m pip install --no-deps "flag-gems==5.4.0" \
-  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+  --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 
 # 2. 安装 FlagGems-vllm（vLLM 专用算子）
 git clone https://github.com/flagos-ai/FlagGems-vllm.git
@@ -413,8 +433,9 @@ export USE_FLAGCX=OFF
 
 `src/flaggems_vllm/backends.yaml` 中的 NVIDIA 配置已经设置了该变量，所以由
 `tools/setup.sh` 创建的环境会从 venv 激活脚本继承它；手动安装则需要自行导出。
-另外，当 `tools/setup.sh` 没有替换编译器时（`COMPILER=keep`，即 `--no-venv`
-的默认行为），它会报告当前的编译器与 TLE 状态。
+另外，当 `tools/setup.sh` 没有替换编译器时（`COMPILER=keep`，即调用方设置了
+`--skip-compiler`，或 `--no-venv` 发现 FlagTree 已是最新版/调用方设置 `COMPILER=triton`，
+或新 venv 中已有 FlagTree），它会报告当前的编译器与 TLE 状态。
 
 ### Triton 版本不匹配
 

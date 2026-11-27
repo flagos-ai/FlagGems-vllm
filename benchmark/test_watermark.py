@@ -2,20 +2,33 @@
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
 """Benchmark draft context-mask latency across accelerator backends."""
 
+from dataclasses import asdict
+
 import pytest
 import torch
 
 import flaggems_vllm
 from benchmark import base
-from benchmark.conftest import Config
+from benchmark.conftest import Config, emit_record_logger, update_result
+from benchmark.consts import (
+    BenchmarkMetrics,
+    BenchmarkResult,
+    lookup_base_record_ex,
+    lookup_scaling_factor,
+)
 from flaggems_vllm import draft_watermarking_mask
+
+VLLM_REFERENCE_UNAVAILABLE_REASON = None
 
 try:
     from vllm.v1.worker.gpu.sample.watermark import (
         draft_watermarking_mask as vllm_reference,
     )
-except (ImportError, OSError):
+except (ImportError, OSError) as exc:
     vllm_reference = None
+    VLLM_REFERENCE_UNAVAILABLE_REASON = (
+        f"vLLM watermark reference unavailable: {type(exc).__name__}: {exc}"
+    )
 
 
 SHAPES = (
@@ -96,6 +109,9 @@ def case_scenario(shape):
 
 class DraftWatermarkBenchmark(base.Benchmark):
     DEFAULT_SHAPES = SHAPES
+    DEFAULT_METRICS = (
+        base.Benchmark.DEFAULT_METRICS if vllm_reference is not None else ["latency"]
+    )
     DEFAULT_SHAPE_DESC = (
         "requests, history, context_width, draft_steps, step, max_history, "
         "include_prompt, pattern"
@@ -134,22 +150,55 @@ class DraftWatermarkBenchmark(base.Benchmark):
         if vllm_reference is not None or Config.query:
             return super().run()
         self.init_user_config()
-        rows = []
+        # Keep measured latency when both native and external baselines are absent.
+        # The generic loop treats an unmatched external baseline as an error.
+        print(VLLM_REFERENCE_UNAVAILABLE_REASON)
         for dtype in self.to_bench_dtypes:
+            metrics = []
             for inputs in self.get_input_iter(dtype):
                 args, kwargs = self.unpack_to_args_kwargs(inputs)
-                latency_us = self.get_latency(self.gems_op, *args, **kwargs) * 1000
-                rows.append((self._case_shape, latency_us))
-        print(
-            "\nDraft watermark mask: FlagGems-vllm latency (vLLM reference unavailable)"
-        )
-        print("Requests  History  Width  Scenario                 FlagGems-vllm (us)")
-        print("-" * 72)
-        for shape, latency_us in rows:
-            print(
-                f"{shape[0]:>8}  {shape[1]:>7}  {shape[2]:>5}  "
-                f"{case_scenario(shape):<24} {latency_us:>18.3f}"
+                metric = BenchmarkMetrics(
+                    shape_detail=self.record_shapes(*args, **kwargs),
+                    latency=self.get_latency(self.gems_op, *args, **kwargs),
+                )
+                if Config.model_profile and self.op_name in Config.model_profile:
+                    metric.time_share = Config.model_profile[self.op_name]
+                if Config.base_data is not None:
+                    record, reason = lookup_base_record_ex(
+                        Config.base_data,
+                        self.op_name,
+                        dtype,
+                        metric.shape_detail,
+                        self.base_variant,
+                    )
+                    base_ms = record.get("latency_ms") if record else None
+                    if base_ms is not None:
+                        factor = lookup_scaling_factor(
+                            Config.base_data,
+                            flaggems_vllm.vendor_name,
+                            record.get("bottle_neck_unit"),
+                            self.scaling_dtype or dtype,
+                        )
+                        metric.compared_speedup = base_ms / metric.latency
+                        if factor:
+                            metric.compared_speedup /= factor
+                    else:
+                        metric.base_miss_reason = reason
+                metrics.append(metric)
+            result = BenchmarkResult(
+                level=Config.bench_level.value,
+                op_name=self.op_name,
+                dtype=str(dtype),
+                mode=Config.mode.value,
+                result=metrics,
             )
+            payload = asdict(result)
+            # optest uses this field to preserve an absent speedup as null.
+            # Never substitute this operator itself or a CPU run as its baseline.
+            payload["native_baseline_skip_reason"] = VLLM_REFERENCE_UNAVAILABLE_REASON
+            print(result)
+            update_result(self.op_name, payload)
+            emit_record_logger(result.to_json())
 
 
 @pytest.mark.draft_watermarking_mask

@@ -51,7 +51,7 @@ try:
     )
 
     _HAS_MNNVL_RUNTIME = True
-except (ImportError, OSError):
+except (ImportError, OSError, AssertionError):
     TorchDistBackend = None
     McastGPUBuffer = None
     all_ranks_support_mnnvl = None

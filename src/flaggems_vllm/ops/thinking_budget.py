@@ -35,7 +35,7 @@ def _use_tle(device):
         return False
     if runtime.torch_device_fn.get_device_capability(device) != (9, 0):
         return False
-    return tle_api.is_primitive_supported("nvidia", "gpu.set_layout")
+    return tle_api.is_tle_supported("gpu.set_layout")
 
 
 @triton.jit

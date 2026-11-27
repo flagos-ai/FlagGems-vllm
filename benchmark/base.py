@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import importlib
 import math
 import os
 import time
@@ -54,6 +55,18 @@ else:
         torch_backend_device.matmul.allow_tf32 = False
     except Exception:
         pass
+
+
+def import_vllm_benchmark_baseline(module_name):
+    """Skip a benchmark when its vLLM baseline module is unavailable."""
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name and (
+            exc.name == module_name or module_name.startswith(f"{exc.name}.")
+        ):
+            pytest.skip(f"installed vLLM does not provide {module_name}")
+        raise
 
 
 def get_iter_count(fn):
@@ -178,6 +191,11 @@ class Benchmark:
         self._input_iter = None
         # Baseline sub-entry for kanban operators that merge several precisions.
         self.base_variant = None
+        # Precision used when picking the hardware scaling factor for the
+        # "vs Base" column. None means "same as the benchmarked io dtype";
+        # ops whose kernels compute in another precision (e.g. INT8 transport
+        # of FP8 weights) set this to that compute dtype.
+        self.scaling_dtype = None
 
         # Theoretical supported dtypes, metrics for the operation.
         # These are set by default.
@@ -551,14 +569,17 @@ class Benchmark:
                             # Both baseline (latency_ms) and metric.latency are in
                             # ms, so the raw ratio is dimensionless. Divide by this
                             # chip's scaling factor for the baseline's bottleneck
-                            # resource to normalize away the hardware peak gap;
-                            # missing factor -> keep the raw ratio.
+                            # resource (bandwidth for mem, compute peak for tensor
+                            # points, using the precision the kernels actually run
+                            # in when the op overrides scaling_dtype) to normalize
+                            # away the hardware peak gap; missing factor -> raw
+                            # ratio.
                             speedup = base_ms / metric.latency
                             factor = lookup_scaling_factor(
                                 Config.base_data,
                                 vendor_name,
                                 base_rec.get("bottle_neck_unit"),
-                                dtype,
+                                self.scaling_dtype or dtype,
                             )
                             if factor:
                                 speedup /= factor

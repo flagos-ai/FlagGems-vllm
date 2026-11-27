@@ -131,6 +131,10 @@ def _gems_inplace_fused_experts_wrapper(
 
 @pytest.mark.inplace_fused_experts
 @pytest.mark.skipif(not HAS_VLLM_FUSED_MOE, reason="vLLM not installed")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "enflame",
+    reason="vLLM native ref is unsupported on enflame",
+)
 def test_inplace_fused_experts_gems_vs_vllm():
     """
     Benchmark FlagGems inplace_fused_experts vs vLLM in-place fused_experts_impl.

@@ -8,7 +8,25 @@ import math
 import torch
 import torch.nn.functional as F
 
+import flaggems_vllm
+
 NULL_BLOCK_ID = -1
+
+# GCU (enflame): advanced indexing whose index tensors broadcast against each
+# other lowers to a topsaten "repeat" that aborts the whole process
+# (op_aten_repeat_base.h:386 -> TOPSATEN_STATUS_BAD_PARAM, gcu_utils.cpp:74;
+# P21 archive torch_gcu_aten_runtime_defects).  On that vendor the affected
+# lookups below are routed through flattened 1D advanced indexing instead --
+# numerically identical aten ops; other backends keep the original form.
+_P21_BROADCAST_INDEX = flaggems_vllm.vendor_name == "enflame"
+
+
+def _broadcast_lookup(table, row_idx, col_idx):
+    """table[row_idx, col_idx] with a P21-safe flattened fallback."""
+    if not _P21_BROADCAST_INDEX:
+        return table[row_idx, col_idx]
+    linear = row_idx * table.shape[1] + col_idx
+    return table.reshape(-1)[linear]
 
 
 def _reference_combine_norm(
@@ -79,10 +97,11 @@ def sparse_reference(
         & (requests[:, None] >= 0)
         & (requests[:, None] < table.shape[0])
     )
-    physical = table[
+    physical = _broadcast_lookup(
+        table,
         requests.clamp(0, table.shape[0] - 1)[:, None],
         pages.clamp(0, table.shape[1] - 1),
-    ].long()
+    ).long()
     valid &= (physical >= 0) & (physical < k.shape[0])
     offset = indices.remainder(page_size)
     keys = (

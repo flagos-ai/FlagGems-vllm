@@ -112,7 +112,7 @@ class KdaGateCumsumBenchmark(base.Benchmark):
             yield g, A_log, dt_bias, cu_dev, chunk_indices, LOWER_BOUND, CHUNK
 
 
-@pytest.mark.kda_gate_cumsum
+@pytest.mark.kda_gate_cumsum_triton
 @pytest.mark.skipif(
     flaggems_vllm.vendor_name != "ascend",
     reason="the optimized KDA gate cumsum targets Ascend",
