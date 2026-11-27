@@ -294,6 +294,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
     "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
         "tests/test_fused_experts_impl.py",
     ],
+    "src/flaggems_vllm/ops/grouped_topk.py": [
+        "tests/test_grouped_topk.py",
+        "tests/test_grouped_topk_materialization.py",
+    ],
 }
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
@@ -486,6 +490,10 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
     ],
     "src/flaggems_vllm/runtime/backend/_thead/ops/fused_moe.py": [
         "benchmark/test_fused_moe.py",
+    ],
+    "src/flaggems_vllm/ops/grouped_topk.py": [
+        "benchmark/test_grouped_topk.py",
+        "benchmark/test_grouped_topk_materialization_perf.py",
     ],
 }
 
