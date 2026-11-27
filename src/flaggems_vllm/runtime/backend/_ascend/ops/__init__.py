@@ -111,6 +111,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.per_token_group_quant_fp8 import 
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.per_token_quant_int8 import (
+    per_token_quant_int8,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.persistent_topk import persistent_topk
 from flaggems_vllm.runtime.backend._ascend.ops.ple_state import ple_state_scatter_
 from flaggems_vllm.runtime.backend._ascend.ops.qsa import qwen4_store_qsa_kv_rows
@@ -198,6 +201,7 @@ __all__ = [
     "pack_seq_triton",
     "paged_scatter_triton",
     "per_token_group_quant_fp8",
+    "per_token_quant_int8",
     "persistent_topk",
     "ple_state_scatter_",
     "prepare_compressor_workspace",
