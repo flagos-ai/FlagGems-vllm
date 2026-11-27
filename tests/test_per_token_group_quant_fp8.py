@@ -85,7 +85,15 @@ def native_per_token_group_quant_fp8(
     fp8_max = finfo.max
 
     x_ = x.reshape(x.numel() // group_size, group_size)
-    amax = x_.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)
+    if flaggems_vllm.vendor_name == "enflame":
+        # torch_gcu P21-family defect: topsatenMax aborts
+        # (TOPSATEN_STATUS_NOT_SUPPORT -> C++ CHECK failure) when a bf16
+        # reduction must also emit the int64 index tensor. aten::amax
+        # returns identical values without the index output.
+        amax = x_.abs().amax(dim=-1, keepdim=True)
+    else:
+        amax = x_.abs().max(dim=-1, keepdim=True)[0]
+    amax = amax.clamp(min=eps).to(torch.float32)
     x_s = amax * torch.tensor(1.0 / fp8_max, dtype=torch.float32, device=x.device)
     if scale_ue8m0:
         min_val = torch.tensor(1e-10, dtype=x_s.dtype, device=x_s.device)

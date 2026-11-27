@@ -69,6 +69,7 @@ def rand_quantized_tensor(shape, device, dtype):
 
 
 class W8A8BlockMatmulBenchmark(base.Benchmark):
+    DEFAULT_SHAPES = W8A8_BLOCK_MNK_SHAPES
     DEFAULT_METRICS = consts.DEFAULT_METRICS[:] + ["tflops"]
 
     def __init__(self, *args, block_size=None, **kwargs):
@@ -85,7 +86,7 @@ class W8A8BlockMatmulBenchmark(base.Benchmark):
         if shape_file_path:
             super().set_shapes(shape_file_path)
         else:
-            self.shapes = W8A8_BLOCK_MNK_SHAPES[:]
+            self.shapes = self.DEFAULT_SHAPES[:]
         self.shape_desc = "M, N, K"
         if not self.shapes or any(len(s) != 3 or min(s) <= 0 for s in self.shapes):
             raise ValueError("Expected nonempty positive M,N,K shapes")

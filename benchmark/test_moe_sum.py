@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 import pytest
 import torch
 
@@ -52,6 +54,11 @@ hygon_op = None
 iluvatar_moe_reduce_sum = None
 maybe_fast_moe_sum = None
 _BASELINE_IMPORT_ERROR = None
+# Set when the mthreads fast path is importable but rejects every dtype at
+# runtime (JIT build failure or guard rejection); the run then demotes to the
+# latency-only + --base-data fallback, same route as a missing library.
+_BASELINE_PROBE_REJECTED = False
+_MUSA_PROBE_RESULT = None
 
 if VENDOR == "nvidia":
     try:
@@ -309,12 +316,39 @@ def _mthreads_native_op(input_tensor, output_tensor):
     torch.ops.vllm.musa_fast_moe_sum(output_tensor, input_tensor)
 
 
+def _probe_musa_fast_path():
+    """One-shot runtime probe of vllm_musa's fast moe_sum path, per dtype.
+
+    Importing vllm_musa succeeds in builds where the JIT kernel cannot
+    actually be built (or where the guard rejects the dtype), and the guard
+    then returns False at call time instead of raising. Probe every dtype
+    the benchmark will run, once, on small real buffers; the caller decides
+    from the result whether a native baseline exists at all. Returns
+    {dtype: bool}; an empty dict when the library is missing.
+    """
+    results = {}
+    if maybe_fast_moe_sum is None:
+        return results
+    for dtype in _get_supported_dtypes():
+        try:
+            x = torch.randn(8, 6, 128, dtype=dtype, device=flaggems_vllm.device)
+            o = torch.empty(8, 128, dtype=dtype, device=flaggems_vllm.device)
+            results[dtype] = bool(maybe_fast_moe_sum(x, o))
+        except Exception:
+            results[dtype] = False
+    return results
+
+
 def _get_baseline_op():
     """Select the baseline implementation for the current vendor.
 
-    Returns None when the vendor has no native op or when its library is not
-    installed in this environment; the caller then runs latency-only.
+    Returns None when the vendor has no native op, when its library is not
+    installed in this environment, or (mthreads) when the importable fast
+    path rejects every dtype at runtime; the caller then runs latency-only
+    and can compare against --base-data instead.
     """
+    global _BASELINE_PROBE_REJECTED, _MUSA_PROBE_RESULT
+
     if VENDOR == "nvidia":
         return _vllm_native_op if vendor_ops is not None else None
 
@@ -328,7 +362,19 @@ def _get_baseline_op():
         return _iluvatar_native_op if iluvatar_moe_reduce_sum is not None else None
 
     if VENDOR == "mthreads":
-        return _mthreads_native_op if maybe_fast_moe_sum is not None else None
+        if maybe_fast_moe_sum is None:
+            return None
+        # Import success does not imply the JIT kernel is usable. Probe every
+        # dtype up front; if none pass, demote to the fallback route instead
+        # of silently skipping every shape in get_input_iter and reporting
+        # nothing. The per-shape probe in get_input_iter stays in place for
+        # the normal case where only some shapes are unsupported.
+        if _MUSA_PROBE_RESULT is None:
+            _MUSA_PROBE_RESULT = _probe_musa_fast_path()
+        if not any(_MUSA_PROBE_RESULT.values()):
+            _BASELINE_PROBE_REJECTED = True
+            return None
+        return _mthreads_native_op
 
     return None
 
@@ -405,22 +451,34 @@ class MoeSumBenchmark(base.GenericBenchmarkExcluse1D):
             ]
 
     def get_input_iter(self, dtype):
-        # Also take the generic path when the MUSA library is missing: there
-        # is no fast-path guard to probe and no native baseline to compare.
-        if VENDOR != "mthreads" or maybe_fast_moe_sum is None:
+        # Also take the generic path when the MUSA library is missing, and
+        # when the runtime probe demoted the run to the latency-only fallback
+        # (self.torch_op is None): there is no native baseline to guard, so
+        # no shape may be skipped here.
+        if VENDOR != "mthreads" or maybe_fast_moe_sum is None or self.torch_op is None:
             yield from super().get_input_iter(dtype)
             return
 
         # Probe the MUSA fast-path guard on the real buffers and skip shapes
         # it rejects instead of failing the whole benchmark. The probe also
         # warms up the JIT kernel, so the timed op can call the raw op.
+        yielded = False
         for shape in self.shapes:
             for args in self.input_fn(shape, dtype, self.device):
                 input_tensor, output_tensor = args
                 if not maybe_fast_moe_sum(input_tensor, output_tensor):
                     continue
 
+                yielded = True
                 yield args
+
+        if not yielded:
+            warnings.warn(
+                f"moe_sum benchmark: musa fast path rejected every shape for "
+                f"dtype {dtype}; this dtype reports no results.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -438,7 +496,13 @@ def test_moe_sum():
         # its library is not installed. FlagGems latency is still measured,
         # and passing --base-data=<h800_baseline.json> additionally reports
         # the H800 latency scaled by the bandwidth ratio as 'compared_speedup'.
-        if _BASELINE_IMPORT_ERROR is not None:
+        if _BASELINE_PROBE_REJECTED:
+            reason = (
+                "vllm_musa fast moe_sum path is importable but rejected "
+                "every dtype at runtime (JIT build failure or guard "
+                f"rejection; probe={_MUSA_PROBE_RESULT})"
+            )
+        elif _BASELINE_IMPORT_ERROR is not None:
             reason = (
                 f"native baseline library for vendor {VENDOR!r} is not "
                 f"installed ({_BASELINE_IMPORT_ERROR})"

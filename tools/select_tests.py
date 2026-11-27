@@ -104,6 +104,10 @@ EXPLICIT_SOURCE_TO_TESTS = {
         ]
         for name in THEAD_MEGAPREATTENTION_SOURCES
     },
+    "src/flaggems_vllm/ops/rejection_sampler.py": [
+        "tests/test_gather_draft_sampled.py",
+        "tests/test_rejection_sampler.py",
+    ],
     "conftest.py": ["tests/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "tests/test_fused_matmul_reduce_scatter.py"
@@ -319,6 +323,10 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         ]
         for name in THEAD_MEGAPREATTENTION_SOURCES
     },
+    "src/flaggems_vllm/ops/rejection_sampler.py": [
+        "benchmark/test_gather_draft_sampled.py",
+        "benchmark/test_rejection_sampler.py",
+    ],
     "conftest.py": ["benchmark/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "benchmark/test_fused_matmul_reduce_scatter.py"

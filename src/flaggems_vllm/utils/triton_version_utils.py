@@ -44,7 +44,12 @@ def has_triton_tle(major: int = 0, minor: int = 0, patch: int = 0) -> bool:
         import triton.experimental.tle.language as _tle  # noqa: F401
 
         return True
-    except ImportError:
+    # A present TLE module can still fail to load for reasons other than a
+    # missing import: on a CUDA 13 host FlagTree's flagcx wrapper dlopens a
+    # CUDA 12 libcudart and raises OSError. This probe decides whether the TLE
+    # fast paths are reachable, so any failure must degrade to "unavailable"
+    # rather than propagate and break `import flaggems_vllm` outright.
+    except Exception:
         return False
 
 
@@ -58,7 +63,7 @@ def has_triton_tle_attrs(
         return False
     try:
         import triton.experimental.tle.language as tle
-    except ImportError:
+    except Exception:
         return False
 
     for attr in attrs:
@@ -80,7 +85,7 @@ def has_tle_device_mesh() -> bool:
         import triton.experimental.tle.language as tle_exp
 
         return hasattr(tle_exp, "device_mesh")
-    except ImportError:
+    except Exception:
         return False
 
 

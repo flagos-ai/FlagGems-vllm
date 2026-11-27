@@ -152,6 +152,24 @@ def expand_pools_and_append_tail(
     if rows == 0 or out_cols == 0:
         return out
     row_stride = pool_ids.stride(0)
+    if (
+        device.type == "npu"
+        and pool_size in (1, 2, 4, 8, 16)
+        # Bound relative offsets from each view's data pointer for the int32 tile.
+        and max(
+            ((rows - 1) * row_stride + n_groups) * pool_ids.element_size(),
+            rows * seq_lens.element_size(),
+            rows * out_cols * out.element_size(),
+        )
+        <= _INT32_MAX
+    ):
+        from flaggems_vllm.runtime.backend._ascend.ops.expand_pools_and_append_tail import (
+            _launch_expand_pool_tiles,
+        )
+
+        with runtime.torch_device_fn.device(device):
+            _launch_expand_pool_tiles(pool_ids, seq_lens, pool_size, out)
+        return out
     launch = None
     if _CACHE_LAUNCH:
         key = (

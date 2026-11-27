@@ -51,6 +51,15 @@ try:
             fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
         )
 
+    elif vendor == "enflame":
+        # GCU has no vendor-native aten op for this fusion; vLLM's upstream
+        # Triton kernel is the native baseline (it compiles on GCU through
+        # FlagTree) and is the reference the historical speedups were
+        # measured against.
+        from vllm.v1.attention.ops.deepseek_v4_ops import (
+            fused_q_kv_rmsnorm as reference_fused_q_kv_rmsnorm,
+        )
+
 except Exception as e:
     print(e)
     reference_fused_q_kv_rmsnorm = None
