@@ -283,9 +283,11 @@ def keep(cfg, must_keep=None):
 def prune_fwd_configs(configs, nargs, **kwargs):
     is_dropout = nargs["is_dropout"]
     if is_dropout:
-        return list(
+        pruned = list(
             filter(lambda cfg: cfg.num_warps == 4 and cfg.num_stages < 4, configs)
         )
+        # Backends without 4-warp configs (e.g. single-warp CTAs) keep all.
+        return pruned if pruned else configs
     else:
         return configs
 
@@ -294,9 +296,16 @@ def flash_fwd_kernel_heur_block_k(args):
     return triton.next_power_of_2(args["d"])
 
 
+# vLLM-shape tuned configs; fall back to the full backend list when the
+# backend provides no `keep`-compatible configs (e.g. single-warp CTAs).
+_attention_cfgs = runtime.get_tuned_config("attention")
+_kept_flash_fwd_cfgs = list(filter(keep, _attention_cfgs))
+_flash_fwd_configs = _kept_flash_fwd_cfgs if _kept_flash_fwd_cfgs else _attention_cfgs
+
+
 @libentry()
 @triton.autotune(
-    configs=list(filter(keep, runtime.get_tuned_config("attention"))),
+    configs=_flash_fwd_configs,
     prune_configs_by={"early_config_prune": prune_fwd_configs},
     key=["d", "is_dropout"],
 )

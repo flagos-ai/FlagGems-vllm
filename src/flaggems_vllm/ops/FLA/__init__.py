@@ -81,3 +81,7 @@ elif _runtime.device.vendor_name == "metax":
     from flaggems_vllm.runtime.backend._metax.FLA import (  # noqa: F811
         chunk_kda_with_fused_gate,
     )
+elif _runtime.device.vendor_name == "tsingmicro":
+    from flaggems_vllm.runtime.backend._tsingmicro.tx81.ops.FLA import (  # noqa: F811
+        chunk_gated_delta_rule_fwd,
+    )
