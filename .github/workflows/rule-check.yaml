@@ -54,22 +54,7 @@ jobs:
         shell: bash
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          # Pin the target to this checkout: the event base can be stale, and
-          # fetching a moving main would race the merge tree we actually check.
-          read -r merge_sha target_base actual_head extra < <(git rev-list --parents -n 1 HEAD)
-          if [[ "${merge_sha}" != "${GITHUB_SHA}" || -z "${target_base}" || \
-                -z "${actual_head}" || -n "${extra}" || "${actual_head}" != "${PR_HEAD_SHA}" ]]; then
-            echo "::error::Expected the checked-out two-parent PR merge with the PR head as second parent."
-            exit 1
-          fi
-          merge_base="$(git merge-base "${target_base}" "${PR_HEAD_SHA}")"
-          {
-            echo "target_base=${target_base}"
-            echo "head=${PR_HEAD_SHA}"
-            echo "merge_base=${merge_base}"
-          } >> "${GITHUB_OUTPUT}"
+        run: bash tools/resolve-ci-pr-range.sh
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0

@@ -104,6 +104,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve pull request check range
+        id: pr-range
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash tools/resolve-ci-pr-range.sh
+
       - name: create selector python environment
         shell: bash
         run: |
@@ -120,11 +128,13 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_TARGET_BASE: ${{ steps.pr-range.outputs.target_base }}
+          PR_HEAD_SHA: ${{ steps.pr-range.outputs.head }}
           BEFORE_SHA: ${{ github.event.before }}
         run: |
+          set -euo pipefail
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            git diff --name-only -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_files.bin
+            git diff --name-only -z "${PR_TARGET_BASE}...${PR_HEAD_SHA}" > changed_files.bin
           elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
             git diff --name-only -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_files.bin
           else
