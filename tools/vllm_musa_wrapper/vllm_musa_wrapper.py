@@ -233,7 +233,9 @@ def _ensure_vllm_runtime_deps(source: pathlib.Path) -> None:
     """
     requirements = source / "requirements" / "common.txt"
     if not requirements.is_file():
-        _log(f"no vllm-musa requirements at {requirements}; skipping dependency install")
+        _log(
+            f"no vllm-musa requirements at {requirements}; skipping dependency install"
+        )
         return
     # The MUSA image and optest's mthreads.sh own NumPy and torchada.  In
     # particular, reinstalling torchada after mthreads.sh would overwrite the
