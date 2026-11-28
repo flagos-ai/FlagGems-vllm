@@ -1931,6 +1931,42 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.3'
+- id: mixed_quant_sparse_flash_mla
+  description: 'Sparse MLA decode attention over an FP8 paged KV cache for Ascend 950DT
+
+    (A5 / arch35). The implementation lives under
+
+    `runtime/backend/_ascend/a5/ops/` and targets the CANN
+
+    `aclnnMixedQuantSparseFlashMla` interface in its ORI_SPARSE decode form:
+
+    quant_mode 1 (544B/token rows, E4M3 data with bf16 per-32-channel scales),
+
+    layout_q TND, layout_kv PA_BBND, head_dim 512, rope_head_dim 64, with
+
+    optional attention sinks and per-row top-k lengths. Dispatch picks between
+
+    a fused scattered kernel and a gather pass followed by contiguous or
+
+    split-K attention, from the token count and the core count. The FP4
+
+    compressed side (cmp_kv, 320B rows) and other quant modes raise an
+
+    explicit error.
+
+    '
+  for:
+  - mixed_quant_sparse_flash_mla
+  labels:
+  - fused
+  - Attention
+  - vLLM
+  - Quantization
+  - DeepSeekV4
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '0.3'
 - id: minimax_m3_sparse_attn
   description: 'MiniMax M3 block-sparse GQA prefill attention over packed paged KV
 
