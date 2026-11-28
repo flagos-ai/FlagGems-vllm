@@ -146,6 +146,19 @@ EXPLICIT_SOURCE_TO_TESTS = {
         ]
         for name in ("__init__", "common", "attention", "pipeline")
     },
+    **{
+        f"src/flaggems_vllm/runtime/backend/_ascend/a5/ops/mixed_quant_sparse_flash_mla/{name}.py": [  # noqa: E501
+            "tests/test_mixed_quant_sparse_flash_mla.py"
+        ]
+        for name in (
+            "__init__",
+            "common",
+            "gather",
+            "attention",
+            "scattered",
+            "launcher",
+        )
+    },
     "src/flaggems_vllm/runtime/backend/_ascend/ops/mhc_post.py": [
         "tests/test_mhc_post.py",
     ],
