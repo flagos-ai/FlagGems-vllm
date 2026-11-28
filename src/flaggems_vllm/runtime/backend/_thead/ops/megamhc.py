@@ -28,9 +28,8 @@ import triton
 from triton.runtime.cache import get_cache_manager
 
 from flaggems_vllm.runtime import device, torch_device_fn
+from flaggems_vllm.runtime.backend._thead.ops.megamhc_kernel import mega_mhc_kernel
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
-
-from .megamhc_kernel import mega_mhc_kernel
 
 
 @functools.lru_cache(maxsize=1)
@@ -180,7 +179,9 @@ def pack_mega_mhc_weights(fn):
     ):
         raise ValueError("expected a nonempty contiguous FP32 inference weight matrix")
 
-    from .megamhc_kernel import pack_mega_mhc_weights_kernel
+    from flaggems_vllm.runtime.backend._thead.ops.megamhc_kernel import (
+        pack_mega_mhc_weights_kernel,
+    )
 
     p, k = fn.shape
     q = max(16, triton.next_power_of_2(p))
@@ -388,7 +389,9 @@ def mega_mhc(
         if native_simt:
             bitcode = device_bitcode()
             if bitcode is not None:
-                from .megamhc_tle import mega_mhc_simt_kernel
+                from flaggems_vllm.runtime.backend._thead.ops.megamhc_tle import (
+                    mega_mhc_simt_kernel,
+                )
 
                 rows, warps, blocks, large_blocks = _simt_launch_config(
                     tokens, hidden, mixes, multiprocessors
@@ -455,7 +458,7 @@ def _launch_pipeline(
     packed_fn=None,
     bitcode=None,
 ):
-    from .megamhc_tle import mega_mhc_pipeline
+    from flaggems_vllm.runtime.backend._thead.ops.megamhc_tle import mega_mhc_pipeline
 
     device = inputs[0].device
     m, bk, pack_block = 64, _PROJECTION_BLOCK_K, 2048

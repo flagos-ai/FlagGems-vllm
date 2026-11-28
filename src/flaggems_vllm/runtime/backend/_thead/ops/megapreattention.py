@@ -154,8 +154,10 @@ def megapreattention(
     ):
         raise ValueError("invalid KV cache shape or last-axis stride")
 
-    from ._sailshmem import runtime_for
-    from .megapreattention_kernel import megapreattention_kernel
+    from flaggems_vllm.runtime.backend._thead.ops._sailshmem import runtime_for
+    from flaggems_vllm.runtime.backend._thead.ops.megapreattention_kernel import (
+        megapreattention_kernel,
+    )
 
     block_m, block_k, stages = 64, 64, 3
     # Keep CTAs using the same weight tile adjacent when there are fewer heads
@@ -239,6 +241,6 @@ def megapreattention(
 
 def clear_megapreattention_cache():
     """Collectively free native workspace after all dependent graphs are reset."""
-    from ._sailshmem import clear_workspace
+    from flaggems_vllm.runtime.backend._thead.ops._sailshmem import clear_workspace
 
     clear_workspace()

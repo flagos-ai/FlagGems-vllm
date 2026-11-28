@@ -9,8 +9,7 @@ from triton.experimental.tle import language as tle
 from triton.language import core
 
 from flaggems_vllm.ops.mhc.mhc_pre import _mhc_recip
-
-from .megamhc_kernel import _pack_weights
+from flaggems_vllm.runtime.backend._thead.ops.megamhc_kernel import _pack_weights
 
 
 @core.extern
