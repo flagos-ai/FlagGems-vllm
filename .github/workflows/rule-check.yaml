@@ -48,6 +48,14 @@ jobs:
           # diff) and by the changed-file checks below.
           fetch-depth: 0
 
+      - name: Resolve pull request check range
+        id: pr-range
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash tools/resolve-ci-pr-range.sh
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
@@ -72,10 +80,14 @@ jobs:
       # is still caught there.
       - name: Run pre-commit (code style, changed files)
         if: github.event_name == 'pull_request'
+        env:
+          PR_MERGE_BASE: ${{ steps.pr-range.outputs.merge_base }}
+          PR_HEAD_SHA: ${{ steps.pr-range.outputs.head }}
         run: |
+          set -euo pipefail
           pre-commit run --show-diff-on-failure --color=always \
-            --from-ref "${{ github.event.pull_request.base.sha }}" \
-            --to-ref "${{ github.event.pull_request.head.sha }}"
+            --from-ref "${PR_MERGE_BASE}" \
+            --to-ref "${PR_HEAD_SHA}"
 
       - name: Run pre-commit (code style, all files)
         if: github.event_name != 'pull_request'
@@ -98,12 +110,13 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_TARGET_BASE: ${{ steps.pr-range.outputs.target_base }}
+          PR_HEAD_SHA: ${{ steps.pr-range.outputs.head }}
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            git diff --name-only --diff-filter=d -z "${PR_BASE_SHA}" "${GITHUB_SHA}" > changed_py.bin
+            git diff --name-only --diff-filter=d -z "${PR_TARGET_BASE}...${PR_HEAD_SHA}" > changed_py.bin
           elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
             git diff --name-only --diff-filter=d -z "${BEFORE_SHA}" "${GITHUB_SHA}" > changed_py.bin
           else
@@ -126,10 +139,13 @@ jobs:
       - name: Derive changed operators
         id: derive
         if: github.event_name == 'pull_request'
+        env:
+          PR_TARGET_BASE: ${{ steps.pr-range.outputs.target_base }}
+          PR_HEAD_SHA: ${{ steps.pr-range.outputs.head }}
         run: |
           python3 tools/ci_checks/derive_changed_operators.py \
-            --base "${{ github.event.pull_request.base.sha }}" \
-            --head "${{ github.event.pull_request.head.sha }}"
+            --base "${PR_TARGET_BASE}" \
+            --head "${PR_HEAD_SHA}"
 
       - name: Check operators.yaml
         id: check-operators-yaml
