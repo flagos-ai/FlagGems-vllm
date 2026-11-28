@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import os
 from functools import wraps
 from typing import Any, List, Optional
 
@@ -75,6 +76,16 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
     """
 
     def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
+        shape_set = os.environ.get("MTHREADS_FA_SHAPE_SET", "default")
+        if shape_set != "default":
+            if vendor_name != "mthreads":
+                raise ValueError("MTHREADS_FA_SHAPE_SET is a MThreads-only selector")
+            from .qwen36_flash_attn_cases import case_config, load_cases
+
+            self.trace_cases = load_cases(shape_set)
+            self.shapes = [case_config(case) for case in self.trace_cases]
+            return
+
         # Collected from Qwen3.6-35B-A3B: six TP1 cases followed by six TP4 cases.
         all_cu_seq_lens_q = [
             # TP1: short prefill (qwen36_tp1_p1024d1024_l0002).
@@ -207,8 +218,24 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
         self.shapes = all_configs
 
     def get_input_iter(self, dtype):
-        for config in self.shapes:
-            yield self.flash_attn_varlen_input_fn(config, dtype, self.device)
+        for index, config in enumerate(self.shapes):
+            if getattr(self, "trace_cases", None):
+                self.trace_case = self.trace_cases[index]
+                yield self.trace_input_fn(self.trace_case, dtype, self.device)
+            else:
+                yield self.flash_attn_varlen_input_fn(config, dtype, self.device)
+
+    def trace_input_fn(self, case, dtype, device):
+        from .qwen36_flash_attn_cases import case_config, case_seed
+
+        if case["tp"] == "TP2":
+            from .mthreads_tp2_cases import TP2InputFactory
+
+            if not hasattr(self, "_tp2_input_factory"):
+                self._tp2_input_factory = TP2InputFactory()
+            return self._tp2_input_factory.packed_inputs(case, dtype, device)
+        torch.manual_seed(case_seed(case))
+        return self.flash_attn_varlen_input_fn(case_config(case), dtype, device)
 
     def flash_attn_varlen_input_fn(self, config, dtype, device):
         """Input function for flash attention varlen benchmark"""
@@ -445,6 +472,59 @@ def flash_attn_varlen_metax(*args, **kwargs):
     )
 
 
+def flash_attn_varlen_mthreads(*args, **kwargs):
+    """Adapt vLLM arguments to MUSA FlashAttention's paged-KV interface."""
+    (
+        query,
+        key_cache,
+        value_cache,
+        max_query_len,
+        cu_query_lens,
+        max_kv_len,
+        cu_seqlens_k,
+        seqused_k,
+        q_v,
+        _,  # dropout_p is always zero in this benchmark.
+        scale,
+        causal,
+        window_size,
+        soft_cap,
+        _,  # alibi_slopes is always None in this benchmark.
+        deterministic,
+        return_attn_probs,
+        block_tables,
+        return_softmax_lse,
+        out,
+        *_,
+    ) = args
+
+    from flash_attn_interface import flash_attn_varlen_func
+
+    # The native MUSA interface selects its own FlashAttention version.
+    kwargs.pop("fa_version", None)
+    return flash_attn_varlen_func(
+        query,
+        key_cache,
+        value_cache,
+        cu_seqlens_q=cu_query_lens,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        seqused_k=seqused_k,
+        qv=q_v,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=soft_cap,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        block_table=block_tables,
+        return_softmax_lse=return_softmax_lse,
+        out=out,
+        **kwargs,
+    )
+
+
 @pytest.mark.skipif(
     utils.SkipVersion("vllm", "<0.9"),
     reason="vLLM version prior to 0.9 does not include the flash_attn_varlen_func API.",
@@ -478,6 +558,8 @@ def test_flash_attn_varlen_func(monkeypatch):
             " absent, and the naive torch reference OOMs on long-context core"
             " shapes."
         )
+    elif vendor_name == "mthreads":
+        flash_attn_varlen_func = flash_attn_varlen_mthreads
     else:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 

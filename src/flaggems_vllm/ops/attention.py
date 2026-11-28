@@ -1484,6 +1484,11 @@ def flash_attn_varlen_func(
             launch_attention as specialized_attention,
         )
 
+    elif runtime.device.vendor_name == "mthreads":
+        from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention import (
+            launch_attention as specialized_attention,
+        )
+
     if specialized_attention is not None:
         return specialized_attention(
             q,

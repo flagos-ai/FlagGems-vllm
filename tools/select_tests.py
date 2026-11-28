@@ -97,6 +97,32 @@ THEAD_MEGAPREATTENTION_SOURCES = (
 
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
+MTHREADS_ATTENTION_SOURCES = (
+    "__init__.py",
+    "autotune.py",
+    "bounded_prefill.py",
+    "bounds.py",
+    "cached.py",
+    "capabilities.py",
+    "common.py",
+    "decode_tile.py",
+    "direct.py",
+    "execution.py",
+    "kv_cache.py",
+    "launcher.py",
+    "math_affine4.bc",
+    "math_affine4.mu",
+    "math_packed4.bc",
+    "math_packed4.mu",
+    "policy.py",
+    "ragged.py",
+    "scheduling.py",
+    "single_kv.py",
+    "splitkv.py",
+    "tle_decode.py",
+    "tle_prefill.py",
+)
+
 EXPLICIT_SOURCE_TO_TESTS = {
     **{
         f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
@@ -108,6 +134,23 @@ EXPLICIT_SOURCE_TO_TESTS = {
         "tests/test_gather_draft_sampled.py",
         "tests/test_rejection_sampler.py",
     ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_mthreads/ops/flash_attention/{name}": [
+            "tests/test_flash_attn_varlen_mthreads.py",
+            "tests/test_flash_attn_varlen_mthreads_full.py",
+            "tests/test_flash_attn_varlen_mthreads_standard_prefill.py",
+            "tests/test_flash_attn_varlen_mthreads_splitkv.py",
+            "tests/test_flash_attn_varlen_mthreads_single_kv.py",
+            "tests/test_flash_attn_varlen_mthreads_medium_prefill.py",
+            "tests/test_flash_attn_varlen_mthreads_ragged.py",
+            "tests/test_flash_attn_varlen_mthreads_strided.py",
+            "tests/test_flash_attn_varlen_mthreads_autotune.py",
+            "tests/test_flash_attn_varlen_mthreads_cached_scale.py",
+            "tests/test_flash_attn_varlen_mthreads_bounded.py",
+            "tests/test_flash_attn_varlen_mthreads_packed.py",
+        ]
+        for name in MTHREADS_ATTENTION_SOURCES
+    },
     "conftest.py": ["tests/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "tests/test_fused_matmul_reduce_scatter.py"
@@ -327,6 +370,12 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         "benchmark/test_gather_draft_sampled.py",
         "benchmark/test_rejection_sampler.py",
     ],
+    **{
+        f"src/flaggems_vllm/runtime/backend/_mthreads/ops/flash_attention/{name}": [
+            "benchmark/test_flash_attn_varlen_func.py"
+        ]
+        for name in MTHREADS_ATTENTION_SOURCES
+    },
     "conftest.py": ["benchmark/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "benchmark/test_fused_matmul_reduce_scatter.py"

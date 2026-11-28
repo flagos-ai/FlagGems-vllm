@@ -934,3 +934,223 @@ fused_kimi_k3_mla_kv_concat:
   - META: {BLOCK: 4096, ROW_LAYOUT: true}
     num_warps: 4
     num_stages: 1
+
+flash_attn_varlen_mthreads:
+- META:
+    ROUTE: 6
+    BM: 32
+    WARPS: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 5
+    BM: 0
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 5
+    BM: 1
+    WARPS: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 5
+    BM: 4
+    WARPS: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 5
+    BM: 8
+    WARPS: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 5
+    BM: 16
+    WARPS: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 5
+    BM: 8
+    WARPS: 8
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 0
+    SPLITS: 1
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 0
+    SPLITS: 2
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 1
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 2
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 3
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 2
+    GATHER_TILE: 64
+    GATHER_WARPS: 4
+    PACK: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 2
+    GATHER_TILE: 64
+    GATHER_WARPS: 4
+    PACK: 8
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 2
+    GATHER_TILE: 64
+    GATHER_WARPS: 8
+    PACK: 1
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: 2
+    GATHER_TILE: 16
+    GATHER_WARPS: 8
+    PACK: 8
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    BM: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    BM: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    BM: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    BN: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    WARPS: 8
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    STAGES: 2
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    GATHER_TILE: 32
+    GATHER_WARPS: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    SPLITS: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    SPLITS: 8
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    SPLITS: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    SPLITS: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    HEAD_PACK: 1
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    HEAD_PACK: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    HEAD_PACK: 8
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    GATHER_TILE: 16
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    GATHER_TILE: 32
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    GATHER_TILE: 64
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    GATHER_WARPS: 8
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    PACK: 1
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    PACK: 4
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    PACK: 8
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    COMPACT: 0
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    COMPACT: 1
+  num_warps: 4
+  num_stages: 1
+- META:
+    ROUTE: -1
+    BM: 64
+    BN: 64
+    WARPS: 8
+  num_warps: 4
+  num_stages: 1
