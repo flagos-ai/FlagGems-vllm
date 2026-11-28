@@ -109,13 +109,31 @@ HASH_NUM_EXPERTS_LIST = [256, 384, 512] if not cfg.QUICK_MODE else [256]
 HASH_TOPK_LIST = [6, 8, 16] if not cfg.QUICK_MODE else [6, 8]
 HASH_RSF_LIST = [1.0, 2.5] if not cfg.QUICK_MODE else [1.0]
 
-try:
-    from vllm._custom_ops import topk_hash_softplus_sqrt as vllm_topk_softplus_sqrt
 
-    HAS_VLLM = True
-except ImportError:
-    HAS_VLLM = False
-    vllm_topk_softplus_sqrt = None
+def _detect_vllm_topk_kernel():
+    """Detect whether vLLM's topk_hash_softplus_sqrt is really usable.
+
+    A successful Python import does not guarantee that the underlying CUDA
+    custom op `torch.ops._moe_C.topk_softplus_sqrt` has been compiled into
+    the currently installed vllm package (the Python source and the
+    compiled .so can be out of sync). Probe for the op at runtime too, so
+    we skip cleanly instead of hitting an AttributeError mid-test.
+    """
+    try:
+        from vllm._custom_ops import topk_hash_softplus_sqrt as _fn
+    except ImportError:
+        return False, None
+
+    try:
+        if not hasattr(torch.ops._moe_C, "topk_softplus_sqrt"):
+            return False, None
+    except Exception:
+        return False, None
+
+    return True, _fn
+
+
+HAS_VLLM, vllm_topk_softplus_sqrt = _detect_vllm_topk_kernel()
 
 
 def _torch_topk_softplus_sqrt_reference(
@@ -398,7 +416,10 @@ def test_topk_softplus_sqrt_tle_hash(
 
 @pytest.mark.topk_softplus_sqrt
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.skipif(not HAS_VLLM, reason="vLLM is not installed")
+@pytest.mark.skipif(
+    not HAS_VLLM,
+    reason="vLLM is not installed, or its _moe_C.topk_softplus_sqrt CUDA kernel is missing",
+)
 @pytest.mark.parametrize("num_tokens", [1, 10, 128])
 @pytest.mark.parametrize("num_experts", [256])
 @pytest.mark.parametrize("topk", [6])

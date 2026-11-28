@@ -559,9 +559,14 @@ def torch_per_token_group_quant_fp8(
 
     finfo = torch.finfo(dtype)
     x_reshaped = x.reshape(x.numel() // group_size, group_size)
-    amax = (
-        x_reshaped.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)
-    )
+    # gcu400: aten max(dim) with bf16 inputs aborts the process (torch_gcu
+    # raises TOPSATEN_STATUS_NOT_SUPPORT via Check failed); amax has no index
+    # output and is bitwise-identical to max(dim)[0].
+    if flaggems_vllm.vendor_name == "enflame":
+        amax = x_reshaped.abs().amax(dim=-1, keepdim=True)
+    else:
+        amax = x_reshaped.abs().max(dim=-1, keepdim=True)[0]
+    amax = amax.clamp(min=eps).to(torch.float32)
     x_scales = amax / finfo.max
     x_quant = (x_reshaped / x_scales).clamp(min=finfo.min, max=finfo.max).to(dtype)
     x_quant = x_quant.reshape(x.shape)

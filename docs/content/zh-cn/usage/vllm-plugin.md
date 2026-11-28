@@ -30,7 +30,7 @@ vllm-plugin-fl (插件层)
 
 ```bash
 # 1. 安装 FlagGems (通用基础算子，5.4.0 版本)
-pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-hosted/simple/
+pip install flag-gems==5.4.0 --extra-index-url https://resource.flagos.net/repository/flagos-pypi-daily/simple/
 
 # 2. 安装 FlagGems-vllm (vLLM 专用算子)
 git clone https://github.com/flagos-ai/FlagGems-vllm.git

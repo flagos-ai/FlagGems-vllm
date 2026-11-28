@@ -21,6 +21,8 @@ Inputs are seeded synthetic tensors. --warmup/--iter are counts.
 
 import hashlib
 import inspect
+import json
+import os
 import statistics
 import sys
 import time
@@ -31,7 +33,10 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm
+import triton
+import triton.language as tl
 
+import flaggems_vllm
 from tests.test_megapreattention import Output, run_distributed
 
 from . import base
@@ -128,6 +133,91 @@ class NativeWindow:
             products[0], inputs.positions, inputs.cache, inputs.slots.contiguous()
         )
         return Output(*values, (gathered, products[0]))
+
+
+@triton.jit
+def _store_kv(
+    key,
+    value,
+    cache,
+    slots,
+    K_WIDTH: tl.constexpr,
+    V_STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    slot = tl.load(slots + token)
+    d = tl.arange(0, triton.next_power_of_2(K_WIDTH))
+    # Cache layout is [blocks, heads, block_size, 2 * head_dim].
+    target = (
+        (slot // BLOCK_SIZE) * BLOCK_SIZE * K_WIDTH * 2
+        + (d // 256) * BLOCK_SIZE * 512
+        + (slot % BLOCK_SIZE) * 512
+        + d % 256
+    )
+    valid = (d < K_WIDTH) & (slot >= 0)
+    k = tl.load(key + token * K_WIDTH + d, valid, other=0)
+    v = tl.load(value + token * V_STRIDE + d, valid, other=0)
+    tl.store(cache + target, k, valid)
+    tl.store(cache + target + 256, v, valid)
+
+
+PPU_SPLIT_BASELINE = (
+    "SymmMem projection + Q/K copies + separate RMSNorm, MRoPE, KV store"
+)
+
+
+class SplitWindow:
+    """Split baseline for the contiguous PPU performance workload."""
+
+    def __init__(self, inputs, rope):
+        self.group_name = inputs.group.group_name
+        symm.enable_symm_mem_for_group(self.group_name)
+        self.axis_map = None
+        if inputs.config.mrope_mode == "interleaved":
+            self.axis_map = torch.tensor(
+                rope.mrope_dim[: inputs.config.rotary_dim // 2],
+                device=inputs.hidden.device,
+                dtype=torch.int32,
+            )
+
+    def __call__(self, inputs):
+        c = inputs.config
+        tokens = inputs.positions.shape[1]
+        _, (qkv,) = torch.ops.symm_mem.fused_all_gather_matmul(
+            inputs.hidden, [inputs.weight.t()], 0, self.group_name
+        )
+        qgate, key, value = qkv.split((2 * c.q_size, c.kv_size, c.kv_size), dim=-1)
+        query, gate = qgate.view(tokens, c.num_q_heads, 2 * c.head_dim).chunk(2, dim=-1)
+        query = flaggems_vllm.gemma_rms_norm(
+            query.contiguous().view(-1, c.head_dim), inputs.q_norm, c.eps
+        ).view(tokens, c.q_size)
+        key = flaggems_vllm.gemma_rms_norm(
+            key.contiguous().view(-1, c.head_dim), inputs.k_norm, c.eps
+        ).view(tokens, c.kv_size)
+        flaggems_vllm.mrope(
+            query,
+            key,
+            inputs.rope,
+            inputs.positions,
+            *c.mrope_section,
+            c.head_dim,
+            c.rotary_dim,
+            is_interleaved=True,
+            is_interleaved_glm=self.axis_map is not None,
+            axis_map=self.axis_map,
+        )
+        _store_kv[(tokens,)](
+            key,
+            value,
+            inputs.cache,
+            inputs.slots,
+            c.kv_size,
+            value.stride(0),
+            inputs.cache.shape[2],
+            num_warps=4,
+        )
+        return Output(query, key, value, gate, (qkv,))
 
 
 def distribution(samples):
@@ -308,4 +398,36 @@ class MegaPreAttentionBenchmark(base.Benchmark):
 
 @pytest.mark.megapreattention
 def test_megapreattention():
+    if flaggems_vllm.vendor_name != "nvidia":
+        pytest.skip("requires NVIDIA Hopper")
     MegaPreAttentionBenchmark().run()
+
+
+@pytest.mark.megapreattention
+@pytest.mark.parametrize("tokens", [4096, 8192, 16384, 32768])
+@pytest.mark.parametrize("tp", [1, 2, 4, 8, 16])
+def test_megapreattention_ppu(tokens, tp):
+    if flaggems_vllm.vendor_name != "thead" or torch.cuda.device_count() < tp:
+        pytest.skip(f"requires {tp} T-Head PPUs")
+    warmup = (
+        Config.warm_up if any(a.split("=")[0] == "--warmup" for a in sys.argv) else 20
+    )
+    iterations = (
+        Config.repetition if any(a.split("=")[0] == "--iter" for a in sys.argv) else 100
+    )
+    if warmup < 1 or iterations < 1:
+        raise ValueError("MegaPreAttention benchmark needs positive warmup and samples")
+    mrope_mode = os.getenv("MEGAPREATTENTION_MROPE_MODE", "qwen")
+    result = run_distributed(
+        tp,
+        tokens,
+        "cudagraph",
+        rounds=3,
+        warmup=warmup,
+        iterations=iterations,
+        fixture_path=os.getenv("MEGAPREATTENTION_FIXTURE"),
+        mrope_mode=mrope_mode,
+        multimodal=mrope_mode == "interleaved",
+    )
+    result.update(baseline=PPU_SPLIT_BASELINE, warmup=warmup, iterations=iterations)
+    print("MEGAPREATTENTION_RESULT " + json.dumps(result))

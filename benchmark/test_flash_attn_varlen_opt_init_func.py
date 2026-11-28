@@ -279,7 +279,18 @@ def flash_attn_varlen_func_ref(*args, **kwargs):
     ) = args
 
     # TODO(Qiming): don't import things in the middle
-    from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+    if vendor_name == "enflame":
+        # vLLM's CUDA flash-attn extensions are unavailable on GCU and the
+        # opt-init entry has no independent native reference to run against,
+        # so skip the benchmark instead of timing a self-referential
+        # reference leg (abolished per the 2026-11-20 calibration).
+        pytest.skip(
+            "GCU has no vllm native flash-attn extension; opt-init has no "
+            "independent reference to run (self-referential leg abolished "
+            "per the 2026-11-20 calibration)."
+        )
+    else:
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
     try:
         result = flash_attn_varlen_func(

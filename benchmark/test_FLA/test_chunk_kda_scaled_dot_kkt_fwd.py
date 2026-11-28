@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import functools
 import importlib.util
+import inspect
 import math
 import sys
 from contextlib import contextmanager
@@ -18,6 +20,34 @@ spec = importlib.util.spec_from_file_location(
 )
 workload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(workload)
+
+
+def _adapt_native_op(op):
+    """Adapt the resolved native vLLM op to the workload's calling convention.
+
+    The new-stack vLLM wrapper derives chunk indices from ``cu_seqlens``
+    internally and dropped the explicit ``chunk_indices`` parameter that the
+    flaggems op still accepts (the workload passes it for varlen shapes).
+    Keep only kwargs the native signature still declares so the baseline leg
+    stays measurable; on stacks that still accept them nothing is dropped.
+    """
+    native_params = set(inspect.signature(op).parameters)
+
+    @functools.wraps(op)
+    def wrapper(*args, **kwargs):
+        dropped = [name for name in kwargs if name not in native_params]
+        if dropped:
+            print(
+                f"[native-adapt] {workload.OP_NAME}: dropping kwargs {dropped} "
+                "absent from the native signature"
+            )
+            kwargs = {
+                name: value for name, value in kwargs.items() if name in native_params
+            }
+        return op(*args, **kwargs)
+
+    return wrapper
+
 
 # Only these measured bindings use the bounded native search. Custom and
 # comprehensive-only shapes retain the provider's original configuration list.
@@ -176,9 +206,25 @@ class ChunkKDAScaledDotKKTFwdBenchmark(Benchmark):
 
 @pytest.mark.chunk_kda_scaled_dot_kkt_fwd
 def test_chunk_kda_scaled_dot_kkt_fwd_perf():
+    # enflame-only gate (calibrated 2026-11-20): the vLLM import chain
+    # (vllm.config -> transformers.audio_utils -> torchaudio) can raise OSError
+    # from a broken torchaudio/torch c10 ABI pairing in addition to ImportError,
+    # neither of which is an op defect. Degrade to latency-only metrics
+    # (torch_op=None) instead of failing the whole benchmark run. When the
+    # native op does resolve, adapt its signature (see _adapt_native_op).
+    if gems.vendor_name == "enflame":
+        try:
+            torch_op = workload.native()
+        except (ImportError, OSError) as exc:
+            workload.NATIVE_UNAVAILABLE_REASON = repr(exc)
+            torch_op = None
+        if torch_op is not None:
+            torch_op = _adapt_native_op(torch_op)
+    else:
+        torch_op = workload.native()
     bench = ChunkKDAScaledDotKKTFwdBenchmark(
         op_name=workload.OP_NAME,
-        torch_op=_native_slot,
+        torch_op=torch_op,
     )
     bench.set_gems(gems.chunk_kda_scaled_dot_kkt_fwd)
     bench.run()

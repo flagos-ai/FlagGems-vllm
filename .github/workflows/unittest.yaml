@@ -381,13 +381,14 @@ jobs:
         continue-on-error: true
         env:
           INSTALL_WITH_SETUP_SH: ${{ matrix.install_with_setup_sh }}
+          COMPILER: triton
         run: |
           set -euo pipefail
           python3 --version
           if [[ "${INSTALL_WITH_SETUP_SH}" == "true" ]]; then
             # The image has no flag-gems. --no-venv keeps its torch, Triton
             # and vLLM and only adds flag-gems, this repository and the test
-            # dependencies.
+            # dependencies. COMPILER=triton prevents flagtree upgrade.
             bash tools/setup.sh --no-venv "${BACKEND}"
           else
             # The image already ships a vendor-patched torch/triton/vLLM stack
