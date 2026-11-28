@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import os
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -345,10 +347,10 @@ def test_mega_mhc_empty_and_invalid_shape(shifted):
         flaggems_vllm.mega_mhc(inputs[0], inputs[1][:, :3], *inputs[2:])
 
 
-@pytest.mark.parametrize("shifted", [False, True])
+@pytest.mark.parametrize("shifted,tokens", [(False, 16), (True, 16), (False, 496)])
 @torch.inference_mode()
-def test_mega_mhc_prepared_context(shifted):
-    case = MhcCase("prepared", 16, 5120 if shifted else 4096, shifted=shifted)
+def test_mega_mhc_prepared_context(shifted, tokens):
+    case = MhcCase("prepared", tokens, 5120 if shifted else 4096, shifted=shifted)
     eps = mhc_eps(case)
     original = mhc_inputs(case, 2026)
     if not shifted:
@@ -399,6 +401,8 @@ def test_mega_mhc_prepared_context(shifted):
             graph.replay()
             torch.npu.synchronize()
             check_mhc(case, original, result)
+            # An ordinary context must read an in-place weight update on replay.
+            changed = (*changed[:4], new[4], *changed[5:])
             for dst, before, after in zip(static_inputs, original, changed):
                 if after is not before:
                     dst.copy_(after)
@@ -406,4 +410,83 @@ def test_mega_mhc_prepared_context(shifted):
             torch.npu.synchronize()
             check_mhc(case, changed, result)
         finally:
+            graph.reset()
+
+
+@torch.inference_mode()
+def test_mega_mhc_shared_packed_weights(monkeypatch):
+    assert not hasattr(flaggems_vllm, "pack_mega_mhc_weights")
+    cases = [MhcCase("packed", 496, 4096), MhcCase("packed", 513, 4096, True)]
+    original = [mhc_inputs(case, 2000) for case in cases]
+    fn_cpu = original[0][4]
+    fn = fn_cpu.npu()
+    module = importlib.import_module(
+        "flaggems_vllm.runtime.backend._ascend.ops.mega_mhc"
+    )
+    pack = Mock(wraps=module._write_projection)
+    monkeypatch.setattr(module, "_write_projection", pack)
+    short_case = MhcCase("direct", 1, 4096)
+    short = _to_npu(mhc_inputs(short_case, 2000))
+    direct = flaggems_vllm.create_mega_mhc_context(
+        *short[:4], fn, *short[5:], rms_eps=mhc_eps(short_case), fixed_weights=True
+    )
+    direct.refresh_weights()
+    pack.assert_not_called()
+    fixed_context = None
+    planes = None
+    torch.npu.current_stream().synchronize()
+    graphs = []
+    try:
+        # A dynamic context created after the two fixed contexts must still
+        # observe fn.copy_() immediately, including in a previously captured graph.
+        for index, fixed in ((0, True), (1, True), (0, False)):
+            case, cpu = cases[index], original[index]
+            stream = torch.npu.Stream()
+            with torch.npu.stream(stream):
+                inputs = (*_to_npu(cpu[:4]), fn, *_to_npu(cpu[5:]))
+                context = flaggems_vllm.create_mega_mhc_context(
+                    *inputs, rms_eps=mhc_eps(case), fixed_weights=fixed
+                )
+                buffer = context._launch_tail[3]
+                if planes is None:
+                    fixed_context = context
+                    planes = buffer
+                    high = fn_cpu.bfloat16()
+                    expected = torch.zeros((64, fn_cpu.shape[1]), dtype=torch.bfloat16)
+                    expected[:24] = high
+                    expected[32:56] = (fn_cpu - high.float()).bfloat16()
+                    assert torch.equal(planes.cpu(), expected)
+                assert (buffer is planes) == fixed
+                call = partial(
+                    flaggems_vllm.mega_mhc,
+                    *inputs,
+                    rms_eps=mhc_eps(case),
+                    context=context,
+                )
+                call()
+                stream.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph, stream=stream):
+                    outputs = call()
+                graphs.append((graph, stream, call, outputs, index, fixed))
+        assert pack.call_count == 1
+        with pytest.raises(AssertionError, match="requires a fixed-weight context"):
+            context.refresh_weights()  # The last context is dynamic.
+        updated = fn_cpu.neg()
+        fn.copy_(updated)
+        for refreshed in (False, True):
+            if refreshed:
+                fixed_context.refresh_weights()
+                assert pack.call_count == 2
+            for graph, stream, *_ in graphs:
+                stream.wait_stream(torch.npu.current_stream())
+                with torch.npu.stream(stream):
+                    graph.replay()
+            torch.npu.synchronize()
+            for _, _, _, outputs, index, fixed in graphs:
+                cpu = original[index]
+                weight = fn_cpu if fixed and not refreshed else updated
+                check_mhc(cases[index], (*cpu[:4], weight, *cpu[5:]), outputs)
+    finally:
+        for graph, *_ in graphs:
             graph.reset()

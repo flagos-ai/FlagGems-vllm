@@ -53,14 +53,30 @@ def pytest_generate_tests(metafunc):
 
 @torch.inference_mode()
 def test_mega_mhc_latency(case):
+    # Capture prepared launches on the same non-default stream that owns the context.
+    if conftest.Config.mode == BenchMode.CUDAGRAPH:
+        with torch.npu.stream(torch.npu.Stream()):
+            _measure(case)
+    else:
+        _measure(case)
+
+
+def _measure(case):
     config = conftest.Config
     mode = config.mode
     inputs = _to_npu(mhc_inputs(case, 2026))
     calls = {name: partial(op, *inputs) for name, op, _ in mhc_operations(case)}
     baseline = next(iter(calls))
+    candidate = calls["candidate"]
     if mode == BenchMode.OPERATOR:
         context = flaggems_vllm.create_mega_mhc_context(*inputs, rms_eps=mhc_eps(case))
-        calls["candidate"] = partial(calls["candidate"], context=context)
+        calls["candidate"] = partial(candidate, context=context)
+    if mode in (BenchMode.OPERATOR, BenchMode.CUDAGRAPH):
+        prepared = flaggems_vllm.create_mega_mhc_context(
+            *inputs, rms_eps=mhc_eps(case), fixed_weights=True
+        )
+        calls["prepacked"] = partial(candidate, context=prepared)
+    if mode == BenchMode.OPERATOR:
         for call in calls.values():
             call()  # Exclude initialization and JIT from eager calibration.
         torch.npu.synchronize()
@@ -103,4 +119,7 @@ def test_mega_mhc_latency(case):
         )
     else:
         result["speedup"] = us[baseline] / us["candidate"]
+    if "prepacked" in us:
+        result["speedup_prepacked"] = us[baseline] / us["prepacked"]
+        result["raw_over_prepacked"] = us["candidate"] / us["prepacked"]
     conftest.update_result("mega_mhc", result)

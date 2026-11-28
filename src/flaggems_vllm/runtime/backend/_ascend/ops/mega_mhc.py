@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.experimental.tle as tle
 import triton.language as tl
+from torch.utils.weak import WeakTensorKeyDictionary
 from triton.runtime import driver
 
 
@@ -426,6 +427,20 @@ def _mhc_post_range(
 
 
 @triton.jit
+def _store_weight_planes(fn_ptr, packed_ptr, offsets, live, width: tl.constexpr):
+    value = tl.load(fn_ptr + offsets, live, other=0)
+    high = value.to(tl.bfloat16)
+    tl.store(packed_ptr + offsets, high)
+    tl.store(packed_ptr + 32 * width + offsets, value - high.to(tl.float32))
+
+
+@triton.jit
+def _pack_weights_kernel(fn_ptr, packed_ptr, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    _store_weight_planes(fn_ptr, packed_ptr, offsets, offsets < 24 * WIDTH, WIDTH)
+
+
+@triton.jit
 def _mega_mhc_kernel(
     x_ptr,
     residual_ptr,
@@ -458,6 +473,7 @@ def _mega_mhc_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     PACK_K: tl.constexpr,
+    PREPACKED: tl.constexpr,
     OUT_ROWS: tl.constexpr,
     EXPLICIT_VECTOR: tl.constexpr,
     ALIGNED_ROWS: tl.constexpr,
@@ -494,20 +510,19 @@ def _mega_mhc_kernel(
         local_vector_step: tl.constexpr = 1
     h_tiles: tl.constexpr = HIDDEN // POST_H
     if BF16_CUBE:
-        width: tl.constexpr = 4 * HIDDEN
-        pack_tiles: tl.constexpr = width // PACK_K
-        # Each Cube reads only the weights prepared by its own Vector pair.
-        # The first tile's Vector-to-Cube handoff also orders these MTE3 stores.
-        packed_fn_ptr += worker * 64 * width
-        for pack_task in range(sub, 8 * pack_tiles, local_vector_step):
-            k = (pack_task % pack_tiles) * PACK_K + tl.arange(0, PACK_K)
-            channels = (pack_task // pack_tiles) * 4 + tl.arange(0, 4)
-            offsets = channels[:, None] * width + k[None, :]
-            value = tl.load(fn_ptr + offsets, channels[:, None] < 24, other=0)
-            # The two BF16 weight planes share one Cube dot and FP32 accumulation.
-            high = value.to(tl.bfloat16)
-            tl.store(packed_fn_ptr + offsets, high)
-            tl.store(packed_fn_ptr + offsets + 32 * width, value - high.to(tl.float32))
+        if not PREPACKED:
+            width: tl.constexpr = 4 * HIDDEN
+            pack_tiles: tl.constexpr = width // PACK_K
+            # Each Cube reads only the weights prepared by its own Vector pair.
+            # The first tile's Vector-to-Cube handoff also orders these MTE3 stores.
+            packed_fn_ptr += worker * 64 * width
+            for pack_task in range(sub, 8 * pack_tiles, local_vector_step):
+                k = (pack_task % pack_tiles) * PACK_K + tl.arange(0, PACK_K)
+                channels = (pack_task // pack_tiles) * 4 + tl.arange(0, 4)
+                offsets = channels[:, None] * width + k[None, :]
+                _store_weight_planes(
+                    fn_ptr, packed_fn_ptr, offsets, channels[:, None] < 24, width
+                )
         cube_rows = tl.cdiv(tokens, BLOCK_M) * BLOCK_M
         weights = packed_fn_ptr
     else:
@@ -873,6 +888,45 @@ def _mega_mhc_kernel(
                 )
 
 
+# A layer owns its packed projection for the lifetime of its source tensor.
+_layer_weights = WeakTensorKeyDictionary()
+_layer_weights_lock = threading.Lock()
+
+
+def _write_projection(fn, planes):
+    # The validated width is a multiple of 512, including padded heads.
+    width = fn.shape[1]
+    block = 2048
+    _pack_weights_kernel[(32 * width // block,)](
+        fn, planes, width, block, use_bytecode=False
+    )
+    # Publish the complete projection before a different stream can use it.
+    torch.npu.current_stream().synchronize()
+
+
+def _layer_projection(fn, *, refresh=False):
+    width = fn.shape[1]
+    with _layer_weights_lock:
+        entry = _layer_weights.get(fn)
+        if entry is not None:
+            ptr, planes = entry
+            if (
+                ptr == fn.data_ptr()
+                and planes.shape == (64, width)
+                and planes.device == fn.device
+            ):
+                if refresh:
+                    _write_projection(fn, planes)
+                return planes
+        if refresh:
+            # This layer may have used only direct FP32 projections so far.
+            return None
+        planes = torch.empty((64, width), device=fn.device, dtype=torch.bfloat16)
+        _write_projection(fn, planes)
+        _layer_weights[fn] = (fn.data_ptr(), planes)
+        return planes
+
+
 @dataclass(frozen=True, eq=False, repr=False)
 class MegaMHCContext:
     """Prepared launch and scratch storage for one layer, shape and NPU stream.
@@ -887,12 +941,35 @@ class MegaMHCContext:
     shifted: bool
     _weights: tuple[torch.Tensor, ...]
     _weight_ptrs: tuple[int, ...]
+    _fixed_weights: bool
     _owner: int
     _stream: int
     _cube_rows: int | None
     _runner: Callable
     _launch_tail: tuple
     _input_alignment: tuple[tuple[int, int], ...]
+
+    def refresh_weights(self) -> None:
+        """Refresh this layer's shared projection after updating fn in place.
+
+        Finish all outstanding readers before updating fn. Call this method
+        on the update stream outside capture, before any calls or graph replays
+        using the new weights. All fixed contexts bound to fn share the refresh.
+        """
+        assert self._fixed_weights, "refresh_weights requires a fixed-weight context"
+        fn = self._weights[0]
+        assert (
+            fn.device == self.device
+            and fn.data_ptr() == self._weight_ptrs[0]
+            and fn.shape == (24, 4 * self.shape[1])
+            and fn.dtype == torch.float32
+            and fn.is_contiguous()
+        ), "projection storage or layout changed; rebuild the context and graphs"
+        assert driver.active.get_current_device() == self.device.index
+        assert (
+            not torch.npu.is_current_stream_capturing()
+        ), "refresh outside Graph capture"
+        _layer_projection(fn, refresh=True)
 
 
 def _validate_inputs(x, residual, post, comb, fn, scale, base, norm_weight, pre_mix):
@@ -1120,7 +1197,7 @@ def _launch_config(tokens, hidden, shifted, cores, vector_cores):
     return (workers,), cube_rows, options
 
 
-def _prepare_launch(x, residual, post, comb, pre_mix):
+def _prepare_launch(x, residual, post, comb, pre_mix, fixed_fn=None):
     tokens, hidden = x.shape
     utils = driver.active.utils
     grid, cube_rows, options = _launch_config(
@@ -1152,15 +1229,18 @@ def _prepare_launch(x, residual, post, comb, pre_mix):
         if bf16_cube
         else torch.empty((scratch_rows, 4, hidden), dtype=torch.float32, device=device)
     )
-    packed_fn = (
-        torch.empty(
-            (grid[0], projection_width, 4 * hidden),
-            dtype=torch.bfloat16,
-            device=device,
+    options["PREPACKED"] = bf16_cube and fixed_fn is not None
+    packed_fn = None
+    if bf16_cube:
+        packed_fn = (
+            _layer_projection(fixed_fn)
+            if fixed_fn is not None
+            else torch.empty(
+                (grid[0], projection_width, 4 * hidden),
+                dtype=torch.bfloat16,
+                device=device,
+            )
         )
-        if bf16_cube
-        else None
-    )
     return (
         grid,
         output_rows,
@@ -1210,8 +1290,15 @@ def create_mega_mhc_context(
     pre_mix: torch.Tensor | None = None,
     *,
     rms_eps: float = 1e-6,
+    fixed_weights: bool = False,
 ) -> MegaMHCContext:
-    """Prepare an exact-shape MegaMHC launch before inference or Graph capture."""
+    """Prepare a launch for this shape and stream.
+
+    By default the kernel reads the current fn on each invocation or replay.
+    Set fixed_weights=True for each context that should share a layer's fixed
+    projection. Only shapes using the dual-BF16 projection allocate packed weights.
+    Use context.refresh_weights() after an in-place update to fixed weights.
+    """
     inputs = (x, residual, post, comb, fn, scale, base, norm_weight, pre_mix)
     _validate_inputs(*inputs)
     assert math.isfinite(rms_eps) and rms_eps > 0, "rms_eps must be positive and finite"
@@ -1227,7 +1314,7 @@ def create_mega_mhc_context(
     ), "prepared MegaMHC requires no JIT pre-run hooks"
 
     grid, output_rows, outputs, workspace, options = _prepare_launch(
-        x, residual, post, comb, pre_mix
+        x, residual, post, comb, pre_mix, fn if fixed_weights else None
     )
     tail = (*workspace, x.shape[0], rms_eps)
     args = (*inputs, *outputs, *tail)
@@ -1256,6 +1343,7 @@ def create_mega_mhc_context(
         shifted=pre_mix is not None,
         _weights=weights,
         _weight_ptrs=tuple(weight.data_ptr() for weight in weights),
+        _fixed_weights=fixed_weights,
         _owner=threading.get_ident(),
         _stream=npu.get_current_stream(device_index),
         _cube_rows=output_rows,
