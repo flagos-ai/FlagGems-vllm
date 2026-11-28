@@ -16,8 +16,7 @@
 
 Run on an idle 950DT, for example:
 
-    ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src pytest -q \
-        src/flaggems_vllm/runtime/backend/_ascend/a5/tests/test_swiglu_group_quant.py
+    ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src pytest -q tests/test_swiglu_group_quant.py
 """
 
 import pytest

@@ -21,8 +21,14 @@ from flaggems_vllm.runtime.backend._ascend.a5.ops.causal_conv1d_update import (
 from flaggems_vllm.runtime.backend._ascend.a5.ops.flash_attention_bnsd import (
     flash_attention_fwd,
 )
+from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_mxfp8 import (
+    grouped_matmul_mxfp8,
+)
 from flaggems_vllm.runtime.backend._ascend.a5.ops.grouped_matmul_swiglu_quant_v2 import (
     grouped_matmul_swiglu_quant_v2,
+)
+from flaggems_vllm.runtime.backend._ascend.a5.ops.quant_batch_matmul_mxfp8 import (
+    quant_batch_matmul_mxfp8,
 )
 from flaggems_vllm.runtime.backend._ascend.a5.ops.swiglu_group_quant import (
     swiglu_group_quant,
@@ -33,5 +39,7 @@ __all__ = [
     "causal_conv1d_update",
     "flash_attention_fwd",
     "swiglu_group_quant",
+    "grouped_matmul_mxfp8",
     "grouped_matmul_swiglu_quant_v2",
+    "quant_batch_matmul_mxfp8",
 ]
