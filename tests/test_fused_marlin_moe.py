@@ -676,6 +676,10 @@ def _reference_w8a16_grouped(
 
 def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
     """Compare fused_marlin_moe (packed INT4) against PyTorch reference (dequant)."""
+    if flaggems_vllm.vendor_name == "ascend" and (
+        dtype != torch.bfloat16 or apply_router_weight_on_input
+    ):
+        pytest.skip("Ascend W4A16 accuracy is BF16 with output-side router weights")
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
 
@@ -761,6 +765,8 @@ def _check_w4a16_int4(config, dtype, apply_router_weight_on_input):
     ],
 )
 def test_fused_marlin_moe_w8a16_output(precision, dtype, output_mode, shape):
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip("Ascend requires an internally allocated output")
     make_inputs = (
         _make_inputs_fp8_weight if precision == "fp8" else _make_inputs_w8a16_int8
     )
@@ -1422,7 +1428,7 @@ def _check_w8a16_int8(config, dtype):
         topk_ids=ti,
     )
     ref = _reference_w8a16_grouped(hs, w1_ref, w2_ref, tw, ti)
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
     # INT8 should be tighter than INT4; same vLLM Marlin metric.
     max_diff = compute_max_diff(result.float(), ref)
     assert max_diff < 0.04, f"max_diff={max_diff:.4f}"
@@ -1432,6 +1438,8 @@ def _check_w4a16_mxfp4(config, dtype):
     """Compare fused_marlin_moe (MXFP4) against PyTorch reference (dequant)."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip("Ascend does not support MXFP4 weights")
 
     hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_w4a16_mxfp4(
         num_tokens,
@@ -1533,6 +1541,8 @@ def _check_w8a16_fp8(
     """Compare W(FP8)A16 against a dequantized PyTorch MoE reference."""
     num_tokens, num_experts, hidden_size, intermediate_size, topk = config
     device = flaggems_vllm.device
+    if flaggems_vllm.vendor_name == "ascend":
+        pytest.skip("Ascend does not support FP8 weights")
     hs, w1_q, w2_q, w1_ref, w2_ref, tw, ti, w1s, w2s = _make_inputs_fp8_weight(
         num_tokens,
         num_experts,
@@ -1626,6 +1636,8 @@ def test_fused_marlin_moe_w8a16_fp8_ppu(
 def test_fused_marlin_moe_w8a16_inference_updates(
     precision, num_tokens, updated_tensor
 ):
+    if precision == "fp8" and flaggems_vllm.vendor_name == "ascend":
+        pytest.skip("Ascend does not support FP8 weights")
     with torch.inference_mode():
         if precision == "int8":
             args = _make_inputs_w8a16_int8(
@@ -1659,6 +1671,115 @@ def test_fused_marlin_moe_w8a16_inference_updates(
             kwargs[updated_tensor].zero_()
         actual = flaggems_vllm.fused_marlin_moe(**kwargs)
         gems_assert_equal(actual, torch.zeros_like(hs))
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend FP16 INT8 projections"
+)
+@pytest.mark.parametrize(("tokens", "n"), [(1, 1024), (513, 1024), (1025, 8192)])
+def test_fused_marlin_moe_w8a16_projection_cancellation(tokens, n):
+    device = flaggems_vllm.device
+    k = 1024
+    experts = 4
+    x = torch.full((tokens, k), 2, device=device, dtype=torch.float16)
+    # Opposite K halves exceed FP16 range separately. Their sums are 10 and
+    # 4, so SwiGLU rounds to 40 at the FP16 activation boundary.
+    w1 = torch.full((experts, 2 * n, k), 28, device=device, dtype=torch.uint8)
+    w1[:, :, : k // 2] = 228
+    w1[:, :n, -1] = 33
+    w1[:, n:, -1] = 30
+    w2 = torch.full((experts, k, n), 64, device=device, dtype=torch.uint8)
+    w2[:, :, : n // 2] = 192
+    for expert in range(experts):
+        w2[expert, :, -1] = 65 + expert
+    s1 = torch.ones((experts, 2 * n, k // 128), device=device, dtype=x.dtype)
+    s2 = torch.ones((experts, k, n // 128), device=device, dtype=x.dtype)
+    ids = torch.tensor([[1, 0, 1]], device=device, dtype=torch.int64).repeat(tokens, 1)
+    weights = torch.tensor(
+        [[0.25, 0.5, 0.25]], device=device, dtype=torch.float32
+    ).repeat(tokens, 1)
+    if tokens > 1:
+        # A seven-row tail, repeated routes, and an empty fourth expert.
+        ids[:7, 2] = 2
+    actual = flaggems_vllm.fused_marlin_moe(
+        x, w1, w2, None, None, s1, s2, weights, ids, QUANT_TYPE_UINT8B128
+    )
+    expected = (
+        (40 * ((ids + 1) * weights).sum(dim=1, keepdim=True))
+        .to(x.dtype)
+        .expand_as(actual)
+    )
+    gems_assert_equal(actual, expected)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend FP16 streaming weight reads"
+)
+@pytest.mark.parametrize("tokens", [1, 33])
+def test_fused_marlin_moe_w8a16_streaming_weight_updates(tokens):
+    hs, w1, w2, ref1, ref2, probs, ids, s1, s2 = _make_inputs_w8a16_int8(
+        tokens, 4, 1024, 1024, 2, torch.float16, flaggems_vllm.device
+    )
+    args = hs, w1, w2, None, None, s1, s2, probs, ids, QUANT_TYPE_UINT8B128
+    flaggems_vllm.fused_marlin_moe(*args)
+    # An in-place update must be visible through the read alias after repacking.
+    w2[..., 512:].fill_(128)
+    ref2[..., 512:].zero_()
+    actual = flaggems_vllm.fused_marlin_moe(*args)
+    expected = _reference_w8a16_grouped(hs, ref1, ref2, probs, ids)
+    error = compute_max_diff(actual.float(), expected)
+    gems_assert_close(error, torch.zeros_like(error), torch.float32, atol=0.04)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend rectangular expert panels"
+)
+def test_fused_marlin_moe_w8a16_rectangular_panels():
+    hs, w1, w2, ref1, ref2, probs, ids, s1, s2 = _make_inputs_w8a16_int8(
+        256, 8, 3072, 1024, 4, torch.float16, flaggems_vllm.device
+    )
+    # Exercise short and multi-panel experts plus the final 32 columns of the
+    # 2048-column gate/up matrix. One expert has no routes.
+    ids = (
+        torch.arange(ids.numel(), device=ids.device, dtype=torch.int64).reshape_as(ids)
+        % 8
+    )
+    ids[ids == 7] = 0
+    ids[:160] = torch.where(ids[:160] == 1, 0, ids[:160])
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, probs, ids, QUANT_TYPE_UINT8B128
+    )
+    expected = _reference_w8a16_grouped(hs, ref1, ref2, probs, ids)
+    error = compute_max_diff(actual.float(), expected)
+    gems_assert_close(error, torch.zeros_like(error), torch.float32, atol=0.04)
+
+
+@pytest.mark.fused_marlin_moe_w8a16
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name != "ascend", reason="Ascend workspace bound"
+)
+@pytest.mark.parametrize(("hidden_size", "workspace_mib"), [(1024, 24), (2048, 40)])
+def test_fused_marlin_moe_w8a16_segmented_experts(
+    monkeypatch, hidden_size, workspace_mib
+):
+    # The hot expert spans several workspace segments. Other experts can be empty.
+    backend = importlib.import_module(flaggems_vllm.fused_marlin_moe.__module__)
+    # With the wider output, the down projection needs several column strips.
+    monkeypatch.setattr(backend, "GROUPED_WORKSPACE_BYTES", workspace_mib << 20)
+    hs, w1, w2, ref1, ref2, probs, ids, s1, s2 = _make_inputs_w8a16_int8(
+        1057, 32, hidden_size, 1024, 4, torch.float16, flaggems_vllm.device
+    )
+    ids = ids.to(torch.int64) % 16
+    ids[:, 0] = 0
+    actual = flaggems_vllm.fused_marlin_moe(
+        hs, w1, w2, None, None, s1, s2, probs, ids, QUANT_TYPE_UINT8B128
+    )
+    expected = _reference_w8a16_grouped(hs, ref1, ref2, probs, ids)
+    error = compute_max_diff(actual.float(), expected)
+    gems_assert_close(error, torch.zeros_like(error), torch.float32, atol=0.04)
 
 
 @pytest.mark.fused_marlin_moe_w8a16
@@ -2023,7 +2144,16 @@ _W4A16_CASES += _cases(
 )
 
 _W8A16_CASES = _cases("fp8", W8A16_CONFIGS) + _cases(
-    "int8", W8A16_CONFIGS, marks=_MTHREADS_NO_INT8
+    "int8",
+    W8A16_CONFIGS
+    + [
+        (1, 8, 1024, 1024, 2),  # wide column tiles on both small-route projections
+        (1, 8, 4096, 256, 2),  # split the first projection across K
+        (67, 129, 4096, 256, 2),  # stable routing with empty experts
+        (513, 8, 256, 512, 2),  # dense experts with a partial final tile
+        (33, 8, 384, 256, 2),  # odd number of K128 groups
+    ],
+    marks=_MTHREADS_NO_INT8,
 )
 
 _W8A16_CASES += [

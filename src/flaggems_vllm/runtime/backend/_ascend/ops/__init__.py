@@ -58,6 +58,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.fused_inv_rope_int8_quant import 
 from flaggems_vllm.runtime.backend._ascend.ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
     fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.fused_marlin_moe import fused_marlin_moe
 from flaggems_vllm.runtime.backend._ascend.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -184,6 +185,7 @@ __all__ = [
     "fused_indexer_weight_scale",
     "fused_inv_rope_int8_quant",
     "fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
+    "fused_marlin_moe",
     "fused_q",
     "fused_q_kv_rmsnorm",
     "gather_conv_state",

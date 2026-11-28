@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+from functools import lru_cache
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -49,13 +53,13 @@ except ImportError:
 import flaggems_vllm
 
 # FlagGems wrapper under test
-from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128, fused_marlin_moe
+from flaggems_vllm.ops.fused_marlin_moe import QUANT_TYPE_UINT8B128
 
 from . import base
 
 
 def is_supported_device():
-    if flaggems_vllm.vendor_name == "hygon":
+    if flaggems_vllm.vendor_name in ("hygon", "ascend"):
         return True
     if flaggems_vllm.device != "cuda":
         return False
@@ -65,11 +69,12 @@ def is_supported_device():
 
 
 SUPPORTED_DEVICE = is_supported_device()
-HAS_REQUIRED_VLLM = (
-    HAS_VLLM_FUSED_EXPERTS
-    if flaggems_vllm.vendor_name == "hygon"
-    else HAS_VLLM_FUSED_MARLIN_MOE
-)
+if flaggems_vllm.vendor_name == "ascend":
+    HAS_REQUIRED_VLLM = importlib.util.find_spec("vllm_ascend") is not None
+elif flaggems_vllm.vendor_name == "hygon":
+    HAS_REQUIRED_VLLM = HAS_VLLM_FUSED_EXPERTS
+else:
+    HAS_REQUIRED_VLLM = HAS_VLLM_FUSED_MARLIN_MOE
 
 GROUP_SIZE = 128
 
@@ -301,6 +306,150 @@ def _marlin_repack_per_expert_int8(w_q, scales):
     return qweight, scales
 
 
+@lru_cache(maxsize=16)
+def ascend_dispatcher(experts, topk):
+    from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGather
+    from vllm_ascend.utils import enable_custom_op
+
+    if not enable_custom_op():
+        raise RuntimeError("vLLM-Ascend custom operators could not be loaded")
+    return TokenDispatcherWithAllGather(
+        num_experts=experts, num_local_experts=experts, top_k=topk
+    )
+
+
+def ascend_native_moe(hidden_states, w1, w2, probabilities, expert_ids):
+    from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
+    from vllm_ascend.ops.fused_moe.moe_runtime_args import (
+        build_fused_experts_input,
+        build_mlp_compute_input,
+        build_token_dispatch_input,
+    )
+    from vllm_ascend.quantization.quant_type import QuantType
+
+    routing = ascend_dispatcher(w1.shape[0], expert_ids.shape[1])
+    inputs = build_fused_experts_input(
+        hidden_states=hidden_states,
+        topk_weights=probabilities.to(hidden_states.dtype),
+        topk_ids=expert_ids,
+        w1=w1,
+        w2=w2,
+        quant_type=QuantType.NONE,
+        dynamic_eplb=False,
+        need_trans=False,
+    )
+    routed = routing.token_dispatch(
+        build_token_dispatch_input(fused_experts_input=inputs)
+    )
+    expert_outputs, _ = unified_apply_mlp(
+        mlp_compute_input=build_mlp_compute_input(
+            fused_experts_input=inputs,
+            token_dispatch_output=routed,
+            use_fusion_ops=False,
+        )
+    )
+    return routing.token_combine(expert_outputs, routed.combine_metadata)
+
+
+def ascend_int8_weights(experts, output_size, input_size, dtype):
+    from tests.test_fused_marlin_moe import _gptq_quantize_uint8b128
+
+    device = flaggems_vllm.device
+    codes = torch.empty(
+        (experts, output_size, input_size), device=device, dtype=torch.uint8
+    )
+    scales = torch.empty(
+        (experts, output_size, input_size // GROUP_SIZE), device=device, dtype=dtype
+    )
+    native = torch.empty(
+        (experts, input_size, output_size), device=device, dtype=torch.bfloat16
+    )
+    # Generate and cast one expert at a time while the previous benchmark inputs are live.
+    for expert in range(experts):
+        source = (
+            torch.randn((output_size, input_size), device=device, dtype=dtype) / 10.0
+        )
+        reference, codes[expert], scales[expert] = _gptq_quantize_uint8b128(
+            source, GROUP_SIZE
+        )
+        native[expert].copy_(reference.T)
+    return codes, scales, native
+
+
+def ascend_int8_inputs(shapes, dtype):
+    from tests.accuracy_utils import gems_assert_close
+    from tests.test_fused_marlin_moe import _reference_w8a16_grouped, compute_max_diff
+
+    geometry = None
+    for num_tokens, experts, hidden, intermediate, topk in shapes:
+        if geometry != (experts, hidden, intermediate):
+            torch.manual_seed(0)
+            w1, s1, baseline1 = ascend_int8_weights(
+                experts, 2 * intermediate, hidden, dtype
+            )
+            w2, s2, baseline2 = ascend_int8_weights(
+                experts, hidden, intermediate, dtype
+            )
+            geometry = (experts, hidden, intermediate)
+        torch.manual_seed(num_tokens)
+        hidden_states = torch.randn(
+            (num_tokens, hidden), device=flaggems_vllm.device, dtype=dtype
+        )
+        probabilities, ids = torch.randn(
+            (num_tokens, experts), device=flaggems_vllm.device
+        ).topk(topk)
+        probabilities = torch.softmax(probabilities, dim=-1)
+        ids = ids.to(torch.int32)
+        baseline_hidden = hidden_states.to(torch.bfloat16)
+        baseline_expected = _reference_w8a16_grouped(
+            baseline_hidden,
+            baseline1.transpose(1, 2),
+            baseline2.transpose(1, 2),
+            probabilities,
+            ids,
+        )
+        expected = baseline_expected
+        if dtype != torch.bfloat16:
+            # Keep the FP16 reference bounded even for the largest upstream geometry.
+            expected = torch.zeros_like(hidden_states, dtype=torch.float32)
+            for start in range(0, experts, 8):
+                chunk = slice(start, start + 8)
+                refs = [
+                    (
+                        (w[chunk].unflatten(-1, (-1, GROUP_SIZE)).to(dtype) - 128)
+                        * scale[chunk].unsqueeze(-1)
+                    ).flatten(-2)
+                    for w, scale in ((w1, s1), (w2, s2))
+                ]
+                expected += _reference_w8a16_grouped(
+                    hidden_states, *refs, probabilities, ids - start
+                )
+                del refs
+        outputs = (
+            ascend_native_moe(
+                baseline_hidden, baseline1, baseline2, probabilities, ids
+            ),
+            flaggems_vllm.fused_marlin_moe(
+                hidden_states,
+                w1,
+                w2,
+                None,
+                None,
+                s1,
+                s2,
+                probabilities,
+                ids,
+                QUANT_TYPE_UINT8B128,
+            ),
+        )
+        for output, reference in zip(outputs, (baseline_expected, expected)):
+            error = compute_max_diff(output.float(), reference)
+            gems_assert_close(error, torch.zeros_like(error), torch.float32, atol=0.04)
+        yield hidden_states, w1, w2, s1, s2, baseline1, baseline2, (
+            baseline_hidden if dtype == torch.float16 else None
+        ), None, probabilities, ids
+
+
 class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
     """
     Benchmark for fused_marlin_moe W8A16 INT8 (fused-dequant MoE GEMM).
@@ -310,19 +459,35 @@ class FusedMarlinMoEW8A16INT8Benchmark(base.Benchmark):
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name=op_name, torch_op=torch_op, dtypes=dtypes)
 
+    DEFAULT_SHAPE_FILES = str(Path(__file__).with_name("core_shapes.yaml"))
+    DEFAULT_SHAPE_DESC = "M, E, K, N, topk"
+
+    DEFAULT_SHAPES = [
+        (tokens, experts, hidden, intermediate, topk)
+        for experts, hidden, intermediate, topk in (
+            (8, 4096, 14336, 2),  # Mixtral-8x7B
+            (256, 7168, 2048, 8),  # DeepSeek-V3 (TP=8)
+            (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
+            (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
+        )
+        for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
+    ]
+
     def set_shapes(self, shape_file_path=None):
-        self.shapes = [
-            (tokens, experts, hidden, intermediate, topk)
-            for experts, hidden, intermediate, topk in (
-                (8, 4096, 14336, 2),  # Mixtral-8x7B
-                (256, 7168, 2048, 8),  # DeepSeek-V3 (TP=8)
-                (512, 4096, 1024, 10),  # Qwen3.5-397B-A17B
-                (256, 4096, 2048, 6),  # DeepSeek-V4-Flash
-            )
-            for tokens in (1, 16, 64, 256, 1024, 4096, 16384)
-        ]
+        if (
+            shape_file_path is None
+            or Path(shape_file_path).resolve()
+            == Path(self.DEFAULT_SHAPE_FILES).resolve()
+        ):
+            self.shapes = self.DEFAULT_SHAPES.copy()
+            self.shape_desc = self.DEFAULT_SHAPE_DESC
+            return
+        super().set_shapes(shape_file_path)
 
     def get_input_iter(self, cur_dtype):
+        if flaggems_vllm.vendor_name == "ascend":
+            yield from ascend_int8_inputs(self.shapes, cur_dtype)
+            return
         if flaggems_vllm.vendor_name == "hygon":
             yield from self._get_hygon_input_iter(cur_dtype)
             return
@@ -483,8 +648,14 @@ def _vllm_baseline_int8(
     topk_weights,
     topk_ids,
 ):
-    """Baseline: vLLM's CUDA Marlin fused_marlin_moe (NVIDIA) or native INT8
-    W8A16 fused_experts (Hygon)."""
+    """Use native BF16 MoE on Ascend and native INT8 MoE on NVIDIA and Hygon."""
+    if flaggems_vllm.vendor_name == "ascend":
+        baseline_hidden = (
+            w1_scale_marlin if w1_scale_marlin is not None else hidden_states
+        )
+        return ascend_native_moe(
+            baseline_hidden, w1_q_marlin, w2_q_marlin, topk_weights, topk_ids
+        )
     if flaggems_vllm.vendor_name == "hygon":
         return vllm_fused_experts(
             hidden_states,
@@ -524,12 +695,7 @@ def _gems_call_int8(
     topk_ids,
 ):
     """FlagGems' Triton wna16 fused_marlin_moe W8A16."""
-    gems_op = (
-        flaggems_vllm.fused_marlin_moe
-        if flaggems_vllm.vendor_name == "hygon"
-        else fused_marlin_moe
-    )
-    return gems_op(
+    return flaggems_vllm.fused_marlin_moe(
         bias1=None,
         bias2=None,
         quant_type_id=QUANT_TYPE_UINT8B128,
@@ -548,7 +714,7 @@ def _gems_call_int8(
     not HAS_REQUIRED_VLLM, reason="required vLLM baseline is unavailable"
 )
 @pytest.mark.skipif(
-    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper or a Hygon device"
+    not SUPPORTED_DEVICE, reason="requires NVIDIA Hopper, Hygon or Ascend"
 )
 def test_fused_marlin_moe_w8a16_int8():
     """
@@ -556,12 +722,17 @@ def test_fused_marlin_moe_w8a16_int8():
     fused_marlin_moe W8A16 (CUDA Marlin) on Hopper, or vs vLLM native INT8
     W8A16 fused_experts on Hygon. Both use the same UINT8 codes and
     per-group-128 scales, in native and Marlin-repacked layouts respectively.
+    Ascend compares FP16 activations and INT8 weights with the native BF16 MoE.
     """
     bench = FusedMarlinMoEW8A16INT8Benchmark(
         op_name="fused_marlin_moe_w8a16",
         torch_op=_vllm_baseline_int8,
-        dtypes=[torch.bfloat16],
+        dtypes=(
+            [torch.float16]
+            if flaggems_vllm.vendor_name == "ascend"
+            else [torch.bfloat16]
+        ),
     )
-    bench.base_variant = "int8"
+    bench.base_variant = "bf16" if flaggems_vllm.vendor_name == "ascend" else "int8"
     bench.set_gems(_gems_call_int8)
     bench.run()
