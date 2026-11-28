@@ -18,6 +18,7 @@ import importlib
 import inspect
 import json
 import math
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +67,18 @@ FULL_CASES = QUICK_CASES + (
     (3, 4096),
 )
 FINITE_CASES = QUICK_CASES if cfg.QUICK_MODE else FULL_CASES
+
+
+@pytest.fixture
+def preserve_cpu_subnormals():
+    # PyTorch exposes a setter, so probe the prior mode with a tiny FP32 value.
+    tiny = FP32_EDGE_EPS_VALUES[0]
+    was_flushing = struct.unpack("f", struct.pack("f", tiny))[0] == 0
+    if was_flushing:
+        assert torch.set_flush_denormal(False)
+    yield
+    if was_flushing:
+        assert torch.set_flush_denormal(True)
 
 
 def _eps32(eps):
@@ -511,6 +524,7 @@ def test_fused_indexer_k_norm_eps_values(dtype, eps):
 
 @pytest.mark.fused_indexer_k_norm
 @DEVICE_REQUIRED
+@pytest.mark.usefixtures("preserve_cpu_subnormals")
 @torch.inference_mode()
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("eps", FP32_EDGE_EPS_VALUES)
@@ -1054,6 +1068,7 @@ def test_fp64_metadata_rejected_before_device_check(monkeypatch):
 
 @pytest.mark.fused_indexer_k_norm
 @DEVICE_REQUIRED
+@pytest.mark.usefixtures("preserve_cpu_subnormals")
 @torch.inference_mode()
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
 @pytest.mark.parametrize("eps", (2.0**-149, 2.0**-126, 2.0**-125))
@@ -1134,6 +1149,7 @@ def test_d128_row_tail_offsets_all_dtypes_and_out_modes(rows, row_gap, dtype, pr
 
 @pytest.mark.fused_indexer_k_norm
 @DEVICE_REQUIRED
+@pytest.mark.usefixtures("preserve_cpu_subnormals")
 @torch.inference_mode()
 @pytest.mark.parametrize("provided", (False, True))
 @pytest.mark.parametrize("rows", (9, 129, 1025, 4097))
