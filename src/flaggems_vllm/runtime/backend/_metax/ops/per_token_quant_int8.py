@@ -17,6 +17,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as libdevice
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.per_token_quant_int8 import (
@@ -124,6 +125,53 @@ def _per_token_quant_int8_metax_kernel(
     )
 
 
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("per_token_quant_int8_flat"),
+    key=["M", "N", "stride_xm", "stride_xn", "ALIGNED"],
+    rep=20,
+)
+@triton.jit
+def _per_token_quant_int8_metax_flat_kernel(
+    x_ptr,
+    xq_ptr,
+    scale_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    stride_xm: tl.constexpr,
+    stride_xn: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    VEC_SIZE: tl.constexpr,
+    STREAM_STORE: tl.constexpr,
+    ALIGNED: tl.constexpr,
+):
+    # One CTA owns one wide row. Keeping the row one-dimensional avoids the
+    # extra layout and register pressure of the general row-tiled kernel.
+    row = tl.program_id(0)
+    cols = tl.max_contiguous(tl.arange(0, BLOCK_N), VEC_SIZE)
+    mask = (row < M) & (cols < N)
+    in_base = row * stride_xm
+    out_base = row * N
+    if ALIGNED:
+        in_base = tl.multiple_of(in_base, 16)
+        out_base = tl.multiple_of(out_base, 16)
+    x = tl.load(x_ptr + in_base + cols * stride_xn, mask=mask, other=0.0)
+    xf = x.to(tl.float32)
+    absmax = tl.maximum(tl.max(tl.abs(xf), axis=0).to(tl.float32), 1e-10)
+    scale = absmax / 127.0
+    xq = libdevice.round(xf * (127.0 / absmax)).to(tl.int8)
+    if STREAM_STORE:
+        tl.store(
+            xq_ptr + out_base + cols,
+            xq,
+            mask=mask,
+            cache_modifier=".cs",
+        )
+    else:
+        tl.store(xq_ptr + out_base + cols, xq, mask=mask)
+    tl.store(scale_ptr + row, scale, mask=row < M)
+
+
 def per_token_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     logger.debug("GEMS PER TOKEN QUANT INT8 METAX")
     shape = x.shape
@@ -135,18 +183,38 @@ def per_token_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scales = torch.empty(shape[:-1] + (1,), device=x.device, dtype=torch.float32)
 
     with torch_device_fn.device(x.device):
-        grid = lambda meta: (
-            triton.cdiv(M, meta["BLOCK_M"] * meta["ROW_TILES"]),
-            meta["QUANT_PARTS"],
+        block_n = triton.next_power_of_2(N)
+        aligned = (
+            N % 16 == 0
+            and x.stride(-2) % 16 == 0
+            and x.stride(-1) == 1
+            and x.data_ptr() % 16 == 0
         )
-        _per_token_quant_int8_metax_kernel[grid](
-            x,
-            xq,
-            scales,
-            M,
-            N,
-            x.stride(-2),
-            x.stride(-1),
-            triton.next_power_of_2(N),
-        )
+        if M >= 64 and 5120 <= N <= 16384:
+            _per_token_quant_int8_metax_flat_kernel[(M,)](
+                x,
+                xq,
+                scales,
+                M,
+                N,
+                x.stride(-2),
+                x.stride(-1),
+                block_n,
+                ALIGNED=aligned,
+            )
+        else:
+            grid = lambda meta: (
+                triton.cdiv(M, meta["BLOCK_M"] * meta["ROW_TILES"]),
+                meta["QUANT_PARTS"],
+            )
+            _per_token_quant_int8_metax_kernel[grid](
+                x,
+                xq,
+                scales,
+                M,
+                N,
+                x.stride(-2),
+                x.stride(-1),
+                block_n,
+            )
     return xq, scales

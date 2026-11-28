@@ -620,3 +620,21 @@ per_token_quant_int8:
       num_stages: 1
     quant_parts:
       - 16
+
+per_token_quant_int8_flat:
+  - gen: true
+    param_map:
+      META:
+        VEC_SIZE: vec_size
+        STREAM_STORE: stream_store
+      num_warps: warps
+      num_stages: 1
+    vec_size:
+      - 8
+      - 16
+    stream_store:
+      - false
+      - true
+    warps:
+      - 4
+      - 8
