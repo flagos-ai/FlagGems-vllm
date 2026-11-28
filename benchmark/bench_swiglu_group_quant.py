@@ -15,7 +15,7 @@
 """Benchmark A5 swiglu_group_quant against aclnnSwigluGroupQuant.
 
     ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src python \
-        src/flaggems_vllm/runtime/backend/_ascend/a5/tests/bench_swiglu_group_quant.py
+        benchmark/bench_swiglu_group_quant.py
 
 The stdout latency is the median NPU Event time after warmup. The
 operator is compiled and its raw launcher bound before measurement, so neither

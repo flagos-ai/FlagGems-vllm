@@ -21,19 +21,12 @@ encode one implementation's rounding. The vendor op
 (`torch_npu.npu_fusion_attention` -> aclnnFlashAttentionScoreV4) is additionally
 checked as a cross-implementation sanity bound.
 
-Lives next to the kernel it tests rather than in the repo's ``tests/`` tree,
-because the kernel is 950DT-specific and ships under ``_ascend/a5``. The a5
-path is listed in ``pytest.ini``'s ``testpaths`` so a default ``pytest`` run
-still collects it; this directory has no ``__init__.py``, so setuptools does
-not package it into the wheel.
+Run on an idle 950DT card:
 
-Run (pick an idle card):
+    ASCEND_RT_VISIBLE_DEVICES=7 pytest tests/test_flash_attention_bnsd.py
 
-    ASCEND_RT_VISIBLE_DEVICES=7 pytest \\
-        src/flaggems_vllm/runtime/backend/_ascend/a5/tests/test_flash_attention_bnsd.py
-
-The benchmark that produces the numbers (latency, speedup, TFLOPS) is
-``bench_flash_attention_bnsd.py`` beside this file; its last full sweep is
+The standalone benchmark that produces the numbers (latency, speedup, TFLOPS)
+is ``benchmark/bench_flash_attention_bnsd.py``; its last full sweep is
 ``20261114_fa_clc_480.csv``.
 """
 

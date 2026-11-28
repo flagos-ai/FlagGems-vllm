@@ -23,7 +23,7 @@ Default shape (GLM W8A8C8):
 
 Usage:
   ASCEND_RT_VISIBLE_DEVICES=7 PYTHONPATH=src python \\
-      src/flaggems_vllm/runtime/backend/_ascend/a5/tests/bench_grouped_matmul_swiglu_quant_v2.py
+      benchmark/bench_grouped_matmul_swiglu_quant_v2.py
   ... --shape qwen
   ... --block-n 256
 """

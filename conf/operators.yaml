@@ -1502,6 +1502,41 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '0.3'
+- id: grouped_matmul_mxfp8
+  description: 'MX-FP8 grouped matmul for Ascend 950DT (A5 / arch35), replacing the
+
+    CANN GroupedMatmul call behind vllm-ascend''s MoE `apply_gmm1` / `apply_gmm2`
+
+    (without the SwiGLU epilogue, which has its own fused implementation). The
+
+    implementation lives under `runtime/backend/_ascend/a5/ops/` and takes
+
+    FP8_E4M3FN x and per-expert weight with E8M0 per-32 micro-scales on both
+
+    sides, cumulative or per-expert group_list, and BF16/FP16 output. ND and
+
+    FRACTAL_NZ weights are both supported and the layout is detected from the
+
+    ACL descriptor, so callers pass no extra argument. Scheduling is persistent
+
+    over the Cube cores so group_list is never read back to the host. The
+
+    hardware MX-MAC path is bit-exact with CANN; K that is only 32-aligned
+
+    takes a software-scale fallback that is BF16-output accurate instead.
+
+    '
+  for:
+  - torch_npu.npu_grouped_matmul
+  labels:
+  - fused
+  - vLLM
+  - Quantization
+  - MoE
+  kind:
+  - BLAS
+  stages:
+  - beta: '0.3'
 - id: grouped_topk
   description: 'A specialized routing mechanism used in Mixture-of-Experts (MoE) models
     (like DeepSeek-V3/R1)
