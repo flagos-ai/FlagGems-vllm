@@ -42,6 +42,9 @@ Constraints established by profiling (do not relax without re-validation):
   * BLOCK_N must divide N; hardware-path BLOCK_K=64 (larger values can severely
     degrade the interleaved B-scale access).
   * Persistent scheduling avoids reading group_list back to the host.
+  * B is double-buffered on the hardware path, which the 950 compiler default
+    leaves off: the launch asks for ``multibuffer=True`` whenever the tiles fit
+    the UB budget (worth 16-23% of the main kernel).
 
 Forward inference only; non-contiguous inputs, unsupported dtypes/layouts and
 FP4 are rejected rather than silently falling back to torch.
@@ -57,6 +60,11 @@ __all__ = ["grouped_matmul_mxfp8"]
 
 MX_BLOCK = 32
 ACL_FORMAT_FRACTAL_NZ = 29
+
+# The 950 unified buffer is 256KB; the backend's own graph budget caps usable
+# space at 80% of it (``graph_ub_budget_bytes_for_arch``).  The same accounting
+# is used here to decide whether B can be double-buffered.
+_UB_BUDGET_BYTES = 256 * 1024 * 80 // 100
 
 
 def _cube_core_num(device=None) -> int:
@@ -425,6 +433,7 @@ def grouped_matmul_mxfp8(
     k_unroll: int | None = None,
     launch_num_stages: int | None = None,
     multibuffer_mode: dict[str, int] | None = None,
+    multibuffer: bool | None = None,
     b_cache: str = "",
     sb_cache: str = "",
     block_k: int | None = None,
@@ -436,7 +445,8 @@ def grouped_matmul_mxfp8(
     ``group_list_type=1`` means per-expert row counts; 0 means cumulative ends.
     The optional tuning parameters preserve the source implementation's
     experiment interface.  Production defaults select variant=2, BM=16,
-    BN=1024 (or its largest suitable divisor), BK=64, and mask-free A loads.
+    BN=1024 (or its largest suitable divisor), BK=64, mask-free A loads, and B
+    double-buffering wherever the UB budget allows it.
     No NVIDIA autotune is attached because this is an A5-only implementation.
     """
     if output_dtype not in (torch.bfloat16, torch.float16):
@@ -550,6 +560,35 @@ def grouped_matmul_mxfp8(
                 "launch_num_stages and multibuffer_mode are mutually exclusive"
             )
         extra["num_stages"] = launch_num_stages
+
+    # ---- B double-buffering ----
+    # triton-ascend disables auto multi-buffer on the 950 by default
+    # (``NPUOptions.multibuffer = None`` resolves to False there, on the grounds
+    # that the extra ring buffer may overflow the UB), but a transfer-bound
+    # kernel is exactly what needs it: on the M3.1 shape the main kernel goes
+    # from 168.22 to 140.90 us (ND) and 141.28 to 108.61 us (NZ), bit-exact
+    # either way.  It cannot be enabled by trial and error, because a UB
+    # overflow is a runtime aicore exception rather than a compile failure, so
+    # the budget is checked on the host:
+    #   B tile (double-buffered)  BLOCK_K * BLOCK_N * 1B * 2
+    #   accumulator               BLOCK_M * BLOCK_N * 4B
+    #   A tile                    BLOCK_M * BLOCK_K * 1B
+    #   both scales               (BLOCK_M + BLOCK_N) * (BLOCK_K/32)
+    # BLOCK_N=1024/BLOCK_K=64 needs 195KB <= 204.8KB.  Only the hardware
+    # MX-MAC path is accounted for here; variant 0/1 hold other tiles in the UB
+    # and are left on the compiler default, and an explicit ``multibuffer_mode``
+    # already states the per-level counts, so it is not second-guessed.
+    if multibuffer is not None:
+        extra["multibuffer"] = multibuffer
+    elif variant == 2 and multibuffer_mode is None:
+        need = (
+            bk * bn * 2
+            + block_m * bn * 4
+            + block_m * bk
+            + (block_m + bn) * (bk // MX_BLOCK)
+        )
+        if need <= _UB_BUDGET_BYTES:
+            extra["multibuffer"] = True
     _grouped_matmul_mxfp8_kernel[(cores,)](
         ain,
         sab,

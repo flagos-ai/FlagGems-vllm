@@ -307,6 +307,17 @@ def test_default_tiling(M, sizes):
 
 
 @pytest.mark.grouped_matmul_mxfp8
+@pytest.mark.parametrize("multibuffer", [True, False, None])
+def test_multibuffer_override(multibuffer):
+    """B double-buffering is a compile option, so it must not move any bit.
+
+    ``None`` is the production path, where the wrapper asks for it after
+    checking the UB budget; the explicit values are the tuning escape hatch.
+    """
+    run_edge_case(64, 3072, 6144, [4] * 16, 1, multibuffer=multibuffer)
+
+
+@pytest.mark.grouped_matmul_mxfp8
 def test_fp16_output_dtype():
     cfg = SHAPES["qwen"]
     x, w, sb, sa, gl = build_inputs(cfg["M"], cfg["K"], cfg["N"], cfg["E"])

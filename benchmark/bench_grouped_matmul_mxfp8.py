@@ -293,6 +293,11 @@ def main():
         choices=[0, 1, 2],
         help="2=hardware MX-MAC (default); 0/1 are the software-scale fallbacks",
     )
+    ap.add_argument(
+        "--no-multibuffer",
+        action="store_true",
+        help="disable B double-buffering (default: enabled when the UB budget fits)",
+    )
     args = ap.parse_args()
 
     kw = dict(
@@ -302,6 +307,8 @@ def main():
         num_cores=args.cores,
         variant=args.variant,
     )
+    if args.no_multibuffer:
+        kw["multibuffer"] = False
     if args.all:
         bench_all(kw, args.iters)
     else:
