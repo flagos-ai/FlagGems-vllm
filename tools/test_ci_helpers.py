@@ -991,9 +991,17 @@ class ConftestDeviceProbeTest(unittest.TestCase):
         def skip(msg=""):
             raise Skipped(msg)
 
+        class Failed(Exception):
+            pass
+
+        def fail(msg=""):
+            raise Failed(msg)
+
         stub_pytest.hookimpl = hookimpl
         stub_pytest.skip = skip
         stub_pytest.Skipped = Skipped
+        stub_pytest.fail = fail
+        stub_pytest.Failed = Failed
 
         saved = {}
         overrides = {
@@ -1064,7 +1072,7 @@ class ConftestDeviceProbeTest(unittest.TestCase):
         item = types.SimpleNamespace(nodeid="tests/test_fault.py::test_kernel")
         gen = conftest.pytest_runtest_teardown(item, None)
         next(gen)
-        with self.assertRaises(StopIteration):
+        with self.assertRaisesRegex(stub_pytest.Failed, "device context poisoned"):
             next(gen)
         self.assertTrue(conftest._DEVICE_CONTEXT_DEAD)
         with self.assertRaises(stub_pytest.Skipped):
@@ -1149,6 +1157,88 @@ class ConftestDeviceProbeTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("2 passed", proc.stdout)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("pytest") is not None, "requires pytest"
+    )
+    def test_pytest_subprocess_async_fault_fails_and_records_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pkg = tmp / "flaggems_vllm"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text(
+                'from flaggems_vllm import runtime\ndevice = "cuda"\n',
+                encoding="utf-8",
+            )
+            (pkg / "runtime.py").write_text(
+                textwrap.dedent(
+                    """\
+                    from types import SimpleNamespace
+                    device = SimpleNamespace(name="cuda", vendor_name="nvidia")
+                    fault = False
+                    class _Dev:
+                        @staticmethod
+                        def is_available():
+                            return True
+                        @staticmethod
+                        def synchronize():
+                            if fault:
+                                raise RuntimeError("asynchronous device fault")
+                    torch_device_fn = _Dev()
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (tmp / "fcntl.py").write_text(
+                "LOCK_EX = 2\ndef flock(*args, **kwargs):\n    return None\n",
+                encoding="utf-8",
+            )
+            tests_dir = tmp / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "conftest.py").write_text(
+                self.CONFTEST_PATH.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (tests_dir / "test_async_fault.py").write_text(
+                textwrap.dedent(
+                    """\
+                    from pathlib import Path
+                    from flaggems_vllm import runtime
+
+                    def test_call_passes_before_fault_surfaces():
+                        runtime.fault = True
+                        assert True
+
+                    def test_later_call_must_not_execute():
+                        Path("unexpected-later-call").touch()
+                    """
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(tmp),
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            }
+            proc = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", str(tests_dir)],
+                cwd=tmp,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("device context poisoned", proc.stdout)
+            self.assertIn("1 passed", proc.stdout)
+            self.assertIn("1 skipped", proc.stdout)
+            self.assertFalse((tmp / "unexpected-later-call").exists())
+            results = json.loads((tmp / "accuracy_result.json").read_text())
+            first = next(v for k, v in results.items() if "test_call_passes" in k)
+            later = next(v for k, v in results.items() if "test_later_call" in k)
+            self.assertEqual(first["result"], "failed")
+            self.assertIn("device context poisoned", first["reason"])
+            self.assertEqual(later["result"], "skipped")
 
 
 if __name__ == "__main__":

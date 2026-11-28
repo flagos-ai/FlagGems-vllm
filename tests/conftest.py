@@ -170,12 +170,12 @@ def pytest_configure(config):
 
     # Print info when first-parameter-only is enabled
     if FIRST_PARAMETER_ONLY:
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("FIRST-PARAMETER-ONLY MODE ENABLED")
         print(
             "   Each test function will run with only its first parameter combination"
         )
-        print(f"{'='*70}\n")
+        print(f"{'=' * 70}\n")
 
 
 def _probe_device_context() -> bool:
@@ -229,6 +229,8 @@ def pytest_runtest_teardown(item, nextitem):
             "device context poisoned after %s, remaining tests will be skipped",
             item.nodeid,
         )
+        # An asynchronous fault may surface only after the test call passed.
+        pytest.fail(f"device context poisoned after {item.nodeid}")
 
     if not RECORD_LOG:
         return
@@ -303,6 +305,10 @@ def pytest_runtest_logreport(report):
             result["reason"] = reason
         else:
             result["reason"] = None
+    elif report.when == "teardown" and report.outcome == "failed":
+        if result["result"] != "failed":
+            result["result"] = "failed"
+            result["reason"] = get_reason(report)
 
 
 def pytest_terminal_summary(terminalreporter):
@@ -391,13 +397,13 @@ def pytest_collection_modifyitems(session, config, items):
         original_count = len(items)
         items[:] = kept_items
 
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("FIRST-PARAMETER-ONLY MODE ENABLED (bfloat16 preferred)")
         print(f"   Original tests: {original_count}")
         print(f"   Running tests:  {len(kept_items)} (one per test function)")
         print(f"      bfloat16 preferred: {bfloat16_count}")
         print(f"      fallback (no bfloat16): {fallback_count}")
-        print(f"{'='*70}\n")
+        print(f"{'=' * 70}\n")
 
     if collect_marks_file:
         report = []
