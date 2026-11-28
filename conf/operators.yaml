@@ -1824,6 +1824,17 @@ ops:
     - NeuralNetwork
   stages:
     - alpha: '5.4'
+- id: megagate
+  description: Fuses the MoE gate projection with expert selection and routing weights.
+  for:
+  - vllm.utils.deep_gemm.bf16_mega_gate
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - MoE
+  stages:
+  - alpha: '5.4'
 - id: megamoe_int8
   description: 'Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
 
