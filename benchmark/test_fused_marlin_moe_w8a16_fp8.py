@@ -12,14 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 import torch
 
 try:
     import vllm._custom_ops as vllm_ops
-    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
-        fused_marlin_moe as vllm_fused_marlin_moe,
-    )
+
+    try:
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+            fused_marlin_moe as vllm_fused_marlin_moe,
+        )
+    except ModuleNotFoundError:
+        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+            fused_marlin_moe as vllm_fused_marlin_moe,
+        )
     from vllm.model_executor.layers.quantization.utils.marlin_utils import (
         marlin_permute_scales,
     )
@@ -254,16 +262,21 @@ def _marlin_repack_per_expert_fp8(w_q, scales, dtype):
     """Convert E4M3 weights and per-group scales to vLLM Marlin layout."""
     num_experts, out_dim, in_dim = w_q.shape
     perm = torch.empty(0, dtype=torch.int, device=w_q.device)
+    repack_kwargs = (
+        {"perm": perm}
+        if "perm" in inspect.signature(vllm_ops.gptq_marlin_repack).parameters
+        else {}
+    )
     qweight_list = []
     scale_list = []
     for expert in range(num_experts):
         qweight = pack_fp8_to_int32(w_q[expert], size_k_first=False)
         qweight = vllm_ops.gptq_marlin_repack(
             b_q_weight=qweight.T.contiguous(),
-            perm=perm,
             size_k=in_dim,
             size_n=out_dim,
             num_bits=8,
+            **repack_kwargs,
         )
         marlin_scales = marlin_permute_scales(
             s=scales[expert].T.to(dtype).contiguous(),
