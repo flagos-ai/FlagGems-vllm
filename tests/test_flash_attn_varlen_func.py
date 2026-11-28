@@ -722,3 +722,76 @@ def test_flash_attn_varlen_func_fa3_matches_fa2(
         )
         torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2)
         torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.flash_attn_varlen_func
+@pytest.mark.skipif(not IS_HOPPER, reason="FA3 requires Hopper")
+@pytest.mark.parametrize(
+    "query_length,capacity,kv_lengths",
+    [
+        (1, 2048, [129, 0]),
+        (512, 512, [512, 493]),
+        (1024, 1024, [1024, 1015, 1021]),
+        (1040, 1040, [0, 217, 1040]),
+    ],
+)
+@torch.inference_mode()
+def test_flash_attn_varlen_func_fa3_paged_capacity(query_length, capacity, kv_lengths):
+    """Graph capacity can exceed the live KV lengths, including an empty split."""
+    utils.init_seed(1234567)
+    batch = len(kv_lengths)
+    h, hk, dim, page = 8, 2, 128, 16
+    q = torch.randn(batch * query_length, h, dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(
+        batch * capacity // page, page, hk, dim, device=device, dtype=q.dtype
+    )
+    v = torch.randn_like(k)
+    pages = torch.randperm(len(k), device=device, dtype=torch.int32).view(batch, -1)
+    lengths = torch.tensor(kv_lengths, device=device, dtype=torch.int32)
+    cu = torch.arange(batch + 1, device=device, dtype=torch.int32) * query_length
+    out = torch.empty_like(q)
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=query_length,
+        max_seqlen_k=capacity,
+        seqused_k=lengths,
+        block_table=pages,
+        causal=True,
+        fa_version=3,
+        out=out,
+        return_softmax_lse=True,
+    )
+    got, lse = flaggems_vllm.flash_attn_varlen_func(**kwargs)
+    if query_length == 1:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got, lse = flaggems_vllm.flash_attn_varlen_func(**kwargs)
+        for _ in range(3):
+            out.fill_(float("nan"))
+            graph.replay()
+            assert torch.isfinite(got).all()
+    assert got.data_ptr() == out.data_ptr()
+    for b, length in enumerate(kv_lengths):
+        rows = slice(b * query_length, (b + 1) * query_length)
+        if length == 0:
+            assert torch.count_nonzero(got[rows]) == 0
+            assert torch.isneginf(lse[:, rows]).all()
+            continue
+
+        def unpack(cache):
+            tokens = cache[pages[b].long()].reshape(-1, hk, dim)[:length]
+            return tokens.float().repeat_interleave(h // hk, dim=1)
+
+        scores = torch.einsum("qhd,khd->hqk", q[rows].float(), unpack(k)) * dim**-0.5
+        q_pos = torch.arange(query_length, device=device) + length - query_length
+        scores.masked_fill_(
+            torch.arange(length, device=device) > q_pos[:, None], -torch.inf
+        )
+        ref_lse = torch.logsumexp(scores, dim=-1)
+        probs = torch.softmax(scores, -1).nan_to_num()
+        ref = torch.einsum("hqk,khd->qhd", probs, unpack(v))
+        torch.testing.assert_close(got[rows].float(), ref, atol=2e-2, rtol=1e-2)
+        torch.testing.assert_close(lse[:, rows], ref_lse, atol=1e-3, rtol=1e-3)

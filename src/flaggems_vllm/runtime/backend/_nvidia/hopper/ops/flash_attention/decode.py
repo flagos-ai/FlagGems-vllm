@@ -14,6 +14,7 @@
 
 """Device-adaptive direct decode with in-kernel Split-KV reduction."""
 
+import torch
 import triton
 import triton.language as tl
 
@@ -669,3 +670,167 @@ def flash_varlen_fwd_v3_tle_decode_kernel(
 def _zero_decode_split_counters(counter_ptr, numel):
     offsets = tl.program_id(0) * 256 + tl.arange(0, 256)
     tl.store(counter_ptr + offsets, 0, mask=offsets < numel)
+
+
+@triton.jit
+def _decode_page_tile(
+    Q,
+    K,
+    V,
+    Table,
+    Length,
+    Acc,
+    Stats,
+    Out,
+    Lse,
+    Counter,
+    out_batch_stride,
+    out_head_stride,
+    q_batch_stride,
+    q_head_stride,
+    page_stride,
+    token_stride,
+    kv_head_stride,
+    table_stride,
+    HEADS: tl.constexpr,
+    RATIO: tl.constexpr,
+    DIM: tl.constexpr,
+    PAGE: tl.constexpr,
+    TILES: tl.constexpr,
+    SCALE_LOG2: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+    WIDE_OFFSETS: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    kv_head = tl.program_id(0)
+    tile = tl.program_id(1)
+    batch = tl.program_id(2)
+    dims = tl.arange(0, DIM)
+    rows = tl.arange(0, 16)
+    heads = kv_head * RATIO + rows
+    token = tile * TILE + tl.arange(0, TILE)
+    length = tl.load(Length + batch)
+    page = tl.load(
+        Table + batch.to(tl.int64) * table_stride + token // PAGE,
+        token < length,
+        other=0,
+    )
+    if WIDE_OFFSETS:
+        page = page.to(tl.int64)
+    row_in_page = token % PAGE
+    head_offset = kv_head
+    if WIDE_OFFSETS:
+        row_in_page = row_in_page.to(tl.int64)
+        head_offset = head_offset.to(tl.int64)
+    kv_offset = page * page_stride + row_in_page * token_stride
+    kv_ptr = kv_offset[:, None] + head_offset * kv_head_stride + dims[None, :]
+    k = tl.load(K + kv_ptr, (token < length)[:, None], other=0.0)
+    v = tl.load(V + kv_ptr, (token < length)[:, None], other=0.0)
+    q = tl.load(
+        Q
+        + batch.to(tl.int64) * q_batch_stride
+        + heads[:, None].to(tl.int64) * q_head_stride
+        + dims[None, :],
+        (rows < RATIO)[:, None],
+        other=0.0,
+    )
+    score = tl.dot(q, tl.trans(k)) * SCALE_LOG2
+    score = tl.where(token[None, :] < length, score, float("-inf"))
+    maximum = tl.max(score, 1)
+    weight = tl.exp2(score - tl.where(maximum == float("-inf"), 0.0, maximum)[:, None])
+    acc = tl.dot(weight.to(v.dtype), v)
+    part = (batch * HEADS + heads) * TILES + tile
+    tl.store(Acc + part[:, None] * DIM + dims[None, :], acc, (rows < RATIO)[:, None])
+    tl.store(Stats + part, maximum, rows < RATIO)
+    tl.store(
+        Stats + tl.num_programs(2) * HEADS * TILES + part,
+        tl.sum(weight, 1),
+        rows < RATIO,
+    )
+
+    # Publish all partials before the last CTA in this KV head reduces them.
+    tl.debug_barrier()
+    counter = Counter + batch * tl.num_programs(0) + kv_head
+    ticket = tl.atomic_add(counter, 1, sem="acq_rel", scope="gpu")
+    if ticket == TILES - 1:
+        query_heads = kv_head * RATIO + tl.arange(0, RATIO)
+        splits = tl.arange(0, triton.next_power_of_2(TILES))
+        addr = (batch * HEADS + query_heads[:, None]) * TILES + splits[None, :]
+        split_valid = splits < TILES
+        maxima = tl.load(
+            Stats + addr,
+            split_valid[None, :],
+            other=float("-inf"),
+            cache_modifier=".cg",
+        )
+        top = tl.max(maxima, 1)
+        weights = tl.exp2(maxima - tl.where(top == float("-inf"), 0.0, top)[:, None])
+        sums = tl.load(
+            Stats + tl.num_programs(2) * HEADS * TILES + addr,
+            split_valid[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        den = tl.sum(weights * sums, 1)
+        accumulators = tl.load(
+            Acc + addr[:, :, None] * DIM + dims[None, None, :],
+            split_valid[None, :, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        result = (
+            tl.sum(accumulators * weights[:, :, None], 1)
+            / tl.where(den > 0, den, 1.0)[:, None]
+        )
+        tl.store(
+            Out
+            + batch.to(tl.int64) * out_batch_stride
+            + query_heads[:, None].to(tl.int64) * out_head_stride
+            + dims[None, :],
+            result,
+        )
+        if STORE_LSE:
+            tl.store(
+                Lse + query_heads * tl.num_programs(2) + batch,
+                tl.where(
+                    den > 0, top * 0.6931471805599453 + tl.log(den), float("-inf")
+                ),
+            )
+        tl.debug_barrier()
+        tl.store(counter, 0)
+
+
+def launch_decode_page_tiles(
+    q, k, v, table, lengths, out, lse, counter, tiles, scale, wide_offsets
+):
+    """Compute one tile per CTA and normalize once across KV splits."""
+    batch, heads, dim = q.shape
+    kv_heads = k.size(2)
+    acc = q.new_empty((batch, heads, tiles, dim), dtype=torch.float32)
+    stats = q.new_empty((2, batch, heads, tiles), dtype=torch.float32)
+    _decode_page_tile[(kv_heads, tiles, batch)](
+        q,
+        k,
+        v,
+        table,
+        lengths,
+        acc,
+        stats,
+        out,
+        q if lse is None else lse,
+        counter,
+        *out.stride()[:2],
+        *q.stride()[:2],
+        *k.stride()[:3],
+        table.stride(0),
+        heads,
+        heads // kv_heads,
+        dim,
+        k.size(1),
+        tiles,
+        scale * 1.4426950408889634,
+        lse is not None,
+        wide_offsets,
+        128,
+        num_warps=4,
+    )

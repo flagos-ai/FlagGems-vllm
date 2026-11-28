@@ -296,6 +296,43 @@ def _paged_tile_cache_state(
     page_stride_rows,
     BLOCK_N: tl.constexpr,
     BOUNDARY_CHECK: tl.constexpr,
+    VECTOR: tl.constexpr = False,
+):
+    """Build the reusable page state consumed by the unified KV publisher."""
+
+    if VECTOR:
+        return _paged_blockwise_cache_indices(
+            n_start,
+            tl.arange(0, BLOCK_N),
+            max_virtual_index,
+            page_table_ptr,
+            block_size,
+            page_stride_rows,
+            BLOCK_N,
+            1,
+            BOUNDARY_CHECK,
+        )
+    else:
+        return _paged_fragment_cache_state(
+            n_start,
+            max_virtual_index,
+            page_table_ptr,
+            block_size,
+            page_stride_rows,
+            BLOCK_N,
+            BOUNDARY_CHECK,
+        )
+
+
+@triton.jit
+def _paged_fragment_cache_state(
+    n_start,
+    max_virtual_index,
+    page_table_ptr,
+    block_size: tl.constexpr,
+    page_stride_rows,
+    BLOCK_N: tl.constexpr,
+    BOUNDARY_CHECK: tl.constexpr,
 ):
     """Build the reusable page state consumed by the unified KV publisher."""
 
@@ -586,6 +623,7 @@ def _copy_paged_kv_tile_to_pipe(
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
     BOUNDARY_CHECK: tl.constexpr = True,
+    VECTOR: tl.constexpr = False,
 ):
     """Publish any paged KV tile through a cp.async-capable TLE pipe."""
 
@@ -601,13 +639,16 @@ def _copy_paged_kv_tile_to_pipe(
     # Seed the first logical fragment directly and select only the remaining
     # ones.  Carrier rows beyond BLOCK_N intentionally keep this address as a
     # don't-care value: logical-domain planning never extracts or lowers them.
-    cache_idx = cache_state[0] + row_in_fragment
-    for fragment_idx in tl.static_range(1, NUM_FRAGMENTS):
-        cache_idx = tl.where(
-            fragment == fragment_idx,
-            cache_state[fragment_idx] + row_in_fragment,
-            cache_idx,
-        )
+    if VECTOR:
+        cache_idx = cache_state
+    else:
+        cache_idx = cache_state[0] + row_in_fragment
+        for fragment_idx in tl.static_range(1, NUM_FRAGMENTS):
+            cache_idx = tl.where(
+                fragment == fragment_idx,
+                cache_state[fragment_idx] + row_in_fragment,
+                cache_idx,
+            )
 
     logical_idx = n_offset + rows
     src_ptrs = src_base + cache_idx[:, None] * row_stride + cols[None, :]
@@ -638,16 +679,27 @@ def _copy_dense_kv_tma_tile_to_pipe(
     row_offset,
     BLOCK_N: tl.constexpr,
     HEAD_DIM_PADDED: tl.constexpr,
+    batch=0,
+    head=0,
+    HOST: tl.constexpr = False,
 ):
     """Publish one contiguous K/V tile through a TMA descriptor and TLE pipe."""
 
     slot = writer.acquire(iteration)
-    tle.gpu.copy(
-        desc,
-        slot.kv,
-        [BLOCK_N, HEAD_DIM_PADDED],
-        [row_offset, 0],
-    )
+    if HOST:
+        tle.gpu.copy(
+            desc,
+            slot.kv,
+            [1, BLOCK_N, HEAD_DIM_PADDED],
+            [batch, row_offset, head * HEAD_DIM_PADDED],
+        )
+    else:
+        tle.gpu.copy(
+            desc,
+            slot.kv,
+            [BLOCK_N, HEAD_DIM_PADDED],
+            [row_offset, 0],
+        )
     writer.commit(iteration)
 
 

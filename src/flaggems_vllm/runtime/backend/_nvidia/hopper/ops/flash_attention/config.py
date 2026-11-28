@@ -272,7 +272,7 @@ def direct_launch_plan(
 # Bump when candidate policy or compiler lowering invalidates cached timings.
 # This version separates candidates by SM count and includes native N80
 # for wide prefill/Split-KV while retaining conservative lower-SM choices.
-PERSISTENT_AUTOTUNE_POLICY_VERSION = 22
+PERSISTENT_AUTOTUNE_POLICY_VERSION = 23
 PERSISTENT_DEFAULT_BLOCK_M = 128
 PERSISTENT_LPT_HEURISTIC_BLOCK_N = 128
 PERSISTENT_LPT_L2_BYTES = 32 * 1024 * 1024
@@ -563,6 +563,18 @@ def prune_persistent_configs(configs, nargs, **kwargs):
         and block_size in (16, 32)
         and head_dim == 256
     )
+    compact_prefill = (
+        is_paged
+        and paged_kv_non_tma
+        and pack_gqa
+        and not split_kv
+        and block_size == 16
+        and head_dim == 128
+        and is_causal
+        and seqlen_q is not None
+        and seqlen_q >= 256
+        and not (is_local or is_alibi or is_softcap or is_s_aux)
+    )
     wide_paged_prefill_packgqa_ws = (
         paged_prefill_profile
         and not split_kv
@@ -631,7 +643,7 @@ def prune_persistent_configs(configs, nargs, **kwargs):
         if early_cast_p and not tiled_extent:
             return False
         if (stagger_kv or tiled_extent or rescale_o_before_pv) and not (
-            wide_paged_prefill_packgqa_ws or explicit_wide_split_ws
+            wide_paged_prefill_packgqa_ws or explicit_wide_split_ws or compact_prefill
         ):
             return False
         if tiled_extent and (
@@ -697,7 +709,8 @@ def prune_persistent_configs(configs, nargs, **kwargs):
             and pack_gqa
             and config.kwargs["BLOCK_N"] < 128
             and not (
-                decode_packgqa_ws
+                compact_prefill
+                or decode_packgqa_ws
                 or explicit_wide_split_ws
                 or wide_paged_prefill_packgqa_ws
             )
