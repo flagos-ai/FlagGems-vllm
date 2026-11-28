@@ -1824,6 +1824,17 @@ ops:
     - NeuralNetwork
   stages:
     - alpha: '5.4'
+- id: megamhc
+  description: Single-kernel mHC post-to-pre boundary for BF16 inference.
+  for:
+  - vllm.model_executor.kernels.mhc.tilelang.mhc_fused_post_pre_tilelang
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.4'
 - id: megamoe_int8
   description: 'Fused multi-rank expert-parallel W8A8 MegaMoE for Hygon accelerators,
 

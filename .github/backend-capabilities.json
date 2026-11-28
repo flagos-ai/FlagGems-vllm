@@ -49,6 +49,7 @@
     },
     "thead": {
       "tests_allow": [
+        "tests/test_megamhc.py",
         "tests/test_megapreattention.py"
       ]
     },

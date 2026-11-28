@@ -562,7 +562,9 @@ elif _runtime.device.vendor_name == "thead":
     from flaggems_vllm.runtime.backend._thead.fused import attention as thead_attention
     from flaggems_vllm.runtime.backend._thead.ops import (
         int8_einsum,
+        mega_mhc,
         megapreattention,
+        pack_mega_mhc_weights,
         w8a8_block_int8_bmm,
     )
 
@@ -570,7 +572,9 @@ elif _runtime.device.vendor_name == "thead":
     __all__ += [
         "flash_attn_varlen_func_w8a8_int8",
         "int8_einsum",
+        "mega_mhc",
         "megapreattention",
+        "pack_mega_mhc_weights",
         "w8a8_block_int8_bmm",
     ]
 

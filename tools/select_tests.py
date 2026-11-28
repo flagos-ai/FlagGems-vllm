@@ -86,6 +86,13 @@ FULL_BENCHMARK_TRIGGER_FILES = {
     "benchmark/performance_utils.py",
 }
 
+THEAD_MEGAMHC_SOURCES = (
+    "megamhc.py",
+    "megamhc_kernel.py",
+    "megamhc_tle.py",
+    "megamhc_device.cu",
+)
+
 THEAD_MEGAPREATTENTION_SOURCES = (
     "megapreattention.py",
     "megapreattention_kernel.py",
@@ -98,6 +105,12 @@ THEAD_MEGAPREATTENTION_SOURCES = (
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
+    **{
+        f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
+            "tests/test_megamhc.py"
+        ]
+        for name in THEAD_MEGAMHC_SOURCES
+    },
     **{
         f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
             "tests/test_megapreattention.py"
@@ -317,6 +330,12 @@ EXPLICIT_SOURCE_TO_TESTS = {
 
 # Same for benchmarks: keep explicit entries only for non-standard names that cannot be inferred from the source stem.
 EXPLICIT_SOURCE_TO_BENCHMARKS = {
+    **{
+        f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
+            "benchmark/test_megamhc.py"
+        ]
+        for name in THEAD_MEGAMHC_SOURCES
+    },
     **{
         f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
             "benchmark/test_megapreattention.py"
