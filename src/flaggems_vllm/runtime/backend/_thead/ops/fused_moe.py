@@ -14,7 +14,6 @@
 
 import functools
 import logging
-import weakref
 from enum import Enum
 from typing import Any, Optional
 
@@ -75,6 +74,7 @@ def try_get_optimal_moe_config(
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
     return_is_embedded: bool = False,
+    use_original_layout: bool = False,
 ) -> dict[str, Any] | tuple[dict[str, Any], bool]:
     if gemm_stage not in ("gemm1", "gemm2"):
         raise ValueError(f"Unsupported MoE GEMM stage: {gemm_stage}")
@@ -102,6 +102,7 @@ def try_get_optimal_moe_config(
             block_shape,
             gemm_stage=gemm_stage,
             enable_gemm_fast_path=enable_gemm_fast_path,
+            use_original_layout=use_original_layout,
         )
         is_embedded = False
     if return_is_embedded:
@@ -189,6 +190,7 @@ def get_default_config(
     block_shape: list[int] | None = None,
     gemm_stage: str = "gemm1",
     enable_gemm_fast_path: bool = False,
+    use_original_layout: bool = False,
 ) -> dict[str, Any]:
     """PPU-tuned per-M config (V6 sweep 2026-08-14; small-M re-sweep
     2026-08-17).
@@ -212,20 +214,77 @@ def get_default_config(
         bm, bn, bk = 16, 128, 32
     else:
         bm, bn, bk = 16, 256, 64
+    stages, warps = 4, 4
+    use_swap = False
+    group_size_m = 8
+    if use_original_layout and dtype in _PLAIN_HALF_CONFIG_DTYPES and 0 < M <= 1024:
+        # Original [E, N, K] weights are contiguous along K. Keep the row tile
+        # small for sparse expert routing and load longer contiguous K spans.
+        bm = 32 if M * topk >= 16 * E else 16
+        bn, bk, stages = 128, 128, 3 if bm == 32 and E <= 32 else 2
+        if M <= 8 and min(N, K) >= 1024:
+            stages = 4
+        if gemm_stage == "gemm1":
+            if N <= 256 and bm == 16 and (M >= 256 or M * topk * 4 <= E):
+                bn = 64
+            elif enable_gemm_fast_path and M > 8 and K >= N >= 1024 and bm == 16:
+                # Fused gate/up projections benefit from a longer K tile.
+                bn, bk = 64, 256
+    # For sparse long-K projections, the existing transposed-dot schedule
+    # keeps original weights contiguous without materializing a packed copy.
+    # Partial tiles regress; small projections become host-bound in eager
+    # execution after the separate activation, so retain their vendor path.
+    # Limit the new schedule to the measured token and routed-row range.
+    if (
+        use_original_layout
+        and dtype in _PLAIN_HALF_CONFIG_DTYPES
+        and gemm_stage == "gemm1"
+        and 16 <= M <= 256
+        and M * topk >= 64
+        and E >= 128
+        and E < 4 * M * topk <= 32 * E
+        and K >= N >= 2048
+        and K >= 3072
+        and K % 256 == 0
+        and N % 256 == 0
+    ):
+        bn, bk, stages, warps = 64, 256, 2, 2
+        # Sparse routed rows: expert-local N tiles improve locality; dense
+        # workloads retain the prior grouped order.
+        group_size_m = 1 if M * topk <= E else 8
+        use_swap = True
+    if (
+        use_original_layout
+        and dtype in _PLAIN_HALF_CONFIG_DTYPES
+        and gemm_stage == "gemm2"
+        and 16 <= M <= 256
+        and M * topk >= 64
+        and E >= 128
+        and E < 4 * M * topk <= 32 * E
+        and N >= 2 * K >= 2048
+        and N >= 3072
+        and N % 256 == 0
+        and K % 128 == 0
+    ):
+        bn, bk, stages, warps = 128, 128, 2, 2
+        use_swap = True
     use_int32 = dtype in ("bf16", "fp16") and max(M * K, M * topk * N, E * N * K) < (
         1 << 31
     )
-    return {
+    config = {
         "BLOCK_SIZE_M": bm,
         "BLOCK_SIZE_N": bn,
         "BLOCK_SIZE_K": bk,
-        "GROUP_SIZE_M": 8,
-        "num_warps": 4,
-        "num_stages": 4,
+        "GROUP_SIZE_M": group_size_m,
+        "num_warps": warps,
+        "num_stages": stages,
         # PPU: int32 addressing ~2-3% faster than int64 (V6 exp); gated to
         # plain-half dtypes and overflow-safe shapes.
         "USE_INT32_OFFSETS": use_int32,
     }
+    if use_swap:
+        config["SWAP_AB"] = True
+    return config
 
 
 def _get_config_dtype_str(
@@ -1325,8 +1384,29 @@ def invoke_fused_moe_triton_kernel(
     direct_sum: bool = False,
     out_top_k: int = 1,
 ) -> None:
-    """Select bounded W8A8 GEMM1/GEMM2, otherwise keep the vendor schedule."""
-    if _use_gemm2_int32(
+    """Select bounded half/W8A8 schedules, otherwise keep the vendor schedule."""
+    use_half_swap = (
+        config.get("SWAP_AB", False)
+        and A.dtype == B.dtype == C.dtype
+        and A.dtype in (torch.float16, torch.bfloat16)
+        and A_scale is None
+        and B_scale is None
+        and B_bias is None
+        and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        and sorted_token_ids is not None
+        and not (FUSE_SILU or direct_sum)
+    )
+    if (
+        config.get("SWAP_AB", False)
+        and not use_half_swap
+        and A.dtype == B.dtype == C.dtype
+        and A.dtype in (torch.float16, torch.bfloat16)
+        and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+    ):
+        # SWAP_AB is generic-only; preserve vendor dispatch for other contracts.
+        config = dict(config)
+        config.pop("SWAP_AB")
+    if use_half_swap or _use_gemm2_int32(
         A,
         B,
         C,
@@ -1469,9 +1549,9 @@ def invoke_fused_moe_triton_kernel(
     # PPU small-M naive path: per-row GEMV kernel (mirrors DeepGemm Gemvt).
     # No BLOCK_M tiling -> no 1/16 MMA-row waste for one-token-per-expert
     # routing. Only for plain-half, non-fused, non-direct-sum calls, and only
-    # where per-row work is large enough to amortise the block: >=32 routed
-    # rows and N >= 1024 (measured: wins on M=8/2I=2048, regresses on M=1
-    # and small-N shapes, which keep the tiled kernel).
+    # N >= 1024. For original K-contiguous plain-half weights, narrow N tiles
+    # also make single-token routing profitable; other layouts/dtypes retain
+    # the previous >=32-routed-row crossover.
     if (
         sorted_token_ids is None
         and not FUSE_SILU
@@ -1479,7 +1559,15 @@ def invoke_fused_moe_triton_kernel(
         and not (use_int8_w8a16 or use_int4_w4a16)
         and A_scale is None
         and B_scale is None
-        and num_tokens >= 32
+        and (
+            num_tokens >= 32
+            or (
+                num_tokens > 0
+                and A.dtype == B.dtype
+                and A.dtype in (torch.float16, torch.bfloat16)
+                and B.stride(2) == 1
+            )
+        )
         and actual_N >= 1024
     ):
         _g = _GEMV_CFG
@@ -1488,6 +1576,17 @@ def invoke_fused_moe_triton_kernel(
             gemv_block_k = _g["BLOCK_K"]
             gemv_warps = _g.get("num_warps", 1)
             gemv_stages = _g.get("num_stages", 3)
+        elif (
+            A.dtype == B.dtype
+            and A.dtype in (torch.float16, torch.bfloat16)
+            and B.stride(2) == 1
+        ):
+            # Narrow N tiles coalesce the original K-contiguous weights. With
+            # few routed rows, halve N again to expose enough independent work.
+            gemv_block_n = 8 if num_tokens <= 16 else 16
+            gemv_block_k = 128 if B.size(2) <= 128 else 256
+            gemv_warps = 1
+            gemv_stages = 2
         else:
             gemv_block_n = 128
             gemv_block_k = 32
@@ -1664,47 +1763,7 @@ def dispatch_fused_moe_kernel(
         )
 
 
-_TRANSPOSE_CACHE: dict = {}
 _GEMV_CFG = None  # optional gemv tuning override: {"BLOCK_N":..,"BLOCK_K":..}
-_TRANSPOSE_CACHE_MAX = 4
-# Memory-pressure adaptive degradation: below LOW the transpose cache is
-# dropped and the path degrades to the untransposed layout; only above HIGH
-# is transposing re-enabled (hysteresis prevents flapping). Re-transposing on
-# every call under sustained pressure would cost ~21ms per call, far worse
-# than the ~1.8ms kernel win the transpose provides.
-_TRANSPOSE_MEM_LOW_BYTES = 10 * 1024**3
-_TRANSPOSE_MEM_HIGH_BYTES = 16 * 1024**3
-_TRANSPOSE_DISABLED = False
-_ENABLE_TRANSPOSE = True  # debug: set False to disable weight transposition
-
-
-def _transposed_view(w: torch.Tensor) -> torch.Tensor:
-
-    from flaggems_vllm.ops.permute_copy import permute_copy  # FlagGems kernel
-
-    key = (w.data_ptr(), w.shape, w.dtype)
-    entry = _TRANSPOSE_CACHE.get(key)
-    if entry is not None and entry[0]() is w:
-        return entry[1]
-    if len(_TRANSPOSE_CACHE) >= _TRANSPOSE_CACHE_MAX:
-        dead = [k for k, (r, _) in _TRANSPOSE_CACHE.items() if r() is None]
-        for k in dead:
-            del _TRANSPOSE_CACHE[k]
-        while len(_TRANSPOSE_CACHE) >= _TRANSPOSE_CACHE_MAX:
-            _TRANSPOSE_CACHE.pop(next(iter(_TRANSPOSE_CACHE)))
-    t = permute_copy(w, (0, 2, 1))  # (E, K, N) contiguous, FlagGems kernel
-    E, N, K = w.shape
-    view = t.as_strided((E, N, K), (K * N, 1, N))
-
-    # Transpose-copy lifetime is tied to the original weight: when the weight
-    # is garbage-collected the weakref callback drops the cache entry, so the
-    # (possibly huge) transposed copy is released immediately instead of
-    # lingering until the next LRU-triggered sweep.
-    def _cleanup(ref, _cache=_TRANSPOSE_CACHE, _key=key):
-        _cache.pop(_key, None)
-
-    _TRANSPOSE_CACHE[key] = (weakref.ref(w, _cleanup), view)
-    return view
 
 
 def fused_experts_impl(
@@ -1734,7 +1793,7 @@ def fused_experts_impl(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    logger.debug("GEMS FUSED MOE")
+    logger.debug("GEMS_THEAD FUSED_EXPERTS_IMPL")
     assert (
         activation == "silu"
     ), f"Only 'silu' activation is supported, got {activation}"
@@ -1764,30 +1823,10 @@ def fused_experts_impl(
     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
     assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
 
-    # PPU: transposed weight view -> b-tile BN-contiguous reads (nopad layout
-    # win). Same shape, so N/K semantics are untouched. Quantized paths keep
-    # their original layout. Under memory pressure (free < LOW) the transpose
-    # cache is dropped and this path degrades to the untransposed layout;
-    # recovery (> HIGH) re-enables transposing. Hysteresis avoids flapping.
-    global _TRANSPOSE_DISABLED
-    try:
-        _free, _ = torch.cuda.mem_get_info()
-        if _free < _TRANSPOSE_MEM_LOW_BYTES:
-            if not _TRANSPOSE_DISABLED:
-                _TRANSPOSE_CACHE.clear()
-            _TRANSPOSE_DISABLED = True
-        elif _TRANSPOSE_DISABLED and _free > _TRANSPOSE_MEM_HIGH_BYTES:
-            _TRANSPOSE_DISABLED = False
-    except (AttributeError, RuntimeError):
-        _TRANSPOSE_DISABLED = False  # no CUDA-semantic mem query -> keep cache
-
-    if (
-        _ENABLE_TRANSPOSE
-        and not (use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-        and not (_TRANSPOSE_DISABLED)
-    ):
-        w1 = _transposed_view(w1)
-        w2 = _transposed_view(w2)
+    # GEMM and GEMV consume the caller's weight strides directly. An implicit
+    # transpose backed by a bounded cache thrashes across MoE layers and can
+    # record full-weight copies into every graph replay. Keep the original
+    # weights instead, without persistent copies or memory-pressure queries.
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
     num_tokens = hidden_states.size(0)
@@ -1808,6 +1847,15 @@ def fused_experts_impl(
         dtype=hidden_states.dtype,
     )
     is_plain_half_config = config_dtype in _PLAIN_HALF_CONFIG_DTYPES
+    use_original_layout = (
+        is_plain_half_config
+        and hidden_states.dtype == w1.dtype == w2.dtype
+        and not use_int8_w8a8
+        and expert_map is None
+        and w1_bias is None
+        and w2_bias is None
+        and not apply_router_weight_on_input
+    )
     is_fp8_blockwise = config_dtype == "fp8_w8a8" and block_shape is not None
 
     quant_dtype = _get_config_quant_dtype(
@@ -1823,6 +1871,7 @@ def fused_experts_impl(
         block_shape=block_shape,
         E=E,
         return_is_embedded=True,
+        use_original_layout=use_original_layout,
     )
 
     base_config, is_embedded_config = get_moe_config(M)
@@ -1878,6 +1927,25 @@ def fused_experts_impl(
         and activation_enum in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
         and w1_bias is None
         and expert_map is None  # Fused kernel doesn't handle EP -1 experts
+        # For tiny routed batches with large projections, one joint GEMM and
+        # a separate activation outperform the two sequential fused dots.
+        and not (
+            use_original_layout
+            and min(N, K) >= 1024
+            and (
+                0 < num_tokens <= 8
+                or (
+                    16 <= num_tokens <= 256
+                    and num_tokens * top_k_num >= 64
+                    and E >= 128
+                    and E < 4 * num_tokens * top_k_num <= 32 * E
+                    and K >= N >= 2048
+                    and K >= 3072
+                    and K % 256 == 0
+                    and N % 256 == 0
+                )
+            )
+        )
     )
 
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
