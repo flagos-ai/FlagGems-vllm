@@ -103,6 +103,7 @@ from flaggems_vllm.runtime.backend._ascend.ops.kv_rmsnorm_rope_cache import (
 from flaggems_vllm.runtime.backend._ascend.ops.lightning_indexer import (
     lightning_indexer,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.mega_gate import mega_gate
 from flaggems_vllm.runtime.backend._ascend.ops.matmul_persistent import (
     matmul_persistent,
 )
@@ -204,6 +205,7 @@ __all__ = [
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",
     "matmul_persistent",
+    "mega_gate",
     "mhc_post",
     "npu_mhc_pre_clamp_sinkhorn",
     "outplace_fused_experts",
