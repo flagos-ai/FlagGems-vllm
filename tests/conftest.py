@@ -41,6 +41,9 @@ import flaggems_vllm
 # actual culprit.
 # ---------------------------------------------------------------------------
 _DEVICE_CONTEXT_DEAD = False
+_DEFAULT_TORCH_DEVICE_FN = getattr(
+    getattr(flaggems_vllm, "runtime", None), "torch_device_fn", None
+)
 
 # On platforms without a native CUDA backend, torchada redirects
 # torch.cuda.* entry points (e.g. torch.cuda.synchronize) to the vendor
@@ -185,7 +188,12 @@ def _probe_device_context() -> bool:
     a bad state. It goes through ``torch_device_fn`` (the vendor's
     ``torch.cuda`` equivalent) so non-CUDA backends are probed the same way.
     """
-    torch_device_fn = flaggems_vllm.runtime.torch_device_fn
+    runtime_mod = getattr(flaggems_vllm, "runtime", None)
+    torch_device_fn = getattr(runtime_mod, "torch_device_fn", None)
+    if torch_device_fn is None:
+        torch_device_fn = _DEFAULT_TORCH_DEVICE_FN
+    if torch_device_fn is None:
+        return True
     try:
         if not torch_device_fn.is_available():
             return True
@@ -208,7 +216,12 @@ def pytest_runtest_setup(item):
         pytest.skip("device context poisoned by an earlier test failure")
 
 
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_teardown(item, nextitem):
+    # Run fixture teardowns (such as monkeypatch.undo()) before probing the
+    # device context, so tests that replace flaggems_vllm.runtime with a stub
+    # restore the real runtime module first.
+    yield
     global _DEVICE_CONTEXT_DEAD
     if not _DEVICE_CONTEXT_DEAD and not _probe_device_context():
         _DEVICE_CONTEXT_DEAD = True

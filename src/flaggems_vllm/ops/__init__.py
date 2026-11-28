@@ -31,7 +31,19 @@ from flaggems_vllm.ops.cast_sigmoid import cast_sigmoid
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
+from flaggems_vllm.ops.fused_kimi_k3_mla_decode_q_concat_ds_mla_insert import (
+    fused_kimi_k3_mla_decode_q_concat_ds_mla_insert,
+)
+from flaggems_vllm.ops.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert import (
+    fused_kimi_k3_mla_decode_q_concat_kv_cache_insert,
+)
+from flaggems_vllm.ops.fused_kimi_k3_mla_key_concat_kv_cache_insert import (
+    fused_kimi_k3_mla_key_concat_kv_cache_insert,
+)
 from flaggems_vllm.ops.fused_kimi_k3_mla_kv_concat import fused_kimi_k3_mla_kv_concat
+from flaggems_vllm.ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
+)
 from flaggems_vllm.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
@@ -102,6 +114,9 @@ from flaggems_vllm.ops.fused_matmul_reduce_scatter import (
     configure_fused_matmul_reduce_scatter,
     fused_matmul_reduce_scatter,
 )
+from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert,
+)
 from flaggems_vllm.ops.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert import (
     fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert,
 )
@@ -122,6 +137,7 @@ from flaggems_vllm.ops.fused_moe import (
     invoke_fused_moe_triton_kernel,
     outplace_fused_experts,
 )
+from flaggems_vllm.ops.fused_moe_lora import fused_moe_lora
 from flaggems_vllm.ops.geglu import dgeglu, geglu
 from flaggems_vllm.ops.gelu_and_mul import gelu_and_mul
 from flaggems_vllm.ops.gemma_rms_norm import gemma_rms_norm
@@ -130,6 +146,7 @@ from flaggems_vllm.ops.grouped_topk import grouped_topk
 from flaggems_vllm.ops.indexer_k_quant_and_cache import indexer_k_quant_and_cache
 from flaggems_vllm.ops.instance_norm import instance_norm
 from flaggems_vllm.ops.logprob import compute_topk_scores
+from flaggems_vllm.ops.lora_expand import lora_expand
 from flaggems_vllm.ops.ihc import (
     ihc_post,
     ihc_post_ref,
@@ -178,6 +195,7 @@ from flaggems_vllm.ops.qwen4 import (
     qwen4_vendor_store_qsa_rows,
     qsa_prepare,
 )
+from flaggems_vllm.ops.lora_shrink import lora_shrink
 from flaggems_vllm.ops.minimax_m3_sparse_attn import (
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
@@ -205,7 +223,7 @@ from flaggems_vllm.ops.per_token_group_quant_fp8 import (
 from flaggems_vllm.ops.permute_copy import permute_copy
 from flaggems_vllm.ops.persistent_topk import persistent_topk
 from flaggems_vllm.ops.reglu import dreglu, reglu
-from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled
+from flaggems_vllm.ops.rejection_sampler import gather_draft_sampled, rejection_sample
 from flaggems_vllm.ops.reshape_and_cache import reshape_and_cache
 from flaggems_vllm.ops.reshape_and_cache_flash import reshape_and_cache_flash
 from flaggems_vllm.ops.reshape_and_cache_flash_strided import (
@@ -213,6 +231,9 @@ from flaggems_vllm.ops.reshape_and_cache_flash_strided import (
 )
 from flaggems_vllm.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
+)
+from flaggems_vllm.ops.triton_reshape_and_cache_flash_per_token_head_quant import (
+    triton_reshape_and_cache_flash_per_token_head_quant,
 )
 from flaggems_vllm.ops.rotary_embedding import apply_rotary_pos_emb
 from flaggems_vllm.ops.router_gemm import router_gemm
@@ -229,6 +250,9 @@ from flaggems_vllm.ops.silu_and_mul_with_clamp import (
 )
 from flaggems_vllm.ops.skip_layernorm import skip_layer_norm
 from flaggems_vllm.ops.sparse_attention import sparse_attn_triton
+from flaggems_vllm.ops.split_kv_compress_norm_rope_insert_sparse_attn_cutedsl import (
+    split_kv_compress_norm_rope_insert_sparse_attn_cutedsl,
+)
 from flaggems_vllm.ops.stage_deepseek_v4_mega_moe_inputs import (
     stage_deepseek_v4_mega_moe_inputs,
 )
@@ -358,6 +382,7 @@ __all__ = [
     "fp8_fp4_paged_mqa_logits_graph",
     "fused_add_rms_norm",
     "fused_allreduce_rms_norm",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_experts_impl",
@@ -365,10 +390,15 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_indexer_weight_scale",
     "fused_inv_rope_fp8_quant",
+    "fused_kimi_k3_mla_decode_q_concat_ds_mla_insert",
+    "fused_kimi_k3_mla_decode_q_concat_kv_cache_insert",
+    "fused_kimi_k3_mla_key_concat_kv_cache_insert",
     "fused_kimi_k3_mla_kv_concat",
+    "fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "fused_marlin_moe",
     "fused_matmul_reduce_scatter",
     "fused_minimax_m3_qknorm_rope_kv_insert",
+    "fused_moe_lora",
     "fused_q",
     "fused_q_kv_rmsnorm",
     "fused_recurrent_gated_delta_rule_fwd",
@@ -404,6 +434,8 @@ __all__ = [
     "kpool_compress_and_write_cache",
     "kpool_decode_update_and_maybe_write_cache_batched",
     "kpool_seed_tail_cache",
+    "lora_expand",
+    "lora_shrink",
     "mamba_mixer",
     "marlin_gemm",
     "matmul_persistent",
@@ -465,6 +497,7 @@ __all__ = [
     "qwen4_vendor_store_qsa_rows",
     "recurrent_kda",
     "reglu",
+    "rejection_sample",
     "reshape_and_cache",
     "reshape_and_cache_flash",
     "reshape_and_cache_flash_strided",
@@ -483,6 +516,7 @@ __all__ = [
     "silu_and_mul_with_clamp_out",
     "skip_layer_norm",
     "sparse_attn_triton",
+    "split_kv_compress_norm_rope_insert_sparse_attn_cutedsl",
     "stage_deepseek_v4_mega_moe_inputs",
     "SUPPORTED_FP8_DTYPE",
     "swiglu",
@@ -495,6 +529,7 @@ __all__ = [
     "triton_ihc_post",
     "triton_ihc_pre",
     "triton_reshape_and_cache_flash",
+    "triton_reshape_and_cache_flash_per_token_head_quant",
     "triton_scaled_mm",
     "triton_unified_attention",
     "unpack_seq_triton",
@@ -528,6 +563,7 @@ elif _runtime.device.vendor_name == "thead":
     from flaggems_vllm.runtime.backend._thead.ops import (
         int8_einsum,
         mega_mhc,
+        megapreattention,
         pack_mega_mhc_weights,
         w8a8_block_int8_bmm,
     )
@@ -537,6 +573,7 @@ elif _runtime.device.vendor_name == "thead":
         "flash_attn_varlen_func_w8a8_int8",
         "int8_einsum",
         "mega_mhc",
+        "megapreattention",
         "pack_mega_mhc_weights",
         "w8a8_block_int8_bmm",
     ]
@@ -558,11 +595,21 @@ if _runtime.device.vendor_name == "metax":
 
     __all__.append("flash_attn_varlen_func_w8a8_int8")
 
-if _runtime.device.vendor_name == "ascend":
+if _runtime.device.vendor_name == "nvidia":
+    from flaggems_vllm.runtime.backend._nvidia import ops as nvidia_ops
+
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl = (  # noqa: F811
+        nvidia_ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+    )
+elif _runtime.device.vendor_name == "ascend":
+    from flaggems_vllm.runtime.backend._ascend import ops as ascend_ops
     from flaggems_vllm.runtime.backend._ascend.fused import (
         attention as ascend_attention,
     )
 
+    fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl = (  # noqa: F811
+        ascend_ops.fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl
+    )
     flash_attn_varlen_func = ascend_attention.flash_attn_varlen_func  # noqa: F811
     flash_attn_varlen_func_w8a8 = ascend_attention.flash_attn_varlen_func_w8a8
     __all__.append("flash_attn_varlen_func_w8a8")

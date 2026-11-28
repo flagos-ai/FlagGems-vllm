@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+lora_shrink:
+  shape_desc: "tokens, hidden, rank, slices, adapter slots"
+
 cooperative_topk: &cooperative_topk_shapes
   shapes:
     - [1, 127, 512]
@@ -471,6 +474,10 @@ QuantLightningIndexerVllmAscendBenchmark:
     - [16]
   shape_desc: "(tokens), heads=64, head_dim=128, TopK=32"
 
+# Shapes come from baseline.lora_expand.grid().
+lora_expand:
+  shape_desc: "LoRA expand workload key from baseline.lora_expand"
+
 # the default shapes info
 Benchmark:
   shapes:
@@ -879,3 +886,12 @@ matmul_persistent:
     - [2, 32, 64, 5, 1, 2, 2, 64, 16]
     - [5, 1, 2, 2, 32, 64, 2, 64, 16]
     - [5, 1, 2, 4, 32, 64, 5, 1, 2, 4, 64, 16]
+
+W8A8BlockMatmulBenchmark:
+  shapes:
+    - [64, 128, 128]
+    - [128, 256, 512]
+    - [1, 4096, 7168]
+    - [16, 4096, 7168]
+    - [64, 4096, 7168]
+  shape_desc: "M, N, K"

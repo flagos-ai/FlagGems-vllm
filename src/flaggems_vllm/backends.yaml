@@ -53,16 +53,22 @@
 #   flagtree  -> install the `flagtree:` package (default when available)
 #   triton    -> install the `triton:` package
 #   keep      -> leave the environment's existing compiler untouched
-#   unset     -> flagtree when available, otherwise triton; in `--no-venv`
-#                mode the default is `keep`
+#   unset     -> in `--no-venv` mode: compare installed flagtree against the
+#                backend pin, upgrade if older, otherwise `keep` (set
+#                COMPILER=triton to preserve the image's triton); in venv
+#                mode: flagtree when available, otherwise triton; `keep` if
+#                FlagTree is already present in the venv
 
 default_backend: nvidia-cuda133
 python: "3.12"
 pypi_base: "https://resource.flagos.net/repository/flagos-pypi-{vendor}/simple"
-# FlagGems 5.4.0 is published on the daily index. Pin the release that this
-# repository's tests target.
+# FlagGems is published to the shared hosted index (also mirrored in the
+# per-vendor indexes). Pin the release that this repository's tests target.
 flag_gems_version: "5.4.0"
-flag_gems_index: "https://resource.flagos.net/repository/flagos-pypi-daily/simple"
+flag_gems_index: "https://resource.flagos.net/repository/flagos-pypi-hosted/simple"
+# Searched when the index above lacks the pinned release (the hosted index does
+# not carry every FlagGems release; the daily index does).
+flag_gems_fallback_index: "https://resource.flagos.net/repository/flagos-pypi-daily/simple"
 # Fallback index for packages the vendor indexes do not carry. It defaults to
 # the Aliyun PyPI mirror because the CI runners reach pypi.org slowly. Set
 # PIP_INDEX_URL (for example to https://pypi.org/simple) to use another index.
@@ -133,21 +139,20 @@ backends:
     triton: triton==3.6.0
     flagtree: flagtree==0.7.0
     vllm:
-      - vllm==0.20.2
+      - vllm==0.32.0
     test_deps:
       - "cupy-cuda12x>=12.0.0,<14.0.0"
     env:
       PATH: /usr/local/cuda/bin:$PATH
       LD_LIBRARY_PATH: /usr/local/cuda/lib64:$LD_LIBRARY_PATH
       USE_FLAGCX: "OFF"
-    # numpy is intentionally not pinned: vllm==0.20.2 needs
-    # opencv-python-headless>=4.13, which needs numpy>=2, so a numpy==1.26.4 pin
-    # makes the vLLM install unsatisfiable. The vLLM step resolves it.
+    # numpy is intentionally not pinned: vllm==0.32.0 requires numpy, and
+    # pinning numpy==1.26.4 makes the vLLM install unsatisfiable.
     deps:
       - flagcx==0.14.1+cuda13.3
-      - torch==2.11.0+cu130
+      - torch==2.13.0+cu130
       - torchaudio==2.11.0+cu130
-      - torchvision==0.26.0+cu130
+      - torchvision==0.28.0+cu130
 
   # ---------------------------------------------------------------------------
   # Huawei Ascend

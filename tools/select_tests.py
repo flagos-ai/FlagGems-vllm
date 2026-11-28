@@ -93,6 +93,15 @@ THEAD_MEGAMHC_SOURCES = (
     "megamhc_device.cu",
 )
 
+THEAD_MEGAPREATTENTION_SOURCES = (
+    "megapreattention.py",
+    "megapreattention_kernel.py",
+    "_sailshmem/__init__.py",
+    "_sailshmem/bootstrap.cpp",
+    "_sailshmem/p2p.cu",
+)
+
+
 # Some existing tests do not follow the source-stem naming convention, so keep
 # a small explicit map here to avoid missing those tests.
 EXPLICIT_SOURCE_TO_TESTS = {
@@ -102,6 +111,16 @@ EXPLICIT_SOURCE_TO_TESTS = {
         ]
         for name in THEAD_MEGAMHC_SOURCES
     },
+    **{
+        f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
+            "tests/test_megapreattention.py"
+        ]
+        for name in THEAD_MEGAPREATTENTION_SOURCES
+    },
+    "src/flaggems_vllm/ops/rejection_sampler.py": [
+        "tests/test_gather_draft_sampled.py",
+        "tests/test_rejection_sampler.py",
+    ],
     "conftest.py": ["tests/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "tests/test_fused_matmul_reduce_scatter.py"
@@ -317,6 +336,16 @@ EXPLICIT_SOURCE_TO_BENCHMARKS = {
         ]
         for name in THEAD_MEGAMHC_SOURCES
     },
+    **{
+        f"src/flaggems_vllm/runtime/backend/_thead/ops/{name}": [
+            "benchmark/test_megapreattention.py"
+        ]
+        for name in THEAD_MEGAPREATTENTION_SOURCES
+    },
+    "src/flaggems_vllm/ops/rejection_sampler.py": [
+        "benchmark/test_gather_draft_sampled.py",
+        "benchmark/test_rejection_sampler.py",
+    ],
     "conftest.py": ["benchmark/test_fused_matmul_reduce_scatter.py"],
     "src/flaggems_vllm/testing/fused_matmul_reduce_scatter.py": [
         "benchmark/test_fused_matmul_reduce_scatter.py"

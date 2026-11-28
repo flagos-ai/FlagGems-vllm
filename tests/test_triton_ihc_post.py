@@ -25,6 +25,7 @@ SHAPES = (
     (64, 4, 6144),
     (256, 4, 6144),
     (1024, 4, 6144),
+    (65536, 3, 3),  # One tile beyond the Ascend launch limit, with masked HC and D.
 )
 LAYOUTS = tuple(itertools.product((False, True), repeat=3))
 ENTRY_NAMES = ("canonical", "legacy")

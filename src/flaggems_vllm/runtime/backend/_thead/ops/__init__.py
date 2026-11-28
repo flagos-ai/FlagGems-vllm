@@ -50,6 +50,7 @@ from flaggems_vllm.runtime.backend._thead.ops.megamhc import (
     mega_mhc,
     pack_mega_mhc_weights,
 )
+from flaggems_vllm.runtime.backend._thead.ops.megapreattention import megapreattention
 from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     SUPPORTED_FP8_DTYPE,
     per_token_group_quant_fp8,
@@ -80,6 +81,7 @@ __all__ = [
     "inplace_fused_experts",
     "int8_einsum",
     "mega_mhc",
+    "megapreattention",
     "outplace_fused_experts",
     "pack_mega_mhc_weights",
     "per_token_group_quant_fp8",
