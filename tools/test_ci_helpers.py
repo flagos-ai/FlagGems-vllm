@@ -93,6 +93,21 @@ class SelectTestsTest(TemporaryRepositoryTestCase):
         self.assertEqual(tests, ["tests/test_mul.py"])
         self.assertEqual(benchmarks, [])
 
+    def test_mthreads_tle_decode_selects_attention_checks(self):
+        self.make_file("tests/test_flash_attn_varlen_mthreads_autotune.py")
+        self.make_file("benchmark/test_flash_attn_varlen_func.py")
+
+        mode, tests, benchmarks = select_tests.select_targets(
+            self.repo_root,
+            [
+                "src/flaggems_vllm/runtime/backend/_mthreads/ops/flash_attention/tle_decode.py"
+            ],
+        )
+
+        self.assertEqual(mode, "smoke")
+        self.assertIn("tests/test_flash_attn_varlen_mthreads_autotune.py", tests)
+        self.assertIn("benchmark/test_flash_attn_varlen_func.py", benchmarks)
+
     def test_documentation_change_is_skipped(self):
         self.assertEqual(
             select_tests.select_targets(self.repo_root, ["docs/guide.md"]),
