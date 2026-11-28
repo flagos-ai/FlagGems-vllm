@@ -32,6 +32,6 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "flash_attention_fwd",
-    "swiglu_group_quant",
     "grouped_matmul_swiglu_quant_v2",
+    "swiglu_group_quant",
 ]
