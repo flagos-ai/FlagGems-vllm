@@ -129,6 +129,12 @@ exclude-dependencies = [
     "torch_musa", "deep_ep",
     "flash_attn_3", "flash_mla", "deep-gemm", "sageattention",
 ]
+# vllm_sail pins apache-tvm-ffi==0.1.9, while xgrammar 0.2.8+flagos
+# needs the extra_lib_paths argument added in apache-tvm-ffi 0.1.11.
+override-dependencies = [
+    "apache-tvm-ffi>=0.1.11,<0.2",
+]
+
 no-build-isolation-package = ["vllm-musa"]
 
 [tool.uv.sources]
